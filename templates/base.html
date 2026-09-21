@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Chemical Stock Tracker{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <!-- Select2 CSS -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/select2/4.0.13/css/select2.min.css">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="nav-brand">Chemical Stock Tracker</div>
+        <div class="nav-links">
+            <a href="{{ url_for('home') }}" class="{% if request.endpoint == 'home' %}active{% endif %}">Home</a>
+            <a href="{{ url_for('stock') }}" class="{% if request.endpoint == 'stock' %}active{% endif %}">Stock</a>
+            <a href="{{ url_for('stock_upload') }}" class="{% if request.endpoint == 'stock_upload' %}active{% endif %}">Upload & Compare</a>
+            <a href="{{ url_for('recipes') }}" class="{% if request.endpoint in ['recipes', 'recipe_detail'] %}active{% endif %}">Recipes</a>
+            <a href="{{ url_for('reports') }}" class="{% if request.endpoint == 'reports' %}active{% endif %}">Reports</a>
+            <a href="{{ url_for('audit_logs') }}" class="{% if request.endpoint == 'audit_logs' %}active{% endif %}">Audit Logs</a>
+        </div>
+    </nav>
+
+    <div class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ category }}">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+    </div>
+
+    <footer>
+        <p>Chemical Stock Tracker - ChemicalCalc v1.0</p>
+    </footer>
+
+    <!-- jQuery -->
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <!-- Select2 JS -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/select2/4.0.13/js/select2.min.js"></script>
+</body>
+</html>

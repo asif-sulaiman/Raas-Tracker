@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+
+{% block title %}Review Upload - Chemical Stock Tracker{% endblock %}
+
+{% block content %}
+<h1>Review Upload #{{ upload[0] }}</h1>
+
+<!-- Upload Info -->
+<div class="card">
+    <h2>Upload Details</h2>
+    <p><strong>Filename:</strong> {{ upload[1] }}</p>
+    <p><strong>Upload Date:</strong> {{ upload[2] }}</p>
+    <p><strong>Status:</strong> {{ upload[4] }}</p>
+    <p><strong>Match Score:</strong> {{ upload[12] }}%</p>
+</div>
+
+<!-- Pending Approvals -->
+{% if pending %}
+<div class="card">
+    <h2>Pending Approvals ({{ pending|length }})</h2>
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Chemical</th>
+                <th>Last Month</th>
+                <th>This Month</th>
+                <th>Status</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for item in pending %}
+            <tr>
+                <td>{{ item.id }}</td>
+                <td>{{ item.chemical_name or 'N/A' }}</td>
+                <td>{{ item.balance_last_month }}</td>
+                <td>{{ item.balance_this_month }}</td>
+                <td>{{ item.status }}</td>
+                <td>
+                    <form method="POST" action="{{ url_for('stock_upload_approve_row', workflow_id=item.id) }}" style="display:inline;">
+                        <input type="hidden" name="upload_id" value="{{ upload[0] }}">
+                        <select name="reason_code" class="btn btn-sm">
+                            {% for reason in reasons %}
+                            <option value="{{ reason.code }}">{{ reason.code }}</option>
+                            {% endfor %}
+                        </select>
+                        <input type="text" name="comments" placeholder="Comments" class="btn btn-sm">
+                        <input type="text" name="reviewed_by" placeholder="Your Name" value="Admin" class="btn btn-sm">
+                        <button type="submit" class="btn btn-sm btn-success">Approve</button>
+                    </form>
+                    <form method="POST" action="{{ url_for('stock_upload_reject_row', workflow_id=item.id) }}" style="display:inline;">
+                        <input type="hidden" name="upload_id" value="{{ upload[0] }}">
+                        <select name="reason_code" class="btn btn-sm">
+                            {% for reason in reasons %}
+                            <option value="{{ reason.code }}">{{ reason.code }}</option>
+                            {% endfor %}
+                        </select>
+                        <input type="text" name="comments" placeholder="Comments" class="btn btn-sm">
+                        <input type="text" name="reviewed_by" placeholder="Your Name" value="Admin" class="btn btn-sm">
+                        <button type="submit" class="btn btn-sm btn-danger">Reject</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+<!-- Approve All Button -->
+{% if upload[4] == 'uploaded' or upload[4] == 'completed' %}
+<div class="card">
+    <h2>Bulk Actions</h2>
+    <form method="POST" action="{{ url_for('stock_upload_approve', upload_id=upload[0]) }}">
+        <div class="form-row">
+            <div class="form-group">
+                <label>Reviewed By</label>
+                <input type="text" name="reviewed_by" value="Admin" required>
+            </div>
+            <div class="form-group">
+                <button type="submit" class="btn btn-success">Approve All & Adjust Stock</button>
+            </div>
+        </div>
+    </form>
+</div>
+{% endif %}
+
+<!-- Upload Rows -->
+<div class="card">
+    <h2>All Upload Rows</h2>
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Chemical</th>
+                <th>Last Month</th>
+                <th>This Month</th>
+                <th>Matched</th>
+                <th>Unit Match</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in rows %}
+            <tr>
+                <td>{{ row.id }}</td>
+                <td>{{ row.name }}</td>
+                <td>{{ row.balance_last_month }}</td>
+                <td>{{ row.balance_this_month }}</td>
+                <td>{{ '✓' if row.matched else '✗' }}</td>
+                <td>{{ '✓' if row.get('unit_match', 1) else '✗' }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<div class="card">
+    <a href="{{ url_for('stock_upload_results', upload_id=upload[0]) }}" class="btn btn-primary">Back to Results</a>
+</div>
+
+{% endblock %}

@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block title %}Audit Logs - Chemical Stock Tracker{% endblock %}
+
+{% block content %}
+<h1>Audit Logs</h1>
+
+<div class="card">
+    <h2>Recent Activity ({{ logs|length }} entries)</h2>
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Action</th>
+                <th>Entity Type</th>
+                <th>Entity ID</th>
+                <th>User</th>
+                <th>Old Value</th>
+                <th>New Value</th>
+                <th>Timestamp</th>
+                <th>IP Address</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for log in logs %}
+            <tr>
+                <td>{{ log.id }}</td>
+                <td>{{ log.action }}</td>
+                <td>{{ log.entity_type or '-' }}</td>
+                <td>{{ log.entity_id or '-' }}</td>
+                <td>{{ log.user_id }}</td>
+                <td>{{ log.old_value or '-' }}</td>
+                <td>{{ log.new_value or '-' }}</td>
+                <td>{{ log.timestamp }}</td>
+                <td>{{ log.ip_address or '-' }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+{% endblock %}

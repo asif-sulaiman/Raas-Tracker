@@ -1,0 +1,309 @@
+{% extends "base.html" %}
+
+{% block title %}Upload & Compare Stock - Chemical Stock Tracker{% endblock %}
+
+{% block content %}
+<h1>Upload & Compare Monthly Stock</h1>
+
+<!-- Upload Form -->
+<div class="card">
+    <h2>Upload Stock File</h2>
+    <form method="POST" action="{{ url_for('stock_upload') }}" enctype="multipart/form-data">
+        <div class="form-row">
+            <div class="form-group">
+                <label>Select Excel or PDF file</label>
+                <input type="file" name="file" accept=".xlsx,.xls,.pdf" required>
+            </div>
+            <div class="form-group">
+                <button type="submit" class="btn btn-primary">Upload & Compare</button>
+            </div>
+        </div>
+    </form>
+</div>
+
+{% if results %}
+<!-- Results Summary -->
+<div class="card">
+    <h2>Comparison Report - {{ filename }}</h2>
+    <p>Uploaded: {{ results.stats.total }} chemicals</p>
+    
+    <div class="stats-grid">
+        <div class="stat-card stat-success">
+            <div class="stat-number">{{ results.stats.matched }}</div>
+            <div class="stat-label">Matched</div>
+        </div>
+        <div class="stat-card stat-warning">
+            <div class="stat-number">{{ results.stats.last_month_mismatches + results.stats.this_month_mismatches }}</div>
+            <div class="stat-label">Partial Mismatch</div>
+        </div>
+        <div class="stat-card stat-danger">
+            <div class="stat-number">{{ results.stats.both_mismatches }}</div>
+            <div class="stat-label">Both Months Wrong</div>
+        </div>
+        <div class="stat-card stat-info">
+            <div class="stat-number">{{ results.stats.not_in_db }}</div>
+            <div class="stat-label">Not in DB</div>
+        </div>
+        <div class="stat-card stat-secondary">
+            <div class="stat-number">{{ results.stats.not_in_upload }}</div>
+            <div class="stat-label">Missing from Upload</div>
+        </div>
+    </div>
+    
+    <p><strong>Match Score: {{ results.stats.match_percentage }}%</strong></p>
+</div>
+
+<!-- Matches -->
+{% if results.matches %}
+<div class="card">
+    <h2>✅ Matched ({{ results.matches|length }})</h2>
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Chemical Name</th>
+                <th>DB Last Month</th>
+                <th>DB This Month</th>
+                <th>Upload Last Month</th>
+                <th>Upload This Month</th>
+                <th>Batch</th>
+                <th>Expiry</th>
+                <th>Unit Match</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for item in results.matches %}
+            <tr>
+                <td>{{ item.name }}</td>
+                <td>{{ item.db_last }}</td>
+                <td>{{ item.db_this }}</td>
+                <td>{{ item.upload_last }}</td>
+                <td>{{ item.upload_this }}</td>
+                <td>{{ item.batch_number or '-' }}</td>
+                <td>{{ item.expiry_date or '-' }}</td>
+                <td class="{% if item.unit_match %}text-success{% else %}text-danger{% endif %}">
+                    {{ '✓' if item.unit_match else '✗' }}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+<!-- Last Month Mismatches -->
+{% if results.last_month_mismatches %}
+<div class="card">
+    <h2>⚠️ Last Month Mismatch ({{ results.last_month_mismatches|length }})</h2>
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Chemical Name</th>
+                <th>DB Last Month</th>
+                <th>Upload Last Month</th>
+                <th>Difference</th>
+                <th>DB This Month</th>
+                <th>Upload This Month</th>
+                <th>Batch</th>
+                <th>Expiry</th>
+                <th>Unit</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for item in results.last_month_mismatches %}
+            <tr>
+                <td>{{ item.name }}</td>
+                <td>{{ item.db_last }}</td>
+                <td>{{ item.upload_last }}</td>
+                <td class="{% if item.diff_last > 0 %}text-success{% elif item.diff_last < 0 %}text-danger{% endif %}">
+                    {{ item.diff_last }}
+                </td>
+                <td>{{ item.db_this }}</td>
+                <td>{{ item.upload_this }}</td>
+                <td>{{ item.batch_number or '-' }}</td>
+                <td>{{ item.expiry_date or '-' }}</td>
+                <td>{{ item.upload_unit or '-' }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+<!-- This Month Mismatches -->
+{% if results.this_month_mismatches %}
+<div class="card">
+    <h2>⚠️ This Month Mismatch ({{ results.this_month_mismatches|length }})</h2>
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Chemical Name</th>
+                <th>DB Last Month</th>
+                <th>Upload Last Month</th>
+                <th>DB This Month</th>
+                <th>Upload This Month</th>
+                <th>Difference</th>
+                <th>Batch</th>
+                <th>Expiry</th>
+                <th>Unit</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for item in results.this_month_mismatches %}
+            <tr>
+                <td>{{ item.name }}</td>
+                <td>{{ item.db_last }}</td>
+                <td>{{ item.upload_last }}</td>
+                <td>{{ item.db_this }}</td>
+                <td>{{ item.upload_this }}</td>
+                <td class="{% if item.diff_this > 0 %}text-success{% elif item.diff_this < 0 %}text-danger{% endif %}">
+                    {{ item.diff_this }}
+                </td>
+                <td>{{ item.batch_number or '-' }}</td>
+                <td>{{ item.expiry_date or '-' }}</td>
+                <td>{{ item.upload_unit or '-' }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+<!-- Both Mismatches -->
+{% if results.both_mismatches %}
+<div class="card">
+    <h2>❌ Both Months Mismatch ({{ results.both_mismatches|length }})</h2>
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Chemical Name</th>
+                <th>DB Last Month</th>
+                <th>Upload Last Month</th>
+                <th>Last Diff</th>
+                <th>DB This Month</th>
+                <th>Upload This Month</th>
+                <th>This Diff</th>
+                <th>Batch</th>
+                <th>Expiry</th>
+                <th>Unit</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for item in results.both_mismatches %}
+            <tr>
+                <td>{{ item.name }}</td>
+                <td>{{ item.db_last }}</td>
+                <td>{{ item.upload_last }}</td>
+                <td class="{% if item.diff_last > 0 %}text-success{% elif item.diff_last < 0 %}text-danger{% endif %}">
+                    {{ item.diff_last }}
+                </td>
+                <td>{{ item.db_this }}</td>
+                <td>{{ item.upload_this }}</td>
+                <td class="{% if item.diff_this > 0 %}text-success{% elif item.diff_this < 0 %}text-danger{% endif %}">
+                    {{ item.diff_this }}
+                </td>
+                <td>{{ item.batch_number or '-' }}</td>
+                <td>{{ item.expiry_date or '-' }}</td>
+                <td>{{ item.upload_unit or '-' }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+<!-- Not in DB -->
+{% if results.not_in_db %}
+<div class="card">
+    <h2>🆕 Not in Database ({{ results.not_in_db|length }})</h2>
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Chemical Name</th>
+                <th>Upload Last Month</th>
+                <th>Upload This Month</th>
+                <th>Batch</th>
+                <th>Expiry</th>
+                <th>Unit</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for item in results.not_in_db %}
+            <tr>
+                <td>{{ item.name }}</td>
+                <td>{{ item.upload_last }}</td>
+                <td>{{ item.upload_this }}</td>
+                <td>{{ item.batch_number or '-' }}</td>
+                <td>{{ item.expiry_date or '-' }}</td>
+                <td>{{ item.upload_unit or '-' }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+<!-- Not in Upload -->
+{% if results.not_in_upload %}
+<div class="card">
+    <h2>👻 Missing from Upload ({{ results.not_in_upload|length }})</h2>
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Chemical Name</th>
+                <th>DB Last Month</th>
+                <th>DB This Month</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for item in results.not_in_upload %}
+            <tr>
+                <td>{{ item.name }}</td>
+                <td>{{ item.db_last }}</td>
+                <td>{{ item.db_this }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+{% endif %}
+
+<!-- Upload History -->
+{% if upload_history %}
+<div class="card">
+    <h2>Upload History</h2>
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Filename</th>
+                <th>Upload Date</th>
+                <th>Status</th>
+                <th>Total</th>
+                <th>Matched</th>
+                <th>Match %</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for upload in upload_history %}
+            <tr>
+                <td>{{ upload.id }}</td>
+                <td>{{ upload.filename }}</td>
+                <td>{{ upload.upload_date }}</td>
+                <td>{{ upload.status }}</td>
+                <td>{{ upload.total_chemicals }}</td>
+                <td>{{ upload.matched }}</td>
+                <td>{{ upload.match_percentage }}%</td>
+                <td>
+                    <a href="{{ url_for('stock_upload_results', upload_id=upload.id) }}" class="btn btn-sm btn-primary">View</a>
+                    <a href="{{ url_for('stock_upload_review', upload_id=upload.id) }}" class="btn btn-sm btn-success">Review</a>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+{% endblock %}

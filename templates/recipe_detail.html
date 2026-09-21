@@ -1,0 +1,155 @@
+{% extends "base.html" %}
+
+{% block title %}{{ recipe.name }} - Chemical Stock Tracker{% endblock %}
+
+{% block content %}
+<div class="breadcrumb">
+    <a href="{{ url_for('recipes') }}">Recipes</a> / {{ recipe.name }}
+</div>
+
+<h1>{{ recipe.name }}</h1>
+<p class="text-muted">
+    <strong>Total Quantity:</strong> <span id="batchYield" data-totalquantity="{{ recipe.total_quantity }}">{{ recipe.total_quantity }}</span> units | 
+    <strong>Created:</strong> {{ recipe.created }}
+    <a href="{{ url_for('recipe_edit', name=recipe.name) }}" class="btn btn-sm btn-warning" style="margin-left: 15px;">Edit Total Quantity / Water %</a>
+</p>
+
+<!-- Current Recipe Items -->
+<div class="card">
+    <h2>Formulation & Ingredients</h2>
+    
+    {% if items %}
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>#</th>
+                <th>Chemical Name</th>
+                <th>Percentage (%)</th>
+                <th>Calculated Qty (for {{ recipe.total_quantity }} yield)</th>
+                <th>Current Stock</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% set total_ingredient_pct = namespace(value=0.0) %}
+            {% for item in items %}
+            {% set total_ingredient_pct.value = total_ingredient_pct.value + item.percentage %}
+            <tr>
+                <td>{{ loop.index }}</td>
+                <td><strong>{{ item.chemical_name }}</strong></td>
+                <td>
+                    <form method="POST" action="{{ url_for('recipe_update_item_route', name=recipe.name) }}" style="display:inline-flex; align-items: center; gap: 5px;">
+                        <input type="hidden" name="chemical" value="{{ item.chemical_name }}">
+                        <input type="number" step="0.01" min="0" max="100" name="percentage" value="{{ item.percentage }}" style="width: 80px; padding: 3px;" required> %
+                        <button type="submit" class="btn btn-sm btn-primary">Update</button>
+                    </form>
+                </td>
+                <td class="text-info"><strong>{{ "%.2f"|format(item.batch_qty) }}</strong> {{ item.unit }}</td>
+                <td>{{ item.current_stock }} {{ item.unit }}</td>
+                <td>
+                    <form method="POST" action="{{ url_for('recipe_delete_item', name=recipe.name, chem=item.chemical_name) }}" style="display:inline;" onsubmit="return confirm('Remove {{ item.chemical_name }} from recipe?');">
+                        <button type="submit" class="btn btn-sm btn-danger">Remove</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    
+    <div style="margin-top: 15px; padding: 15px; background: #222; border-radius: 5px; display: flex; justify-content: space-between; align-items: center;">
+        <div>
+            <strong>Raw Materials Total:</strong> 
+            <span id="totalPct" style="font-size: 1.2em; font-weight: bold; {% if total_ingredient_pct.value == 100 %}color: #2ecc71;{% else %}color: #e74c3c;{% endif %}">
+                {{ "%.2f"|format(total_ingredient_pct.value) }}%
+            </span>
+        </div>
+        <div>
+            <strong>Water %:</strong> 
+            <span id="waterPct" style="font-size: 1.2em; font-weight: bold; color: #2ecc71;">
+                {% if recipe.water_percentage and recipe.water_percentage > 0 %}
+                    {{ "%.2f"|format(recipe.water_percentage) }}%
+                {% else %}
+                    Auto: {{ "%.2f"|format(100 - total_ingredient_pct.value) }}%
+                {% endif %}
+            </span>
+        </div>
+        <div>
+            <strong>Grand Total:</strong> 
+            {% set grand_total = total_ingredient_pct.value + (recipe.water_percentage if recipe.water_percentage else (100 - total_ingredient_pct.value)) %}
+            <span style="font-size: 1.2em; font-weight: bold; {% if grand_total == 100 %}color: #2ecc71;{% else %}color: #e74c3c;{% endif %}">
+                {{ "%.2f"|format(grand_total) }}%
+            </span>
+            {% if grand_total == 100 %}
+                <span class="text-success" style="margin-left: 10px; font-size: 0.9em;">(Complete formulation)</span>
+            {% else %}
+                <span class="text-danger" style="margin-left: 10px; font-size: 0.9em;">(Should equal 100%)</span>
+            {% endif %}
+        </div>
+    </div>
+    {% else %}
+    <p class="text-muted">No chemicals added to this recipe yet. Add chemicals below using percentage (%) input.</p>
+    
+    <!-- Show water info even when no ingredients -->
+    <div style="margin-top: 15px; padding: 15px; background: #222; border-radius: 5px;">
+        <strong>Water %:</strong> 
+        <span style="font-size: 1.2em; font-weight: bold; color: #2ecc71;">
+            {% if recipe.water_percentage and recipe.water_percentage > 0 %}
+                {{ "%.2f"|format(recipe.water_percentage) }}%
+            {% else %}
+                Not set (auto-calculated from ingredients when added)
+            {% endif %}
+        </span>
+    </div>
+    {% endif %}
+</div>
+
+<!-- Add Chemical to Recipe with Percentage Input -->
+<div class="card">
+    <h2>Add Chemical by Percentage (%)</h2>
+    <p class="text-muted">Enter percentage (e.g., 20 for 20%). The system automatically calculates: <code>Total Quantity ({{ recipe.total_quantity }}) × Percentage% = Required Quantity</code></p>
+    
+    <form method="POST" action="{{ url_for('recipe_add_item', name=recipe.name) }}>
+        <div class="form-row">
+            <div class="form-group">
+                <label>Select Chemical from Inventory</label>
+                <select name="chemical" class="select2" style="width: 100%;" required>
+                    <option value="">-- Select Chemical --</option>
+                    {% for chem in chemicals %}
+                    <option value="{{ chem.name }}">{{ chem.name }} (In stock: {{ chem.qty }} {{ chem.unit }})</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Percentage (%)</label>
+                <input type="number" step="0.01" min="0.01" max="100" name="percentage" id="inputPct" placeholder="e.g. 20" required>
+            </div>
+            <div class="form-group">
+                <label>Calculated Quantity</label>
+                <div style="padding: 8px; background: #1a1a1a; border: 1px solid #444; border-radius: 4px; font-weight: bold; color: #3498db;">
+                    <span id="calcPreview">0.00</span> Units
+                </div>
+            </div>
+            <div class="form-group" style="display: flex; align-items: flex-end;">
+                <button type="submit" class="btn btn-success">Add to Recipe</button>
+            </div>
+        </div>
+    </form>
+</div>
+{% endblock %}
+
+<script>
+    $(document).ready(function() {
+        $('.select2').select2({
+            tags: true,
+            allowClear: true
+        });
+
+        // Live calculation preview
+        const totalQuantity = parseFloat($('#batchYield').data('totalquantity')) || 1;
+        $('#inputPct').on('input', function() {
+            const pct = parseFloat($(this).val()) || 0;
+            const calc = (totalQuantity * pct) / 100;
+            $('#calcPreview').text(calc.toFixed(2));
+        });
+    });
+</script>
