@@ -161,6 +161,31 @@ def test_mailing_address_client_and_dedupe():
     ) == "EXAMPLE CLIENT LTD"
 
 
+def test_header_row_labels_not_mistaken_for_values():
+    # Labels share one header row, values sit on the row below (real RAAS PDF).
+    text = ("Mailing Address Delivery Address Invoice Number Invoice Date\n"
+            "EXAMPLE CLIENT LTD EXAMPLE CLIENT LTD 99000001 15/09/2026")
+    assert extract_client_name(text) == "EXAMPLE CLIENT LTD"
+    assert extract_pi_number_from_text(text) == "99000001"
+    assert extract_pi_date(text) == "2026-09-15"
+
+
+def test_pi_number_value_row_skips_dates():
+    # A date on the value row must not be mistaken for the PI number.
+    assert extract_pi_number_from_text(
+        "Invoice Number\nInvoice Date\n15/09/2026") is None
+    assert extract_pi_number_from_text(
+        "Invoice Number Invoice Date\n99000001 15/09/2026") == "99000001"
+
+
+def test_real_client_names_not_label_like():
+    from parse_sales import _looks_like_label
+    assert not _looks_like_label("GENERIC CHEMICALS LTD")
+    assert not _looks_like_label("EXAMPLE CLIENT LTD")
+    assert _looks_like_label("Invoice Number")
+    assert _looks_like_label("Delivery Address")
+
+
 def test_parse_number_formats():
     assert _parse_number("1,000") == 1000.0
     assert _parse_number("US$48,880.00") == 48880.0

@@ -116,6 +116,15 @@ def extract_pi_number_from_text(text: str) -> Optional[str]:
                       text, re.IGNORECASE)
     if match:
         return match.group(2).strip()
+    # Positional fallback: label row with the value on a following value row,
+    # e.g. 'Invoice Number  Invoice Date' / '99000001  15/09/2026'.
+    m = re.search(r'invoice\s*(number|no\.?)', text, re.IGNORECASE)
+    if m:
+        for line in text[m.end():].split('\n')[:5]:
+            de_dated = re.sub(r'\d{1,4}[\/\-.]\d{1,2}[\/\-.]\d{2,4}', ' ', line)
+            tok = re.search(r'\b(\d{4,}(?:-\d+)?)\b', de_dated)
+            if tok:
+                return tok.group(1)
     match = re.search(r'(PI-\d{4}-\d+)', text, re.IGNORECASE)
     if match:
         return match.group(1).upper()
@@ -136,18 +145,39 @@ def _dedupe_doubled_text(value: str) -> str:
     return value
 
 
+_LABEL_LIKE = ('invoice', 'delivery', 'mailing', 'address', 'number',
+               'shipment', 'payment', 'destination', 'country', 'carriage',
+               'port', 'partial', 'trans-shipment', 'transhipment',
+               'third party', 'account', 'bank', 'swift')
+
+
+def _looks_like_label(value: str) -> bool:
+    """True when a candidate is another form label rather than a real value."""
+    v = value.strip().lower()
+    if len(v) <= 2:
+        return True
+    return any(re.search(r'\b' + re.escape(tok) + r'\b', v)
+               for tok in _LABEL_LIKE)
+
+
 def extract_client_name(text: str) -> Optional[str]:
     """Extract client name: RAAS 'Mailing Address' block first, then labels."""
-    mailing = re.search(r'mailing\s*address\s*([^\n\r]*)\n?([^\n\r]*)',
-                        text, re.IGNORECASE)
-    if mailing:
-        # Same-line remainder may just be the adjacent 'Delivery Address'
-        # column header — in that case the name is on the next line.
-        rest = re.sub(r'(?i)delivery\s*address', '', mailing.group(1)).strip()
-        candidate = rest or mailing.group(2).strip()
-        name = _dedupe_doubled_text(re.sub(r'\s+', ' ', candidate).strip())
-        if name and len(name) > 2:
-            return name
+    m = re.search(r'mailing\s*address', text, re.IGNORECASE)
+    if m:
+        # The label often shares a header row with other labels
+        # ('Mailing Address ... Invoice Number ...'), with values on the
+        # rows below — scan the following lines for the first line that is
+        # a real value rather than another label.
+        for cand in text[m.end():].split('\n')[:4]:
+            name = re.sub(r'(?i)delivery\s*address', '', cand)
+            # Merged multi-column value rows carry the name plus the PI
+            # number/date ('EXAMPLE ... LTD 99000001 15/09/2026') — strip
+            # dates and standalone doc numbers before de-duplication.
+            name = re.sub(r'\d{1,4}[\/\-.]\d{1,2}[\/\-.]\d{2,4}', ' ', name)
+            name = re.sub(r'\b\d{5,}(?:-\d+)?\b', ' ', name)
+            name = _dedupe_doubled_text(re.sub(r'\s+', ' ', name).strip())
+            if name and not _looks_like_label(name):
+                return name
     labels = [
         r'Sold\s+to[:\s]+([^\n\r]+)',
         r'Bill\s+to[:\s]+([^\n\r]+)',
