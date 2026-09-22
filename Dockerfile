@@ -16,7 +16,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY flask_app.py wsgi.py chem_stock.py parse_sales.py parse_stock.py ./
 COPY chemcalc/ ./chemcalc/
-COPY --from=frontend /app/react_frontend ./react_frontend
+COPY --from=frontend /app/chemcalc-frontend/dist ./react_frontend
 VOLUME ["/data"]
 ENV CHEMCALC_DATA_DIR=/data
 EXPOSE 5000
