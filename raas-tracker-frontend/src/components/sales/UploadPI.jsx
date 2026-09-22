@@ -28,8 +28,8 @@ export default function UploadPI({ isOpen, onClose, onParsed }) {
   const validateFile = (file) => {
     if (!file) return 'No file selected';
     const name = file.name.toLowerCase();
-    if (!name.endsWith('.docx') && !name.endsWith('.doc')) {
-      return 'Only .doc and .docx PI files are accepted';
+    if (!name.endsWith('.pdf') && !name.endsWith('.docx')) {
+      return 'Only .pdf and .docx PI files are accepted. For legacy .doc, save as .docx or PDF and retry';
     }
     if (file.size > 50 * 1024 * 1024) {
       return 'File size must be less than 50MB';
@@ -73,7 +73,7 @@ export default function UploadPI({ isOpen, onClose, onParsed }) {
       isOpen={isOpen}
       onClose={handleClose}
       title="Upload PI Document"
-      subtitle="Upload a .doc or .docx proforma invoice - data will be extracted for your review"
+      subtitle="Upload a PDF or .docx proforma invoice - data will be extracted for your review"
       footer={
         <>
           <Button variant="secondary" size="sm" onClick={handleClose} disabled={parsing}>
@@ -120,7 +120,7 @@ export default function UploadPI({ isOpen, onClose, onParsed }) {
           <input
             ref={fileInputRef}
             type="file"
-            accept=".docx,.doc"
+            accept=".pdf,.docx"
             onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFile(f); e.target.value = ''; }}
             className="hidden"
             disabled={parsing}
@@ -134,7 +134,7 @@ export default function UploadPI({ isOpen, onClose, onParsed }) {
               <div>
                 <p className="text-sm font-semibold text-slate-800 dark:text-white">{selectedFile.name}</p>
                 <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                  {(selectedFile.size / 1024).toFixed(1)} KB • {selectedFile.name.toLowerCase().endsWith('.doc') ? 'DOC' : 'DOCX'}
+                  {(selectedFile.size / 1024).toFixed(1)} KB • {selectedFile.name.toLowerCase().endsWith('.pdf') ? 'PDF' : 'DOCX'}
                 </p>
               </div>
               {!parsing && (
@@ -161,20 +161,20 @@ export default function UploadPI({ isOpen, onClose, onParsed }) {
               </div>
               <div>
                 <p className="text-sm font-semibold text-slate-800 dark:text-white">
-                  {isDragging ? 'Drop your PI file here' : 'Drag & drop your PI .doc/.docx here'}
+                  {isDragging ? 'Drop your PI file here' : 'Drag & drop your PI PDF/.docx here'}
                 </p>
                 <p className="text-xs text-slate-500 mt-1">
                   or <span className="text-blue-600 font-medium">browse files</span>
                 </p>
               </div>
               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-blue-50 dark:bg-blue-950/40 text-[10px] font-medium text-blue-600 dark:text-blue-400">
-                <FileText className="h-3 w-3" /> DOC/DOCX • Max 50MB
+                <FileText className="h-3 w-3" /> PDF/DOCX • Max 50MB
               </span>
             </div>
           )}
         </div>
         <p className="text-[11px] text-slate-400 dark:text-slate-500">
-          Tip: name files like <span className="font-mono">PI-2026-001_ClientName.docx</span> so the PI number is detected automatically.
+          Tip: the PI number, date and client are read from the Invoice Number, Invoice Date and Mailing Address in the document.
         </p>
       </div>
     </Modal>

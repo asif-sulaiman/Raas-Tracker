@@ -1,10 +1,14 @@
-"""PI Document Parser using python-docx + Pydantic for structured extraction.
+"""PI Document Parser: PDF + DOCX (legacy .doc via Word) to structured extraction.
 
-Supports both .docx (Office Open XML) and .doc (legacy OLE2) formats.
-.doc files are converted to .docx via Word COM automation (doc2docx) before parsing.
+Primary path is PDF (text-based PIs, e.g. RAAS Biotech proforma invoices)
+parsed with pdfplumber (tables) + PyMuPDF (text fallback) — pure Python, so it
+works on the server/VPS where Microsoft Word is unavailable. .docx is parsed
+with python-docx. Legacy .doc still converts via Word COM for local CLI use,
+but the API no longer accepts it.
 """
 
 import re
+import io
 import os
 import tempfile
 from typing import Optional, List
@@ -18,6 +22,7 @@ class PIItem(BaseModel):
     product_name: str
     quantity: float = 0.0
     unit_price: float = 0.0
+    item_no: Optional[str] = None
 
 
 class PIHeader(BaseModel):
@@ -45,34 +50,104 @@ def extract_pi_number_from_filename(filepath: str) -> Optional[str]:
     return match.group(1).upper() if match else None
 
 
-def extract_pi_date(text: str) -> Optional[str]:
-    """Extract PI date from document text."""
-    date_patterns = [
-        r'\b(\d{4}-\d{2}-\d{2})\b',
-        r'\b(\d{2}/\d{2}/\d{4})\b',
-        r'\b(\d{2}-\d{2}-\d{4})\b',
-        r'\b(\d{2}\.\d{2}\.\d{4})\b',
-    ]
-    for pattern in date_patterns:
-        matches = re.findall(pattern, text)
-        if matches:
-            dt = matches[0]
-            try:
-                if '-' in dt and dt.count('-') == 2 and len(dt.split('-')[0]) == 4:
-                    return dt
-                elif '/' in dt:
-                    return datetime.strptime(dt, "%m/%d/%Y").strftime("%Y-%m-%d")
-                elif '-' in dt:
-                    return datetime.strptime(dt, "%d-%m-%Y").strftime("%Y-%m-%d")
-                elif '.' in dt:
-                    return datetime.strptime(dt, "%d.%m.%Y").strftime("%Y-%m-%d")
-            except ValueError:
-                continue
+def _parse_dayfirst(dt: str) -> Optional[str]:
+    """Parse a date string to ISO format, preferring DD/MM/YYYY for slashes.
+
+    RAAS PIs (Malaysia/Bangladesh) use day-first dates, so 05/09/2026 means
+    5 August — not May 8. Falls back to month-first when day-first is invalid.
+    """
+    dt = dt.strip()
+    if '-' in dt and len(dt.split('-')[0]) == 4:
+        try:
+            return datetime.strptime(dt, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+    if '/' in dt:
+        formats = ["%d/%m/%Y", "%m/%d/%Y"]
+    elif '-' in dt:
+        formats = ["%d-%m-%Y", "%m-%d-%Y"]
+    elif '.' in dt:
+        formats = ["%d.%m.%Y", "%m.%d.%Y"]
+    else:
+        return None
+    for fmt in formats:
+        try:
+            return datetime.strptime(dt, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
     return None
 
 
+def extract_pi_date(text: str) -> Optional[str]:
+    """Extract PI date from document text.
+
+    Prefers a date next to an 'Invoice Date'/'PI date' label, then falls back
+    to scanning every date-like string (not just the first match).
+    """
+    labeled = re.search(
+        r'(invoice\s*date|pi\s*date)\s*[:\-]?\s*'
+        r'(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}-\d{1,2}-\d{1,2})',
+        text, re.IGNORECASE)
+    if labeled:
+        parsed = _parse_dayfirst(labeled.group(2))
+        if parsed:
+            return parsed
+    date_patterns = [
+        r'\b(\d{4}-\d{1,2}-\d{1,2})\b',
+        r'\b(\d{1,2}/\d{1,2}/\d{4})\b',
+        r'\b(\d{1,2}-\d{1,2}-\d{4})\b',
+        r'\b(\d{1,2}\.\d{1,2}\.\d{4})\b',
+    ]
+    for pattern in date_patterns:
+        for dt in re.findall(pattern, text):
+            parsed = _parse_dayfirst(dt)
+            if parsed:
+                return parsed
+    return None
+
+
+def extract_pi_number_from_text(text: str) -> Optional[str]:
+    """Extract PI number from document body.
+
+    RAAS PIs carry a bare number under an 'Invoice Number'/'Invoice No.' label
+    (e.g. 99000001); generic PIs use a PI-YYYY-NNN pattern.
+    """
+    match = re.search(r'invoice\s*(number|no\.?)\s*[:\-]?\s*(\d[\d\-]*)',
+                      text, re.IGNORECASE)
+    if match:
+        return match.group(2).strip()
+    match = re.search(r'(PI-\d{4}-\d+)', text, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    return None
+
+
+def _dedupe_doubled_text(value: str) -> str:
+    """Collapse 'X X' duplications from two-column PDF text extraction.
+
+    Side-by-side mailing/delivery addresses often extract as
+    'EXAMPLE CLIENT LTD EXAMPLE CLIENT LTD' — return one copy.
+    """
+    words = value.split()
+    if len(words) >= 2 and len(words) % 2 == 0:
+        half = len(words) // 2
+        if words[:half] == words[half:]:
+            return ' '.join(words[:half])
+    return value
+
+
 def extract_client_name(text: str) -> Optional[str]:
-    """Extract client name from 'Sold to:', 'Bill to:', 'To:' labels."""
+    """Extract client name: RAAS 'Mailing Address' block first, then labels."""
+    mailing = re.search(r'mailing\s*address\s*([^\n\r]*)\n?([^\n\r]*)',
+                        text, re.IGNORECASE)
+    if mailing:
+        # Same-line remainder may just be the adjacent 'Delivery Address'
+        # column header — in that case the name is on the next line.
+        rest = re.sub(r'(?i)delivery\s*address', '', mailing.group(1)).strip()
+        candidate = rest or mailing.group(2).strip()
+        name = _dedupe_doubled_text(re.sub(r'\s+', ' ', candidate).strip())
+        if name and len(name) > 2:
+            return name
     labels = [
         r'Sold\s+to[:\s]+([^\n\r]+)',
         r'Bill\s+to[:\s]+([^\n\r]+)',
@@ -88,6 +163,192 @@ def extract_client_name(text: str) -> Optional[str]:
             if name and len(name) > 2:
                 return name
     return None
+
+
+def _clean_cell(value) -> str:
+    """Normalize a table cell to single-spaced text."""
+    return re.sub(r'\s+', ' ', str(value or '')).strip()
+
+
+def _parse_number(value: str) -> Optional[float]:
+    """Parse '1,000' / '2.65' / 'US$48,880.00' to float; None if unparseable."""
+    if value is None:
+        return None
+    cleaned = re.sub(r'[^\d.\-]', '', str(value).replace(',', ''))
+    if not cleaned or cleaned in ('.', '-', '-.'):
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _map_product_columns(header_cells: List[str]) -> Optional[dict]:
+    """Map product-table columns by header name instead of fixed positions.
+
+    Handles RAAS layouts (Sr.No | Quantity in Kg | Item No. | Description |
+    HS Code | Unit Price | Total) as well as generic (Item | Qty | Price)
+    tables. Returns None when the row is not a product-table header.
+    """
+    heads = [_clean_cell(c).lower() for c in header_cells]
+
+    def find(*keys, exclude=()):
+        for i, h in enumerate(heads):
+            if any(k in h for k in keys) and not any(e in h for e in exclude):
+                return i
+        return None
+
+    qty = find('quantit', 'qty')
+    if qty is None:
+        return None
+    desc = find('descript', 'product')
+    price = find('unit price', 'unitprice')
+    if price is None:
+        price = find('price', exclude=('total',))
+    if desc is None and price is None:
+        return None
+    return {
+        'qty': qty,
+        'desc': desc,
+        'price': price,
+        'total': find('total'),
+        'item': find('item'),
+        'hs': find('hs'),
+    }
+
+
+_TOTAL_NAMES = {'total', 'total usd', 'subtotal', 'sub total', 'grand total',
+                'net total', 'amount due', 'balance due'}
+
+
+def extract_items_from_tables(tables: List[List[List[str]]],
+                              warnings: List[str]) -> List[PIItem]:
+    """Extract line items from tables using header-name column mapping."""
+    items = []
+    for table in tables:
+        rows = [[_clean_cell(c) for c in row] for row in table]
+        rows = [r for r in rows if any(r)]
+        if len(rows) < 2:
+            continue
+        colmap = None
+        header_idx = 0
+        for i, row in enumerate(rows):
+            colmap = _map_product_columns(row)
+            if colmap:
+                header_idx = i
+                break
+        if not colmap:
+            continue
+        if colmap['price'] is None and colmap['total'] is not None:
+            # Unlabeled/clipped Unit Price header: assume the column just
+            # left of Total (RAAS layout), unless already claimed.
+            cand = colmap['total'] - 1
+            taken = {v for v in (colmap['qty'], colmap['desc'],
+                                 colmap['item'], colmap['hs']) if v is not None}
+            if cand >= 0 and cand not in taken:
+                colmap = dict(colmap, price=cand)
+                warnings.append("Unit Price column inferred next to Total column")
+        if colmap['price'] is None:
+            warnings.append("Unit Price column not found; prices defaulted to 0")
+        width = max(len(r) for r in rows)
+
+        def cell(row, idx):
+            return row[idx] if idx is not None and idx < len(row) else ''
+
+        for lineno, row in enumerate(rows[header_idx + 1:], start=1):
+            row = row + [''] * (width - len(row))
+            raw_name = cell(row, colmap['desc']) if colmap['desc'] is not None else row[0]
+            name = _clean_cell(raw_name)
+            if not name:
+                continue
+            if name.lower() in _TOTAL_NAMES or name.lower().startswith('total '):
+                continue
+            qty = _parse_number(cell(row, colmap['qty'])) or 0.0
+            price = _parse_number(cell(row, colmap['price'])) if colmap['price'] is not None else 0.0
+            price = price or 0.0
+            item_no = _clean_cell(cell(row, colmap['item'])) or None
+            if colmap['total'] is not None:
+                total = _parse_number(cell(row, colmap['total']))
+                if total is not None and abs(qty * price - total) > max(1.0, 0.005 * total):
+                    warnings.append(
+                        f"Row {lineno} total mismatch: {qty:g} x {price:g} != {total:g}")
+            items.append(PIItem(product_name=name, quantity=qty,
+                                unit_price=price, item_no=item_no))
+    return items
+
+
+def _pdf_to_text_and_tables(raw_bytes: bytes):
+    """Return (full_text, tables) from PDF bytes.
+
+    pdfplumber extracts ruled tables; PyMuPDF is the text fallback when
+    pdfplumber finds no readable text.
+    """
+    tables: List[List[List[str]]] = []
+    text = ''
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+            page_texts = []
+            for page in pdf.pages:
+                page_texts.append(page.extract_text() or '')
+                for tbl in page.extract_tables() or []:
+                    tables.append([[c or '' for c in row] for row in tbl])
+            text = '\n'.join(page_texts)
+    except Exception:
+        text = ''
+    if not text.strip():
+        import pymupdf
+        with pymupdf.open(stream=raw_bytes, filetype='pdf') as doc:
+            text = '\n'.join(page.get_text() for page in doc)
+    return text, tables
+
+
+def _docx_to_text_and_tables(doc: Document):
+    """Return (full_text, tables) from a python-docx Document."""
+    full_text = '\n'.join(p.text for p in doc.paragraphs)
+    tables = []
+    for table in doc.tables:
+        rows = []
+        for row in table.rows:
+            rows.append([c.text for c in row.cells])
+            for cell in row.cells:
+                full_text += '\n' + cell.text
+        tables.append(rows)
+    return full_text, tables
+
+
+def _build_extraction(filename: str, full_text: str,
+                      tables: List[List[List[str]]],
+                      legacy_doc: Optional[Document] = None,
+                      extra_warnings: Optional[List[str]] = None) -> PIExtraction:
+    """Assemble a PIExtraction from plain text + row-list tables."""
+    warnings = list(extra_warnings or [])
+
+    pi_number = extract_pi_number_from_filename(filename)
+    if not pi_number:
+        pi_number = extract_pi_number_from_text(full_text)
+        if pi_number:
+            warnings.append("PI number extracted from document body (not filename)")
+    if not pi_number:
+        warnings.append("Could not extract PI number from filename or document")
+
+    pi_date = extract_pi_date(full_text)
+    if not pi_date:
+        warnings.append("Could not extract PI date")
+
+    client_name = extract_client_name(full_text)
+    if not client_name:
+        warnings.append("Could not extract client name")
+
+    items = extract_items_from_tables(tables, warnings)
+    if not items and legacy_doc is not None:
+        items = extract_product_table(legacy_doc)
+    if not items:
+        warnings.append("No product items extracted from tables")
+
+    header = PIHeader(pi_number=pi_number or "UNKNOWN", pi_date=pi_date,
+                      client_name=client_name)
+    return PIExtraction(header=header, items=items, warnings=warnings)
 
 
 def extract_product_table(doc: Document) -> List[PIItem]:
@@ -152,7 +413,7 @@ def _convert_doc_to_docx(doc_bytes: bytes, original_filename: str) -> bytes:
 
 
 def parse_pi_document(filepath: str) -> PIExtraction:
-    """Parse a PI .docx file and return structured extraction."""
+    """Parse a PI file (.pdf, .docx, or legacy .doc) and return structured extraction."""
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"File not found: {filepath}")
 
@@ -161,73 +422,52 @@ def parse_pi_document(filepath: str) -> PIExtraction:
 
 
 def parse_pi_stream(file_stream, filename: str) -> PIExtraction:
-    """Parse a PI document (.doc or .docx) from an in-memory file stream.
+    """Parse a PI document (.pdf, .docx, or legacy .doc) from a file stream.
 
-    For .doc files: converts to .docx via Word COM, then parses.
+    For .pdf files: tables via pdfplumber, text fallback via PyMuPDF.
     For .docx files: parses directly with python-docx.
+    For .doc files: converts to .docx via Word COM (local Windows + Word only).
     Nothing is written to disk permanently (temp files are cleaned up).
     """
-    warnings = []
-
-    pi_number = extract_pi_number_from_filename(filename)
-    if not pi_number:
-        warnings.append("Could not extract PI number from filename")
-
     file_stream.seek(0)
     raw_bytes = file_stream.read()
-    is_doc = filename.lower().endswith(".doc") and not filename.lower().endswith(".docx")
+    lname = filename.lower()
+
+    if lname.endswith(".pdf"):
+        full_text, tables = _pdf_to_text_and_tables(raw_bytes)
+        return _build_extraction(filename, full_text, tables)
+
+    is_doc = lname.endswith(".doc") and not lname.endswith(".docx")
+    extra_warnings: List[str] = []
 
     if is_doc:
         try:
             docx_bytes = _convert_doc_to_docx(raw_bytes, filename)
         except RuntimeError as e:
-            warnings.append(f".doc conversion failed: {e}")
+            extra_warnings.append(f".doc conversion failed: {e}")
             # Fallback: try to read as docx anyway (some .doc files are actually docx)
             try:
-                doc = Document(__import__("io").BytesIO(raw_bytes))
+                doc = Document(io.BytesIO(raw_bytes))
             except Exception:
                 raise ValueError(
                     "Could not read .doc file. Ensure Microsoft Word is installed "
                     "for .doc support, or save the file as .docx and retry."
                 )
         else:
-            doc = Document(__import__("io").BytesIO(docx_bytes))
-            warnings.append(".doc file converted to .docx via Word")
+            doc = Document(io.BytesIO(docx_bytes))
+            extra_warnings.append(".doc file converted to .docx via Word")
     else:
-        doc = Document(__import__("io").BytesIO(raw_bytes))
+        doc = Document(io.BytesIO(raw_bytes))
 
-    full_text = '\n'.join(p.text for p in doc.paragraphs)
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                full_text += '\n' + cell.text
-
-    if not pi_number:
-        match = re.search(r'(PI-\d{4}-\d+)', full_text, re.IGNORECASE)
-        if match:
-            pi_number = match.group(1).upper()
-            warnings.append("PI number extracted from document body (not filename)")
-
-    pi_date = extract_pi_date(full_text)
-    if not pi_date:
-        warnings.append("Could not extract PI date")
-
-    client_name = extract_client_name(full_text)
-    if not client_name:
-        warnings.append("Could not extract client name")
-
-    items = extract_product_table(doc)
-    if not items:
-        warnings.append("No product items extracted from tables")
-
-    header = PIHeader(pi_number=pi_number or "UNKNOWN", pi_date=pi_date, client_name=client_name)
-    return PIExtraction(header=header, items=items, warnings=warnings)
+    full_text, tables = _docx_to_text_and_tables(doc)
+    return _build_extraction(filename, full_text, tables,
+                             legacy_doc=doc, extra_warnings=extra_warnings)
 
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
-        print("Usage: python parse_sales.py <pi_file.docx|pi_file.doc>")
+        print("Usage: python parse_sales.py <pi_file.pdf|pi_file.docx|pi_file.doc>")
         sys.exit(1)
     extraction = parse_pi_document(sys.argv[1])
     print(extraction.model_dump_json(indent=2))

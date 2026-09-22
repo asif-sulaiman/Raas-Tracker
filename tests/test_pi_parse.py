@@ -1,0 +1,205 @@
+"""PI parsing tests: RAAS-format PDF + DOCX extraction, day-first dates, API filter."""
+import io
+
+import pytest
+
+from parse_sales import (
+    _dedupe_doubled_text,
+    _parse_number,
+    extract_client_name,
+    extract_pi_date,
+    extract_pi_number_from_text,
+    parse_pi_stream,
+)
+
+
+RAAS_ITEMS = [
+    {"qty": "1,000", "item_no": "0201001", "desc": "SAMPLE DETERGENT\nDetergent",
+     "hs": "3402.90.10", "price": "2.65", "total": "2,500.00"},
+    {"qty": "4,000", "item_no": "0601002", "desc": "SAMPLE ENZYME T220\nEnzyme",
+     "hs": "3507.90.90", "price": "2.65", "total": "10,000.00"},
+]
+
+
+def _make_raas_docx() -> io.BytesIO:
+    """Build an in-memory .docx shaped like the RAAS proforma invoice."""
+    from docx import Document
+    doc = Document()
+    doc.add_paragraph("DEMO SUPPLIER SDN. BHD.")
+    doc.add_paragraph("Mailing Address")
+    doc.add_paragraph("EXAMPLE CLIENT LTD")
+    doc.add_paragraph("12, SAMPLE STREET")
+    doc.add_paragraph("SAMPLE CITY, SAMPLE COUNTRY")
+    doc.add_paragraph("Invoice Number")
+    doc.add_paragraph("99000001")
+    doc.add_paragraph("Invoice Date")
+    doc.add_paragraph("15/09/2026")
+    table = doc.add_table(rows=1, cols=7)
+    table.rows[0].cells[0].text = "Sr.\nNo."
+    table.rows[0].cells[1].text = "Quantity\nin Kg"
+    table.rows[0].cells[2].text = "Item No."
+    table.rows[0].cells[3].text = "Description"
+    table.rows[0].cells[4].text = "HS Code"
+    table.rows[0].cells[5].text = "Unit Price\nin USD"
+    table.rows[0].cells[6].text = "Total in USD"
+    for i, it in enumerate(RAAS_ITEMS, start=1):
+        cells = table.add_row().cells
+        cells[0].text = str(i)
+        cells[1].text = it["qty"]
+        cells[2].text = it["item_no"]
+        cells[3].text = it["desc"]
+        cells[4].text = it["hs"]
+        cells[5].text = it["price"]
+        cells[6].text = it["total"]
+    total_row = table.add_row().cells
+    total_row[5].text = "Total USD"
+    total_row[6].text = "12,500.00"
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def _make_raas_pdf() -> io.BytesIO:
+    """Build an in-memory text-based PDF with a ruled items table (fitz)."""
+    import pymupdf
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    y = 40
+    for line in ["DEMO SUPPLIER SDN. BHD.", "Mailing Address",
+                 "EXAMPLE CLIENT LTD", "12, SAMPLE STREET",
+                 "SAMPLE CITY, SAMPLE COUNTRY",
+                 "Invoice Number", "99000001",
+                 "Invoice Date", "15/09/2026"]:
+        page.insert_text((40, y), line, fontsize=10)
+        y += 14
+    cols = [40, 70, 140, 210, 360, 440, 500, 575]
+    rows = [["Sr. No.", "Quantity in Kg", "Item No.", "Description",
+             "HS Code", "Unit Price", "Total in USD"]]
+    for i, it in enumerate(RAAS_ITEMS, start=1):
+        rows.append([str(i), it["qty"], it["item_no"],
+                     it["desc"].replace("\n", " "), it["hs"],
+                     it["price"], it["total"]])
+    rows.append(["", "", "", "", "", "Total USD", "12,500.00"])
+    y += 10
+    row_h = 22
+    for r, row in enumerate(rows):
+        for c, val in enumerate(row):
+            rect = pymupdf.Rect(cols[c], y, cols[c + 1], y + row_h)
+            page.draw_rect(rect, color=(0, 0, 0), width=0.5)
+            page.insert_textbox(rect + pymupdf.Rect(2, 2, -2, -2), val, fontsize=8)
+        y += row_h
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def _assert_raas(extraction):
+    assert extraction.header.pi_number == "99000001"
+    assert extraction.header.pi_date == "2026-09-15"
+    assert extraction.header.client_name == "EXAMPLE CLIENT LTD"
+    assert extraction.is_valid()
+    assert len(extraction.items) == 2
+    first, second = extraction.items
+    assert first.quantity == 1000.0
+    assert first.unit_price == 2.65
+    assert first.item_no == "0201001"
+    assert "SAMPLE DETERGENT" in first.product_name
+    assert second.quantity == 4000.0
+    assert second.unit_price == 2.65
+    assert second.item_no == "0601002"
+    assert "SAMPLE ENZYME" in second.product_name
+
+
+def test_raas_docx_extraction():
+    extraction = parse_pi_stream(_make_raas_docx(), "sample.docx")
+    _assert_raas(extraction)
+    # Filename carries no PI number, so the body-source notice is expected.
+    assert extraction.warnings == ["PI number extracted from document body (not filename)"]
+
+
+def test_price_column_inferred_when_header_blank():
+    from parse_sales import extract_items_from_tables
+    tables = [[["Sr.", "Qty", "Item", "Description", "HS", "", "Total"],
+               ["1", "1,000", "0201001", "SAMPLE DETERGENT", "3402.90.10",
+                "2.65", "2,500.00"]]]
+    warnings: list = []
+    items = extract_items_from_tables(tables, warnings)
+    assert len(items) == 1
+    assert items[0].unit_price == 2.65
+    assert any("inferred" in w for w in warnings)
+
+
+def test_raas_pdf_extraction():
+    extraction = parse_pi_stream(_make_raas_pdf(), "99000001.pdf")
+    _assert_raas(extraction)
+    assert extraction.warnings == ["PI number extracted from document body (not filename)"]
+
+
+def test_dayfirst_slash_dates():
+    assert extract_pi_date("Invoice Date\n15/09/2026") == "2026-09-15"
+    # Ambiguous 05/09/2026 must read day-first (5 August), not May 8.
+    assert extract_pi_date("dated 05/09/2026") == "2026-09-05"
+    # Labeled invoice date wins over an earlier stray date.
+    assert extract_pi_date("ref 2026-09-01\nInvoice Date\n15/09/2026") == "2026-09-15"
+
+
+def test_pi_number_from_invoice_label():
+    assert extract_pi_number_from_text("Invoice Number\n99000001") == "99000001"
+    assert extract_pi_number_from_text("Invoice No. 99000001") == "99000001"
+    assert extract_pi_number_from_text("PI-2026-001") == "PI-2026-001"
+
+
+def test_mailing_address_client_and_dedupe():
+    assert extract_client_name("Mailing Address\nEXAMPLE CLIENT LTD\n12 SAMPLE") == \
+        "EXAMPLE CLIENT LTD"
+    assert _dedupe_doubled_text("EXAMPLE CLIENT LTD EXAMPLE CLIENT LTD") == \
+        "EXAMPLE CLIENT LTD"
+    assert extract_client_name(
+        "Mailing Address Delivery Address\nEXAMPLE CLIENT LTD EXAMPLE CLIENT LTD"
+    ) == "EXAMPLE CLIENT LTD"
+
+
+def test_parse_number_formats():
+    assert _parse_number("1,000") == 1000.0
+    assert _parse_number("US$48,880.00") == 48880.0
+    assert _parse_number("2.65") == 2.65
+    assert _parse_number("---") is None
+
+
+def test_total_mismatch_warns():
+    tables = [[["Qty", "Description", "Unit Price", "Total"],
+               ["10", "Widget", "5.00", "999.00"]]]
+    from parse_sales import extract_items_from_tables
+    warnings: list = []
+    items = extract_items_from_tables(tables, warnings)
+    assert len(items) == 1
+    assert any("mismatch" in w for w in warnings)
+
+
+def test_generic_pi_filename_still_works():
+    buf = _make_raas_docx()
+    extraction = parse_pi_stream(buf, "PI-2026-001_Client.docx")
+    assert extraction.header.pi_number == "PI-2026-001"
+    assert len(extraction.items) == 2
+
+
+def test_api_parse_accepts_pdf_rejects_doc(admin_client):
+    pdf = (io.BytesIO(_make_raas_pdf().getvalue()), "99000001.pdf")
+    r = admin_client.post("/api/sales/parse", data={"file": pdf},
+                          content_type="multipart/form-data")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["header"]["pi_number"] == "99000001"
+    assert len(body["items"]) == 2
+
+    docx = (io.BytesIO(_make_raas_docx().getvalue()), "sample.docx")
+    r = admin_client.post("/api/sales/parse", data={"file": docx},
+                          content_type="multipart/form-data")
+    assert r.status_code == 200
+
+    r = admin_client.post("/api/sales/parse",
+                          data={"file": (io.BytesIO(b"fake"), "legacy.doc")},
+                          content_type="multipart/form-data")
+    assert r.status_code == 400

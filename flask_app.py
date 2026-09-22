@@ -926,15 +926,16 @@ def _duplicate_pi_warning(conn, pi_number: str):
 
 @app.route("/api/sales/parse", methods=["POST"])
 def api_parse_pi():
-    """Parse an uploaded PI document (.doc or .docx) in-memory and return extracted data."""
+    """Parse an uploaded PI document (.pdf or .docx) in-memory and return extracted data."""
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
     file = request.files["file"]
     if not file.filename:
         return jsonify({"error": "No file selected"}), 400
     fname = file.filename.lower()
-    if not (fname.endswith(".docx") or fname.endswith(".doc")):
-        return jsonify({"error": "Only .doc and .docx files are accepted"}), 400
+    if not (fname.endswith(".pdf") or fname.endswith(".docx")):
+        return jsonify({"error": "Only .pdf and .docx files are accepted. "
+                                 "For legacy .doc, save as .docx or .pdf and retry."}), 400
     try:
         import io
         from parse_sales import parse_pi_stream
@@ -943,7 +944,7 @@ def api_parse_pi():
         return jsonify(extraction.model_dump())
     except Exception:
         app.logger.exception("PI parse failed")
-        return jsonify({"error": "Could not parse file. For .doc files, ensure Microsoft Word is installed."}), 400
+        return jsonify({"error": "Could not parse file. Text-based .pdf or .docx required."}), 400
 
 
 @app.route("/api/sales")
