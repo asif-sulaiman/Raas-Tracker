@@ -1,0 +1,2 @@
+# Dev-only dependencies (tests, CI). Production uses requirements.txt.
+pytest==8.3.4

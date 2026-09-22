@@ -127,7 +127,10 @@ def _convert_doc_to_docx(doc_bytes: bytes, original_filename: str) -> bytes:
     Requires Microsoft Word installed on the machine.
     Raises RuntimeError if conversion fails.
     """
-    from doc2docx import convert as _doc2docx_convert
+    try:
+        from doc2docx import convert as _doc2docx_convert
+    except ImportError:
+        raise RuntimeError(".doc conversion needs doc2docx + Microsoft Word (Windows only)")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         doc_path = os.path.join(tmpdir, original_filename)

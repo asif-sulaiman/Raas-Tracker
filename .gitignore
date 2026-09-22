@@ -36,11 +36,6 @@ reports/
 # === Runtime Data ===
 stock_data.json
 
-# === Throwaway Tests ===
-test_*.py
-audit_*.py
-verify_*.py
-
 # === Logs ===
 *.log
 

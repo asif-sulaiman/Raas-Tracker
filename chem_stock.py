@@ -2453,6 +2453,21 @@ def get_user_by_username(conn: sqlite3.Connection, username: str) -> Optional[Di
     return {"id": row[0], "username": row[1], "role": row[2], "created_at": row[3]}
 
 
+_DUMMY_HASH: Optional[str] = None
+
+
+def _dummy_hash() -> str:
+    """Lazily-built bcrypt hash used to equalize login timing.
+
+    Unknown usernames run the same bcrypt work as real ones, so response
+    time cannot reveal which usernames exist.
+    """
+    global _DUMMY_HASH
+    if _DUMMY_HASH is None:
+        _DUMMY_HASH = _hash_password("dummy-never-a-real-password")
+    return _DUMMY_HASH
+
+
 def verify_user(conn: sqlite3.Connection, username: str, password: str) -> Optional[Dict[str, Any]]:
     """Check credentials. Returns the public user dict or None (generic failure)."""
     row = conn.execute(
@@ -2460,6 +2475,7 @@ def verify_user(conn: sqlite3.Connection, username: str, password: str) -> Optio
         ((username or "").strip(),)
     ).fetchone()
     if not row:
+        _check_password(password or "", _dummy_hash())
         return None
     if not _check_password(password or "", row[2]):
         return None
