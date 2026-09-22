@@ -54,6 +54,9 @@ from chem_stock import (get_session_user, validate_api_key,
                         list_api_keys, revoke_api_key, set_audit_actor,
                         create_first_admin, ensure_setup_token, check_setup_token,
                         log_audit_action, check_api_key_rate_limit, record_api_key_hit)
+from chemcalc.notifications import (
+    list_notifications_for, unread_count, mark_read, mark_read_all_for
+)
 
 SESSION_COOKIE = "chemcalc_session"
 API_KEY_HEADER = "X-API-Key"
@@ -213,6 +216,22 @@ def admin_required(f):
     return decorated
 
 
+def _notify_login_failures(conn, username, ip) -> None:
+    """Admin-only security alert when the failed-login threshold is reached."""
+    try:
+        from chemcalc.notifications import notify
+        who = (username or "").strip() or "unknown"
+        from datetime import datetime as _dt
+        bucket = _dt.utcnow().strftime("%Y%m%d%H")
+        notify(conn, type="login_failures",
+               title=f"Repeated failed logins: {who}",
+               body=f"Failed-login threshold reached for '{who}' from {ip} within 10 minutes.",
+               severity="critical", role_scope="admin", entity_type="user",
+               dedupe_key=f"logfail:{who}:{ip}:{bucket}")
+    except Exception:
+        app.logger.exception("login-failure notification failed")
+
+
 # ==================== API: AUTH ====================
 def _set_session_cookie(resp, token):
     resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL_HOURS * 3600,
@@ -289,6 +308,8 @@ def api_auth_login():
     user = verify_user(conn, username, password)
     if not user:
         record_login_attempt(conn, username, ip, False)
+        if is_login_blocked(conn, username, ip):
+            _notify_login_failures(conn, username, ip)
         conn.close()
         return jsonify({"error": "invalid credentials"}), 401
     record_login_attempt(conn, username, ip, True)
@@ -796,6 +817,53 @@ def api_audit_logs():
     logs = get_audit_logs(conn, limit=limit)
     conn.close()
     return jsonify(logs)
+
+
+# ==================== API: NOTIFICATIONS ====================
+def _human_identity():
+    ident = getattr(g, "current_identity", None) or {}
+    if ident.get("type") != "human":
+        return None
+    return ident
+
+
+@app.route("/api/notifications")
+def api_notifications():
+    ident = _human_identity()
+    if not ident:
+        return jsonify({"error": "authentication required"}), 401
+    limit = request.args.get("limit", 50, type=int)
+    conn = get_db()
+    try:
+        items = list_notifications_for(conn, ident["id"], ident["role"], limit=limit)
+        unread = unread_count(conn, ident["id"], ident["role"])
+    finally:
+        conn.close()
+    return jsonify({"items": items, "unread": unread})
+
+
+@app.route("/api/notifications/read", methods=["POST"])
+def api_notifications_read():
+    ident = _human_identity()
+    if not ident:
+        return jsonify({"error": "authentication required"}), 401
+    data = request.get_json() or {}
+    ids = data.get("ids")
+    if ids is not None and (
+        not isinstance(ids, list)
+        or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids)
+    ):
+        return jsonify({"error": "ids must be a list of integers"}), 400
+    conn = get_db()
+    try:
+        if ids is None:
+            marked = mark_read_all_for(conn, ident["id"], ident["role"])
+        else:
+            marked = mark_read(conn, ident["id"], ids)
+        unread = unread_count(conn, ident["id"], ident["role"])
+    finally:
+        conn.close()
+    return jsonify({"marked": marked, "unread": unread})
 
 
 # ==================== API: REASON CODES ====================

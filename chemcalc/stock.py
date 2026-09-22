@@ -8,6 +8,8 @@ from datetime import date, datetime
 from typing import Optional, List, Dict, Any, Union
 
 from .db import JSON_PATH, get_connection, logger
+from .audit import log_audit_action
+from .notifications import notify_reorder_status
 
 def import_from_json(json_path: str = JSON_PATH) -> Dict[str, int]:
     """Import chemical stock from parsed JSON data.
@@ -187,7 +189,7 @@ def update_stock(conn: sqlite3.Connection, name: str, delta: float, unit: str = 
     """
     # Get chemical info
     chemical = conn.execute(
-        "SELECT id, name, current_qty, unit FROM chemicals WHERE name = ?",
+        "SELECT id, name, current_qty, unit, reorder_level FROM chemicals WHERE name = ?",
         (name,)
     ).fetchone()
     
@@ -195,7 +197,7 @@ def update_stock(conn: sqlite3.Connection, name: str, delta: float, unit: str = 
         logger.warning("Chemical '%s' not found in database", name)
         return False
     
-    chem_id, chem_name, current_qty, chem_unit = chemical
+    chem_id, chem_name, current_qty, chem_unit, reorder_level = chemical
     
     # Normalize unit - if user provides unit, validate it matches or is KG
     if unit.upper() != chem_unit.upper() and unit.upper() != "KG":
@@ -215,6 +217,9 @@ def update_stock(conn: sqlite3.Connection, name: str, delta: float, unit: str = 
         (new_qty, date.isoformat(date.today()), chem_id)
     )
     conn.commit()
+    log_audit_action(conn, "ADJUST_STOCK", "chemical", chem_id,
+                     old_value=str(current_qty), new_value=str(new_qty))
+    notify_reorder_status(conn, chem_id, chem_name, new_qty, reorder_level)
 
     logger.info("Updated '%s': %s %s -> %s %s (change: %s %s)",
                 chem_name, current_qty, chem_unit, new_qty, chem_unit, delta, chem_unit)
@@ -229,11 +234,18 @@ def set_reorder_level(conn: sqlite3.Connection, name: str, level: float) -> bool
     """
     if level is None or level < 0:
         raise ValueError("reorder_level must be 0 or greater")
-    row = conn.execute("SELECT id FROM chemicals WHERE name = ?", (name,)).fetchone()
+    row = conn.execute(
+        "SELECT id, name, current_qty, reorder_level FROM chemicals WHERE name = ?",
+        (name,),
+    ).fetchone()
     if not row:
         return False
-    conn.execute("UPDATE chemicals SET reorder_level = ? WHERE id = ?", (level, row[0]))
+    chem_id, chem_name, qty, old_level = row
+    conn.execute("UPDATE chemicals SET reorder_level = ? WHERE id = ?", (level, chem_id))
     conn.commit()
+    log_audit_action(conn, "SET_REORDER_LEVEL", "chemical", chem_id,
+                     old_value=str(old_level), new_value=str(level))
+    notify_reorder_status(conn, chem_id, chem_name, qty, level)
     return True
 
 

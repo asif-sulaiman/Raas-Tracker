@@ -265,7 +265,54 @@ def save_upload(conn: sqlite3.Connection, filename: str, results: Dict[str, Any]
         )
     
     conn.commit()
+    log_audit_action(conn, "UPLOAD_CREATE", "upload", upload_id, new_value=filename)
+    _notify_upload_outcome(conn, upload_id, filename, results)
     return upload_id
+
+
+def _notify_upload_outcome(conn: sqlite3.Connection, upload_id: int,
+                           filename: str, results: Dict[str, Any]) -> None:
+    """Raise notifications for upload mismatches and expiry findings."""
+    from .notifications import notify
+
+    stats = results["stats"]
+    total_mismatches = (stats["last_month_mismatches"] + stats["this_month_mismatches"]
+                        + stats["both_mismatches"] + stats["not_in_db"]
+                        + stats["not_in_upload"])
+    if total_mismatches > 0:
+        notify(
+            conn, type="upload_mismatch",
+            title=f"Upload has {total_mismatches} discrepancies: {filename}",
+            body=(f"{stats['total']} rows checked, {stats['match_percentage']:.1f}% match. "
+                  f"Review the comparison to resolve mismatches."),
+            severity="warning", entity_type="upload", entity_id=upload_id,
+            dedupe_key=f"upload:{upload_id}:mismatch",
+        )
+
+    expired = expiring = 0
+    for key in ("matches", "last_month_mismatches", "this_month_mismatches", "both_mismatches"):
+        for row in results.get(key, []):
+            _, _, status = validate_expiry_date(row.get("expiry_date", "") or "")
+            if status == "EXPIRED":
+                expired += 1
+            elif status == "EXPIRING_SOON":
+                expiring += 1
+    if expired:
+        notify(
+            conn, type="stock_expired",
+            title=f"{expired} expired item{'s' if expired != 1 else ''} in {filename}",
+            body="Expired stock found during reconciliation. Remove or dispose immediately.",
+            severity="critical", entity_type="upload", entity_id=upload_id,
+            dedupe_key=f"upload:{upload_id}:expired",
+        )
+    if expiring:
+        notify(
+            conn, type="stock_expiring",
+            title=f"{expiring} item{'s' if expiring != 1 else ''} expiring within 30 days",
+            body=f"Found in {filename}. Plan usage or disposal before expiry.",
+            severity="warning", entity_type="upload", entity_id=upload_id,
+            dedupe_key=f"upload:{upload_id}:expiring",
+        )
 
 
 def get_upload_history(conn: sqlite3.Connection, limit: int = 20) -> List[Dict[str, Any]]:

@@ -8,6 +8,7 @@ from datetime import date, datetime
 from typing import Optional, List, Dict, Any, Union
 
 from .audit import log_audit_action
+from .notifications import notify_sale_stage
 
 SALE_STAGE_ORDER = ["pi_issued", "lc_received", "shipment_ongoing", "payment_due", "completed"]
 
@@ -135,10 +136,10 @@ def get_sale_by_id(conn: sqlite3.Connection, sale_id: int) -> Optional[Dict[str,
 def move_sale_to_stage(conn: sqlite3.Connection, sale_id: int, new_stage: str,
                        notes: Optional[str] = None) -> bool:
     """Move a sale to the next (or specified) stage. Logs the transition."""
-    row = conn.execute("SELECT stage FROM sales WHERE id = ?", (sale_id,)).fetchone()
+    row = conn.execute("SELECT stage, client_name FROM sales WHERE id = ?", (sale_id,)).fetchone()
     if not row:
         return False
-    current = row[0]
+    current, client_name = row[0], row[1] or f"#{sale_id}"
     if new_stage not in SALE_STAGE_ORDER:
         return False
     conn.execute(
@@ -153,6 +154,7 @@ def move_sale_to_stage(conn: sqlite3.Connection, sale_id: int, new_stage: str,
     log_audit_action(conn, "SALE_MOVE", "sale", sale_id,
                      old_value=current, new_value=new_stage)
     conn.commit()
+    notify_sale_stage(conn, sale_id, client_name, current, new_stage)
     return True
 
 

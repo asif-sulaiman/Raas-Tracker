@@ -269,6 +269,26 @@ def _create_tables(conn: sqlite3.Connection) -> None:
             hit_at TEXT DEFAULT (datetime('now')),
             FOREIGN KEY (key_id) REFERENCES api_keys(id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            body TEXT,
+            severity TEXT NOT NULL DEFAULT 'info',
+            role_scope TEXT NOT NULL DEFAULT 'all',
+            entity_type TEXT,
+            entity_id INTEGER,
+            dedupe_key TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(dedupe_key);
+        CREATE TABLE IF NOT EXISTS notification_reads (
+            user_id INTEGER NOT NULL,
+            notification_id INTEGER NOT NULL,
+            read_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (user_id, notification_id),
+            FOREIGN KEY (notification_id) REFERENCES notifications(id) ON DELETE CASCADE
+        );
     """)
     # Migration for existing databases - add batch/unit columns to upload_rows
     cursor = conn.execute("PRAGMA table_info(upload_rows)")
