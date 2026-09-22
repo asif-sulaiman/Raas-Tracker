@@ -478,6 +478,13 @@ def parse_pi_stream(file_stream, filename: str) -> PIExtraction:
 
     if lname.endswith(".pdf"):
         full_text, tables = _pdf_to_text_and_tables(raw_bytes)
+        if os.getenv("RAAS_PI_DEBUG") == "1":
+            # TEMPORARY diagnostic: dump raw extraction to the server console
+            # so real-PI layouts can be diagnosed without sharing the file.
+            print(f"PI-DEBUG filename={filename} text={full_text[:20000]!r}",
+                  flush=True)
+            print(f"PI-DEBUG filename={filename} tables={tables!r}"[:20000],
+                  flush=True)
         return _build_extraction(filename, full_text, tables)
 
     is_doc = lname.endswith(".doc") and not lname.endswith(".docx")
