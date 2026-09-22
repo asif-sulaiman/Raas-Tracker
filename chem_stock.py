@@ -2195,6 +2195,84 @@ def delete_sale_item(conn: sqlite3.Connection, item_id: int) -> bool:
     return True
 
 
+def update_sale_full(conn: sqlite3.Connection, sale_id: int, header: Dict[str, Any],
+                     items: List[Dict[str, Any]], removed_ids: List[int]) -> Optional[Dict[str, Any]]:
+    """Atomically replace a sale's header + items in ONE transaction.
+
+    Validates everything (under a write lock) before writing anything, then
+    commits once. Any failure rolls back, so the sale is never left partial.
+    Raises ValueError on business-rule violations. Returns the updated sale
+    dict, or None when the sale does not exist.
+    """
+    removed_ids = [int(r) for r in (removed_ids or [])]
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT id FROM sales WHERE id = ?", (sale_id,)).fetchone()
+        if not row:
+            conn.rollback()
+            return None
+        existing_ids = {r[0] for r in conn.execute(
+            "SELECT id FROM sale_items WHERE sale_id = ?", (sale_id,)).fetchall()}
+
+        pi_number = (header.get("pi_number") or "").strip()
+        if not pi_number:
+            raise ValueError("pi_number is required")
+        if not items:
+            raise ValueError("A sale must keep at least one product item")
+
+        seen: List[Dict[str, Any]] = []
+        for pos, it in enumerate(items):
+            name = (it.get("product_name") or "").strip()
+            if not name:
+                raise ValueError(f"items[{pos}].product_name is required")
+            try:
+                qty = float(it.get("quantity", 0))
+                price = float(it.get("unit_price", 0))
+            except (TypeError, ValueError):
+                raise ValueError(f"items[{pos}] quantity/unit_price must be numbers")
+            if qty < 0 or price < 0:
+                raise ValueError("Quantity and price cannot be negative")
+            item_id = it.get("id")
+            if item_id is not None:
+                item_id = int(item_id)
+                if item_id not in existing_ids:
+                    raise ValueError(f"items[{pos}].id {item_id} does not belong to sale {sale_id}")
+                if item_id in removed_ids:
+                    raise ValueError(f"item {item_id} is both updated and removed")
+            seen.append({"id": item_id, "product_name": name, "quantity": qty, "unit_price": price})
+
+        for rid in removed_ids:
+            if rid not in existing_ids:
+                raise ValueError(f"removed id {rid} does not belong to sale {sale_id}")
+
+        conn.execute(
+            """UPDATE sales SET pi_number = ?, pi_date = ?, client_name = ?,
+               updated_at = datetime('now') WHERE id = ?""",
+            (pi_number, header.get("pi_date"), header.get("client_name"), sale_id)
+        )
+        for it in seen:
+            if it["id"] is None:
+                conn.execute(
+                    "INSERT INTO sale_items (sale_id, product_name, quantity, unit_price) VALUES (?, ?, ?, ?)",
+                    (sale_id, it["product_name"], it["quantity"], it["unit_price"])
+                )
+            else:
+                conn.execute(
+                    "UPDATE sale_items SET product_name = ?, quantity = ?, unit_price = ? WHERE id = ?",
+                    (it["product_name"], it["quantity"], it["unit_price"], it["id"])
+                )
+        for rid in removed_ids:
+            conn.execute("DELETE FROM sale_items WHERE id = ?", (rid,))
+        conn.commit()
+        return get_sale_by_id(conn, sale_id)
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+
+
 def delete_sale(conn: sqlite3.Connection, sale_id: int) -> bool:
     """Delete a sale and cascade-delete its items and history."""
     row = conn.execute("SELECT pi_number FROM sales WHERE id = ?", (sale_id,)).fetchone()

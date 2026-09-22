@@ -39,7 +39,7 @@ from chem_stock import (
     add_sale, get_all_sales, get_sale_by_id, move_sale_to_stage, advance_sale,
     update_sale_lc, update_sale_payment, add_sale_item, update_sale_item,
     delete_sale_item, delete_sale, get_sales_summary, record_sale_payment,
-    update_sale_payment_record, delete_sale_payment_record
+    update_sale_payment_record, delete_sale_payment_record, update_sale_full
 )
 
 # ---- AuthN/Z: sessions (humans) OR api_keys (scripts) ----
@@ -933,10 +933,46 @@ class SaleHeaderPatchIn(_StrippedModel):
     pi_file_path: str | None = None
 
 
+class SaleFullItemIn(_StrippedModel):
+    id: int | None = None
+    product_name: str = Field(min_length=1)
+    quantity: float = Field(ge=0)
+    unit_price: float = Field(ge=0)
+
+
+class SaleFullUpdateIn(BaseModel):
+    header: SaleHeaderIn
+    items: list[SaleFullItemIn] = Field(min_length=1)
+    removedIds: list[int] = Field(default_factory=list)
+
+
 @app.route("/api/sales/<int:sale_id>", methods=["PUT"])
 def api_update_sale(sale_id):
+    raw = request.get_json() or {}
+    if "items" in raw:
+        # Atomic full update: header + items + removals in one transaction.
+        try:
+            full = SaleFullUpdateIn(**raw)
+        except ValidationError as e:
+            return _validation_error_response(e)
+        conn = get_db()
+        try:
+            sale = update_sale_full(conn, sale_id, full.header.model_dump(),
+                                    [i.model_dump() for i in full.items],
+                                    full.removedIds)
+        except ValueError as e:
+            conn.close()
+            return jsonify({"error": str(e)}), 400
+        except Exception:
+            conn.close()
+            app.logger.exception("sale full update failed")
+            return jsonify({"error": "internal server error"}), 500
+        conn.close()
+        if not sale:
+            return jsonify({"error": "Sale not found"}), 404
+        return jsonify(sale)
     try:
-        patch = SaleHeaderPatchIn(**(request.get_json() or {}))
+        patch = SaleHeaderPatchIn(**raw)
     except ValidationError as e:
         return _validation_error_response(e)
     data = patch.model_dump(exclude_none=True)
