@@ -105,10 +105,12 @@ def _assert_raas(extraction):
     assert first.quantity == 1000.0
     assert first.unit_price == 2.65
     assert first.item_no == "0201001"
+    assert first.line_total == 2500.0
     assert "SAMPLE DETERGENT" in first.product_name
     assert second.quantity == 4000.0
     assert second.unit_price == 2.65
     assert second.item_no == "0601002"
+    assert second.line_total == 10000.0
     assert "SAMPLE ENZYME" in second.product_name
 
 
@@ -128,7 +130,7 @@ def test_price_column_inferred_when_header_blank():
     items = extract_items_from_tables(tables, warnings)
     assert len(items) == 1
     assert items[0].unit_price == 2.65
-    assert any("inferred" in w for w in warnings)
+    assert any("recognized" in w for w in warnings)
 
 
 def test_raas_pdf_extraction():
@@ -203,8 +205,8 @@ def test_recover_pair_from_merged_cells():
     assert len(items) == 1
     assert items[0].quantity == 11000.0
     assert items[0].unit_price == 2.65
-    assert any("recovered" in w for w in warnings)
-    assert not any("mismatch" in w for w in warnings)
+    assert any("filled in" in w for w in warnings)
+    assert not any("does not match" in w for w in warnings)
 
 
 def test_derive_price_from_total():
@@ -214,7 +216,8 @@ def test_derive_price_from_total():
     warnings: list = []
     items = extract_items_from_tables(tables, warnings)
     assert items[0].unit_price == 2.65
-    assert any("derived" in w for w in warnings)
+    assert items[0].line_total == 29150.0
+    assert any("filled in" in w for w in warnings)
 
 
 def test_derive_qty_from_total():
@@ -224,7 +227,8 @@ def test_derive_qty_from_total():
     warnings: list = []
     items = extract_items_from_tables(tables, warnings)
     assert items[0].quantity == pytest.approx(1000.0)
-    assert any("derived" in w for w in warnings)
+    assert items[0].line_total == 2500.0
+    assert any("filled in" in w for w in warnings)
 
 
 def test_recovery_ignores_dates_and_item_numbers():
@@ -236,7 +240,7 @@ def test_recovery_ignores_dates_and_item_numbers():
     items = extract_items_from_tables(tables, warnings)
     assert items[0].quantity == 0.0
     assert items[0].unit_price == 0.0
-    assert any("mismatch" in w for w in warnings)
+    assert any("does not match" in w for w in warnings)
 
 
 def test_select_best_tables_prefers_valid():
@@ -275,7 +279,8 @@ def test_recover_pair_space_thousands():
     assert len(items) == 1
     assert items[0].quantity == 11000.0
     assert items[0].unit_price == 2.65
-    assert any("recovered" in w for w in warnings)
+    assert items[0].line_total == 29150.0
+    assert any("filled in" in w for w in warnings)
 
 
 def test_layout_block_tables_ignore_grid_and_notes():
@@ -312,7 +317,7 @@ def test_total_mismatch_warns():
     warnings: list = []
     items = extract_items_from_tables(tables, warnings)
     assert len(items) == 1
-    assert any("mismatch" in w for w in warnings)
+    assert any("does not match" in w for w in warnings)
 
 
 def test_generic_pi_filename_still_works():

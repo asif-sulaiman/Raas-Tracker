@@ -25,6 +25,7 @@ class PIItem(BaseModel):
     quantity: float = 0.0
     unit_price: float = 0.0
     item_no: Optional[str] = None
+    line_total: Optional[float] = None
 
 
 class PIHeader(BaseModel):
@@ -368,9 +369,9 @@ def extract_items_from_tables(tables: List[List[List[str]]],
                                  colmap['item'], colmap['hs']) if v is not None}
             if cand >= 0 and cand not in taken:
                 colmap = dict(colmap, price=cand)
-                warnings.append("Unit Price column inferred next to Total column")
+                warnings.append("Unit price column recognized next to the total column")
         if colmap['price'] is None:
-            warnings.append("Unit Price column not found; prices defaulted to 0")
+            warnings.append("Unit price column not found; prices were set to 0")
         width = max(len(r) for r in rows)
 
         def cell(row, idx):
@@ -397,21 +398,23 @@ def extract_items_from_tables(tables: List[List[List[str]]],
                     if recovered:
                         qty, price = recovered
                         warnings.append(
-                            f"Row {lineno} qty/price recovered from row values "
-                            f"({qty:g} x {price:g} ~= {total:g}) — please verify")
+                            f"Row {lineno}: quantity and unit price filled in "
+                            f"from the invoice line total.")
                 elif qty == 0:
                     qty = _derive_missing(total, price)
                     warnings.append(
-                        f"Row {lineno} quantity derived from total/price — please verify")
+                        f"Row {lineno}: quantity filled in from the invoice line total.")
                 elif price == 0:
                     price = _derive_missing(total, qty)
                     warnings.append(
-                        f"Row {lineno} unit price derived from total/quantity — please verify")
+                        f"Row {lineno}: unit price filled in from the invoice line total.")
             if total is not None and abs(qty * price - total) > max(1.0, 0.005 * total):
                     warnings.append(
-                        f"Row {lineno} total mismatch: {qty:g} x {price:g} != {total:g}")
+                        f"Row {lineno}: quantity x unit price does not match "
+                        f"the invoice line total.")
             items.append(PIItem(product_name=name, quantity=qty,
-                                unit_price=price, item_no=item_no))
+                                unit_price=price, item_no=item_no,
+                                line_total=total))
     return items
 
 
