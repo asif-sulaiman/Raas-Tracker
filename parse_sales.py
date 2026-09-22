@@ -216,16 +216,25 @@ def _clean_cell(value) -> str:
 
 
 def _parse_number(value: str) -> Optional[float]:
-    """Parse '1,000' / '2.65' / 'US$48,880.00' to float; None if unparseable.
+    """Parse '1,000' / '11 280' / '2.65' / 'US$48,880.00' to float.
 
     Returns None for merged multi-number cells ('1 11,000') so callers fall
     back to total-anchored recovery instead of a concatenated wrong value.
+    Pure-digit multi-token strings are space-separated thousands ('11 280').
     """
     if value is None:
         return None
-    s = str(value).replace(',', '')
-    if len([t for t in s.split() if re.search(r'\d', t)]) > 1:
-        return None
+    raw = str(value)
+    toks = raw.split()
+    if len(toks) > 1:
+        if all(re.fullmatch(r'\d+', t) for t in toks):
+            raw = ''.join(toks)
+        else:
+            digit_toks = [t for t in toks if re.search(r'\d', t)]
+            if len(digit_toks) > 1:
+                return None
+            raw = digit_toks[0] if digit_toks else ''
+    s = raw.replace(',', '')
     cleaned = re.sub(r'[^\d.\-]', '', s)
     if not cleaned or cleaned in ('.', '-', '-.'):
         return None
@@ -258,13 +267,23 @@ def _recover_pair(row: List[str], total_col: Optional[int],
     for idx, cell in enumerate(row):
         if idx == total_col:
             continue
-        for tpos, tok in enumerate(str(cell).split()):
+        toks = str(cell).split()
+        for tpos, tok in enumerate(toks):
             if '/' in tok:
                 continue  # dates like 15/09/2026
             v = _parse_number(tok)
             if v is None or v == 0:
                 continue
             nums.append(((idx, tpos), v))
+        # Space-separated thousands split across tokens ('11 280').
+        for tpos in range(len(toks) - 1):
+            if (re.fullmatch(r'\d+', toks[tpos])
+                    and re.fullmatch(r'\d+', toks[tpos + 1])):
+                try:
+                    nums.append(((idx, tpos + 0.5),
+                                 float(toks[tpos] + toks[tpos + 1])))
+                except ValueError:
+                    continue
     threshold = max(0.05, 0.001 * abs(total))
     best = None
     for a in range(len(nums)):
@@ -399,25 +418,48 @@ def extract_items_from_tables(tables: List[List[List[str]]],
 def _pdf_to_text_and_tables(raw_bytes: bytes):
     """Return (full_text, tables) from PDF bytes.
 
-    Tables come from the best of three strategies (see
+    Tables come from the best of four strategies (see
     _pdf_table_candidates/_select_best_tables): pdfplumber line-based,
-    pdfplumber text-based, and PyMuPDF find_tables. PyMuPDF is the text
-    fallback when pdfplumber finds no readable text.
+    pdfplumber text-based, PyMuPDF find_tables, and grid-independent
+    layout-text blocks. PyMuPDF is the text fallback when pdfplumber
+    finds no readable text.
     """
     text, candidates = _pdf_table_candidates(raw_bytes)
     tables, _, _ = _select_best_tables(candidates)
     return text, tables
 
 
+def _layout_block_tables(layout_text: str):
+    """Rebuild tables from layout-preserved text, ignoring grid lines.
+
+    Splits the page into blank-line-delimited blocks; within a block, each
+    line's columns are separated by 2+ spaces (pdfplumber layout mode pads
+    columns apart). Single-column lines (notes, addresses) are dropped, so
+    only genuine row-like lines compete. This catches tables whose ruling
+    lines the grid detectors miss or mis-split.
+    """
+    tables = []
+    for block in re.split(r'\n\s*\n', layout_text):
+        rows = []
+        for line in block.split('\n'):
+            cells = [c.strip() for c in re.split(r'\s{2,}', line.strip())]
+            cells = [c for c in cells if c]
+            if len(cells) > 1:
+                rows.append(cells)
+        if len(rows) >= 2:
+            tables.append(rows)
+    return tables
+
+
 def _pdf_table_candidates(raw_bytes: bytes):
-    """Return (full_text, [tables_lines, tables_text, tables_fitz]).
+    """Return (full_text, [tables_lines, tables_text, tables_fitz, tables_layout]).
 
     Different real-world PIs rule their tables differently (full grid,
     partial lines, shading without lines), so no single detection strategy
     fits all. Each candidate is a tables list in row-list format; empty
     lists are allowed and simply lose the selection vote.
     """
-    candidates: List[List[List[List[str]]]] = [[], [], []]
+    candidates: List[List[List[List[str]]]] = [[], [], [], []]
     text = ''
     try:
         import pdfplumber
@@ -436,10 +478,17 @@ def _pdf_table_candidates(raw_bytes: bytes):
                     }) or []
                 except Exception:
                     text_tbls = []
+                try:
+                    layout = page.extract_text(x_tolerance=1, y_tolerance=1,
+                                               layout=True) or ""
+                except TypeError:
+                    layout = ""  # older pdfplumber without layout mode
                 candidates[0].extend(
                     [[c or '' for c in row] for row in tbl] for tbl in lines_tbls)
                 candidates[1].extend(
                     [[c or '' for c in row] for row in tbl] for tbl in text_tbls)
+                if layout.strip():
+                    candidates[3].extend(_layout_block_tables(layout))
             text = '\n'.join(page_texts)
     except Exception:
         text = ''

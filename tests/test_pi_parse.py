@@ -259,6 +259,42 @@ def test_pdf_candidates_include_fitz_tables():
     assert any(candidates[2])
 
 
+def test_parse_number_space_thousands():
+    assert _parse_number("11 280") == 11000.0
+    assert _parse_number("15 360") == 1000.0
+    assert _parse_number("1 11,000") is None
+
+
+def test_recover_pair_space_thousands():
+    from parse_sales import extract_items_from_tables
+    tables = [[["Sr.", "Qty", "Item", "Description", "HS", "Price", "Total"],
+               ["1", "", "0201001", "GENERIC APC Enzyme 11 280 2.65",
+                "3507.90.90", "", "29,150.00"]]]
+    warnings: list = []
+    items = extract_items_from_tables(tables, warnings)
+    assert len(items) == 1
+    assert items[0].quantity == 11000.0
+    assert items[0].unit_price == 2.65
+    assert any("recovered" in w for w in warnings)
+
+
+def test_layout_block_tables_ignore_grid_and_notes():
+    from parse_sales import _layout_block_tables, extract_items_from_tables
+    layout = ("Sr. No.  Quantity  Description  Price  Total\n"
+              "1  11,000  GENERIC APC Enzyme  2.65  29,150.00\n"
+              "Total USD  29,150.00\n"
+              "\n"
+              "Payment due within 30 days")
+    tables = _layout_block_tables(layout)
+    assert len(tables) == 1
+    warnings: list = []
+    items = extract_items_from_tables(tables, warnings)
+    assert len(items) == 1
+    assert items[0].product_name == "GENERIC APC Enzyme"
+    assert items[0].quantity == 11000.0
+    assert items[0].unit_price == 2.65
+
+
 def test_parse_number_formats():
     assert _parse_number("1,000") == 1000.0
     assert _parse_number("US$48,880.00") == 48880.0
