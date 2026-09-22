@@ -617,7 +617,8 @@ def api_upload():
     ext = os.path.splitext(safe_display)[1].lower()
     if ext not in ALLOWED_UPLOAD_EXTS:
         return jsonify({"error": "Only PDF and Excel files are accepted"}), 400
-    upload_dir = os.path.join(os.path.dirname(__file__), "uploads")
+    from chemcalc.db import data_dir as _data_dir
+    upload_dir = os.path.join(_data_dir(), "uploads")
     os.makedirs(upload_dir, exist_ok=True)
     filepath = os.path.join(upload_dir, f"{uuid.uuid4().hex}{ext}")
     file.save(filepath)
@@ -714,7 +715,8 @@ def api_upload_export(upload_id):
         else:
             results["not_in_db"].append(row)
 
-    output_path = os.path.join(os.path.dirname(__file__), "reports", f"comparison_report_{upload_id}.xlsx")
+    from chemcalc.db import data_dir as _data_dir
+    output_path = os.path.join(_data_dir(), "reports", f"comparison_report_{upload_id}.xlsx")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     from chem_stock import export_comparison_report
     export_comparison_report(results, output_path)
@@ -777,7 +779,8 @@ def api_report_export():
             qty_int = int(qty)
         except (TypeError, ValueError):
             return jsonify({"error": "qty must be a number"}), 400
-        output_path = os.path.join(os.path.dirname(__file__), "reports", f"report_{safe_name}_{qty_int}.csv")
+        from chemcalc.db import data_dir as _data_dir
+        output_path = os.path.join(_data_dir(), "reports", f"report_{safe_name}_{qty_int}.csv")
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         export_report_to_csv(report, ", ".join(recipe_names), qty, output_path)
         return jsonify({"success": True, "filename": f"report_{safe_name}_{qty_int}.csv"})
