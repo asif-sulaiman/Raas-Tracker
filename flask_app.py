@@ -454,6 +454,8 @@ def api_add_chemical():
     conn = get_db()
     success = add_chemical(conn, name, qty, unit)
     conn.close()
+    if not success:
+        return jsonify({"success": success, "name": name}), 409
     return jsonify({"success": success, "name": name})
 
 
@@ -468,6 +470,8 @@ def api_update_chemical():
     conn = get_db()
     success = update_stock(conn, name, delta)
     conn.close()
+    if not success:
+        return jsonify({"success": success, "name": name, "delta": delta}), 404
     return jsonify({"success": success, "name": name, "delta": delta})
 
 
@@ -503,6 +507,8 @@ def api_create_recipe():
     conn = get_db()
     success = add_recipe(conn, name, product_yield, water_pct)
     conn.close()
+    if not success:
+        return jsonify({"success": success, "name": name}), 409
     return jsonify({"success": success, "name": name})
 
 
@@ -517,6 +523,8 @@ def api_add_recipe_item(name):
     conn = get_db()
     success = add_recipe_item(conn, name, chem_name, pct)
     conn.close()
+    if not success:
+        return jsonify({"success": success}), 404
     return jsonify({"success": success})
 
 
@@ -525,6 +533,8 @@ def api_delete_recipe_item(name, chem):
     conn = get_db()
     success = delete_recipe_item(conn, name, chem)
     conn.close()
+    if not success:
+        return jsonify({"success": success}), 404
     return jsonify({"success": success})
 
 
@@ -533,6 +543,8 @@ def api_delete_recipe(name):
     conn = get_db()
     success = delete_recipe(conn, name)
     conn.close()
+    if not success:
+        return jsonify({"success": success}), 404
     return jsonify({"success": success})
 
 
