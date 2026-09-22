@@ -2,10 +2,19 @@
 
 import sqlite3
 import json
+import logging as _logging
 import os
 import re
 from datetime import date
 from typing import Optional, List, Dict, Any, Union
+
+
+logger = _logging.getLogger("chemcalc")
+if not logger.handlers:
+    _handler = _logging.StreamHandler()
+    _handler.setFormatter(_logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(os.getenv("CHEMCALC_LOG_LEVEL", "INFO").upper() or "INFO")
 
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "chem_stock.db")
@@ -31,7 +40,8 @@ def _create_tables(conn: sqlite3.Connection) -> None:
             current_qty REAL NOT NULL DEFAULT 0,
             balance_last_month REAL NOT NULL DEFAULT 0,
             unit TEXT NOT NULL DEFAULT 'KG',
-            last_updated TEXT
+            last_updated TEXT,
+            reorder_level REAL NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS recipes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,6 +91,12 @@ def _create_tables(conn: sqlite3.Connection) -> None:
     columns = [col[1] for col in cursor.fetchall()]
     if "balance_last_month" not in columns:
         conn.execute("ALTER TABLE chemicals ADD COLUMN balance_last_month REAL DEFAULT 0")
+        conn.commit()
+    # Migration - per-chemical reorder level (0 = feature off, only exact-zero counts)
+    cursor = conn.execute("PRAGMA table_info(chemicals)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "reorder_level" not in columns:
+        conn.execute("ALTER TABLE chemicals ADD COLUMN reorder_level REAL NOT NULL DEFAULT 0")
         conn.commit()
     # Create upload tracking tables
     conn.executescript("""
@@ -305,7 +321,7 @@ def import_from_json(json_path: str = JSON_PATH) -> Dict[str, int]:
     Returns dict of {name: current_qty} for successfully imported chemicals.
     """
     if not os.path.exists(json_path):
-        print(f"JSON file not found: {json_path}")
+        logger.warning("JSON file not found: %s", json_path)
         return {}
     
     with open(json_path, 'r', encoding='utf-8') as f:
@@ -346,17 +362,19 @@ def import_from_json(json_path: str = JSON_PATH) -> Dict[str, int]:
     conn.commit()
     conn.close()
     
-    print(f"Import complete: {imported} chemicals imported, {skipped} skipped")
+    logger.info("Import complete: %s chemicals imported, %s skipped", imported, skipped)
     return {item["product_name"]: item["balance_this_month"] for item in data[:5]}  # sample
 
 
 def get_all_chemicals(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     """Return all chemicals with current stock levels."""
     cursor = conn.execute(
-        "SELECT id, name, current_qty, balance_last_month, unit, last_updated FROM chemicals ORDER BY name"
+        "SELECT id, name, current_qty, balance_last_month, unit, last_updated, "
+        "COALESCE(reorder_level, 0) FROM chemicals ORDER BY name"
     )
     return [
-        {"id": row[0], "name": row[1], "qty": row[2], "balance_last_month": row[3], "unit": row[4], "last_updated": row[5]}
+        {"id": row[0], "name": row[1], "qty": row[2], "balance_last_month": row[3], "unit": row[4],
+         "last_updated": row[5], "reorder_level": row[6] or 0}
         for row in cursor.fetchall()
     ]
 
@@ -434,7 +452,7 @@ def add_unit_conversion(conn: sqlite3.Connection, from_unit: str, to_unit: str, 
         conn.commit()
         return True
     except Exception as e:
-        print(f"Error adding conversion: {e}")
+        logger.exception("Error adding conversion")
         return False
 
 
@@ -448,7 +466,7 @@ def delete_unit_conversion(conn: sqlite3.Connection, from_unit: str, to_unit: st
         conn.commit()
         return True
     except Exception as e:
-        print(f"Error deleting conversion: {e}")
+        logger.exception("Error deleting conversion")
         return False
 
 
@@ -769,7 +787,7 @@ def export_comparison_report(results: Dict[str, Any], output_path: str) -> str:
         from openpyxl import Workbook
         from openpyxl.styles import PatternFill, Font, Alignment
     except ImportError:
-        print("openpyxl not installed. Run: pip install openpyxl")
+        logger.warning("openpyxl not installed. Run: pip install openpyxl")
         return None
     
     wb = Workbook()
@@ -940,7 +958,7 @@ def approve_upload_row(conn: sqlite3.Connection, workflow_id: int, reason_code: 
         conn.commit()
         return True
     except Exception as e:
-        print(f"Error approving row: {e}")
+        logger.exception("Error approving row")
         return False
 
 
@@ -980,7 +998,7 @@ def reject_upload_row(conn: sqlite3.Connection, workflow_id: int, reason_code: s
         conn.commit()
         return True
     except Exception as e:
-        print(f"Error rejecting row: {e}")
+        logger.exception("Error rejecting row")
         return False
 
 
@@ -1021,7 +1039,7 @@ def approve_upload(conn: sqlite3.Connection, upload_id: int, reviewed_by: str = 
         conn.commit()
         return True
     except Exception as e:
-        print(f"Error approving upload: {e}")
+        logger.exception("Error approving upload")
         return False
 
 
@@ -1195,7 +1213,7 @@ def lock_reconciliation_period(conn: sqlite3.Connection, period_id: int, locked_
         conn.commit()
         return True
     except Exception as e:
-        print(f"Error locking period: {e}")
+        logger.exception("Error locking period")
         return False
 
 
@@ -1262,10 +1280,10 @@ def adjust_stock_from_upload(conn: sqlite3.Connection, upload_id: int,
         )
         
         conn.commit()
-        print(f"Applied {adjustments} stock adjustments from upload {upload_id}")
+        logger.info("Applied %s stock adjustments from upload %s", adjustments, upload_id)
         return True
     except Exception as e:
-        print(f"Error adjusting stock: {e}")
+        logger.exception("Error adjusting stock")
         return False
 
 
@@ -1288,14 +1306,14 @@ def update_stock(conn: sqlite3.Connection, name: str, delta: float, unit: str = 
     ).fetchone()
     
     if not chemical:
-        print(f"Chemical '{name}' not found in database")
+        logger.warning("Chemical '%s' not found in database", name)
         return False
     
     chem_id, chem_name, current_qty, chem_unit = chemical
     
     # Normalize unit - if user provides unit, validate it matches or is KG
     if unit.upper() != chem_unit.upper() and unit.upper() != "KG":
-        print(f"Unit mismatch: chemical is '{chem_unit}', provided '{unit}'")
+        logger.warning("Unit mismatch: chemical is '%s', provided '%s'", chem_unit, unit)
         # Try converting: if chemical is KG and user says KG, that's fine
         # If different units, we need conversion logic
         # For now, just use the chemical's unit and ignore provided unit
@@ -1303,7 +1321,7 @@ def update_stock(conn: sqlite3.Connection, name: str, delta: float, unit: str = 
     
     new_qty = current_qty + delta
     if new_qty < 0:
-        print(f"Warning: Stock would go negative ({new_qty} {chem_unit}). Setting to 0.")
+        logger.warning("Stock would go negative (%s %s). Setting to 0.", new_qty, chem_unit)
         new_qty = 0
     
     conn.execute(
@@ -1311,8 +1329,25 @@ def update_stock(conn: sqlite3.Connection, name: str, delta: float, unit: str = 
         (new_qty, date.isoformat(date.today()), chem_id)
     )
     conn.commit()
-    
-    print(f"Updated '{chem_name}': {current_qty} {chem_unit} -> {new_qty} {chem_unit} (change: {delta} {chem_unit})")
+
+    logger.info("Updated '%s': %s %s -> %s %s (change: %s %s)",
+                chem_name, current_qty, chem_unit, new_qty, chem_unit, delta, chem_unit)
+    return True
+
+
+def set_reorder_level(conn: sqlite3.Connection, name: str, level: float) -> bool:
+    """Set the per-chemical reorder threshold. Returns False if not found.
+
+    Raises ValueError on negative levels. A level of 0 disables the
+    low-stock state (only exact-zero counts as out of stock).
+    """
+    if level is None or level < 0:
+        raise ValueError("reorder_level must be 0 or greater")
+    row = conn.execute("SELECT id FROM chemicals WHERE name = ?", (name,)).fetchone()
+    if not row:
+        return False
+    conn.execute("UPDATE chemicals SET reorder_level = ? WHERE id = ?", (level, row[0]))
+    conn.commit()
     return True
 
 
@@ -1324,10 +1359,10 @@ def add_chemical(conn: sqlite3.Connection, name: str, qty: float, unit: str = "K
             (name, qty, unit, date.isoformat(date.today()))
         )
         conn.commit()
-        print(f"Added chemical: {name} = {qty} {unit}")
+        logger.info("Added chemical: %s = %s %s", name, qty, unit)
         return True
     except sqlite3.IntegrityError:
-        print(f"Chemical '{name}' already exists. Use update_stock instead.")
+        logger.warning("Chemical '%s' already exists. Use update_stock instead.", name)
         return False
 
 
@@ -1353,10 +1388,10 @@ def add_recipe(conn: sqlite3.Connection, name: str, total_quantity: float = 1, w
             (name, total_quantity, water_percentage)
         )
         conn.commit()
-        print(f"Created recipe: '{name}' (total quantity: {total_quantity})")
+        logger.info("Created recipe: '%s' (total quantity: %s)", name, total_quantity)
         return True
     except sqlite3.IntegrityError:
-        print(f"Recipe '{name}' already exists.")
+        logger.warning("Recipe '%s' already exists.", name)
         return False
 
 
@@ -1388,7 +1423,7 @@ def add_recipe_item(conn: sqlite3.Connection, recipe_name: str, chemical_name: s
     # Check recipe exists
     recipe = get_recipe_by_name(conn, recipe_name)
     if not recipe:
-        print(f"Recipe '{recipe_name}' not found. Create it first.")
+        logger.warning("Recipe '%s' not found. Create it first.", recipe_name)
         return False
     
     # Check chemical exists
@@ -1396,7 +1431,7 @@ def add_recipe_item(conn: sqlite3.Connection, recipe_name: str, chemical_name: s
         "SELECT id FROM chemicals WHERE name = ?", (chemical_name,)
     ).fetchone()
     if not chemical:
-        print(f"Chemical '{chemical_name}' not found in database.")
+        logger.warning("Chemical '%s' not found in database.", chemical_name)
         return False
     
     # Check if item already exists in recipe
@@ -1405,7 +1440,8 @@ def add_recipe_item(conn: sqlite3.Connection, recipe_name: str, chemical_name: s
         (recipe["id"], chemical[0])
     ).fetchone()
     if existing:
-        print(f"'{chemical_name}' already in recipe '{recipe_name}'. Use update_recipe_item instead.")
+        logger.warning("'%s' already in recipe '%s'. Use update_recipe_item instead.",
+                       chemical_name, recipe_name)
         return False
     
     required_qty_per_unit = percentage / 100.0
@@ -1414,7 +1450,7 @@ def add_recipe_item(conn: sqlite3.Connection, recipe_name: str, chemical_name: s
         (recipe["id"], chemical[0], percentage, required_qty_per_unit)
     )
     conn.commit()
-    print(f"Added '{chemical_name}' to recipe '{recipe_name}': {percentage}% ({required_qty_per_unit * recipe['total_quantity']} KG for total quantity {recipe['total_quantity']})")
+    logger.info("Added '%s' to recipe '%s': %s%%", chemical_name, recipe_name, percentage)
     return True
 
 
@@ -1433,7 +1469,7 @@ def list_recipe_items(conn: sqlite3.Connection, recipe_name: str) -> List[Dict[s
     """List all chemicals in a recipe with percentages and required quantities."""
     recipe = get_recipe_by_name(conn, recipe_name)
     if not recipe:
-        print(f"Recipe '{recipe_name}' not found.")
+        logger.warning("Recipe '%s' not found.", recipe_name)
         return []
     
     cursor = conn.execute("""
@@ -1471,12 +1507,12 @@ def update_recipe_item(conn: sqlite3.Connection, recipe_name: str, chemical_name
     """Update the percentage of a chemical in a recipe."""
     recipe = get_recipe_by_name(conn, recipe_name)
     if not recipe:
-        print(f"Recipe '{recipe_name}' not found.")
+        logger.warning("Recipe '%s' not found.", recipe_name)
         return False
     
     chemical = conn.execute("SELECT id FROM chemicals WHERE name = ?", (chemical_name,)).fetchone()
     if not chemical:
-        print(f"Chemical '{chemical_name}' not found.")
+        logger.warning("Chemical '%s' not found.", chemical_name)
         return False
     
     new_qty_per_unit = new_percentage / 100.0
@@ -1487,10 +1523,10 @@ def update_recipe_item(conn: sqlite3.Connection, recipe_name: str, chemical_name
     conn.commit()
     
     if result.rowcount > 0:
-        print(f"Updated '{chemical_name}' in '{recipe_name}': now {new_percentage}%")
+        logger.info("Updated '%s' in '%s': now %s%%", chemical_name, recipe_name, new_percentage)
         return True
     else:
-        print(f"'{chemical_name}' not found in recipe '{recipe_name}'.")
+        logger.warning("'%s' not found in recipe '%s'.", chemical_name, recipe_name)
         return False
 
 
@@ -1498,12 +1534,12 @@ def delete_recipe_item(conn: sqlite3.Connection, recipe_name: str, chemical_name
     """Remove a chemical from a recipe."""
     recipe = get_recipe_by_name(conn, recipe_name)
     if not recipe:
-        print(f"Recipe '{recipe_name}' not found.")
+        logger.warning("Recipe '%s' not found.", recipe_name)
         return False
     
     chemical = conn.execute("SELECT id FROM chemicals WHERE name = ?", (chemical_name,)).fetchone()
     if not chemical:
-        print(f"Chemical '{chemical_name}' not found.")
+        logger.warning("Chemical '%s' not found.", chemical_name)
         return False
     
     result = conn.execute(
@@ -1513,10 +1549,10 @@ def delete_recipe_item(conn: sqlite3.Connection, recipe_name: str, chemical_name
     conn.commit()
     
     if result.rowcount > 0:
-        print(f"Removed '{chemical_name}' from recipe '{recipe_name}'")
+        logger.info("Removed '%s' from recipe '%s'", chemical_name, recipe_name)
         return True
     else:
-        print(f"'{chemical_name}' was not in recipe '{recipe_name}'.")
+        logger.warning("'%s' was not in recipe '%s'.", chemical_name, recipe_name)
         return False
 
 
@@ -1524,13 +1560,13 @@ def delete_recipe(conn: sqlite3.Connection, name: str) -> bool:
     """Delete a recipe and all its items."""
     recipe = get_recipe_by_name(conn, name)
     if not recipe:
-        print(f"Recipe '{name}' not found.")
+        logger.warning("Recipe '%s' not found.", name)
         return False
     
     conn.execute("DELETE FROM recipe_items WHERE recipe_id = ?", (recipe["id"],))
     conn.execute("DELETE FROM recipes WHERE id = ?", (recipe["id"],))
     conn.commit()
-    print(f"Deleted recipe '{name}' and all its items.")
+    logger.info("Deleted recipe '%s' and all its items.", name)
     return True
 
 
@@ -1549,7 +1585,7 @@ def update_recipe(conn: sqlite3.Connection, name: str,
     """
     recipe = get_recipe_by_name(conn, name)
     if not recipe:
-        print(f"Recipe '{name}' not found.")
+        logger.warning("Recipe '%s' not found.", name)
         return False
     
     updates = []
@@ -1567,7 +1603,7 @@ def update_recipe(conn: sqlite3.Connection, name: str,
     params.append(recipe["id"])
     conn.execute(f"UPDATE recipes SET {', '.join(updates)} WHERE id = ?", params)
     conn.commit()
-    print(f"Updated recipe '{name}': {updates}")
+    logger.info("Updated recipe '%s': %s", name, updates)
     return True
 
 
@@ -1890,10 +1926,10 @@ def get_all_sales(conn: sqlite3.Connection, stage: Optional[str] = None,
         SELECT s.id, s.stage, s.pi_number, s.pi_date, s.client_name, s.pi_file_path,
                s.lc_number, s.lc_date, s.shipment_date, s.payment_date, s.payment_amount,
                s.created_at, s.updated_at,
-               COALESCE(SUM(si.quantity * si.unit_price), 0) AS total_value,
-               COUNT(si.id) AS item_count,
-               COALESCE((SELECT SUM(sp.payment_amount) FROM sale_payments sp
-                         WHERE sp.sale_id = s.id), 0) AS total_paid
+                COALESCE(ROUND(SUM(si.quantity * si.unit_price), 2), 0) AS total_value,
+                COUNT(si.id) AS item_count,
+                COALESCE((SELECT ROUND(SUM(sp.payment_amount), 2) FROM sale_payments sp
+                          WHERE sp.sale_id = s.id), 0) AS total_paid
         FROM sales s
         LEFT JOIN sale_items si ON si.sale_id = s.id
     """
@@ -2017,7 +2053,7 @@ def update_sale_lc(conn: sqlite3.Connection, sale_id: int, lc_number: str,
 def get_sale_invoice_total(conn: sqlite3.Connection, sale_id: int) -> float:
     """Sum of quantity * unit_price over all line items of a sale."""
     row = conn.execute(
-        "SELECT COALESCE(SUM(quantity * unit_price), 0) FROM sale_items WHERE sale_id = ?",
+        "SELECT COALESCE(ROUND(SUM(quantity * unit_price), 2), 0) FROM sale_items WHERE sale_id = ?",
         (sale_id,)
     ).fetchone()
     return row[0] if row else 0
@@ -2026,7 +2062,7 @@ def get_sale_invoice_total(conn: sqlite3.Connection, sale_id: int) -> float:
 def get_sale_total_paid(conn: sqlite3.Connection, sale_id: int) -> float:
     """Sum of all recorded payments for a sale."""
     row = conn.execute(
-        "SELECT COALESCE(SUM(payment_amount), 0) FROM sale_payments WHERE sale_id = ?",
+        "SELECT COALESCE(ROUND(SUM(payment_amount), 2), 0) FROM sale_payments WHERE sale_id = ?",
         (sale_id,)
     ).fetchone()
     return row[0] if row else 0
@@ -2035,7 +2071,7 @@ def get_sale_total_paid(conn: sqlite3.Connection, sale_id: int) -> float:
 def _sync_sale_payment_totals(conn: sqlite3.Connection, sale_id: int) -> None:
     """Keep legacy sales.payment_amount/date in sync with payment records."""
     row = conn.execute(
-        """SELECT COALESCE(SUM(payment_amount), 0), MAX(payment_date)
+        """SELECT COALESCE(ROUND(SUM(payment_amount), 2), 0), MAX(payment_date)
            FROM sale_payments WHERE sale_id = ?""",
         (sale_id,)
     ).fetchone()
@@ -2289,7 +2325,7 @@ def get_sales_summary(conn: sqlite3.Connection) -> Dict[str, Any]:
     rows = conn.execute("""
         SELECT s.stage,
                COUNT(DISTINCT s.id) AS cnt,
-               COALESCE(SUM(si.quantity * si.unit_price), 0) AS val
+                COALESCE(ROUND(SUM(si.quantity * si.unit_price), 2), 0) AS val
         FROM sales s
         LEFT JOIN sale_items si ON si.sale_id = s.id
         GROUP BY s.stage

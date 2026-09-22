@@ -49,6 +49,18 @@ def test_complete_if_paid_only_from_payment_due(db):
     assert _complete_if_paid(db, sid, "payment_due", 100.0, 100.0) is True
 
 
+def test_money_sums_rounded_to_cents(db):
+    sid = add_sale(db, {"pi_number": "PI-CENTS"},
+                   [{"product_name": "A", "quantity": 3, "unit_price": 0.1},
+                    {"product_name": "B", "quantity": 1, "unit_price": 19.99}])
+    assert get_sale_invoice_total(db, sid) == 20.29
+    out = record_sale_payment(db, sid, "2026-09-02", 0.1)
+    assert round(out["balance"], 2) == 20.19
+    record_sale_payment(db, sid, "2026-09-03", 0.2)
+    assert get_sale_total_paid(db, sid) == 0.3
+    assert round(get_sale_invoice_total(db, sid) - get_sale_total_paid(db, sid), 2) == 19.99
+
+
 def test_non_positive_payment_rejected(db):
     sid = _sale(db)
     with pytest.raises(ValueError):

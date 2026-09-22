@@ -80,6 +80,46 @@ def test_update_missing_chemical_404(admin_client):
     assert r.get_json()["success"] is False
 
 
+def test_reorder_migration_on_legacy_schema(tmp_path):
+    import sqlite3
+    from chem_stock import get_connection
+    legacy = str(tmp_path / "legacy.db")
+    raw = sqlite3.connect(legacy)
+    raw.execute("CREATE TABLE chemicals (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "name TEXT NOT NULL UNIQUE, current_qty REAL DEFAULT 0, "
+                "balance_last_month REAL DEFAULT 0, unit TEXT DEFAULT 'KG')")
+    raw.execute("INSERT INTO chemicals (name, current_qty) VALUES ('Old', 7)")
+    raw.commit()
+    raw.close()
+    conn = get_connection(legacy)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(chemicals)").fetchall()}
+    assert "reorder_level" in cols
+    assert conn.execute("SELECT reorder_level FROM chemicals WHERE name = 'Old'").fetchone()[0] == 0
+    conn.close()
+
+
+def test_reorder_level_roundtrip(admin_client):
+    admin_client.post("/api/chemicals", json={"name": "RL", "qty": 30, "unit": "KG"})
+    rows = admin_client.get("/api/chemicals").get_json()
+    assert [c for c in rows if c["name"] == "RL"][0]["reorder_level"] == 0
+    r = admin_client.put("/api/chemicals/reorder", json={"name": "RL", "reorder_level": 25})
+    assert r.status_code == 200
+    assert r.get_json() == {"success": True, "name": "RL", "reorder_level": 25.0}
+    rows = admin_client.get("/api/chemicals").get_json()
+    assert [c for c in rows if c["name"] == "RL"][0]["reorder_level"] == 25.0
+
+
+def test_reorder_level_validation(admin_client):
+    admin_client.post("/api/chemicals", json={"name": "RL2", "qty": 5, "unit": "KG"})
+    assert admin_client.put("/api/chemicals/reorder",
+                            json={"name": "RL2", "reorder_level": -1}).status_code == 400
+    assert admin_client.put("/api/chemicals/reorder",
+                            json={"name": "RL2", "reorder_level": "abc"}).status_code == 400
+    assert admin_client.put("/api/chemicals/reorder",
+                            json={"name": "Ghost", "reorder_level": 5}).status_code == 404
+    assert admin_client.put("/api/chemicals/reorder", json={"reorder_level": 5}).status_code == 400
+
+
 def test_recipe_crud_statuses(admin_client):
     assert admin_client.post("/api/recipes",
                              json={"name": "R1", "yield": 5}).status_code == 200

@@ -29,7 +29,7 @@ app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 REACT_BUILD_DIR = os.path.join(os.path.dirname(__file__), "react_frontend")
 
 from chem_stock import (
-    get_connection, get_all_chemicals, update_stock, add_chemical,
+    get_connection, get_all_chemicals, update_stock, add_chemical, set_reorder_level,
     add_recipe, get_recipe_by_name, add_recipe_item, list_recipes,
     list_recipe_items, update_recipe, update_recipe_item, delete_recipe_item,
     delete_recipe, generate_report, generate_multi_recipe_report, export_report_to_csv,
@@ -473,6 +473,28 @@ def api_update_chemical():
     if not success:
         return jsonify({"success": success, "name": name, "delta": delta}), 404
     return jsonify({"success": success, "name": name, "delta": delta})
+
+
+@app.route("/api/chemicals/reorder", methods=["PUT"])
+def api_set_reorder_level():
+    data = request.get_json() or {}
+    name = str(data.get("name", "")).strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    try:
+        level = float(data.get("reorder_level", 0) or 0)
+    except (TypeError, ValueError):
+        return jsonify({"error": "reorder_level must be a number"}), 400
+    conn = get_db()
+    try:
+        success = set_reorder_level(conn, name, level)
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
+    conn.close()
+    if not success:
+        return jsonify({"error": "Chemical not found"}), 404
+    return jsonify({"success": True, "name": name, "reorder_level": level})
 
 
 # ==================== API: RECIPES ====================

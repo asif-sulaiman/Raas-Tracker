@@ -1,5 +1,5 @@
 @echo off
-cd /d "O:\Study  Career\Python\ChemCalc"
+cd /d "%~dp0"
 echo ============================================
 echo   Chemical Stock Tracker
 echo ============================================
