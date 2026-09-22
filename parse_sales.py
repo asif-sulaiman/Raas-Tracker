@@ -106,19 +106,22 @@ def extract_pi_date(text: str) -> Optional[str]:
     return None
 
 
+_PI_NO_LABEL = r'(?:invoice|proforma\s+invoice|p\.?\s*i\.?)\s*(?:number|no\.?)'
+
+
 def extract_pi_number_from_text(text: str) -> Optional[str]:
     """Extract PI number from document body.
 
     RAAS PIs carry a bare number under an 'Invoice Number'/'Invoice No.' label
     (e.g. 99000001); generic PIs use a PI-YYYY-NNN pattern.
     """
-    match = re.search(r'invoice\s*(number|no\.?)\s*[:\-]?\s*(\d[\d\-]*)',
+    match = re.search(_PI_NO_LABEL + r'\s*[:\-]?\s*(\d[\d\-]*)',
                       text, re.IGNORECASE)
     if match:
-        return match.group(2).strip()
+        return match.group(1).strip()
     # Positional fallback: label row with the value on a following value row,
     # e.g. 'Invoice Number  Invoice Date' / '99000001  15/09/2026'.
-    m = re.search(r'invoice\s*(number|no\.?)', text, re.IGNORECASE)
+    m = re.search(_PI_NO_LABEL, text, re.IGNORECASE)
     if m:
         for line in text[m.end():].split('\n')[:5]:
             de_dated = re.sub(r'\d{1,4}[\/\-.]\d{1,2}[\/\-.]\d{2,4}', ' ', line)
@@ -160,24 +163,34 @@ def _looks_like_label(value: str) -> bool:
                for tok in _LABEL_LIKE)
 
 
+def _scan_address_block(text: str, anchor: str) -> Optional[str]:
+    """First real value line after an address anchor (mailing/delivery)."""
+    m = re.search(anchor, text, re.IGNORECASE)
+    if not m:
+        return None
+    for cand in text[m.end():].split('\n')[:4]:
+        name = re.sub(r'(?i)delivery\s*address', '', cand)
+        # Merged multi-column value rows carry the name plus the PI
+        # number/date ('EXAMPLE ... LTD 99000001 15/09/2026') — strip
+        # dates and standalone doc numbers before de-duplication.
+        name = re.sub(r'\d{1,4}[\/\-.]\d{1,2}[\/\-.]\d{2,4}', ' ', name)
+        name = re.sub(r'\b\d{5,}(?:-\d+)?\b', ' ', name)
+        name = _dedupe_doubled_text(re.sub(r'\s+', ' ', name).strip())
+        if name and not _looks_like_label(name):
+            return name
+    return None
+
+
 def extract_client_name(text: str) -> Optional[str]:
     """Extract client name: RAAS 'Mailing Address' block first, then labels."""
-    m = re.search(r'mailing\s*address', text, re.IGNORECASE)
-    if m:
-        # The label often shares a header row with other labels
-        # ('Mailing Address ... Invoice Number ...'), with values on the
-        # rows below — scan the following lines for the first line that is
-        # a real value rather than another label.
-        for cand in text[m.end():].split('\n')[:4]:
-            name = re.sub(r'(?i)delivery\s*address', '', cand)
-            # Merged multi-column value rows carry the name plus the PI
-            # number/date ('EXAMPLE ... LTD 99000001 15/09/2026') — strip
-            # dates and standalone doc numbers before de-duplication.
-            name = re.sub(r'\d{1,4}[\/\-.]\d{1,2}[\/\-.]\d{2,4}', ' ', name)
-            name = re.sub(r'\b\d{5,}(?:-\d+)?\b', ' ', name)
-            name = _dedupe_doubled_text(re.sub(r'\s+', ' ', name).strip())
-            if name and not _looks_like_label(name):
-                return name
+    # The label often shares a header row with other labels
+    # ('Mailing Address ... Invoice Number ...'), with values on the
+    # rows below — scan the following lines for the first line that is
+    # a real value rather than another label.
+    for anchor in (r'mailing\s*address', r'delivery\s*address'):
+        name = _scan_address_block(text, anchor)
+        if name:
+            return name
     labels = [
         r'Sold\s+to[:\s]+([^\n\r]+)',
         r'Bill\s+to[:\s]+([^\n\r]+)',

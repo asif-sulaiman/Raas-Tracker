@@ -148,6 +148,8 @@ def test_dayfirst_slash_dates():
 def test_pi_number_from_invoice_label():
     assert extract_pi_number_from_text("Invoice Number\n99000001") == "99000001"
     assert extract_pi_number_from_text("Invoice No. 99000001") == "99000001"
+    assert extract_pi_number_from_text("PI Number 99000001") == "99000001"
+    assert extract_pi_number_from_text("Proforma Invoice No. 99000001") == "99000001"
     assert extract_pi_number_from_text("PI-2026-001") == "PI-2026-001"
 
 
@@ -184,6 +186,11 @@ def test_real_client_names_not_label_like():
     assert not _looks_like_label("EXAMPLE CLIENT LTD")
     assert _looks_like_label("Invoice Number")
     assert _looks_like_label("Delivery Address")
+
+
+def test_delivery_address_fallback():
+    assert extract_client_name("Delivery Address\nEXAMPLE CLIENT LTD\n12 SAMPLE") == \
+        "EXAMPLE CLIENT LTD"
 
 
 def test_parse_number_formats():
