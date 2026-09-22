@@ -239,6 +239,26 @@ def test_recovery_ignores_dates_and_item_numbers():
     assert any("mismatch" in w for w in warnings)
 
 
+def test_select_best_tables_prefers_valid():
+    from parse_sales import _select_best_tables
+    broken = [[["Sr.", "Qty", "Item", "Description", "Price", "Total"],
+               ["1", "", "0201001", "GENERIC APC Enzyme", "", "29,150.00"]]]
+    good = [[["Sr.", "Qty", "Item", "Description", "Price", "Total"],
+             ["1", "11,000", "0201001", "GENERIC APC Enzyme", "2.65", "29,150.00"]]]
+    tables, items, warnings = _select_best_tables([broken, good])
+    assert tables == good
+    assert items[0].quantity == 11000.0
+    assert items[0].unit_price == 2.65
+
+
+def test_pdf_candidates_include_fitz_tables():
+    from parse_sales import _pdf_table_candidates
+    text, candidates = _pdf_table_candidates(_make_raas_pdf().getvalue())
+    assert "99000001" in text
+    assert any(candidates[0])
+    assert any(candidates[2])
+
+
 def test_parse_number_formats():
     assert _parse_number("1,000") == 1000.0
     assert _parse_number("US$48,880.00") == 48880.0

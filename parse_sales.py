@@ -1,10 +1,12 @@
 """PI Document Parser: PDF + DOCX (legacy .doc via Word) to structured extraction.
 
-Primary path is PDF (text-based PIs, e.g. RAAS Biotech proforma invoices)
-parsed with pdfplumber (tables) + PyMuPDF (text fallback) — pure Python, so it
-works on the server/VPS where Microsoft Word is unavailable. .docx is parsed
-with python-docx. Legacy .doc still converts via Word COM for local CLI use,
-but the API no longer accepts it.
+Primary path is PDF (text-based PIs, e.g. RAAS Biotech proforma invoices).
+Tables are extracted with three competing strategies — pdfplumber
+line-based, pdfplumber text-based, and PyMuPDF find_tables — and the
+candidate whose items validate best (qty x price ~= total) wins. All are
+pure Python, so parsing works on the server/VPS where Microsoft Word is
+unavailable. .docx is parsed with python-docx. Legacy .doc still converts
+via Word COM for local CLI use, but the API no longer accepts it.
 """
 
 import re
@@ -397,10 +399,25 @@ def extract_items_from_tables(tables: List[List[List[str]]],
 def _pdf_to_text_and_tables(raw_bytes: bytes):
     """Return (full_text, tables) from PDF bytes.
 
-    pdfplumber extracts ruled tables; PyMuPDF is the text fallback when
-    pdfplumber finds no readable text.
+    Tables come from the best of three strategies (see
+    _pdf_table_candidates/_select_best_tables): pdfplumber line-based,
+    pdfplumber text-based, and PyMuPDF find_tables. PyMuPDF is the text
+    fallback when pdfplumber finds no readable text.
     """
-    tables: List[List[List[str]]] = []
+    text, candidates = _pdf_table_candidates(raw_bytes)
+    tables, _, _ = _select_best_tables(candidates)
+    return text, tables
+
+
+def _pdf_table_candidates(raw_bytes: bytes):
+    """Return (full_text, [tables_lines, tables_text, tables_fitz]).
+
+    Different real-world PIs rule their tables differently (full grid,
+    partial lines, shading without lines), so no single detection strategy
+    fits all. Each candidate is a tables list in row-list format; empty
+    lists are allowed and simply lose the selection vote.
+    """
+    candidates: List[List[List[List[str]]]] = [[], [], []]
     text = ''
     try:
         import pdfplumber
@@ -408,16 +425,67 @@ def _pdf_to_text_and_tables(raw_bytes: bytes):
             page_texts = []
             for page in pdf.pages:
                 page_texts.append(page.extract_text() or '')
-                for tbl in page.extract_tables() or []:
-                    tables.append([[c or '' for c in row] for row in tbl])
+                try:
+                    lines_tbls = page.extract_tables() or []
+                except Exception:
+                    lines_tbls = []
+                try:
+                    text_tbls = page.extract_tables(table_settings={
+                        "vertical_strategy": "text",
+                        "horizontal_strategy": "text",
+                    }) or []
+                except Exception:
+                    text_tbls = []
+                candidates[0].extend(
+                    [[c or '' for c in row] for row in tbl] for tbl in lines_tbls)
+                candidates[1].extend(
+                    [[c or '' for c in row] for row in tbl] for tbl in text_tbls)
             text = '\n'.join(page_texts)
     except Exception:
         text = ''
-    if not text.strip():
+    try:
         import pymupdf
         with pymupdf.open(stream=raw_bytes, filetype='pdf') as doc:
-            text = '\n'.join(page.get_text() for page in doc)
-    return text, tables
+            if not text.strip():
+                text = '\n'.join(page.get_text() for page in doc)
+            # Always collected: a detected-but-misaligned pdfplumber table
+            # must not block the independent fitz strategy from competing.
+            for page in doc:
+                try:
+                    for tbl in page.find_tables():
+                        candidates[2].append(
+                            [[c or '' for c in row]
+                             for row in tbl.extract()])
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return text, candidates
+
+
+def _select_best_tables(candidates):
+    """Pick the table candidate whose items validate best.
+
+    Each candidate is parsed independently; the score is the number of
+    items with real quantity/unit-price values, with warnings as tie-break
+    (fewer wins). Ties resolve to the earlier strategy, so behavior on
+    already-working layouts is unchanged. Returns (tables, items, warnings).
+    """
+    best = ([], [], [])
+    best_key = None
+    for tables in candidates:
+        warnings: List[str] = []
+        try:
+            items = extract_items_from_tables(tables, warnings)
+        except Exception:
+            continue
+        valid = sum(1 for it in items if it.quantity > 0)
+        valid += sum(1 for it in items if it.unit_price > 0)
+        key = (valid, -len(warnings), -len(items) if valid == 0 else 0)
+        if best_key is None or key > best_key:
+            best_key = key
+            best = (tables, items, warnings)
+    return best[0], best[1], best[2]
 
 
 def _docx_to_text_and_tables(doc: Document):
