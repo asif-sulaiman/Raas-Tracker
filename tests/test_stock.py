@@ -120,6 +120,33 @@ def test_reorder_level_validation(admin_client):
     assert admin_client.put("/api/chemicals/reorder", json={"reorder_level": 5}).status_code == 400
 
 
+def test_upload_history_carries_dashboard_fields(admin_client, db):
+    from chem_stock import save_upload
+    results = {
+        "matches": [{"name": "Alpha", "db_last": 90, "db_this": 100,
+                     "upload_last": 90, "upload_this": 100}],
+        "last_month_mismatches": [],
+        "this_month_mismatches": [],
+        "both_mismatches": [],
+        "not_in_db": [{"name": "Zed", "upload_last": 1, "upload_this": 1}],
+        "not_in_upload": [{"name": "Beta", "db_last": 50, "db_this": 50}],
+        "stats": {"total": 3, "matched": 1, "last_month_mismatches": 0,
+                  "this_month_mismatches": 0, "both_mismatches": 0,
+                  "not_in_db": 1, "not_in_upload": 1, "match_percentage": 33.33},
+    }
+    save_upload(db, "AUGUST_2026.pdf", results)
+    rows = admin_client.get("/api/uploads").get_json()
+    assert len(rows) == 1
+    row = rows[0]
+    for field in ("id", "filename", "upload_date", "status", "total_chemicals",
+                  "matched", "last_month_mismatches", "this_month_mismatches",
+                  "both_mismatches", "not_in_db", "not_in_upload", "match_percentage"):
+        assert field in row, field
+    assert row["filename"] == "AUGUST_2026.pdf"
+    assert row["matched"] == 1 and row["not_in_db"] == 1
+    assert row["match_percentage"] == 33.33
+
+
 def test_recipe_crud_statuses(admin_client):
     assert admin_client.post("/api/recipes",
                              json={"name": "R1", "yield": 5}).status_code == 200
