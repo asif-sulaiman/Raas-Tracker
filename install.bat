@@ -1,12 +1,12 @@
 @echo off
-title Chemical Stock Tracker - Installer
+title RAAS Tracker - Installer
 color 0A
 
 echo ============================================
-echo   Chemical Stock Tracker - Installer
+echo   RAAS Tracker - Installer
 echo ============================================
 echo.
-echo This will install Chemical Stock Tracker on your computer.
+echo This will install RAAS Tracker on your computer.
 echo.
 echo Installation location: C:\ChemicalStockTracker
 echo.
@@ -33,7 +33,7 @@ echo [4/4] Creating desktop shortcut...
 (
     echo @echo off
     echo Set WshShell = CreateObject^("WScript.Shell"^)
-    echo Set shortcut = WshShell.CreateShortCut^("%USERPROFILE%\Desktop\Chemical Stock Tracker.lnk"^)
+    echo Set shortcut = WshShell.CreateShortCut^("%USERPROFILE%\Desktop\RAAS Tracker.lnk"^)
     echo shortcut.TargetPath = "C:\ChemicalStockTracker\ChemicalStockTracker.exe"
     echo shortcut.WorkingDirectory = "C:\ChemicalStockTracker"
     echo shortcut.Save
@@ -47,7 +47,7 @@ echo   Installation Complete!
 echo ============================================
 echo.
 echo You can now:
-echo   - Launch from Desktop: "Chemical Stock Tracker"
+echo   - Launch from Desktop: "RAAS Tracker"
 echo   - Or run: C:\ChemicalStockTracker\Start.bat
 echo.
 echo Press any key to exit...

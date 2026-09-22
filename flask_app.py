@@ -1,4 +1,4 @@
-"""Chemical Stock Tracker - Flask API Backend + React CRM Frontend"""
+"""RAAS Tracker - Flask API Backend + React CRM Frontend"""
 
 import os
 import sys
@@ -10,17 +10,17 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 # ---- Environment validation (fail early in production) ----
 IS_PRODUCTION = os.getenv("FLASK_ENV") == "production" or os.getenv("PRODUCTION") == "1"
-_secret = os.getenv("CHEMCALC_SECRET")
+_secret = os.getenv("RAAS_SECRET")
 if IS_PRODUCTION and not _secret:
-    print("FATAL: CHEMCALC_SECRET must be set in production. Generate with:", file=sys.stderr)
+    print("FATAL: RAAS_SECRET must be set in production. Generate with:", file=sys.stderr)
     print("  python -c \"import secrets; print(secrets.token_urlsafe(64))\"", file=sys.stderr)
     sys.exit(1)
 if not _secret:
     import secrets as _sec
     _secret = _sec.token_urlsafe(64)
-    print("WARNING: CHEMCALC_SECRET not set. Using random key (sessions reset on restart).",
+    print("WARNING: RAAS_SECRET not set. Using random key (sessions reset on restart).",
           file=sys.stderr)
-    print("  Set CHEMCALC_SECRET env var for production.", file=sys.stderr)
+    print("  Set RAAS_SECRET env var for production.", file=sys.stderr)
 
 app = Flask(__name__)
 app.secret_key = _secret
@@ -43,7 +43,7 @@ from chem_stock import (
 )
 
 # ---- AuthN/Z: sessions (humans) OR api_keys (scripts) ----
-# The legacy CHEMCALC_TOKEN env gate is retired: per-key api_keys provide
+# The legacy RAAS_TOKEN env gate is retired: per-key api_keys provide
 # expiry, revocation, IP allowlists, and audit identity instead.
 from flask import g
 from chem_stock import (get_session_user, validate_api_key,
@@ -54,11 +54,11 @@ from chem_stock import (get_session_user, validate_api_key,
                         list_api_keys, revoke_api_key, set_audit_actor,
                         create_first_admin, ensure_setup_token, check_setup_token,
                         log_audit_action, check_api_key_rate_limit, record_api_key_hit)
-from chemcalc.notifications import (
+from raas_tracker.notifications import (
     list_notifications_for, unread_count, mark_read, mark_read_all_for
 )
 
-SESSION_COOKIE = "chemcalc_session"
+SESSION_COOKIE = "raas_session"
 API_KEY_HEADER = "X-API-Key"
 KEY_RATE_LIMIT = 300          # API key requests per minute (DB-backed)
 KEY_RATE_WINDOW = 60
@@ -219,7 +219,7 @@ def admin_required(f):
 def _notify_login_failures(conn, username, ip) -> None:
     """Admin-only security alert when the failed-login threshold is reached."""
     try:
-        from chemcalc.notifications import notify
+        from raas_tracker.notifications import notify
         who = (username or "").strip() or "unknown"
         from datetime import datetime as _dt
         bucket = _dt.utcnow().strftime("%Y%m%d%H")
@@ -638,7 +638,7 @@ def api_upload():
     ext = os.path.splitext(safe_display)[1].lower()
     if ext not in ALLOWED_UPLOAD_EXTS:
         return jsonify({"error": "Only PDF and Excel files are accepted"}), 400
-    from chemcalc.db import data_dir as _data_dir
+    from raas_tracker.db import data_dir as _data_dir
     upload_dir = os.path.join(_data_dir(), "uploads")
     os.makedirs(upload_dir, exist_ok=True)
     filepath = os.path.join(upload_dir, f"{uuid.uuid4().hex}{ext}")
@@ -736,7 +736,7 @@ def api_upload_export(upload_id):
         else:
             results["not_in_db"].append(row)
 
-    from chemcalc.db import data_dir as _data_dir
+    from raas_tracker.db import data_dir as _data_dir
     output_path = os.path.join(_data_dir(), "reports", f"comparison_report_{upload_id}.xlsx")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     from chem_stock import export_comparison_report
@@ -800,7 +800,7 @@ def api_report_export():
             qty_int = int(qty)
         except (TypeError, ValueError):
             return jsonify({"error": "qty must be a number"}), 400
-        from chemcalc.db import data_dir as _data_dir
+        from raas_tracker.db import data_dir as _data_dir
         output_path = os.path.join(_data_dir(), "reports", f"report_{safe_name}_{qty_int}.csv")
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         export_report_to_csv(report, ", ".join(recipe_names), qty, output_path)
@@ -1225,7 +1225,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     debug = os.getenv("FLASK_DEBUG") == "1"
     print("=" * 50, file=sys.stderr)
-    print("  Chemical Stock Tracker - React CRM", file=sys.stderr)
+    print("  RAAS Tracker - React CRM", file=sys.stderr)
     print(f"  Mode: {'DEBUG' if debug else 'PRODUCTION'}", file=sys.stderr)
     print(f"  Host: {host}:{port}", file=sys.stderr)
     print(f"  HTTPS: {'enforced' if os.getenv('FORCE_HTTPS') == '1' else 'not enforced'}", file=sys.stderr)

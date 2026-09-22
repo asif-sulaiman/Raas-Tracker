@@ -1,16 +1,16 @@
 services:
-  chemcalc:
+  raas-tracker:
     build: .
     ports:
       - "5000:5000"
     environment:
-      CHEMCALC_SECRET: ${CHEMCALC_SECRET:?Set CHEMCALC_SECRET before starting}
+      RAAS_SECRET: ${RAAS_SECRET:?Set RAAS_SECRET before starting}
       PRODUCTION: "1"
       FORCE_HTTPS: "0"
       COOKIE_SECURE: "0"
     volumes:
-      - chemcalc-data:/data
+      - raas-tracker-data:/data
     restart: unless-stopped
 
 volumes:
-  chemcalc-data:
+  raas-tracker-data:

@@ -1,9 +1,9 @@
 # ---- Frontend build ----
 FROM node:22-slim AS frontend
-WORKDIR /app/chemcalc-frontend
-COPY chemcalc-frontend/package.json chemcalc-frontend/package-lock.json ./
+WORKDIR /app/raas-tracker-frontend
+COPY raas-tracker-frontend/package.json raas-tracker-frontend/package-lock.json ./
 RUN npm ci
-COPY chemcalc-frontend/ ./
+COPY raas-tracker-frontend/ ./
 RUN npx vite build
 
 # ---- Backend ----
@@ -15,9 +15,9 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY flask_app.py wsgi.py chem_stock.py parse_sales.py parse_stock.py ./
-COPY chemcalc/ ./chemcalc/
-COPY --from=frontend /app/chemcalc-frontend/dist ./react_frontend
+COPY raas_tracker/ ./raas_tracker/
+COPY --from=frontend /app/raas-tracker-frontend/dist ./react_frontend
 VOLUME ["/data"]
-ENV CHEMCALC_DATA_DIR=/data
+ENV RAAS_DATA_DIR=/data
 EXPOSE 5000
 CMD ["waitress-serve", "--host=0.0.0.0", "--port=5000", "--threads=4", "wsgi:app"]

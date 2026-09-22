@@ -10,7 +10,7 @@ from chem_stock import (
 
 
 def test_unknown_user_401_and_dummy_work_done(client, db):
-    import chemcalc.auth as auth_mod
+    import raas_tracker.auth as auth_mod
     auth_mod._DUMMY_HASH = None
     r = client.post("/api/auth/login", json={"username": "ghost", "password": "whatever-123"})
     assert r.status_code == 401
@@ -97,7 +97,7 @@ def test_login_cookie_flags(client):
     r = client.post("/api/auth/login", json={"username": "admin", "password": "admin-pass-123"})
     assert r.status_code == 200
     jar = "; ".join(r.headers.getlist("Set-Cookie"))
-    assert "chemcalc_session" in jar and "HttpOnly" in jar and "Secure" in jar
+    assert "raas_session" in jar and "HttpOnly" in jar and "Secure" in jar
     assert "SameSite=Lax" in jar
 
 

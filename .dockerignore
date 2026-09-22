@@ -2,7 +2,7 @@ __pycache__/
 *.pyc
 .git/
 node_modules/
-chemcalc-frontend/node_modules/
+raas-tracker-frontend/node_modules/
 react_frontend/
 uploads/
 reports/
@@ -11,4 +11,4 @@ reports/
 *.db-wal
 *.db-shm
 .env
-chemcalc-frontend/dist/
+raas-tracker-frontend/dist/

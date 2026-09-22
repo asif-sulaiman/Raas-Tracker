@@ -1,4 +1,4 @@
-"""Chemical Stock Tracker - Phase 2: Recipe Management & Stock Tracking."""
+"""RAAS Tracker - Phase 2: Recipe Management & Stock Tracking."""
 
 import sqlite3
 import json
@@ -9,17 +9,17 @@ from datetime import date
 from typing import Optional, List, Dict, Any, Union
 
 
-logger = _logging.getLogger("chemcalc")
+logger = _logging.getLogger("raas")
 if not logger.handlers:
     _handler = _logging.StreamHandler()
     _handler.setFormatter(_logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logger.addHandler(_handler)
-    logger.setLevel(os.getenv("CHEMCALC_LOG_LEVEL", "INFO").upper() or "INFO")
+    logger.setLevel(os.getenv("RAAS_LOG_LEVEL", "INFO").upper() or "INFO")
 
 
 def data_dir() -> str:
-    """Writable data directory: CHEMCALC_DATA_DIR (Docker volume) or repo root."""
-    override = os.getenv("CHEMCALC_DATA_DIR")
+    """Writable data directory: RAAS_DATA_DIR (Docker volume) or repo root."""
+    override = os.getenv("RAAS_DATA_DIR")
     if override:
         os.makedirs(override, exist_ok=True)
         return override

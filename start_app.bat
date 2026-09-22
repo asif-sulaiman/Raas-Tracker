@@ -1,7 +1,7 @@
 @echo off
 cd /d "%~dp0"
 echo ============================================
-echo   Chemical Stock Tracker
+echo   RAAS Tracker
 echo ============================================
 echo.
 echo  Start mode:

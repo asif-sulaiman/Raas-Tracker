@@ -16,7 +16,7 @@ def main():
     import sys
     
     if len(sys.argv) < 2:
-        print("Chemical Stock Tracker")
+        print("RAAS Tracker")
         print("Usage: python chem_stock.py <command> [args]")
         print()
         print("Stock Commands:")

@@ -1,10 +1,10 @@
-"""Compatibility shim: implementation lives in the chemcalc/ package.
+"""Compatibility shim: implementation lives in the raas_tracker/ package.
 
-New code should import from chemcalc.db, chemcalc.audit, chemcalc.auth,
-chemcalc.stock, chemcalc.uploads, chemcalc.recipes, or chemcalc.sales directly.
+New code should import from raas_tracker.db, raas_tracker.audit, raas_tracker.auth,
+raas_tracker.stock, raas_tracker.uploads, raas_tracker.recipes, or raas_tracker.sales directly.
 """
 
-from chemcalc.db import (
+from raas_tracker.db import (
     DB_PATH,
     JSON_PATH,
     _create_tables,
@@ -12,14 +12,14 @@ from chemcalc.db import (
     logger,
 )
 
-from chemcalc.audit import (
+from raas_tracker.audit import (
     _audit_state,
     get_audit_logs,
     log_audit_action,
     set_audit_actor,
 )
 
-from chemcalc.auth import (
+from raas_tracker.auth import (
     BCRYPT_ROUNDS,
     LOGIN_WINDOW_MINUTES,
     MAX_LOGIN_FAILS,
@@ -57,7 +57,7 @@ from chemcalc.auth import (
     verify_user,
 )
 
-from chemcalc.stock import (
+from raas_tracker.stock import (
     add_chemical,
     add_unit_conversion,
     convert_quantity,
@@ -70,7 +70,7 @@ from chemcalc.stock import (
     update_stock,
 )
 
-from chemcalc.uploads import (
+from raas_tracker.uploads import (
     adjust_stock_from_upload,
     approve_upload,
     approve_upload_row,
@@ -89,7 +89,7 @@ from chemcalc.uploads import (
     validate_expiry_date,
 )
 
-from chemcalc.recipes import (
+from raas_tracker.recipes import (
     add_recipe,
     add_recipe_item,
     delete_recipe,
@@ -106,7 +106,7 @@ from chemcalc.recipes import (
     update_recipe_item,
 )
 
-from chemcalc.sales import (
+from raas_tracker.sales import (
     SALE_STAGE_ORDER,
     _complete_if_paid,
     _next_stage,
@@ -132,7 +132,7 @@ from chemcalc.sales import (
     update_sale_payment_record,
 )
 
-from chemcalc.cli import main
+from raas_tracker.cli import main
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ from chem_stock import (
     compare_stock_upload, save_upload, update_stock, set_reorder_level,
     add_sale, move_sale_to_stage,
 )
-from chemcalc.notifications import (
+from raas_tracker.notifications import (
     notify, list_notifications_for, unread_count, mark_read, mark_read_all_for,
     notify_reorder_status,
 )
@@ -147,7 +147,7 @@ def test_save_upload_clean_creates_no_mismatch_alert(db):
 
 
 def test_upload_outcome_expiry_findings(db):
-    from chemcalc.uploads import _notify_upload_outcome
+    from raas_tracker.uploads import _notify_upload_outcome
     past = "2020-01-01"
     soon = (date.today() + timedelta(days=10)).isoformat()
     results = {

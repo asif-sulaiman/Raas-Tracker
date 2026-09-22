@@ -1,4 +1,4 @@
-# ChemCalc — Chemical Stock Tracker + Sales CRM
+# RAAS Tracker — Chemical Inventory + Sales CRM
 
 Warehouse chemical inventory with monthly reconciliation, recipe management,
 file upload comparison (PDF/Excel), a sales pipeline (PI → LC → shipment →
@@ -15,7 +15,7 @@ python flask_app.py            # http://localhost:5000
 Build the frontend into `react_frontend/` (served by Flask):
 
 ```bash
-cd chemcalc-frontend
+cd raas-tracker-frontend
 npm install
 npx vite build          # output is copied to ../react_frontend/
 ```
@@ -36,14 +36,14 @@ username and per IP), per-key rate limits, audited auth events.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CHEMCALC_SECRET` | random per-process | App secret. **Required** when `PRODUCTION=1` |
-| `PRODUCTION` | `0` | `1` refuses to start without `CHEMCALC_SECRET` |
+| `RAAS_SECRET` | random per-process | App secret. **Required** when `PRODUCTION=1` |
+| `PRODUCTION` | `0` | `1` refuses to start without `RAAS_SECRET` |
 | `HOST` / `PORT` | `127.0.0.1` / `5000` | Bind address and port |
 | `FORCE_HTTPS` | `0` | `1` enables HSTS + HTTPS redirect (behind a TLS proxy) |
 | `COOKIE_SECURE` | `1` | Session cookie `Secure` flag (`0` disables, dev only) |
 | `DISABLE_SETUP` | unset | `true` disables the one-time setup endpoint |
 | `FLASK_DEBUG` | `0` | Never enable in production |
-| `CHEMCALC_LOG_LEVEL` | `INFO` | Python log level for the `chemcalc` logger |
+| `RAAS_LOG_LEVEL` | `INFO` | Python log level for the `raas` logger |
 
 See `.env.example` for a template.
 
@@ -51,7 +51,7 @@ See `.env.example` for a template.
 
 ```bash
 pip install -r requirements.txt
-export CHEMCALC_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(64))")
+export RAAS_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(64))")
 export PRODUCTION=1 FORCE_HTTPS=1
 waitress-serve --host=0.0.0.0 --port=5000 --threads=4 wsgi:app
 ```
@@ -63,7 +63,7 @@ conversion needs Windows):
 docker compose up --build
 ```
 
-SQLite, `uploads/` and `reports/` live in a named volume (`chemcalc-data`).
+SQLite, `uploads/` and `reports/` live in a named volume (`raas-tracker-data`).
 Compose defaults to plain HTTP (`COOKIE_SECURE=0`, `FORCE_HTTPS=0`); when
 serving HTTPS (directly or when your proxy doesn't set `X-Forwarded-Proto`),
 flip both to `1`.
@@ -73,7 +73,7 @@ flip both to `1`.
 ```bash
 pip install -r requirements-dev.txt
 python -m pytest tests/ -q        # backend: 40+ tests, isolated temp DBs
-cd chemcalc-frontend
+cd raas-tracker-frontend
 npm install && npx vitest run     # frontend unit tests
 npx oxlint && npx vite build      # lint + production build
 ```
@@ -86,7 +86,7 @@ on every push and pull request to `main`.
 ```
 flask_app.py          Flask API + gates + SPA hosting
 wsgi.py               Waitress entry point
-chemcalc/             Data layer (split from legacy chem_stock.py)
+raas_tracker/          Data layer (split from legacy chem_stock.py)
   db.py               Connection, schema, migrations, settings
   audit.py            Audit log + per-request actor
   auth.py             Users, sessions, API keys, throttle, setup tokens
@@ -95,10 +95,10 @@ chemcalc/             Data layer (split from legacy chem_stock.py)
   recipes.py          Recipes + production reports
   sales.py            Pipeline, items, payments, summaries
   cli.py              python chem_stock.py <command> entry
-chem_stock.py         Compatibility shim (re-exports chemcalc.*)
+chem_stock.py         Compatibility shim (re-exports raas_tracker.*)
 parse_sales.py        PI parser (.docx direct, .doc via Word COM on Windows)
 parse_stock.py        Stock file parsers (PDF/Excel)
-chemcalc-frontend/    React 19 + Vite + Tailwind 4 SPA
+raas-tracker-frontend/  React 19 + Vite + Tailwind 4 SPA
 tests/                pytest suite (temp DB per test, real DB untouched)
 ```
 
