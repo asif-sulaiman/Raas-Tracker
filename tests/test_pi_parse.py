@@ -193,11 +193,60 @@ def test_delivery_address_fallback():
         "EXAMPLE CLIENT LTD"
 
 
+def test_recover_pair_from_merged_cells():
+    from parse_sales import extract_items_from_tables
+    tables = [[["Sr.", "Qty", "Item", "Description", "HS", "Price", "Total"],
+               ["1", "", "0201001", "GENERIC APC Enzyme 11,000 2.65",
+                "3507.90.90", "", "29,150.00"]]]
+    warnings: list = []
+    items = extract_items_from_tables(tables, warnings)
+    assert len(items) == 1
+    assert items[0].quantity == 11000.0
+    assert items[0].unit_price == 2.65
+    assert any("recovered" in w for w in warnings)
+    assert not any("mismatch" in w for w in warnings)
+
+
+def test_derive_price_from_total():
+    from parse_sales import extract_items_from_tables
+    tables = [[["Qty", "Description", "Price", "Total"],
+               ["11,000", "GENERIC APC Enzyme", "", "29,150.00"]]]
+    warnings: list = []
+    items = extract_items_from_tables(tables, warnings)
+    assert items[0].unit_price == 2.65
+    assert any("derived" in w for w in warnings)
+
+
+def test_derive_qty_from_total():
+    from parse_sales import extract_items_from_tables
+    tables = [[["Qty", "Description", "Price", "Total"],
+               ["", "GENERIC APC Enzyme", "2.65", "2,500.00"]]]
+    warnings: list = []
+    items = extract_items_from_tables(tables, warnings)
+    assert items[0].quantity == pytest.approx(1000.0)
+    assert any("derived" in w for w in warnings)
+
+
+def test_recovery_ignores_dates_and_item_numbers():
+    from parse_sales import extract_items_from_tables
+    # No qty/price tokens anywhere: item no. and Sr. must not form a pair.
+    tables = [[["Sr.", "Qty", "Item", "Description", "Price", "Total"],
+               ["3", "", "0601002", "ENZYME X", "", "10,000.00"]]]
+    warnings: list = []
+    items = extract_items_from_tables(tables, warnings)
+    assert items[0].quantity == 0.0
+    assert items[0].unit_price == 0.0
+    assert any("mismatch" in w for w in warnings)
+
+
 def test_parse_number_formats():
     assert _parse_number("1,000") == 1000.0
     assert _parse_number("US$48,880.00") == 48880.0
     assert _parse_number("2.65") == 2.65
     assert _parse_number("---") is None
+    # Merged multi-number cells must not concatenate into a wrong value.
+    assert _parse_number("1 11,000") is None
+    assert _parse_number("2.65 29,150.00") is None
 
 
 def test_total_mismatch_warns():

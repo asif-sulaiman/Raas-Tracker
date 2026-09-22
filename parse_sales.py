@@ -214,16 +214,73 @@ def _clean_cell(value) -> str:
 
 
 def _parse_number(value: str) -> Optional[float]:
-    """Parse '1,000' / '2.65' / 'US$48,880.00' to float; None if unparseable."""
+    """Parse '1,000' / '2.65' / 'US$48,880.00' to float; None if unparseable.
+
+    Returns None for merged multi-number cells ('1 11,000') so callers fall
+    back to total-anchored recovery instead of a concatenated wrong value.
+    """
     if value is None:
         return None
-    cleaned = re.sub(r'[^\d.\-]', '', str(value).replace(',', ''))
+    s = str(value).replace(',', '')
+    if len([t for t in s.split() if re.search(r'\d', t)]) > 1:
+        return None
+    cleaned = re.sub(r'[^\d.\-]', '', s)
     if not cleaned or cleaned in ('.', '-', '-.'):
         return None
     try:
         return float(cleaned)
     except ValueError:
         return None
+
+
+def _parse_last_number(value: str) -> Optional[float]:
+    """Parse the last numeric token — for total cells merged with neighbors."""
+    if value is None:
+        return None
+    tokens = [t for t in str(value).split() if re.search(r'\d', t)]
+    if not tokens:
+        return None
+    return _parse_number(tokens[-1])
+
+
+def _recover_pair(row: List[str], total_col: Optional[int],
+                  total: float) -> Optional[tuple]:
+    """Find the (qty, price) pair in a row whose product matches the total.
+
+    Layout-agnostic fallback for merged/shifted columns: every numeric token
+    in the row (except the total column, dates, and dotted codes like HS
+    '3402.90.10') is a candidate. The pair with qty x price ~= total wins;
+    the left-most token is taken as quantity (RAAS column order).
+    """
+    nums = []
+    for idx, cell in enumerate(row):
+        if idx == total_col:
+            continue
+        for tpos, tok in enumerate(str(cell).split()):
+            if '/' in tok:
+                continue  # dates like 15/09/2026
+            v = _parse_number(tok)
+            if v is None or v == 0:
+                continue
+            nums.append(((idx, tpos), v))
+    threshold = max(0.05, 0.001 * abs(total))
+    best = None
+    for a in range(len(nums)):
+        for b in range(a + 1, len(nums)):
+            (pa, va), (pb, vb) = nums[a], nums[b]
+            err = abs(va * vb - total)
+            if err <= threshold and (best is None or err < best[0]):
+                q, p = (va, vb) if pa <= pb else (vb, va)
+                best = (err, q, p)
+    return (best[1], best[2]) if best else None
+
+
+def _derive_missing(total: float, known: float) -> float:
+    """Derive the missing qty/price from total / known, preferring 2dp."""
+    v = total / known
+    if abs(round(v, 2) * known - total) <= max(0.05, 0.001 * abs(total)):
+        return round(v, 2)
+    return round(v, 4)
 
 
 def _map_product_columns(header_cells: List[str]) -> Optional[dict]:
@@ -310,9 +367,26 @@ def extract_items_from_tables(tables: List[List[List[str]]],
             price = _parse_number(cell(row, colmap['price'])) if colmap['price'] is not None else 0.0
             price = price or 0.0
             item_no = _clean_cell(cell(row, colmap['item'])) or None
+            total = None
             if colmap['total'] is not None:
-                total = _parse_number(cell(row, colmap['total']))
-                if total is not None and abs(qty * price - total) > max(1.0, 0.005 * total):
+                total = _parse_last_number(cell(row, colmap['total']))
+            if total is not None and total != 0:
+                if qty == 0 and price == 0:
+                    recovered = _recover_pair(row, colmap['total'], total)
+                    if recovered:
+                        qty, price = recovered
+                        warnings.append(
+                            f"Row {lineno} qty/price recovered from row values "
+                            f"({qty:g} x {price:g} ~= {total:g}) — please verify")
+                elif qty == 0:
+                    qty = _derive_missing(total, price)
+                    warnings.append(
+                        f"Row {lineno} quantity derived from total/price — please verify")
+                elif price == 0:
+                    price = _derive_missing(total, qty)
+                    warnings.append(
+                        f"Row {lineno} unit price derived from total/quantity — please verify")
+            if total is not None and abs(qty * price - total) > max(1.0, 0.005 * total):
                     warnings.append(
                         f"Row {lineno} total mismatch: {qty:g} x {price:g} != {total:g}")
             items.append(PIItem(product_name=name, quantity=qty,
