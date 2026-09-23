@@ -23,10 +23,23 @@ def test_wrong_password_401(client):
     assert r.status_code == 401
 
 
+def _pin_attempts_to_now(db):
+    """Pin all attempt timestamps to the server clock.
+
+    Makes window checks deterministic: attempt rows and the cutoff below
+    are evaluated against the same server clock moments apart, immune to
+    any host clock drift between the app and database machines.
+    """
+    db.execute("UPDATE login_attempts SET attempted_at = "
+               "to_char(clock_timestamp(), 'YYYY-MM-DD HH:MM:SS')")
+    db.commit()
+
+
 def test_five_fails_then_429(client, db):
     for _ in range(5):
         assert client.post("/api/auth/login",
                            json={"username": "admin", "password": "wrong"}).status_code == 401
+    _pin_attempts_to_now(db)
     assert client.post("/api/auth/login",
                        json={"username": "admin", "password": "wrong"}).status_code == 429
     # Correct password is also blocked inside the window.
@@ -41,19 +54,21 @@ def test_throttle_records_persist_in_db(client, db):
         "SELECT COUNT(*) FROM login_attempts WHERE success = 0 AND username = 'admin'"
     ).fetchone()[0]
     assert fails >= 5
+    _pin_attempts_to_now(db)
     assert is_login_blocked(db, "admin", "127.0.0.1") is True
 
 
 def test_ip_level_throttle_cross_username(client, db):
     for uname in ["b1", "b2", "b3", "b4", "b5", "b6"]:
         client.post("/api/auth/login", json={"username": uname, "password": "bad"})
+    _pin_attempts_to_now(db)
     r = client.post("/api/auth/login", json={"username": "admin", "password": "admin-pass-123"})
     assert r.status_code == 429
 
 
 def test_login_attempts_pruned(db):
     db.execute("INSERT INTO login_attempts (username, success) VALUES ('old', 0)")
-    db.execute("UPDATE login_attempts SET attempted_at = datetime('now', '-2 days')")
+    db.execute("UPDATE login_attempts SET attempted_at = to_char(NOW() - INTERVAL '2 days', 'YYYY-MM-DD HH:MM:SS')")
     db.commit()
     record_login_attempt(db, "fresh", "127.0.0.1", False)
     assert db.execute("SELECT COUNT(*) FROM login_attempts WHERE username = 'old'").fetchone()[0] == 0
@@ -68,7 +83,7 @@ def test_api_key_rate_limit_db_backed(db):
         record_api_key_hit(db, key_id)
     assert check_api_key_rate_limit(db, key_id, max_hits=3, window_seconds=60) is True
     # Old hits are pruned on write.
-    db.execute("UPDATE api_key_rate_limits SET hit_at = datetime('now', '-2 days')")
+    db.execute("UPDATE api_key_rate_limits SET hit_at = to_char(NOW() - INTERVAL '2 days', 'YYYY-MM-DD HH:MM:SS')")
     db.commit()
     record_api_key_hit(db, key_id)
     assert db.execute("SELECT COUNT(*) FROM api_key_rate_limits").fetchone()[0] == 1

@@ -1,13 +1,13 @@
 """In-app notifications: creation (with dedupe), role-filtered listing, read state."""
 
-import sqlite3
+import psycopg
 from typing import Any, Dict, List, Optional
 
 SEVERITIES = ("info", "warning", "critical")
 ROLE_SCOPES = ("all", "admin")
 
 
-def notify(conn: sqlite3.Connection, *, type: str, title: str, body: str = "",
+def notify(conn: psycopg.Connection, *, type: str, title: str, body: str = "",
            severity: str = "info", role_scope: str = "all",
            entity_type: Optional[str] = None, entity_id: Optional[int] = None,
            dedupe_key: Optional[str] = None) -> Optional[int]:
@@ -23,27 +23,27 @@ def notify(conn: sqlite3.Connection, *, type: str, title: str, body: str = "",
         role_scope = "all"
     if dedupe_key:
         existing = conn.execute(
-            "SELECT id FROM notifications WHERE dedupe_key = ?", (dedupe_key,)
+            "SELECT id FROM notifications WHERE dedupe_key = %s", (dedupe_key,)
         ).fetchone()
         if existing:
             return None
     cursor = conn.execute(
         """INSERT INTO notifications
            (type, title, body, severity, role_scope, entity_type, entity_id, dedupe_key)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
         (type, title, body, severity, role_scope, entity_type, entity_id, dedupe_key),
     )
     conn.commit()
-    return cursor.lastrowid
+    return cursor.fetchone()[0]
 
 
-def clear_dedupe(conn: sqlite3.Connection, dedupe_key: str) -> None:
+def clear_dedupe(conn: psycopg.Connection, dedupe_key: str) -> None:
     """Remove a dedupe row so the same condition can notify again later."""
-    conn.execute("DELETE FROM notifications WHERE dedupe_key = ?", (dedupe_key,))
+    conn.execute("DELETE FROM notifications WHERE dedupe_key = %s", (dedupe_key,))
     conn.commit()
 
 
-def list_notifications_for(conn: sqlite3.Connection, user_id: int, user_role: str,
+def list_notifications_for(conn: psycopg.Connection, user_id: int, user_role: str,
                            limit: int = 50) -> List[Dict[str, Any]]:
     """Recent notifications visible to this user, newest first, with read flags."""
     rows = conn.execute(
@@ -51,37 +51,37 @@ def list_notifications_for(conn: sqlite3.Connection, user_id: int, user_role: st
                   n.entity_type, n.entity_id, n.created_at,
                   CASE WHEN r.notification_id IS NULL THEN 0 ELSE 1 END AS is_read
            FROM notifications n
-           LEFT JOIN notification_reads r
-             ON r.notification_id = n.id AND r.user_id = ?
-           WHERE n.role_scope = 'all' OR ? = 'admin'
-           ORDER BY n.id DESC
-           LIMIT ?""",
+            LEFT JOIN notification_reads r
+              ON r.notification_id = n.id AND r.user_id = %s
+            WHERE n.role_scope = 'all' OR %s = 'admin'
+            ORDER BY n.id DESC
+            LIMIT %s""",
         (user_id, user_role, limit),
     )
     return [_row_to_dict(row) for row in rows]
 
 
-def unread_count(conn: sqlite3.Connection, user_id: int, user_role: str) -> int:
+def unread_count(conn: psycopg.Connection, user_id: int, user_role: str) -> int:
     """Number of unseen notifications visible to this user."""
     row = conn.execute(
         """SELECT COUNT(*)
            FROM notifications n
-           LEFT JOIN notification_reads r
-             ON r.notification_id = n.id AND r.user_id = ?
-           WHERE r.notification_id IS NULL
-             AND (n.role_scope = 'all' OR ? = 'admin')""",
+            LEFT JOIN notification_reads r
+              ON r.notification_id = n.id AND r.user_id = %s
+            WHERE r.notification_id IS NULL
+              AND (n.role_scope = 'all' OR %s = 'admin')""",
         (user_id, user_role),
     ).fetchone()
     return row[0]
 
 
-def mark_read(conn: sqlite3.Connection, user_id: int, notification_ids: List[int]) -> int:
+def mark_read(conn: psycopg.Connection, user_id: int, notification_ids: List[int]) -> int:
     """Mark specific notifications read. Returns newly marked count."""
     marked = 0
     for nid in notification_ids:
         cursor = conn.execute(
-            """INSERT OR IGNORE INTO notification_reads (user_id, notification_id)
-               VALUES (?, ?)""",
+            """INSERT INTO notification_reads (user_id, notification_id)
+               VALUES (%s, %s) ON CONFLICT DO NOTHING""",
             (user_id, nid),
         )
         marked += cursor.rowcount
@@ -89,19 +89,19 @@ def mark_read(conn: sqlite3.Connection, user_id: int, notification_ids: List[int
     return marked
 
 
-def mark_read_all_for(conn: sqlite3.Connection, user_id: int, user_role: str) -> int:
+def mark_read_all_for(conn: psycopg.Connection, user_id: int, user_role: str) -> int:
     """Mark every currently visible notification read for this user."""
     cursor = conn.execute(
-        """INSERT OR IGNORE INTO notification_reads (user_id, notification_id)
-           SELECT ?, id FROM notifications
-           WHERE role_scope = 'all' OR ? = 'admin'""",
+        """INSERT INTO notification_reads (user_id, notification_id)
+           SELECT %s, id FROM notifications
+           WHERE role_scope = 'all' OR %s = 'admin' ON CONFLICT DO NOTHING""",
         (user_id, user_role),
     )
     conn.commit()
     return cursor.rowcount
 
 
-def notify_reorder_status(conn: sqlite3.Connection, chem_id: int, name: str,
+def notify_reorder_status(conn: psycopg.Connection, chem_id: int, name: str,
                           qty: float, reorder_level: float) -> None:
     """Sync stock notifications with current qty vs reorder threshold.
 
@@ -128,7 +128,7 @@ def notify_reorder_status(conn: sqlite3.Connection, chem_id: int, name: str,
         clear_dedupe(conn, low_key)
 
 
-def notify_sale_stage(conn: sqlite3.Connection, sale_id: int, client_name: str,
+def notify_sale_stage(conn: psycopg.Connection, sale_id: int, client_name: str,
                       from_stage: str, to_stage: str) -> None:
     """Notify on payment_due entry (warning) and completion (info).
 
@@ -150,7 +150,7 @@ def notify_sale_stage(conn: sqlite3.Connection, sale_id: int, client_name: str,
                dedupe_key=f"sale:{sale_id}:completed")
 
 
-def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+def _row_to_dict(row: Any) -> Dict[str, Any]:
     return {
         "id": row[0], "type": row[1], "title": row[2], "body": row[3],
         "severity": row[4], "role_scope": row[5], "entity_type": row[6],

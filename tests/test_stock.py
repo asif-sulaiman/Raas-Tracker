@@ -80,19 +80,17 @@ def test_update_missing_chemical_404(admin_client):
     assert r.get_json()["success"] is False
 
 
-def test_reorder_migration_on_legacy_schema(tmp_path):
-    import sqlite3
+def test_reorder_migration_on_legacy_schema(pg_dsn):
     from chem_stock import get_connection
-    legacy = str(tmp_path / "legacy.db")
-    raw = sqlite3.connect(legacy)
-    raw.execute("CREATE TABLE chemicals (id INTEGER PRIMARY KEY AUTOINCREMENT, "
-                "name TEXT NOT NULL UNIQUE, current_qty REAL DEFAULT 0, "
-                "balance_last_month REAL DEFAULT 0, unit TEXT DEFAULT 'KG')")
-    raw.execute("INSERT INTO chemicals (name, current_qty) VALUES ('Old', 7)")
-    raw.commit()
-    raw.close()
-    conn = get_connection(legacy)
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(chemicals)").fetchall()}
+    conn = get_connection(pg_dsn)
+    conn.execute("INSERT INTO chemicals (name, current_qty) VALUES ('Old', 7)")
+    conn.execute("ALTER TABLE chemicals DROP COLUMN reorder_level")
+    conn.commit()
+    conn.close()
+    conn = get_connection(pg_dsn)
+    cols = {r[0] for r in conn.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = 'chemicals'")}
     assert "reorder_level" in cols
     assert conn.execute("SELECT reorder_level FROM chemicals WHERE name = 'Old'").fetchone()[0] == 0
     conn.close()

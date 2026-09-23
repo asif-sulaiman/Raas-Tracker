@@ -231,11 +231,20 @@ def test_api_role_scoping_between_admin_and_user(admin_client, user_client, db):
     assert admin_data["unread"] == 2 and user_data["unread"] == 1
 
 
-def test_failed_login_threshold_alerts_admins_only(admin_client, user_client, client):
-    for _ in range(5):
+def test_failed_login_threshold_alerts_admins_only(admin_client, user_client, client, db):
+    # Four fails through the API, then pin their timestamps to the server
+    # clock so the threshold check inside the fifth request is deterministic
+    # regardless of host clock drift between the app and database machines.
+    for _ in range(4):
         resp = client.post("/api/auth/login",
                            json={"username": "admin", "password": "wrong-pass"})
         assert resp.status_code in (401, 429)
+    db.execute("UPDATE login_attempts SET attempted_at = "
+               "to_char(clock_timestamp(), 'YYYY-MM-DD HH:MM:SS')")
+    db.commit()
+    resp = client.post("/api/auth/login",
+                       json={"username": "admin", "password": "wrong-pass"})
+    assert resp.status_code in (401, 429)
     admin_items = admin_client.get("/api/notifications").get_json()["items"]
     user_items = user_client.get("/api/notifications").get_json()["items"]
     admin_types = [i["type"] for i in admin_items]

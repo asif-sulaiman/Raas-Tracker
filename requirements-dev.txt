@@ -1,2 +1,4 @@
 # Dev-only dependencies (tests, CI). Production uses requirements.txt.
 pytest==8.3.4
+# Embedded PostgreSQL for local tests (zero-install; CI uses a service instead).
+pgserver==0.1.4

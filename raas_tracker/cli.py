@@ -1,6 +1,5 @@
 """Command-line entry point."""
 
-import sqlite3
 import json
 import os
 import re

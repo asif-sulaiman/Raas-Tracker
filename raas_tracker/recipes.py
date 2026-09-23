@@ -1,6 +1,6 @@
 """Recipes plus production reports."""
 
-import sqlite3
+import psycopg
 import json
 import os
 import re
@@ -11,7 +11,7 @@ from .db import get_connection, logger
 from .stock import get_all_chemicals
 from .uploads import csv_safe
 
-def add_recipe(conn: sqlite3.Connection, name: str, total_quantity: float = 1, water_percentage: float = 0) -> bool:
+def add_recipe(conn: psycopg.Connection, name: str, total_quantity: float = 1, water_percentage: float = 0) -> bool:
     """Create a new recipe.
     
     Args:
@@ -25,21 +25,25 @@ def add_recipe(conn: sqlite3.Connection, name: str, total_quantity: float = 1, w
     """
     try:
         conn.execute(
-            "INSERT INTO recipes (name, total_quantity, water_percentage) VALUES (?, ?, ?)",
+            "INSERT INTO recipes (name, total_quantity, water_percentage) VALUES (%s, %s, %s)",
             (name, total_quantity, water_percentage)
         )
         conn.commit()
         logger.info("Created recipe: '%s' (total quantity: %s)", name, total_quantity)
         return True
-    except sqlite3.IntegrityError:
+    except psycopg.IntegrityError:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         logger.warning("Recipe '%s' already exists.", name)
         return False
 
 
-def get_recipe_by_name(conn: sqlite3.Connection, name: str) -> Optional[Dict[str, Any]]:
+def get_recipe_by_name(conn: psycopg.Connection, name: str) -> Optional[Dict[str, Any]]:
     """Get recipe info by name."""
     cursor = conn.execute(
-        "SELECT id, name, total_quantity, water_percentage, created_date FROM recipes WHERE name = ?",
+        "SELECT id, name, total_quantity, water_percentage, created_date FROM recipes WHERE name = %s",
         (name,)
     )
     row = cursor.fetchone()
@@ -48,7 +52,7 @@ def get_recipe_by_name(conn: sqlite3.Connection, name: str) -> Optional[Dict[str
     return None
 
 
-def add_recipe_item(conn: sqlite3.Connection, recipe_name: str, chemical_name: str, 
+def add_recipe_item(conn: psycopg.Connection, recipe_name: str, chemical_name: str, 
                     percentage: float) -> bool:
     """Add a chemical to a recipe with percentage of total product yield.
     
@@ -69,15 +73,15 @@ def add_recipe_item(conn: sqlite3.Connection, recipe_name: str, chemical_name: s
     
     # Check chemical exists
     chemical = conn.execute(
-        "SELECT id FROM chemicals WHERE name = ?", (chemical_name,)
+        "SELECT id FROM chemicals WHERE name = %s", (chemical_name,)
     ).fetchone()
     if not chemical:
         logger.warning("Chemical '%s' not found in database.", chemical_name)
         return False
-    
+
     # Check if item already exists in recipe
     existing = conn.execute(
-        "SELECT id FROM recipe_items WHERE recipe_id = ? AND chemical_id = ?",
+        "SELECT id FROM recipe_items WHERE recipe_id = %s AND chemical_id = %s",
         (recipe["id"], chemical[0])
     ).fetchone()
     if existing:
@@ -87,7 +91,7 @@ def add_recipe_item(conn: sqlite3.Connection, recipe_name: str, chemical_name: s
     
     required_qty_per_unit = percentage / 100.0
     conn.execute(
-        "INSERT INTO recipe_items (recipe_id, chemical_id, percentage, required_qty_per_unit) VALUES (?, ?, ?, ?)",
+        "INSERT INTO recipe_items (recipe_id, chemical_id, percentage, required_qty_per_unit) VALUES (%s, %s, %s, %s)",
         (recipe["id"], chemical[0], percentage, required_qty_per_unit)
     )
     conn.commit()
@@ -95,7 +99,7 @@ def add_recipe_item(conn: sqlite3.Connection, recipe_name: str, chemical_name: s
     return True
 
 
-def list_recipes(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+def list_recipes(conn: psycopg.Connection) -> List[Dict[str, Any]]:
     """List all recipes with their total quantity info."""
     cursor = conn.execute(
         "SELECT id, name, total_quantity, water_percentage, created_date FROM recipes ORDER BY name"
@@ -106,7 +110,7 @@ def list_recipes(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     ]
 
 
-def list_recipe_items(conn: sqlite3.Connection, recipe_name: str) -> List[Dict[str, Any]]:
+def list_recipe_items(conn: psycopg.Connection, recipe_name: str) -> List[Dict[str, Any]]:
     """List all chemicals in a recipe with percentages and required quantities."""
     recipe = get_recipe_by_name(conn, recipe_name)
     if not recipe:
@@ -117,12 +121,12 @@ def list_recipe_items(conn: sqlite3.Connection, recipe_name: str) -> List[Dict[s
         SELECT r.name as recipe_name, r.total_quantity, 
                c.name as chemical_name, c.current_qty, c.unit,
                ri.required_qty_per_unit, ri.percentage
-        FROM recipe_items ri
-        JOIN recipes r ON ri.recipe_id = r.id
-        JOIN chemicals c ON ri.chemical_id = c.id
-        WHERE r.name = ?
-        ORDER BY c.name
-    """, (recipe_name,))
+         FROM recipe_items ri
+         JOIN recipes r ON ri.recipe_id = r.id
+         JOIN chemicals c ON ri.chemical_id = c.id
+         WHERE r.name = %s
+         ORDER BY c.name
+     """, (recipe_name,))
     
     items = []
     for row in cursor.fetchall():
@@ -143,7 +147,7 @@ def list_recipe_items(conn: sqlite3.Connection, recipe_name: str) -> List[Dict[s
     return items
 
 
-def update_recipe_item(conn: sqlite3.Connection, recipe_name: str, chemical_name: str,
+def update_recipe_item(conn: psycopg.Connection, recipe_name: str, chemical_name: str,
                        new_percentage: float) -> bool:
     """Update the percentage of a chemical in a recipe."""
     recipe = get_recipe_by_name(conn, recipe_name)
@@ -151,14 +155,14 @@ def update_recipe_item(conn: sqlite3.Connection, recipe_name: str, chemical_name
         logger.warning("Recipe '%s' not found.", recipe_name)
         return False
     
-    chemical = conn.execute("SELECT id FROM chemicals WHERE name = ?", (chemical_name,)).fetchone()
+    chemical = conn.execute("SELECT id FROM chemicals WHERE name = %s", (chemical_name,)).fetchone()
     if not chemical:
         logger.warning("Chemical '%s' not found.", chemical_name)
         return False
-    
+
     new_qty_per_unit = new_percentage / 100.0
     result = conn.execute(
-        "UPDATE recipe_items SET percentage = ?, required_qty_per_unit = ? WHERE recipe_id = ? AND chemical_id = ?",
+        "UPDATE recipe_items SET percentage = %s, required_qty_per_unit = %s WHERE recipe_id = %s AND chemical_id = %s",
         (new_percentage, new_qty_per_unit, recipe["id"], chemical[0])
     )
     conn.commit()
@@ -171,20 +175,20 @@ def update_recipe_item(conn: sqlite3.Connection, recipe_name: str, chemical_name
         return False
 
 
-def delete_recipe_item(conn: sqlite3.Connection, recipe_name: str, chemical_name: str) -> bool:
+def delete_recipe_item(conn: psycopg.Connection, recipe_name: str, chemical_name: str) -> bool:
     """Remove a chemical from a recipe."""
     recipe = get_recipe_by_name(conn, recipe_name)
     if not recipe:
         logger.warning("Recipe '%s' not found.", recipe_name)
         return False
     
-    chemical = conn.execute("SELECT id FROM chemicals WHERE name = ?", (chemical_name,)).fetchone()
+    chemical = conn.execute("SELECT id FROM chemicals WHERE name = %s", (chemical_name,)).fetchone()
     if not chemical:
         logger.warning("Chemical '%s' not found.", chemical_name)
         return False
-    
+
     result = conn.execute(
-        "DELETE FROM recipe_items WHERE recipe_id = ? AND chemical_id = ?",
+        "DELETE FROM recipe_items WHERE recipe_id = %s AND chemical_id = %s",
         (recipe["id"], chemical[0])
     )
     conn.commit()
@@ -197,21 +201,21 @@ def delete_recipe_item(conn: sqlite3.Connection, recipe_name: str, chemical_name
         return False
 
 
-def delete_recipe(conn: sqlite3.Connection, name: str) -> bool:
+def delete_recipe(conn: psycopg.Connection, name: str) -> bool:
     """Delete a recipe and all its items."""
     recipe = get_recipe_by_name(conn, name)
     if not recipe:
         logger.warning("Recipe '%s' not found.", name)
         return False
     
-    conn.execute("DELETE FROM recipe_items WHERE recipe_id = ?", (recipe["id"],))
-    conn.execute("DELETE FROM recipes WHERE id = ?", (recipe["id"],))
+    conn.execute("DELETE FROM recipe_items WHERE recipe_id = %s", (recipe["id"],))
+    conn.execute("DELETE FROM recipes WHERE id = %s", (recipe["id"],))
     conn.commit()
     logger.info("Deleted recipe '%s' and all its items.", name)
     return True
 
 
-def update_recipe(conn: sqlite3.Connection, name: str, 
+def update_recipe(conn: psycopg.Connection, name: str, 
                   total_quantity: float = None, water_percentage: float = None) -> bool:
     """Update recipe metadata (total_quantity and/or water_percentage).
     
@@ -232,17 +236,17 @@ def update_recipe(conn: sqlite3.Connection, name: str,
     updates = []
     params = []
     if total_quantity is not None:
-        updates.append("total_quantity = ?")
+        updates.append("total_quantity = %s")
         params.append(total_quantity)
     if water_percentage is not None:
-        updates.append("water_percentage = ?")
+        updates.append("water_percentage = %s")
         params.append(water_percentage)
-    
+
     if not updates:
         return True
-    
+
     params.append(recipe["id"])
-    conn.execute(f"UPDATE recipes SET {', '.join(updates)} WHERE id = ?", params)
+    conn.execute(f"UPDATE recipes SET {', '.join(updates)} WHERE id = %s", params)
     conn.commit()
     logger.info("Updated recipe '%s': %s", name, updates)
     return True
@@ -253,7 +257,7 @@ def update_recipe(conn: sqlite3.Connection, name: str,
 # ============================================================
 
 
-def generate_report(conn: sqlite3.Connection, recipe_name: str, production_qty: float) -> List[Dict[str, Any]]:
+def generate_report(conn: psycopg.Connection, recipe_name: str, production_qty: float) -> List[Dict[str, Any]]:
     """Generate a production report showing have vs need for each chemical.
     
     Args:
@@ -303,7 +307,7 @@ def generate_report(conn: sqlite3.Connection, recipe_name: str, production_qty: 
     return report
 
 
-def generate_multi_recipe_report(conn: sqlite3.Connection, recipe_selections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def generate_multi_recipe_report(conn: psycopg.Connection, recipe_selections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Generate a combined production report for multiple recipes.
     
     Args:

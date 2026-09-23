@@ -1,6 +1,6 @@
 """Audit log plus per-request actor state."""
 
-import sqlite3
+import psycopg
 import json
 import os
 import re
@@ -18,7 +18,7 @@ def set_audit_actor(name: Optional[str]) -> None:
     _audit_state.name = name or "system"
 
 
-def log_audit_action(conn: sqlite3.Connection, action: str, entity_type: str = None,
+def log_audit_action(conn: psycopg.Connection, action: str, entity_type: str = None,
                      entity_id: int = None, user_id: str = "system",
                      old_value: str = None, new_value: str = None,
                      ip_address: str = None) -> int:
@@ -41,14 +41,14 @@ def log_audit_action(conn: sqlite3.Connection, action: str, entity_type: str = N
         user_id = getattr(_audit_state, "name", "system")
     cursor = conn.execute(
         """INSERT INTO audit_logs (action, entity_type, entity_id, user_id, old_value, new_value, ip_address)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
         (action, entity_type, entity_id, user_id, old_value, new_value, ip_address)
     )
     conn.commit()
-    return cursor.lastrowid
+    return cursor.fetchone()[0]
 
 
-def get_audit_logs(conn: sqlite3.Connection, entity_type: str = None, 
+def get_audit_logs(conn: psycopg.Connection, entity_type: str = None, 
                    entity_id: int = None, limit: int = 50) -> List[Dict[str, Any]]:
     """Get audit logs.
     
@@ -65,16 +65,16 @@ def get_audit_logs(conn: sqlite3.Connection, entity_type: str = None,
     params = []
     
     if entity_type:
-        query += " WHERE entity_type = ?"
+        query += " WHERE entity_type = %s"
         params.append(entity_type)
         if entity_id:
-            query += " AND entity_id = ?"
+            query += " AND entity_id = %s"
             params.append(entity_id)
     elif entity_id:
-        query += " WHERE entity_id = ?"
+        query += " WHERE entity_id = %s"
         params.append(entity_id)
-    
-    query += " ORDER BY timestamp DESC LIMIT ?"
+
+    query += " ORDER BY timestamp DESC LIMIT %s"
     params.append(limit)
     
     cursor = conn.execute(query, params)

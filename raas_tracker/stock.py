@@ -1,6 +1,6 @@
 """Chemicals, units, and reorder levels."""
 
-import sqlite3
+import psycopg
 import json
 import os
 import re
@@ -46,20 +46,24 @@ def import_from_json(json_path: str = JSON_PATH) -> Dict[str, int]:
         
         try:
             existing = conn.execute(
-                "SELECT id FROM chemicals WHERE name = ?", (name,)
+                "SELECT id FROM chemicals WHERE name = %s", (name,)
             ).fetchone()
             if existing:
                 conn.execute(
-                    "UPDATE chemicals SET current_qty = ?, balance_last_month = ?, unit = ?, last_updated = ? WHERE name = ?",
+                    "UPDATE chemicals SET current_qty = %s, balance_last_month = %s, unit = %s, last_updated = %s WHERE name = %s",
                     (float(qty), float(last_qty), unit, date.isoformat(date.today()), name)
                 )
             else:
                 conn.execute(
-                    "INSERT INTO chemicals (name, current_qty, balance_last_month, unit, last_updated) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO chemicals (name, current_qty, balance_last_month, unit, last_updated) VALUES (%s, %s, %s, %s, %s)",
                     (name, float(qty), float(last_qty), unit, date.isoformat(date.today()))
                 )
             imported += 1
-        except sqlite3.IntegrityError:
+        except psycopg.IntegrityError:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             skipped += 1
     
     conn.commit()
@@ -69,7 +73,7 @@ def import_from_json(json_path: str = JSON_PATH) -> Dict[str, int]:
     return {item["product_name"]: item["balance_this_month"] for item in data[:5]}  # sample
 
 
-def get_all_chemicals(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+def get_all_chemicals(conn: psycopg.Connection) -> List[Dict[str, Any]]:
     """Return all chemicals with current stock levels."""
     cursor = conn.execute(
         "SELECT id, name, current_qty, balance_last_month, unit, last_updated, "
@@ -85,7 +89,7 @@ def get_all_chemicals(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
 # ==================== UNIT CONVERSION FUNCTIONS ====================
 
 
-def get_unit_conversion(conn: sqlite3.Connection, from_unit: str, to_unit: str) -> Optional[float]:
+def get_unit_conversion(conn: psycopg.Connection, from_unit: str, to_unit: str) -> Optional[float]:
     """Get conversion factor between two units.
     
     Args:
@@ -104,16 +108,16 @@ def get_unit_conversion(conn: sqlite3.Connection, from_unit: str, to_unit: str) 
     
     # Direct conversion
     cursor = conn.execute(
-        "SELECT factor FROM unit_conversions WHERE from_unit = ? AND to_unit = ?",
+        "SELECT factor FROM unit_conversions WHERE from_unit = %s AND to_unit = %s",
         (from_unit, to_unit)
     )
     row = cursor.fetchone()
     if row:
         return row[0]
-    
+
     # Try reverse conversion
     cursor = conn.execute(
-        "SELECT factor FROM unit_conversions WHERE from_unit = ? AND to_unit = ?",
+        "SELECT factor FROM unit_conversions WHERE from_unit = %s AND to_unit = %s",
         (to_unit, from_unit)
     )
     row = cursor.fetchone()
@@ -123,7 +127,7 @@ def get_unit_conversion(conn: sqlite3.Connection, from_unit: str, to_unit: str) 
     return None  # Conversion not possible
 
 
-def convert_quantity(conn: sqlite3.Connection, qty: float, from_unit: str, to_unit: str) -> Optional[float]:
+def convert_quantity(conn: psycopg.Connection, qty: float, from_unit: str, to_unit: str) -> Optional[float]:
     """Convert quantity from one unit to another.
     
     Args:
@@ -141,17 +145,18 @@ def convert_quantity(conn: sqlite3.Connection, qty: float, from_unit: str, to_un
     return qty * factor
 
 
-def get_all_unit_conversions(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+def get_all_unit_conversions(conn: psycopg.Connection) -> List[Dict[str, Any]]:
     """Return all unit conversions."""
     cursor = conn.execute("SELECT id, from_unit, to_unit, factor FROM unit_conversions ORDER BY from_unit")
     return [{"id": row[0], "from_unit": row[1], "to_unit": row[2], "factor": row[3]} for row in cursor.fetchall()]
 
 
-def add_unit_conversion(conn: sqlite3.Connection, from_unit: str, to_unit: str, factor: float) -> bool:
+def add_unit_conversion(conn: psycopg.Connection, from_unit: str, to_unit: str, factor: float) -> bool:
     """Add a new unit conversion."""
     try:
         conn.execute(
-            "INSERT OR REPLACE INTO unit_conversions (from_unit, to_unit, factor) VALUES (?, ?, ?)",
+            "INSERT INTO unit_conversions (from_unit, to_unit, factor) VALUES (%s, %s, %s) "
+            "ON CONFLICT (from_unit, to_unit) DO UPDATE SET factor = EXCLUDED.factor",
             (from_unit.upper().strip(), to_unit.upper().strip(), factor)
         )
         conn.commit()
@@ -161,11 +166,11 @@ def add_unit_conversion(conn: sqlite3.Connection, from_unit: str, to_unit: str, 
         return False
 
 
-def delete_unit_conversion(conn: sqlite3.Connection, from_unit: str, to_unit: str) -> bool:
+def delete_unit_conversion(conn: psycopg.Connection, from_unit: str, to_unit: str) -> bool:
     """Delete a unit conversion."""
     try:
         conn.execute(
-            "DELETE FROM unit_conversions WHERE from_unit = ? AND to_unit = ?",
+            "DELETE FROM unit_conversions WHERE from_unit = %s AND to_unit = %s",
             (from_unit.upper().strip(), to_unit.upper().strip())
         )
         conn.commit()
@@ -175,7 +180,7 @@ def delete_unit_conversion(conn: sqlite3.Connection, from_unit: str, to_unit: st
         return False
 
 
-def update_stock(conn: sqlite3.Connection, name: str, delta: float, unit: str = "KG") -> bool:
+def update_stock(conn: psycopg.Connection, name: str, delta: float, unit: str = "KG") -> bool:
     """Update chemical stock by delta (positive or negative).
     
     Args:
@@ -189,7 +194,7 @@ def update_stock(conn: sqlite3.Connection, name: str, delta: float, unit: str = 
     """
     # Get chemical info
     chemical = conn.execute(
-        "SELECT id, name, current_qty, unit, reorder_level FROM chemicals WHERE name = ?",
+        "SELECT id, name, current_qty, unit, reorder_level FROM chemicals WHERE name = %s",
         (name,)
     ).fetchone()
     
@@ -213,7 +218,7 @@ def update_stock(conn: sqlite3.Connection, name: str, delta: float, unit: str = 
         new_qty = 0
     
     conn.execute(
-        "UPDATE chemicals SET current_qty = ?, last_updated = ? WHERE id = ?",
+        "UPDATE chemicals SET current_qty = %s, last_updated = %s WHERE id = %s",
         (new_qty, date.isoformat(date.today()), chem_id)
     )
     conn.commit()
@@ -226,7 +231,7 @@ def update_stock(conn: sqlite3.Connection, name: str, delta: float, unit: str = 
     return True
 
 
-def set_reorder_level(conn: sqlite3.Connection, name: str, level: float) -> bool:
+def set_reorder_level(conn: psycopg.Connection, name: str, level: float) -> bool:
     """Set the per-chemical reorder threshold. Returns False if not found.
 
     Raises ValueError on negative levels. A level of 0 disables the
@@ -235,13 +240,13 @@ def set_reorder_level(conn: sqlite3.Connection, name: str, level: float) -> bool
     if level is None or level < 0:
         raise ValueError("reorder_level must be 0 or greater")
     row = conn.execute(
-        "SELECT id, name, current_qty, reorder_level FROM chemicals WHERE name = ?",
+        "SELECT id, name, current_qty, reorder_level FROM chemicals WHERE name = %s",
         (name,),
     ).fetchone()
     if not row:
         return False
     chem_id, chem_name, qty, old_level = row
-    conn.execute("UPDATE chemicals SET reorder_level = ? WHERE id = ?", (level, chem_id))
+    conn.execute("UPDATE chemicals SET reorder_level = %s WHERE id = %s", (level, chem_id))
     conn.commit()
     log_audit_action(conn, "SET_REORDER_LEVEL", "chemical", chem_id,
                      old_value=str(old_level), new_value=str(level))
@@ -249,17 +254,21 @@ def set_reorder_level(conn: sqlite3.Connection, name: str, level: float) -> bool
     return True
 
 
-def add_chemical(conn: sqlite3.Connection, name: str, qty: float, unit: str = "KG") -> bool:
+def add_chemical(conn: psycopg.Connection, name: str, qty: float, unit: str = "KG") -> bool:
     """Add a new chemical to the database."""
     try:
         conn.execute(
-            "INSERT INTO chemicals (name, current_qty, unit, last_updated) VALUES (?, ?, ?, ?)",
+            "INSERT INTO chemicals (name, current_qty, unit, last_updated) VALUES (%s, %s, %s, %s)",
             (name, qty, unit, date.isoformat(date.today()))
         )
         conn.commit()
         logger.info("Added chemical: %s = %s %s", name, qty, unit)
         return True
-    except sqlite3.IntegrityError:
+    except psycopg.IntegrityError:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         logger.warning("Chemical '%s' already exists. Use update_stock instead.", name)
         return False
 

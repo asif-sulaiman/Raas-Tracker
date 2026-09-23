@@ -262,7 +262,7 @@ def api_auth_setup():
 
     First-identity lock: the very first statement rejects when any user
     exists (403, generic body — the route is effectively unbound afterwards).
-    Creation itself is transactional (BEGIN IMMEDIATE) so simultaneous
+    Creation itself runs in a single implicit transaction so simultaneous
     submits cannot both succeed. Layers: DISABLE_SETUP kill switch,
     first-identity lock, single-use console token.
     """
@@ -688,7 +688,7 @@ def api_upload_history():
 @app.route("/api/uploads/<int:upload_id>")
 def api_upload_detail(upload_id):
     conn = get_db()
-    upload = conn.execute("SELECT * FROM uploads WHERE id = ?", (upload_id,)).fetchone()
+    upload = conn.execute("SELECT * FROM uploads WHERE id = %s", (upload_id,)).fetchone()
     rows = get_upload_results(conn, upload_id)
     conn.close()
     if not upload:
@@ -699,13 +699,13 @@ def api_upload_detail(upload_id):
 @app.route("/api/uploads/<int:upload_id>", methods=["DELETE"])
 def api_delete_upload(upload_id):
     conn = get_db()
-    upload = conn.execute("SELECT id FROM uploads WHERE id = ?", (upload_id,)).fetchone()
+    upload = conn.execute("SELECT id FROM uploads WHERE id = %s", (upload_id,)).fetchone()
     if not upload:
         conn.close()
         return jsonify({"error": "Upload not found"}), 404
 
-    conn.execute("DELETE FROM upload_rows WHERE upload_id = ?", (upload_id,))
-    conn.execute("DELETE FROM uploads WHERE id = ?", (upload_id,))
+    conn.execute("DELETE FROM upload_rows WHERE upload_id = %s", (upload_id,))
+    conn.execute("DELETE FROM uploads WHERE id = %s", (upload_id,))
     conn.commit()
     conn.close()
     return jsonify({"success": True, "deleted_id": upload_id})
@@ -714,7 +714,7 @@ def api_delete_upload(upload_id):
 @app.route("/api/uploads/<int:upload_id>/export")
 def api_upload_export(upload_id):
     conn = get_db()
-    upload = conn.execute("SELECT * FROM uploads WHERE id = ?", (upload_id,)).fetchone()
+    upload = conn.execute("SELECT * FROM uploads WHERE id = %s", (upload_id,)).fetchone()
     if not upload:
         conn.close()
         return jsonify({"error": "Upload not found"}), 404
@@ -917,7 +917,7 @@ def _validation_error_response(e: ValidationError):
 
 
 def _duplicate_pi_warning(conn, pi_number: str):
-    row = conn.execute("SELECT COUNT(*) FROM sales WHERE pi_number = ?",
+    row = conn.execute("SELECT COUNT(*) FROM sales WHERE pi_number = %s",
                        (pi_number,)).fetchone()
     if row and row[0] > 0:
         return f"PI number '{pi_number}' already exists ({row[0]} existing record(s)) — saved anyway"
@@ -1074,11 +1074,13 @@ def api_update_sale(sale_id):
     fields, vals = [], []
     for key in ("pi_number", "pi_date", "client_name", "pi_file_path"):
         if key in data:
-            fields.append(f"{key} = ?")
+            fields.append(f"{key} = %s")
             vals.append(data[key])
     if fields:
+        from datetime import datetime as _dt
+        vals.append(_dt.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
         vals.append(sale_id)
-        conn.execute(f"UPDATE sales SET {', '.join(fields)}, updated_at = datetime('now') WHERE id = ?", vals)
+        conn.execute(f"UPDATE sales SET {', '.join(fields)}, updated_at = %s WHERE id = %s", vals)
         conn.commit()
     conn.close()
     return jsonify({"message": "Sale updated"})
@@ -1210,7 +1212,7 @@ def api_update_item(sale_id, item_id):
 @app.route("/api/sales/<int:sale_id>/items/<int:item_id>", methods=["DELETE"])
 def api_delete_item(sale_id, item_id):
     conn = get_db()
-    count = conn.execute("SELECT COUNT(*) FROM sale_items WHERE sale_id = ?",
+    count = conn.execute("SELECT COUNT(*) FROM sale_items WHERE sale_id = %s",
                          (sale_id,)).fetchone()[0]
     if count <= 1:
         conn.close()

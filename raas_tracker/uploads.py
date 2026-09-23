@@ -1,6 +1,6 @@
 """Upload parsing, comparison, approvals, and reconciliation."""
 
-import sqlite3
+import psycopg
 import json
 import os
 import re
@@ -10,6 +10,12 @@ from typing import Optional, List, Dict, Any, Union
 from .audit import log_audit_action
 from .db import logger
 from .stock import convert_quantity, get_unit_conversion
+
+
+def _now_str() -> str:
+    """Current UTC time as 'YYYY-MM-DD HH:MM:SS' for TEXT datetime columns."""
+    from datetime import datetime
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 def validate_expiry_date(expiry_date_str: str) -> tuple:
     """Validate expiry date format and check if expired.
@@ -48,7 +54,7 @@ def validate_expiry_date(expiry_date_str: str) -> tuple:
         return False, None, str(e)
 
 
-def compare_stock_upload(conn: sqlite3.Connection, upload_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+def compare_stock_upload(conn: psycopg.Connection, upload_data: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Compare uploaded stock data against database.
     
     Args:
@@ -195,7 +201,7 @@ def compare_stock_upload(conn: sqlite3.Connection, upload_data: List[Dict[str, A
     }
 
 
-def save_upload(conn: sqlite3.Connection, filename: str, results: Dict[str, Any]) -> int:
+def save_upload(conn: psycopg.Connection, filename: str, results: Dict[str, Any]) -> int:
     """Save upload results to database.
     
     Args:
@@ -211,19 +217,19 @@ def save_upload(conn: sqlite3.Connection, filename: str, results: Dict[str, Any]
         """INSERT INTO uploads (filename, status, total_chemicals, matched, 
            last_month_mismatches, this_month_mismatches, both_mismatches, 
            not_in_db, not_in_upload, match_percentage)
-           VALUES (?, 'completed', ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (%s, 'completed', %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
         (filename, stats["total"], stats["matched"], stats["last_month_mismatches"],
          stats["this_month_mismatches"], stats["both_mismatches"],
          stats["not_in_db"], stats["not_in_upload"], stats["match_percentage"])
     )
-    upload_id = cursor.lastrowid
+    upload_id = cursor.fetchone()[0]
     
     # Save all rows with batch/unit info
     for row in results.get("matches", []):
         conn.execute(
             """INSERT INTO upload_rows (upload_id, chemical_name, batch_number, expiry_date, 
                upload_unit, balance_last_month, balance_this_month, matched_in_db, unit_match) 
-               VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, 1, %s)""",
             (upload_id, row["name"], row.get("batch_number", ""), row.get("expiry_date", ""),
              row.get("upload_unit", ""), row["upload_last"], row["upload_this"], 
              1 if row.get("unit_match", True) else 0)
@@ -232,7 +238,7 @@ def save_upload(conn: sqlite3.Connection, filename: str, results: Dict[str, Any]
         conn.execute(
             """INSERT INTO upload_rows (upload_id, chemical_name, batch_number, expiry_date, 
                upload_unit, balance_last_month, balance_this_month, matched_in_db, unit_match) 
-               VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s)""",
             (upload_id, row["name"], row.get("batch_number", ""), row.get("expiry_date", ""),
              row.get("upload_unit", ""), row["upload_last"], row["upload_this"],
              1 if row.get("unit_match", True) else 0)
@@ -241,7 +247,7 @@ def save_upload(conn: sqlite3.Connection, filename: str, results: Dict[str, Any]
         conn.execute(
             """INSERT INTO upload_rows (upload_id, chemical_name, batch_number, expiry_date, 
                upload_unit, balance_last_month, balance_this_month, matched_in_db, unit_match) 
-               VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s)""",
             (upload_id, row["name"], row.get("batch_number", ""), row.get("expiry_date", ""),
              row.get("upload_unit", ""), row["upload_last"], row["upload_this"],
              1 if row.get("unit_match", True) else 0)
@@ -250,7 +256,7 @@ def save_upload(conn: sqlite3.Connection, filename: str, results: Dict[str, Any]
         conn.execute(
             """INSERT INTO upload_rows (upload_id, chemical_name, batch_number, expiry_date, 
                upload_unit, balance_last_month, balance_this_month, matched_in_db, unit_match) 
-               VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s)""",
             (upload_id, row["name"], row.get("batch_number", ""), row.get("expiry_date", ""),
              row.get("upload_unit", ""), row["upload_last"], row["upload_this"],
              1 if row.get("unit_match", True) else 0)
@@ -259,7 +265,7 @@ def save_upload(conn: sqlite3.Connection, filename: str, results: Dict[str, Any]
         conn.execute(
             """INSERT INTO upload_rows (upload_id, chemical_name, batch_number, expiry_date, 
                upload_unit, balance_last_month, balance_this_month, matched_in_db, unit_match) 
-               VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, 0, 0)""",
             (upload_id, row["name"], row.get("batch_number", ""), row.get("expiry_date", ""),
              row.get("upload_unit", ""), row["upload_last"], row["upload_this"])
         )
@@ -270,7 +276,7 @@ def save_upload(conn: sqlite3.Connection, filename: str, results: Dict[str, Any]
     return upload_id
 
 
-def _notify_upload_outcome(conn: sqlite3.Connection, upload_id: int,
+def _notify_upload_outcome(conn: psycopg.Connection, upload_id: int,
                            filename: str, results: Dict[str, Any]) -> None:
     """Raise notifications for upload mismatches and expiry findings."""
     from .notifications import notify
@@ -315,13 +321,13 @@ def _notify_upload_outcome(conn: sqlite3.Connection, upload_id: int,
         )
 
 
-def get_upload_history(conn: sqlite3.Connection, limit: int = 20) -> List[Dict[str, Any]]:
+def get_upload_history(conn: psycopg.Connection, limit: int = 20) -> List[Dict[str, Any]]:
     """Return recent upload history."""
     cursor = conn.execute(
         """SELECT id, filename, upload_date, status, total_chemicals, matched, 
            last_month_mismatches, this_month_mismatches, both_mismatches,
            not_in_db, not_in_upload, match_percentage 
-           FROM uploads ORDER BY upload_date DESC LIMIT ?""",
+           FROM uploads ORDER BY upload_date DESC LIMIT %s""",
         (limit,)
     )
     return [
@@ -336,10 +342,10 @@ def get_upload_history(conn: sqlite3.Connection, limit: int = 20) -> List[Dict[s
     ]
 
 
-def get_upload_results(conn: sqlite3.Connection, upload_id: int) -> List[Dict[str, Any]]:
+def get_upload_results(conn: psycopg.Connection, upload_id: int) -> List[Dict[str, Any]]:
     """Get upload rows for a specific upload."""
     cursor = conn.execute(
-        "SELECT id, chemical_name, balance_last_month, balance_this_month, matched_in_db FROM upload_rows WHERE upload_id = ?",
+        "SELECT id, chemical_name, balance_last_month, balance_this_month, matched_in_db FROM upload_rows WHERE upload_id = %s",
         (upload_id,)
     )
     return [
@@ -487,13 +493,13 @@ def export_comparison_report(results: Dict[str, Any], output_path: str) -> str:
 # ==================== APPROVAL WORKFLOW FUNCTIONS ====================
 
 
-def get_all_reason_codes(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+def get_all_reason_codes(conn: psycopg.Connection) -> List[Dict[str, Any]]:
     """Return all reason codes."""
     cursor = conn.execute("SELECT id, code, description, category FROM reason_codes ORDER BY code")
     return [{"id": row[0], "code": row[1], "description": row[2], "category": row[3]} for row in cursor.fetchall()]
 
 
-def create_approval_workflow(conn: sqlite3.Connection, upload_id: int, upload_row_id: int = None) -> int:
+def create_approval_workflow(conn: psycopg.Connection, upload_id: int, upload_row_id: int = None) -> int:
     """Create an approval workflow entry for a upload row.
     
     Args:
@@ -505,14 +511,14 @@ def create_approval_workflow(conn: sqlite3.Connection, upload_id: int, upload_ro
         Workflow ID
     """
     cursor = conn.execute(
-        "INSERT INTO approval_workflow (upload_id, upload_row_id, status) VALUES (?, ?, 'pending')",
+        "INSERT INTO approval_workflow (upload_id, upload_row_id, status) VALUES (%s, %s, 'pending') RETURNING id",
         (upload_id, upload_row_id)
     )
     conn.commit()
-    return cursor.lastrowid
+    return cursor.fetchone()[0]
 
 
-def approve_upload_row(conn: sqlite3.Connection, workflow_id: int, reason_code: str, 
+def approve_upload_row(conn: psycopg.Connection, workflow_id: int, reason_code: str, 
                        comments: str, reviewed_by: str = "system") -> bool:
     """Approve a single upload row.
     
@@ -529,14 +535,14 @@ def approve_upload_row(conn: sqlite3.Connection, workflow_id: int, reason_code: 
     try:
         conn.execute(
             """UPDATE approval_workflow 
-               SET status = 'approved', reason_code = ?, comments = ?, reviewed_by = ?, reviewed_at = datetime('now')
-               WHERE id = ?""",
-            (reason_code, comments, reviewed_by, workflow_id)
+               SET status = 'approved', reason_code = %s, comments = %s, reviewed_by = %s, reviewed_at = %s
+               WHERE id = %s""",
+            (reason_code, comments, reviewed_by, _now_str(), workflow_id)
         )
         
         # Get workflow info for audit log
         workflow = conn.execute(
-            "SELECT upload_id, upload_row_id FROM approval_workflow WHERE id = ?",
+            "SELECT upload_id, upload_row_id FROM approval_workflow WHERE id = %s",
             (workflow_id,)
         ).fetchone()
         
@@ -552,7 +558,7 @@ def approve_upload_row(conn: sqlite3.Connection, workflow_id: int, reason_code: 
         return False
 
 
-def reject_upload_row(conn: sqlite3.Connection, workflow_id: int, reason_code: str,
+def reject_upload_row(conn: psycopg.Connection, workflow_id: int, reason_code: str,
                       comments: str, reviewed_by: str = "system") -> bool:
     """Reject a single upload row.
     
@@ -569,14 +575,14 @@ def reject_upload_row(conn: sqlite3.Connection, workflow_id: int, reason_code: s
     try:
         conn.execute(
             """UPDATE approval_workflow 
-               SET status = 'rejected', reason_code = ?, comments = ?, reviewed_by = ?, reviewed_at = datetime('now')
-               WHERE id = ?""",
-            (reason_code, comments, reviewed_by, workflow_id)
+               SET status = 'rejected', reason_code = %s, comments = %s, reviewed_by = %s, reviewed_at = %s
+               WHERE id = %s""",
+            (reason_code, comments, reviewed_by, _now_str(), workflow_id)
         )
         
         # Get workflow info for audit log
         workflow = conn.execute(
-            "SELECT upload_id, upload_row_id FROM approval_workflow WHERE id = ?",
+            "SELECT upload_id, upload_row_id FROM approval_workflow WHERE id = %s",
             (workflow_id,)
         ).fetchone()
         
@@ -592,7 +598,7 @@ def reject_upload_row(conn: sqlite3.Connection, workflow_id: int, reason_code: s
         return False
 
 
-def approve_upload(conn: sqlite3.Connection, upload_id: int, reviewed_by: str = "system") -> bool:
+def approve_upload(conn: psycopg.Connection, upload_id: int, reviewed_by: str = "system") -> bool:
     """Approve entire upload (all rows).
     
     Args:
@@ -606,21 +612,20 @@ def approve_upload(conn: sqlite3.Connection, upload_id: int, reviewed_by: str = 
     try:
         # Update upload status
         conn.execute(
-            "UPDATE uploads SET status = 'approved' WHERE id = ?",
+            "UPDATE uploads SET status = 'approved' WHERE id = %s",
             (upload_id,)
         )
         
         # Create workflow entries for all rows
         rows = conn.execute(
-            "SELECT id FROM upload_rows WHERE upload_id = ?",
+            "SELECT id FROM upload_rows WHERE upload_id = %s",
             (upload_id,)
         ).fetchall()
         
         for row in rows:
-            create_approval_workflow(conn, upload_id, row[0])
-            approve_upload_row(conn, 
-                             conn.execute("SELECT last_insert_rowid()").fetchone()[0],
-                             "AUTO_APPROVED", "Auto-approved with upload", reviewed_by)
+            workflow_id = create_approval_workflow(conn, upload_id, row[0])
+            approve_upload_row(conn, workflow_id,
+                               "AUTO_APPROVED", "Auto-approved with upload", reviewed_by)
         
         # Log the approval
         log_audit_action(conn, "APPROVE_UPLOAD", "upload", upload_id,
@@ -633,7 +638,7 @@ def approve_upload(conn: sqlite3.Connection, upload_id: int, reviewed_by: str = 
         return False
 
 
-def get_pending_approvals(conn: sqlite3.Connection, upload_id: int = None) -> List[Dict[str, Any]]:
+def get_pending_approvals(conn: psycopg.Connection, upload_id: int = None) -> List[Dict[str, Any]]:
     """Get pending approval workflows.
     
     Args:
@@ -650,7 +655,7 @@ def get_pending_approvals(conn: sqlite3.Connection, upload_id: int = None) -> Li
                       ur.chemical_name, ur.balance_last_month, ur.balance_this_month
                FROM approval_workflow aw
                LEFT JOIN upload_rows ur ON aw.upload_row_id = ur.id
-               WHERE aw.upload_id = ? AND aw.status = 'pending'
+               WHERE aw.upload_id = %s AND aw.status = 'pending'
                ORDER BY aw.reviewed_at""",
             (upload_id,)
         )
@@ -676,7 +681,7 @@ def get_pending_approvals(conn: sqlite3.Connection, upload_id: int = None) -> Li
     ]
 
 
-def create_reconciliation_period(conn: sqlite3.Connection, period_name: str,
+def create_reconciliation_period(conn: psycopg.Connection, period_name: str,
                                  period_start: str, period_end: str) -> int:
     """Create a new reconciliation period.
     
@@ -690,14 +695,14 @@ def create_reconciliation_period(conn: sqlite3.Connection, period_name: str,
         Period ID
     """
     cursor = conn.execute(
-        "INSERT INTO reconciliation_periods (period_name, period_start, period_end) VALUES (?, ?, ?)",
+        "INSERT INTO reconciliation_periods (period_name, period_start, period_end) VALUES (%s, %s, %s) RETURNING id",
         (period_name, period_start, period_end)
     )
     conn.commit()
-    return cursor.lastrowid
+    return cursor.fetchone()[0]
 
 
-def lock_reconciliation_period(conn: sqlite3.Connection, period_id: int, locked_by: str = "system") -> bool:
+def lock_reconciliation_period(conn: psycopg.Connection, period_id: int, locked_by: str = "system") -> bool:
     """Lock a reconciliation period (no more changes allowed).
     
     Args:
@@ -711,9 +716,9 @@ def lock_reconciliation_period(conn: sqlite3.Connection, period_id: int, locked_
     try:
         conn.execute(
             """UPDATE reconciliation_periods 
-               SET status = 'locked', locked_by = ?, locked_at = datetime('now')
-               WHERE id = ?""",
-            (locked_by, period_id)
+               SET status = 'locked', locked_by = %s, locked_at = %s
+               WHERE id = %s""",
+            (locked_by, _now_str(), period_id)
         )
         
         # Log the lock
@@ -727,7 +732,7 @@ def lock_reconciliation_period(conn: sqlite3.Connection, period_id: int, locked_
         return False
 
 
-def adjust_stock_from_upload(conn: sqlite3.Connection, upload_id: int, 
+def adjust_stock_from_upload(conn: psycopg.Connection, upload_id: int, 
                              reviewed_by: str = "system") -> bool:
     """Apply stock adjustments based on approved upload data.
     
@@ -745,7 +750,7 @@ def adjust_stock_from_upload(conn: sqlite3.Connection, upload_id: int,
             """SELECT ur.chemical_name, ur.balance_this_month, ur.upload_unit
                FROM upload_rows ur
                LEFT JOIN approval_workflow aw ON ur.id = aw.upload_row_id
-               WHERE ur.upload_id = ? AND (aw.status = 'approved' OR aw.id IS NULL)""",
+               WHERE ur.upload_id = %s AND (aw.status = 'approved' OR aw.id IS NULL)""",
             (upload_id,)
         )
         
@@ -757,7 +762,7 @@ def adjust_stock_from_upload(conn: sqlite3.Connection, upload_id: int,
             
             # Get current stock
             chemical = conn.execute(
-                "SELECT id, current_qty, unit FROM chemicals WHERE name = ?",
+                "SELECT id, current_qty, unit FROM chemicals WHERE name = %s",
                 (chemical_name,)
             ).fetchone()
             
@@ -772,7 +777,7 @@ def adjust_stock_from_upload(conn: sqlite3.Connection, upload_id: int,
                 
                 # Update stock
                 conn.execute(
-                    "UPDATE chemicals SET current_qty = ?, last_updated = ? WHERE id = ?",
+                    "UPDATE chemicals SET current_qty = %s, last_updated = %s WHERE id = %s",
                     (new_qty, date.isoformat(date.today()), chem_id)
                 )
                 
@@ -785,7 +790,7 @@ def adjust_stock_from_upload(conn: sqlite3.Connection, upload_id: int,
         
         # Update upload status
         conn.execute(
-            "UPDATE uploads SET status = 'adjusted' WHERE id = ?",
+            "UPDATE uploads SET status = 'adjusted' WHERE id = %s",
             (upload_id,)
         )
         
