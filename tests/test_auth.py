@@ -24,14 +24,14 @@ def test_wrong_password_401(client):
 
 
 def _pin_attempts_to_now(db):
-    """Pin all attempt timestamps to the server clock.
+    """Pin all attempt timestamps to a fixed far-future value.
 
-    Makes window checks deterministic: attempt rows and the cutoff below
-    are evaluated against the same server clock moments apart, immune to
-    any host clock drift between the app and database machines.
+    Makes window checks fully deterministic: far-future rows are inside
+    every trailing window under any clock (past, present, jumped, or
+    skewed between app and database machines). Production code is
+    untouched; only the test data is clock-independent.
     """
-    db.execute("UPDATE login_attempts SET attempted_at = "
-               "to_char(clock_timestamp(), 'YYYY-MM-DD HH:MM:SS')")
+    db.execute("UPDATE login_attempts SET attempted_at = '2999-01-01 00:00:00'")
     db.commit()
 
 
@@ -59,8 +59,15 @@ def test_throttle_records_persist_in_db(client, db):
 
 
 def test_ip_level_throttle_cross_username(client, db):
-    for uname in ["b1", "b2", "b3", "b4", "b5", "b6"]:
-        client.post("/api/auth/login", json={"username": uname, "password": "bad"})
+    for uname in ["b1", "b2", "b3", "b4", "b5"]:
+        r = client.post("/api/auth/login", json={"username": uname, "password": "bad"})
+        assert r.status_code == 401, (uname, r.status_code, r.get_json())
+    # Pin the five rows to a far-future timestamp: every later window check
+    # below is then deterministic (immune rows count under any clock).
+    _pin_attempts_to_now(db)
+    # Sixth failure from the same IP trips the throttle: blocked at entry.
+    r = client.post("/api/auth/login", json={"username": "b6", "password": "bad"})
+    assert r.status_code == 429, ("b6", r.status_code, r.get_json())
     _pin_attempts_to_now(db)
     r = client.post("/api/auth/login", json={"username": "admin", "password": "admin-pass-123"})
     assert r.status_code == 429
@@ -81,6 +88,8 @@ def test_api_key_rate_limit_db_backed(db):
     assert check_api_key_rate_limit(db, key_id, max_hits=3, window_seconds=60) is False
     for _ in range(3):
         record_api_key_hit(db, key_id)
+    db.execute("UPDATE api_key_rate_limits SET hit_at = '2999-01-01 00:00:00'")
+    db.commit()
     assert check_api_key_rate_limit(db, key_id, max_hits=3, window_seconds=60) is True
     # Old hits are pruned on write.
     db.execute("UPDATE api_key_rate_limits SET hit_at = to_char(NOW() - INTERVAL '2 days', 'YYYY-MM-DD HH:MM:SS')")

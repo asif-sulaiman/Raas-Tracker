@@ -26,6 +26,9 @@ if not logger.handlers:
 DEFAULT_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/raas"
 DEFAULT_TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/raas_test"
 
+# app_settings key holding the schema signature (see _schema_signature).
+_SCHEMA_SIG_KEY = "raas_schema_sig"
+
 
 def data_dir() -> str:
     """Writable data directory: RAAS_DATA_DIR (Docker volume) or repo root."""
@@ -54,10 +57,52 @@ def get_connection(dsn: Optional[str] = None) -> psycopg.Connection:
     (or rolls back with conn.rollback()), matching previous backend semantics.
     Server-side statement preparation is disabled (prepare_threshold=None)
     so the app also works through transaction-mode poolers (e.g. Supabase).
+
+    Schema setup runs only when the live schema drifts from the recorded
+    signature (missing tables/columns after an upgrade or a manual DROP):
+    the common case is a single probe query, which keeps per-request (and
+    per-test) overhead to one round trip instead of the full DDL.
     """
     conn = psycopg.connect(resolve_dsn(dsn), prepare_threshold=None)
-    _create_tables(conn)
+    if not _schema_current(conn):
+        _create_tables(conn)
+    _ensure_seeds(conn)
     return conn
+
+
+def _schema_signature_live(conn: psycopg.Connection) -> str:
+    """Canonical 'table.column:type' listing of the public schema."""
+    cur = conn.execute(
+        """SELECT coalesce(string_agg(table_name || '.' || column_name || ':'
+                                      || data_type, ',' ORDER BY table_name,
+                                      column_name, data_type), '')
+           FROM information_schema.columns WHERE table_schema = 'public'""")
+    return cur.fetchone()[0]
+
+
+def _schema_current(conn: psycopg.Connection) -> bool:
+    """True when the live schema matches the recorded signature.
+
+    Single round trip. Any error (fresh database without app_settings,
+    missing tables) means "not current" and triggers the full path.
+    """
+    try:
+        cur = conn.execute(
+            "SELECT (SELECT value FROM app_settings WHERE key = %s), "
+            "(SELECT coalesce(string_agg(table_name || '.' || column_name || ':'"
+            " || data_type, ',' ORDER BY table_name, column_name, data_type), '') "
+            "FROM information_schema.columns WHERE table_schema = 'public')",
+            (_SCHEMA_SIG_KEY,),
+        )
+        stored, live = cur.fetchone()
+        ready = bool(stored) and stored == live
+    except Exception:
+        ready = False
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+    return ready
 
 
 def _table_columns(conn: psycopg.Connection, table: str) -> Set[str]:
@@ -312,6 +357,21 @@ def _create_tables(conn: psycopg.Connection) -> None:
         conn.execute("ALTER TABLE upload_rows ADD COLUMN expiry_date TEXT")
         conn.execute("ALTER TABLE upload_rows ADD COLUMN upload_unit TEXT")
         conn.execute("ALTER TABLE upload_rows ADD COLUMN unit_match INTEGER DEFAULT 1")
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES (%s, %s) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        (_SCHEMA_SIG_KEY, _schema_signature_live(conn)),
+    )
+    conn.commit()
+
+
+def _ensure_seeds(conn: psycopg.Connection) -> None:
+    """Insert default reason codes / unit conversions when their tables are empty.
+
+    Runs on every connection (cheap: two COUNT probes): test isolation
+    truncates seed tables, and operators may delete rows, so seeds cannot
+    be gated behind the schema version.
+    """
     # Seed default reason codes
     cursor = conn.execute("SELECT COUNT(*) FROM reason_codes")
     if cursor.fetchone()[0] == 0:

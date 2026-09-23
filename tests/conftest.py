@@ -19,11 +19,14 @@ from chem_stock import get_connection, create_first_admin, ensure_setup_token, c
 
 
 _TABLES = (
-    "api_key_rate_limits api_keys app_settings approval_workflow audit_logs "
+    "api_key_rate_limits api_keys approval_workflow audit_logs "
     "chemicals login_attempts notification_reads notifications reason_codes "
     "recipe_items recipes reconciliation_periods sale_items sale_payments sales "
     "sales_stage_history sessions unit_conversions upload_rows uploads users"
 ).split()
+# app_settings is deliberately NOT truncated: it carries the schema version
+# that lets get_connection skip the full DDL (1 probe instead of ~40
+# statements). Setup keys are removed explicitly below instead.
 
 
 @pytest.fixture(scope="session")
@@ -68,6 +71,7 @@ def db(pg_dsn):
     conn = get_connection(pg_dsn)
     tables = ", ".join(f'"{t}"' for t in _TABLES)
     conn.execute(f"TRUNCATE {tables} RESTART IDENTITY CASCADE")
+    conn.execute("DELETE FROM app_settings WHERE key IN ('setup_token_hash', 'setup_completed')")
     conn.commit()
     conn.close()
     conn = get_connection(pg_dsn)

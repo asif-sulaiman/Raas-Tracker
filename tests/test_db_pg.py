@@ -127,6 +127,32 @@ def test_identity_sequence_starts_at_one(clean_pg):
         conn.close()
 
 
+@requires_pg
+def test_schema_signature_recorded(clean_pg):
+    conn = dbmod.get_connection(TEST_DSN)
+    try:
+        val = conn.execute(
+            "SELECT value FROM app_settings WHERE key = 'raas_schema_sig'").fetchone()[0]
+        assert val == dbmod._schema_signature_live(conn)
+    finally:
+        conn.close()
+
+
+@requires_pg
+def test_schema_fast_path_skips_ddl(clean_pg, monkeypatch):
+    dbmod.get_connection(TEST_DSN).close()
+
+    def _boom(conn):
+        raise AssertionError("full DDL must not run on a current database")
+
+    monkeypatch.setattr(dbmod, "_create_tables", _boom)
+    conn = dbmod.get_connection(TEST_DSN)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM chemicals").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_resolve_dsn_prefers_env(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql://env-host/raas")
     assert dbmod.resolve_dsn() == "postgresql://env-host/raas"

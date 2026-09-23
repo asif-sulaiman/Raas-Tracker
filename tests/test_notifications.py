@@ -239,15 +239,41 @@ def test_failed_login_threshold_alerts_admins_only(admin_client, user_client, cl
         resp = client.post("/api/auth/login",
                            json={"username": "admin", "password": "wrong-pass"})
         assert resp.status_code in (401, 429)
-    db.execute("UPDATE login_attempts SET attempted_at = "
-               "to_char(clock_timestamp(), 'YYYY-MM-DD HH:MM:SS')")
+    db.execute("UPDATE login_attempts SET attempted_at = '2999-01-01 00:00:00'")
     db.commit()
     resp = client.post("/api/auth/login",
                        json={"username": "admin", "password": "wrong-pass"})
-    assert resp.status_code in (401, 429)
+    # Fifth failure is not blocked at entry (only four prior fails) and
+    # must record + trigger the threshold notification.
+    assert resp.status_code == 401, (resp.status_code, resp.get_json())
+    # Five fail rows through the API (fixture logins add two success rows).
+    fails = db.execute(
+        "SELECT COUNT(*) FROM login_attempts WHERE success = 0").fetchone()[0]
+    assert fails == 5, fails
     admin_items = admin_client.get("/api/notifications").get_json()["items"]
     user_items = user_client.get("/api/notifications").get_json()["items"]
     admin_types = [i["type"] for i in admin_items]
     user_types = [i["type"] for i in user_items]
     assert "login_failures" in admin_types
     assert "login_failures" not in user_types
+
+
+def test_login_threshold_notification_wiring(admin_client, db):
+    """Hermetic: the same threshold call the login route makes must alert.
+
+    Five API-recorded fails with immune timestamps, notifications wiped,
+    then the route's _notify_login_failures directly: it must insert exactly
+    one admin alert. Fully deterministic under any clock behavior, unlike
+    the end-to-end trigger above whose fresh row needs a stable clock.
+    """
+    from flask_app import _notify_login_failures
+    for _ in range(5):
+        r = admin_client.post("/api/auth/login",
+                              json={"username": "admin", "password": "wrong-pass"})
+        assert r.status_code == 401
+    db.execute("UPDATE login_attempts SET attempted_at = '2999-01-01 00:00:00'")
+    db.execute("DELETE FROM notifications")
+    db.commit()
+    _notify_login_failures(db, "admin", "127.0.0.1")
+    types = [i["type"] for i in admin_client.get("/api/notifications").get_json()["items"]]
+    assert types == ["login_failures"]
