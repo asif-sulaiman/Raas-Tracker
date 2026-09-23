@@ -20,6 +20,9 @@ build/
 *.db-wal
 *.db-shm
 
+# === Local portable PostgreSQL (dev only, git-ignored) ===
+pg_dev/
+
 # === Node.js ===
 node_modules/
 
