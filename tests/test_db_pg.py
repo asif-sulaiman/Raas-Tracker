@@ -139,6 +139,21 @@ def test_schema_signature_recorded(clean_pg):
 
 
 @requires_pg
+def test_chemical_name_unique_index(clean_pg):
+    conn = dbmod.get_connection(TEST_DSN)
+    try:
+        idx = conn.execute(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' "
+            "AND indexname = 'idx_chemicals_name_lower'").fetchone()
+        assert idx is not None
+        conn.execute("INSERT INTO chemicals (name) VALUES ('Acid')")
+        with pytest.raises(psycopg.IntegrityError):
+            conn.execute("INSERT INTO chemicals (name) VALUES ('ACID')")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
 def test_schema_fast_path_skips_ddl(clean_pg, monkeypatch):
     dbmod.get_connection(TEST_DSN).close()
 

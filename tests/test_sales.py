@@ -4,18 +4,39 @@ import pytest
 from chem_stock import (
     _complete_if_paid,
     add_sale,
+    delete_sale_payment_record,
     get_sale_by_id,
     get_sale_invoice_total,
     get_sale_total_paid,
     move_sale_to_stage,
     record_sale_payment,
     update_sale_full,
+    update_sale_payment_record,
 )
 
 
 def _sale(db, total=100.0):
     return add_sale(db, {"pi_number": "PI-T1", "client_name": "T Co"},
                     [{"product_name": "W", "quantity": 10, "unit_price": total / 10}])
+
+
+def test_payment_audit_trail_contents(db):
+    sid = add_sale(db, {"pi_number": "PI-AUD", "client_name": "ACME"},
+                   [{"product_name": "W", "quantity": 10, "unit_price": 10}])
+    out = record_sale_payment(db, sid, "2026-09-01", 40.0)
+    update_sale_payment_record(db, out["payment_id"], payment_amount=50.0)
+    delete_sale_payment_record(db, out["payment_id"])
+    rows = {r[0]: (r[1], r[2]) for r in db.execute(
+        "SELECT action, old_value, new_value FROM audit_logs WHERE entity_type = 'sale'")}
+    pay_old, pay_new = rows["SALE_PAYMENT"]
+    assert "balance=100" in pay_old
+    assert "paid=40" in pay_new and "balance=60" in pay_new and "invoice_total=100" in pay_new
+    edit_old, edit_new = rows["SALE_PAYMENT_EDIT"]
+    assert "amount=40" in edit_old and "balance=60" in edit_old
+    assert "amount=50" in edit_new and "balance=50" in edit_new
+    del_old, del_new = rows["SALE_PAYMENT_DELETE"]
+    assert "amount=50" in del_old and "balance=50" in del_old
+    assert "balance=100" in del_new
 
 
 def test_partial_payment_totals(db):

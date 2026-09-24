@@ -573,7 +573,11 @@ def api_create_recipe():
         return jsonify({"error": str(e)}), 400
     name = str(data.get("name", "")).strip()
     conn = get_db()
-    success = add_recipe(conn, name, product_yield, water_pct)
+    try:
+        success = add_recipe(conn, name, product_yield, water_pct)
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
     conn.close()
     if not success:
         return jsonify({"success": success, "name": name}), 409
@@ -589,7 +593,11 @@ def api_add_recipe_item(name):
         return jsonify({"error": str(e)}), 400
     chem_name = str(data.get("chemical", "")).strip()
     conn = get_db()
-    success = add_recipe_item(conn, name, chem_name, pct)
+    try:
+        success = add_recipe_item(conn, name, chem_name, pct)
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
     conn.close()
     if not success:
         return jsonify({"success": success}), 404
@@ -624,7 +632,11 @@ def api_update_recipe(name):
     total_qty = data.get("total_quantity")
     water_pct = data.get("water_percentage")
     conn = get_db()
-    success = update_recipe(conn, name, total_quantity=total_qty, water_percentage=water_pct)
+    try:
+        success = update_recipe(conn, name, total_quantity=total_qty, water_percentage=water_pct)
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
     conn.close()
     if not success:
         return jsonify({"error": "Recipe not found"}), 404
@@ -639,7 +651,11 @@ def api_update_recipe_item(name, chem):
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     conn = get_db()
-    success = update_recipe_item(conn, name, chem, pct)
+    try:
+        success = update_recipe_item(conn, name, chem, pct)
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
     conn.close()
     if not success:
         return jsonify({"error": "Recipe item not found"}), 404

@@ -1,5 +1,5 @@
 """Stock comparison matrix + chemical/recipe status-code tests."""
-from chem_stock import compare_stock_upload
+from chem_stock import add_chemical, compare_stock_upload
 
 
 def _seed(db):
@@ -171,3 +171,46 @@ def test_recipe_mutations_audited(admin_client, db):
     actors = {r[0] for r in db.execute(
         "SELECT DISTINCT user_id FROM audit_logs WHERE entity_type LIKE 'recipe%'").fetchall()}
     assert actors == {"admin"}
+
+
+def test_recipe_percentage_cap(db):
+    import pytest
+    from chem_stock import add_recipe, add_recipe_item, update_recipe, update_recipe_item
+    add_recipe(db, "Cap", 1, 10.0)
+    add_chemical(db, "CapA", 5, "KG")
+    add_chemical(db, "CapB", 5, "KG")
+    assert add_recipe_item(db, "Cap", "CapA", 60.0) is True
+    with pytest.raises(ValueError):
+        add_recipe_item(db, "Cap", "CapB", 31.0)
+    assert add_recipe_item(db, "Cap", "CapB", 30.0) is True
+    with pytest.raises(ValueError):
+        update_recipe_item(db, "Cap", "CapA", 71.0)
+    assert update_recipe_item(db, "Cap", "CapB", 20.0) is True
+    # Boundary: water 10 + items 90 = exactly 100% total is allowed.
+    assert update_recipe_item(db, "Cap", "CapA", 70.0) is True
+    with pytest.raises(ValueError):
+        update_recipe(db, "Cap", water_percentage=41.0)
+    with pytest.raises(ValueError):
+        update_recipe_item(db, "Cap", "CapA", -1.0)
+
+
+def test_recipe_percentage_cap_api(admin_client):
+    admin_client.post("/api/chemicals", json={"name": "CapC", "qty": 5, "unit": "KG"})
+    admin_client.post("/api/chemicals", json={"name": "CapD", "qty": 5, "unit": "KG"})
+    assert admin_client.post("/api/recipes", json={"name": "CapR", "yield": 5}).status_code == 200
+    assert admin_client.post("/api/recipes/CapR/items",
+                             json={"chemical": "CapC", "percentage": 90}).status_code == 200
+    # 90 + 11 exceeds 100% -> rejected, recipe unchanged.
+    r = admin_client.post("/api/recipes/CapR/items",
+                          json={"chemical": "CapD", "percentage": 11})
+    assert r.status_code == 400
+    assert admin_client.put("/api/recipes/CapR", json={"water_percentage": 101}).status_code == 400
+
+
+def test_chemical_name_case_insensitive(db):
+    from chem_stock import add_chemical
+    assert add_chemical(db, "Acid", 10, "KG") is True
+    assert add_chemical(db, "acid", 5, "KG") is False
+    assert add_chemical(db, "ACID", 5, "KG") is False
+    rows = db.execute("SELECT name, current_qty FROM chemicals").fetchall()
+    assert rows == [("Acid", 10)]

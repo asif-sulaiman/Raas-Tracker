@@ -235,10 +235,14 @@ def record_sale_payment(conn: psycopg.Connection, sale_id: int, payment_date: st
     )
     payment_id = cursor.fetchone()[0]
     _sync_sale_payment_totals(conn, sale_id)
-    log_audit_action(conn, "SALE_PAYMENT", "sale", sale_id,
-                     new_value=str(payment_amount))
     total_paid = get_sale_total_paid(conn, sale_id)
     invoice_total = get_sale_invoice_total(conn, sale_id)
+    old_balance = invoice_total - (total_paid - payment_amount)
+    new_balance = invoice_total - total_paid
+    log_audit_action(conn, "SALE_PAYMENT", "sale", sale_id,
+                     old_value=f"balance={old_balance:g}",
+                     new_value=f"paid={payment_amount:g} balance={new_balance:g} "
+                               f"invoice_total={invoice_total:g}")
     row = conn.execute("SELECT stage FROM sales WHERE id = %s", (sale_id,)).fetchone()
     stage = row[0] if row else None
     if _complete_if_paid(conn, sale_id, stage, total_paid, invoice_total):
@@ -271,11 +275,11 @@ def update_sale_payment_record(conn: psycopg.Connection, payment_id: int,
                                notes: Optional[str] = None) -> bool:
     """Edit a payment record. Reverts a completed sale to payment_due
     if the new total no longer covers the invoice."""
-    row = conn.execute("SELECT sale_id FROM sale_payments WHERE id = %s",
+    row = conn.execute("SELECT sale_id, payment_amount FROM sale_payments WHERE id = %s",
                        (payment_id,)).fetchone()
     if not row:
         return False
-    sale_id = row[0]
+    sale_id, old_amount = row[0], row[1]
     fields, vals = [], []
     if payment_date is not None:
         fields.append("payment_date = %s")
@@ -292,13 +296,18 @@ def update_sale_payment_record(conn: psycopg.Connection, payment_id: int,
         vals.append(payment_id)
         conn.execute(f"UPDATE sale_payments SET {', '.join(fields)} WHERE id = %s", vals)
     _sync_sale_payment_totals(conn, sale_id)
+    total_paid = get_sale_total_paid(conn, sale_id)
+    invoice_total = get_sale_invoice_total(conn, sale_id)
+    new_amount = payment_amount if payment_amount is not None else old_amount
+    old_balance = invoice_total - (total_paid - new_amount + old_amount)
+    new_balance = invoice_total - total_paid
     log_audit_action(conn, "SALE_PAYMENT_EDIT", "sale", sale_id,
-                     new_value=str(payment_id))
+                     old_value=f"amount={old_amount:g} balance={old_balance:g}",
+                     new_value=f"amount={new_amount:g} balance={new_balance:g} "
+                               f"invoice_total={invoice_total:g}")
     row = conn.execute("SELECT stage FROM sales WHERE id = %s", (sale_id,)).fetchone()
     stage = row[0] if row else None
-    _complete_if_paid(conn, sale_id, stage,
-                      get_sale_total_paid(conn, sale_id),
-                      get_sale_invoice_total(conn, sale_id))
+    _complete_if_paid(conn, sale_id, stage, total_paid, invoice_total)
     _revert_if_unpaid(conn, sale_id)
     conn.commit()
     return True
@@ -313,8 +322,13 @@ def delete_sale_payment_record(conn: psycopg.Connection, payment_id: int) -> boo
     sale_id = row[0]
     conn.execute("DELETE FROM sale_payments WHERE id = %s", (payment_id,))
     _sync_sale_payment_totals(conn, sale_id)
+    total_paid = get_sale_total_paid(conn, sale_id)
+    invoice_total = get_sale_invoice_total(conn, sale_id)
+    old_balance = invoice_total - (total_paid + row[1])
+    new_balance = invoice_total - total_paid
     log_audit_action(conn, "SALE_PAYMENT_DELETE", "sale", sale_id,
-                     old_value=str(row[1]))
+                     old_value=f"amount={row[1]:g} balance={old_balance:g}",
+                     new_value=f"balance={new_balance:g} invoice_total={invoice_total:g}")
     _revert_if_unpaid(conn, sale_id)
     conn.commit()
     return True

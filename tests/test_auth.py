@@ -2,7 +2,9 @@
 from chem_stock import (
     _DUMMY_HASH,
     check_api_key_rate_limit,
+    check_setup_token,
     create_api_key,
+    ensure_setup_token,
     is_login_blocked,
     record_api_key_hit,
     record_login_attempt,
@@ -180,3 +182,28 @@ def test_logout_revokes_session(admin_client, db):
     r = admin_client.post("/api/auth/logout")
     assert r.status_code == 200
     assert admin_client.get("/api/chemicals").status_code == 401
+
+
+def test_setup_token_expiry_and_regeneration(db):
+    # Setup tokens only exist pre-first-admin: start from zero users.
+    db.execute("DELETE FROM users")
+    db.commit()
+    raw = ensure_setup_token(db)
+    assert raw and check_setup_token(db, raw) is True
+    assert check_setup_token(db, "wrong-token") is False
+    val = db.execute(
+        "SELECT value FROM app_settings WHERE key = 'setup_token_hash'").fetchone()[0]
+    digest = val.split(":")[0]
+    # Far-past timestamp: expired under any clock.
+    db.execute("UPDATE app_settings SET value = %s WHERE key = 'setup_token_hash'",
+               (f"{digest}:2000-01-01 00:00:00",))
+    db.commit()
+    assert check_setup_token(db, raw) is False
+    # Expired token regenerates on next ensure.
+    raw2 = ensure_setup_token(db)
+    assert raw2 and raw2 != raw and check_setup_token(db, raw2) is True
+    # Legacy timestamp-less rows are treated as expired.
+    db.execute("UPDATE app_settings SET value = %s WHERE key = 'setup_token_hash'",
+               (digest,))
+    db.commit()
+    assert check_setup_token(db, raw2) is False

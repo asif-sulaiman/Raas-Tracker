@@ -71,12 +71,15 @@ def get_connection(dsn: Optional[str] = None) -> psycopg.Connection:
 
 
 def _schema_signature_live(conn: psycopg.Connection) -> str:
-    """Canonical 'table.column:type' listing of the public schema."""
+    """Canonical columns-plus-indexes listing of the public schema."""
     cur = conn.execute(
-        """SELECT coalesce(string_agg(table_name || '.' || column_name || ':'
-                                      || data_type, ',' ORDER BY table_name,
-                                      column_name, data_type), '')
-           FROM information_schema.columns WHERE table_schema = 'public'""")
+        """SELECT (SELECT coalesce(string_agg(table_name || '.' || column_name || ':'
+                                               || data_type, ',' ORDER BY table_name,
+                                               column_name, data_type), '')
+                   FROM information_schema.columns WHERE table_schema = 'public')
+                  || '|idx:' ||
+                  (SELECT coalesce(string_agg(indexname, ',' ORDER BY indexname), '')
+                   FROM pg_indexes WHERE schemaname = 'public')""")
     return cur.fetchone()[0]
 
 
@@ -89,9 +92,12 @@ def _schema_current(conn: psycopg.Connection) -> bool:
     try:
         cur = conn.execute(
             "SELECT (SELECT value FROM app_settings WHERE key = %s), "
-            "(SELECT coalesce(string_agg(table_name || '.' || column_name || ':'"
+            "(SELECT (SELECT coalesce(string_agg(table_name || '.' || column_name || ':'"
             " || data_type, ',' ORDER BY table_name, column_name, data_type), '') "
-            "FROM information_schema.columns WHERE table_schema = 'public')",
+            "FROM information_schema.columns WHERE table_schema = 'public') "
+            "|| '|idx:' || "
+            "(SELECT coalesce(string_agg(indexname, ',' ORDER BY indexname), '') "
+            "FROM pg_indexes WHERE schemaname = 'public'))",
             (_SCHEMA_SIG_KEY,),
         )
         stored, live = cur.fetchone()
@@ -343,6 +349,10 @@ def _create_tables(conn: psycopg.Connection) -> None:
             created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS'))
         );
         CREATE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(dedupe_key);
+        -- Chemical identity is case-insensitive application-wide: forbid
+        -- 'Acid' vs 'acid' duplicates that would split reconciliation.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_chemicals_name_lower
+            ON chemicals (lower(name));
         CREATE TABLE IF NOT EXISTS notification_reads (
             user_id INTEGER NOT NULL,
             notification_id INTEGER NOT NULL,

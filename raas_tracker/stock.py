@@ -46,12 +46,12 @@ def import_from_json(json_path: str = JSON_PATH) -> Dict[str, int]:
         
         try:
             existing = conn.execute(
-                "SELECT id FROM chemicals WHERE name = %s", (name,)
+                "SELECT id FROM chemicals WHERE UPPER(name) = %s", (name.upper(),)
             ).fetchone()
             if existing:
                 conn.execute(
-                    "UPDATE chemicals SET current_qty = %s, balance_last_month = %s, unit = %s, last_updated = %s WHERE name = %s",
-                    (float(qty), float(last_qty), unit, date.isoformat(date.today()), name)
+                    "UPDATE chemicals SET current_qty = %s, balance_last_month = %s, unit = %s, last_updated = %s WHERE UPPER(name) = %s",
+                    (float(qty), float(last_qty), unit, date.isoformat(date.today()), name.upper())
                 )
             else:
                 conn.execute(
@@ -256,6 +256,13 @@ def set_reorder_level(conn: psycopg.Connection, name: str, level: float) -> bool
 
 def add_chemical(conn: psycopg.Connection, name: str, qty: float, unit: str = "KG") -> bool:
     """Add a new chemical to the database."""
+    existing = conn.execute(
+        "SELECT id FROM chemicals WHERE UPPER(name) = %s",
+        ((name or "").strip().upper(),)
+    ).fetchone()
+    if existing:
+        logger.warning("Chemical '%s' already exists (case-insensitive). Use update_stock instead.", name)
+        return False
     try:
         conn.execute(
             "INSERT INTO chemicals (name, current_qty, unit, last_updated) VALUES (%s, %s, %s, %s)",

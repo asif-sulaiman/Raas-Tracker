@@ -18,6 +18,7 @@ BCRYPT_ROUNDS = 13
 SESSION_TTL_HOURS = 1
 MAX_LOGIN_FAILS = 5
 LOGIN_WINDOW_MINUTES = 10
+SETUP_TOKEN_TTL_MINUTES = 60
 
 
 def _hash_password(password: str) -> str:
@@ -81,21 +82,46 @@ def get_setting(conn: psycopg.Connection, key: str) -> Optional[str]:
     return row[0] if row else None
 
 
+def _split_setup_token_value(value: str):
+    """Split stored 'hexdigest:YYYY-MM-DD HH:MM:SS' into (digest, created).
+
+    Legacy rows without a timestamp return (value, None) and are treated
+    as expired, forcing a fresh token.
+    """
+    digest, sep, ts = (value or "").partition(":")
+    if not sep:
+        return digest, None
+    try:
+        return digest, _datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return digest, None
+
+
+def _setup_token_expired(created) -> bool:
+    if created is None:
+        return True
+    age = _datetime.utcnow() - created
+    return age.total_seconds() > SETUP_TOKEN_TTL_MINUTES * 60
+
+
 def ensure_setup_token(conn: psycopg.Connection) -> Optional[str]:
     """Generate the single-use setup token (raw) on first need.
 
-    Stores only its SHA256 hash. Prints the raw token to the server console
-    for the operator. Returns None when setup is closed or a token exists.
+    Stores only its SHA256 hash plus creation time. Prints the raw token
+    to the server console for the operator. Returns None when setup is
+    closed or a live token exists.
     """
     if count_users(conn) > 0:
         return None
     row = conn.execute("SELECT value FROM app_settings WHERE key = 'setup_token_hash'").fetchone()
-    if row:
+    if row and not _setup_token_expired(_split_setup_token_value(row[0])[1]):
         return None
     raw = _secrets.token_urlsafe(32)
+    stamped = (_hashlib.sha256(raw.encode("utf-8")).hexdigest()
+               + ":" + _datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
     conn.execute("INSERT INTO app_settings (key, value) VALUES ('setup_token_hash', %s) "
                  "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-                 (_hashlib.sha256(raw.encode("utf-8")).hexdigest(),))
+                 (stamped,))
     conn.commit()
     import sys as _sys
     print("=" * 64, file=_sys.stderr)
@@ -108,15 +134,22 @@ def ensure_setup_token(conn: psycopg.Connection) -> Optional[str]:
 
 
 def check_setup_token(conn: psycopg.Connection, presented: Optional[str]) -> bool:
-    """Constant-time comparison of the presented setup token."""
+    """Constant-time comparison of the presented setup token.
+
+    Also rejects expired tokens (SETUP_TOKEN_TTL_MINUTES) and legacy
+    timestamp-less rows.
+    """
     import hmac as _hmac
     if not presented:
         return False
     row = conn.execute("SELECT value FROM app_settings WHERE key = 'setup_token_hash'").fetchone()
     if not row:
         return False
-    digest = _hashlib.sha256(presented.encode("utf-8")).hexdigest()
-    return _hmac.compare_digest(digest, row[0])
+    digest, created = _split_setup_token_value(row[0])
+    if _setup_token_expired(created):
+        return False
+    presented_digest = _hashlib.sha256(presented.encode("utf-8")).hexdigest()
+    return _hmac.compare_digest(presented_digest, digest)
 
 
 def create_first_admin(conn: psycopg.Connection, username: str, password: str) -> int:

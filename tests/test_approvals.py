@@ -102,3 +102,14 @@ def test_clean_batch_approves_converts_and_adjusts(db):
     qtys = {r[0]: r[1] for r in db.execute("SELECT name, current_qty FROM chemicals")}
     assert qtys["Alpha"] == 110
     assert qtys["Gamma"] == 2.0
+
+
+def test_adjust_matches_case_insensitively(db):
+    add_chemical(db, "MixedCase", 10, "KG")
+    uid, out = _upload(db, [{"name": "MIXEDCASE", "balance_last_month": 10,
+                             "balance_this_month": 25, "upload_unit": "KG"}])
+    assert out["unmapped_units"] == []
+    assert approve_upload(db, uid, reviewed_by="admin") is True
+    assert adjust_stock_from_upload(db, uid, reviewed_by="admin") is True
+    qty = db.execute("SELECT current_qty FROM chemicals WHERE name = 'MixedCase'").fetchone()[0]
+    assert qty == 25

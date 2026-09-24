@@ -24,6 +24,8 @@ def add_recipe(conn: psycopg.Connection, name: str, total_quantity: float = 1, w
     Returns:
         True if created, False if recipe already exists
     """
+    if water_percentage < 0 or water_percentage > 100:
+        raise ValueError("water_percentage must be between 0 and 100")
     try:
         cursor = conn.execute(
             "INSERT INTO recipes (name, total_quantity, water_percentage) VALUES (%s, %s, %s) RETURNING id",
@@ -53,6 +55,27 @@ def get_recipe_by_name(conn: psycopg.Connection, name: str) -> Optional[Dict[str
     if row:
         return {"id": row[0], "name": row[1], "total_quantity": row[2], "water_percentage": row[3], "created": row[4]}
     return None
+
+
+def _check_percentage_total(conn: psycopg.Connection, recipe_id: int,
+                            water_percentage: float,
+                            items_total: float) -> None:
+    """Reject negative percentages and totals over 100% (water + items)."""
+    if water_percentage < 0 or items_total < 0:
+        raise ValueError("percentages must be 0 or greater")
+    if water_percentage + items_total > 100.0 + 1e-9:
+        raise ValueError(
+            f"water ({water_percentage:g}%) + ingredients ({items_total:g}%) "
+            f"exceed 100%")
+
+
+def _items_percentage_total(conn: psycopg.Connection, recipe_id: int) -> float:
+    """Sum of item percentages for a recipe."""
+    row = conn.execute(
+        "SELECT COALESCE(SUM(percentage), 0) FROM recipe_items WHERE recipe_id = %s",
+        (recipe_id,)
+    ).fetchone()
+    return float(row[0] or 0)
 
 
 def add_recipe_item(conn: psycopg.Connection, recipe_name: str, chemical_name: str, 
@@ -93,6 +116,10 @@ def add_recipe_item(conn: psycopg.Connection, recipe_name: str, chemical_name: s
         return False
     
     required_qty_per_unit = percentage / 100.0
+    if percentage < 0:
+        raise ValueError("percentage must be 0 or greater")
+    _check_percentage_total(conn, recipe["id"], recipe.get("water_percentage") or 0,
+                            _items_percentage_total(conn, recipe["id"]) + percentage)
     cursor = conn.execute(
         "INSERT INTO recipe_items (recipe_id, chemical_id, percentage, required_qty_per_unit) VALUES (%s, %s, %s, %s) RETURNING id",
         (recipe["id"], chemical[0], percentage, required_qty_per_unit)
@@ -175,6 +202,11 @@ def update_recipe_item(conn: psycopg.Connection, recipe_name: str, chemical_name
         return False
 
     new_qty_per_unit = new_percentage / 100.0
+    if new_percentage < 0:
+        raise ValueError("percentage must be 0 or greater")
+    current_total = _items_percentage_total(conn, recipe["id"])
+    _check_percentage_total(conn, recipe["id"], recipe.get("water_percentage") or 0,
+                            current_total - (old[1] or 0) + new_percentage)
     result = conn.execute(
         "UPDATE recipe_items SET percentage = %s, required_qty_per_unit = %s WHERE recipe_id = %s AND chemical_id = %s",
         (new_percentage, new_qty_per_unit, recipe["id"], chemical[0])
@@ -266,6 +298,10 @@ def update_recipe(conn: psycopg.Connection, name: str,
         updates.append("total_quantity = %s")
         params.append(total_quantity)
     if water_percentage is not None:
+        if water_percentage < 0 or water_percentage > 100:
+            raise ValueError("water_percentage must be between 0 and 100")
+        _check_percentage_total(conn, recipe["id"], water_percentage,
+                                _items_percentage_total(conn, recipe["id"]))
         updates.append("water_percentage = %s")
         params.append(water_percentage)
 

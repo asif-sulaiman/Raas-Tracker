@@ -819,10 +819,11 @@ def adjust_stock_from_upload(conn: psycopg.Connection, upload_id: int,
             new_qty = row[1]
             upload_unit = row[2]
             
-            # Get current stock
+            # Get current stock (case-insensitive: chemical identity is
+            # guarded unique on lower(name), uploads may differ in case).
             chemical = conn.execute(
-                "SELECT id, current_qty, unit FROM chemicals WHERE name = %s",
-                (chemical_name,)
+                "SELECT id, current_qty, unit FROM chemicals WHERE UPPER(name) = %s",
+                ((chemical_name or "").strip().upper(),)
             ).fetchone()
             
             if chemical:
