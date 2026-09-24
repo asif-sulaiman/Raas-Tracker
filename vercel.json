@@ -2,7 +2,7 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "buildCommand": "cd raas-tracker-frontend && npm ci && npm run build && mkdir -p ../public ../react_frontend && cp -r dist/. ../public/ && cp -r dist/. ../react_frontend/",
   "rewrites": [
-    { "source": "/((?!api/).*)", "destination": "/index.html" }
+    { "source": "/((?!api/|.*\\.).*)", "destination": "/index.html" }
   ],
   "functions": {
     "wsgi.py": { "maxDuration": 60 }
