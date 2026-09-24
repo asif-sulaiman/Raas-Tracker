@@ -81,6 +81,7 @@ from raas_tracker.uploads import (
     export_comparison_report,
     get_all_reason_codes,
     get_pending_approvals,
+    get_unmapped_rows,
     get_upload_history,
     get_upload_results,
     lock_reconciliation_period,

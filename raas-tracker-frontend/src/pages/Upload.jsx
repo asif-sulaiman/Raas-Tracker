@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { UploadCloud, FileText, AlertCircle, CheckCircle2, Loader2, ArrowRight } from 'lucide-react';
 import UploadArea from '../components/forms/UploadArea';
+import UnitMapping from '../components/forms/UnitMapping';
 import MismatchSummary from '../components/cards/MismatchSummary';
 import ComparisonResults from '../components/tables/ComparisonResults';
 import UploadHistory from '../components/tables/UploadHistory';
@@ -20,6 +21,9 @@ export default function Upload() {
   const [showResults, setShowResults] = useState(false);
   const [currentResults, setCurrentResults] = useState(null);
   const [uploadHistory, setUploadHistory] = useState([]);
+  const [uploadId, setUploadId] = useState(null);
+  const [resolvedUnits, setResolvedUnits] = useState([]);
+  const [approving, setApproving] = useState(false);
 
   const loadHistory = async () => {
     try {
@@ -40,6 +44,8 @@ export default function Upload() {
     setUploadComplete(false);
     setShowResults(false);
     setCurrentResults(null);
+    setUploadId(null);
+    setResolvedUnits([]);
   };
 
   const handleUpload = async () => {
@@ -55,6 +61,8 @@ export default function Upload() {
       if (data.success) {
         setUploadComplete(true);
         setCurrentResults(data.results);
+        setUploadId(data.upload_id ?? null);
+        setResolvedUnits([]);
         setTimeout(() => setShowResults(true), 500);
         toast.success('File uploaded and compared');
         loadHistory();
@@ -68,12 +76,14 @@ export default function Upload() {
     }
   };
 
-  const handleViewHistory = async (uploadId) => {
+  const handleViewHistory = async (historyUploadId) => {
     try {
-      const res = await apiFetch(`/api/uploads/${uploadId}`);
+      const res = await apiFetch(`/api/uploads/${historyUploadId}`);
       const data = await res.json();
       if (data.results) {
         setCurrentResults(data.results);
+        setUploadId(historyUploadId);
+        setResolvedUnits([]);
         setShowResults(true);
       }
     } catch (err) {
@@ -107,6 +117,36 @@ export default function Upload() {
       toast.error(err.message || 'Delete failed');
     }
   };
+
+  const handleApproveApply = async () => {
+    if (!uploadId || approving) return;
+    setApproving(true);
+    try {
+      await apiFetch(`/api/uploads/${uploadId}/approve`, { method: 'POST' });
+      await apiFetch(`/api/uploads/${uploadId}/apply`, { method: 'POST' });
+      toast.success('Approved and applied to stock');
+      loadHistory();
+    } catch (err) {
+      toast.error(err.message || 'Approve & Import failed');
+    } finally {
+      setApproving(false);
+    }
+  };
+
+  const _allResultRows = currentResults ? [
+    ...(currentResults.matches || []),
+    ...(currentResults.last_month_mismatches || []),
+    ...(currentResults.this_month_mismatches || []),
+    ...(currentResults.both_mismatches || []),
+  ] : [];
+  const _flaggedUnits = new Set(
+    (currentResults?.unmapped_units || []).map((u) => String(u.upload_unit || '').toUpperCase())
+  );
+  // Rows needing mapping: backend-flagged, or unit_match === false.
+  const _flaggedRows = _allResultRows.filter((r) =>
+    r.unit_match === false || _flaggedUnits.has(String(r.upload_unit || '').toUpperCase()));
+  const _unresolvedRows = _flaggedRows.filter(
+    (r) => !resolvedUnits.includes(String(r.upload_unit || '').toUpperCase()));
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
@@ -219,6 +259,29 @@ export default function Upload() {
       {/* Comparison Results */}
       {showResults && currentResults && (
         <div className="space-y-6">
+          {_unresolvedRows.length > 0 && (
+            <UnitMapping
+              key={[...new Set(_unresolvedRows.map((r) => String(r.upload_unit || '').toUpperCase()))].sort().join('|')}
+              rows={_unresolvedRows}
+              onMappingsSaved={(units) =>
+                setResolvedUnits((prev) => [...new Set([...prev, ...units])])}
+            />
+          )}
+          <div className="flex items-center justify-end">
+            <Button
+              variant="success"
+              size="sm"
+              icon={approving ? Loader2 : CheckCircle2}
+              loading={approving}
+              disabled={!uploadId || approving || _unresolvedRows.length > 0}
+              title={_unresolvedRows.length > 0
+                ? `Map ${_unresolvedRows.length} flagged row(s) above first`
+                : 'Approve and apply to stock'}
+              onClick={handleApproveApply}
+            >
+              Approve & Import
+            </Button>
+          </div>
           <MismatchSummary stats={currentResults.stats} />
           <ComparisonResults results={currentResults} />
         </div>

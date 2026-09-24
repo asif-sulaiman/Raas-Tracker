@@ -113,3 +113,63 @@ def test_adjust_matches_case_insensitively(db):
     assert adjust_stock_from_upload(db, uid, reviewed_by="admin") is True
     qty = db.execute("SELECT current_qty FROM chemicals WHERE name = 'MixedCase'").fetchone()[0]
     assert qty == 25
+
+
+def test_create_conversion_validation(admin_client):
+    assert admin_client.post("/api/unit-conversions",
+                             json={"from_unit": "", "to_unit": "KG",
+                                   "factor": 2}).status_code == 400
+    for bad in [0, -1, "abc", None]:
+        assert admin_client.post("/api/unit-conversions",
+                                 json={"from_unit": "BARREL", "to_unit": "KG",
+                                       "factor": bad}).status_code == 400
+    r = admin_client.post("/api/unit-conversions",
+                          json={"from_unit": "drum", "to_unit": "kg", "factor": 200})
+    assert r.status_code == 200
+    assert r.get_json()["from_unit"] == "DRUM"
+    rows = admin_client.get("/api/unit-conversions").get_json()
+    assert [c for c in rows if c["from_unit"] == "DRUM" and c["factor"] == 200]
+    # Upsert overwrites.
+    assert admin_client.post("/api/unit-conversions",
+                             json={"from_unit": "DRUM", "to_unit": "KG",
+                                   "factor": 210}).status_code == 200
+    rows = admin_client.get("/api/unit-conversions").get_json()
+    assert [c for c in rows if c["from_unit"] == "DRUM" and c["factor"] == 210]
+
+
+def test_approve_apply_routes(admin_client, db):
+    from chem_stock import get_unmapped_rows
+    add_chemical(db, "Alpha", 100, "KG")
+    uid, _ = _upload(db, [{"name": "Alpha", "balance_last_month": 100,
+                           "balance_this_month": 120, "upload_unit": "NOPE"}],
+                     filename="FLAGGED.pdf")
+    r = admin_client.post(f"/api/uploads/{uid}/approve")
+    assert r.status_code == 400
+    body = r.get_json()
+    assert body["unmapped"] == [{"row_id": body["unmapped"][0]["row_id"],
+                                 "chemical_name": "Alpha",
+                                 "upload_unit": "NOPE", "db_unit": "KG"}]
+    assert get_unmapped_rows(db, uid)[0]["chemical_name"] == "Alpha"
+    # Apply before approve is rejected.
+    assert admin_client.post(f"/api/uploads/{uid}/apply").status_code == 400
+    # Map the unit, then the full flow works.
+    assert admin_client.post("/api/unit-conversions",
+                             json={"from_unit": "NOPE", "to_unit": "KG",
+                                   "factor": 1}).status_code == 200
+    assert admin_client.post(f"/api/uploads/{uid}/approve").status_code == 200
+    r = admin_client.post(f"/api/uploads/{uid}/apply")
+    assert r.status_code == 200 and r.get_json() == {"adjusted": True}
+    qty = db.execute("SELECT current_qty FROM chemicals WHERE name = 'Alpha'").fetchone()[0]
+    assert qty == 120
+
+
+def test_approve_apply_ghost_and_unauth(admin_client, db):
+    import flask_app
+    # Fresh client: the shared `client` fixture IS admin_client after login.
+    anon = flask_app.app.test_client()
+    assert admin_client.post("/api/uploads/999999/approve").status_code == 404
+    assert admin_client.post("/api/uploads/999999/apply").status_code == 404
+    assert anon.post("/api/uploads/1/approve").status_code == 401
+    assert anon.post("/api/unit-conversions",
+                     json={"from_unit": "A", "to_unit": "B",
+                           "factor": 1}).status_code == 401

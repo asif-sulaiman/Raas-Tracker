@@ -214,6 +214,56 @@ def _not_found(_e):
     return send_from_directory(REACT_BUILD_DIR, "index.html")
 
 
+# ==================== RATE LIMITS (tiers 2-3) ====================
+# Tier 1 (login throttle 5 fails/10 min, API-key 300/min) stays DB-backed.
+# These in-process limits are loop/DoS protection: approximate under
+# multiple workers, disabled in tests (RAAS_RATE_LIMITS=off).
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+
+def _limit_key():
+    ident = getattr(g, "current_identity", None) or {}
+    if ident.get("type") == "human" and ident.get("id") is not None:
+        return f"user:{ident['id']}"
+    if ident.get("type") == "api-key" and ident.get("id") is not None:
+        return f"key:{ident['id']}"
+    return get_remote_address()
+
+
+limiter = Limiter(
+    _limit_key,
+    app=app,
+    default_limits=["300 per minute"],
+    storage_uri="memory://",
+    headers_enabled=True,
+)
+
+
+@limiter.request_filter
+def _rate_limit_test_bypass():
+    """Exempt every request when tests disable limits via env.
+
+    Evaluated per request (unlike the init-time `enabled` flag, which 4.x
+    bakes in at startup and cannot be toggled later).
+    """
+    return os.getenv("RAAS_RATE_LIMITS", "on") == "off"
+
+
+@app.errorhandler(429)
+def _rate_limit_exceeded(e):
+    retry = None
+    try:
+        retry = dict(e.get_headers()).get("Retry-After")
+    except Exception:
+        pass
+    resp = jsonify({"error": "rate limit exceeded, slow down"})
+    resp.status_code = 429
+    if retry:
+        resp.headers["Retry-After"] = retry
+    return resp
+
+
 @app.errorhandler(500)
 def _server_error(_e):
     app.logger.exception("unhandled server error")
@@ -664,6 +714,7 @@ def api_update_recipe_item(name, chem):
 
 # ==================== API: UPLOAD & COMPARISON ====================
 @app.route("/api/upload", methods=["POST"])
+@limiter.limit("15 per minute")
 def api_upload():
     if "file" not in request.files:
         return jsonify({"error": "No file selected"}), 400
@@ -755,7 +806,46 @@ def api_delete_upload(upload_id):
     return jsonify({"success": True, "deleted_id": upload_id})
 
 
+@app.route("/api/uploads/<int:upload_id>/approve", methods=["POST"])
+@limiter.limit("15 per minute")
+def api_approve_upload(upload_id):
+    from chem_stock import approve_upload, get_unmapped_rows
+    conn = get_db()
+    exists = conn.execute("SELECT id FROM uploads WHERE id = %s", (upload_id,)).fetchone()
+    if not exists:
+        conn.close()
+        return jsonify({"error": "Upload not found"}), 404
+    ok = approve_upload(conn, upload_id, reviewed_by=_actor())
+    if not ok:
+        unmapped = get_unmapped_rows(conn, upload_id)
+        conn.close()
+        return jsonify({"error": "Upload has unmapped units - map them first",
+                        "unmapped": unmapped}), 400
+    conn.close()
+    return jsonify({"approved": True})
+
+
+@app.route("/api/uploads/<int:upload_id>/apply", methods=["POST"])
+@limiter.limit("15 per minute")
+def api_apply_upload(upload_id):
+    from chem_stock import adjust_stock_from_upload
+    conn = get_db()
+    row = conn.execute("SELECT status FROM uploads WHERE id = %s", (upload_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "Upload not found"}), 404
+    if row[0] != "approved":
+        conn.close()
+        return jsonify({"error": "Approve the upload before applying"}), 400
+    ok = adjust_stock_from_upload(conn, upload_id, reviewed_by=_actor())
+    conn.close()
+    if not ok:
+        return jsonify({"error": "Could not apply upload"}), 500
+    return jsonify({"adjusted": True})
+
+
 @app.route("/api/uploads/<int:upload_id>/export")
+@limiter.limit("15 per minute")
 def api_upload_export(upload_id):
     conn = get_db()
     upload = conn.execute("SELECT * FROM uploads WHERE id = %s", (upload_id,)).fetchone()
@@ -792,6 +882,7 @@ def api_upload_export(upload_id):
 
 # ==================== API: REPORTS ====================
 @app.route("/api/reports/generate", methods=["POST"])
+@limiter.limit("15 per minute")
 def api_report_generate():
     data = request.get_json() or {}
     recipe_names = data.get("recipes", [])
@@ -820,6 +911,7 @@ def api_report_generate():
 
 
 @app.route("/api/reports/export", methods=["POST"])
+@limiter.limit("15 per minute")
 def api_report_export():
     data = request.get_json() or {}
     recipe_names = data.get("recipes", [])
@@ -928,6 +1020,28 @@ def api_unit_conversions():
     return jsonify(conversions)
 
 
+@app.route("/api/unit-conversions", methods=["POST"])
+def api_create_conversion():
+    data = request.get_json() or {}
+    from_unit = str(data.get("from_unit", "")).strip()
+    to_unit = str(data.get("to_unit", "")).strip()
+    try:
+        factor = float(data.get("factor"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "factor must be a positive number"}), 400
+    if not from_unit or not to_unit:
+        return jsonify({"error": "from_unit and to_unit are required"}), 400
+    if not (factor > 0 and factor < float("inf")):
+        return jsonify({"error": "factor must be a positive number"}), 400
+    conn = get_db()
+    ok = add_unit_conversion(conn, from_unit, to_unit, factor)
+    conn.close()
+    if not ok:
+        return jsonify({"error": "Could not save conversion"}), 500
+    return jsonify({"success": True, "from_unit": from_unit.upper(),
+                    "to_unit": to_unit.upper(), "factor": factor})
+
+
 # ==================== API: SALES TRACKER ====================
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -969,6 +1083,7 @@ def _duplicate_pi_warning(conn, pi_number: str):
 
 
 @app.route("/api/sales/parse", methods=["POST"])
+@limiter.limit("15 per minute")
 def api_parse_pi():
     """Parse an uploaded PI document (.pdf or .docx) in-memory and return extracted data."""
     if "file" not in request.files:
@@ -1002,6 +1117,7 @@ def api_list_sales():
 
 
 @app.route("/api/sales/export")
+@limiter.limit("15 per minute")
 def api_sales_export():
     import csv
     import io

@@ -13,6 +13,11 @@ from contextlib import redirect_stderr
 
 import pytest
 
+# In-process rate limits would throttle the suite itself (hundreds of
+# requests per minute across two users): disable globally here. Targeted
+# rate-limit tests re-enable the limiter explicitly.
+os.environ["RAAS_RATE_LIMITS"] = "off"
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from chem_stock import get_connection, create_first_admin, ensure_setup_token, create_user

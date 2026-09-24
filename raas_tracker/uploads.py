@@ -524,6 +524,28 @@ def _row_unit_mappable(conn: psycopg.Connection, chemical_name: str,
                                (row[0] or "KG").upper().strip()) is not None
 
 
+def get_unmapped_rows(conn: psycopg.Connection, upload_id: int) -> List[Dict[str, Any]]:
+    """Rows of an upload whose units cannot be converted (for mapping UI).
+
+    Each entry carries row_id, chemical_name, upload_unit and db_unit so
+    the frontend can render editors and post conversions.
+    """
+    rows = conn.execute(
+        "SELECT ur.id, ur.chemical_name, ur.upload_unit, c.unit "
+        "FROM upload_rows ur LEFT JOIN chemicals c "
+        "ON UPPER(c.name) = UPPER(ur.chemical_name) "
+        "WHERE ur.upload_id = %s",
+        (upload_id,)
+    ).fetchall()
+    out = []
+    for rid, name, unit, db_unit in rows:
+        if (unit or "").strip() and db_unit and get_unit_conversion(
+                conn, unit.upper().strip(), db_unit.upper().strip()) is None:
+            out.append({"row_id": rid, "chemical_name": name,
+                        "upload_unit": unit, "db_unit": db_unit})
+    return out
+
+
 def get_all_reason_codes(conn: psycopg.Connection) -> List[Dict[str, Any]]:
     """Return all reason codes."""
     cursor = conn.execute("SELECT id, code, description, category FROM reason_codes ORDER BY code")
