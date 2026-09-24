@@ -2,13 +2,16 @@
 
 Warehouse chemical inventory with monthly reconciliation, recipe management,
 file upload comparison (PDF/Excel), a sales pipeline (PI → LC → shipment →
-payment → completed) with `.doc`/`.docx` PI parsing, and session + API-key
+payment → completed) with PDF/`.docx` PI parsing, and session + API-key
 authentication. Flask backend serves a React 19 + Vite frontend.
+PostgreSQL (Supabase) is the database in every environment.
 
 ## Quick start (local)
 
 ```bash
 pip install -r requirements.txt
+# Point at Postgres first (required - the app refuses to start without it):
+#   $env:DATABASE_URL="postgresql://postgres.<ref>:<pw>@aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require"
 python flask_app.py            # http://localhost:5000
 ```
 
@@ -36,6 +39,8 @@ username and per IP), per-key rate limits, audited auth events.
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `DATABASE_URL` | (none — **required**) | PostgreSQL connection string (Supabase session pooler). App refuses to start without it |
+| `TEST_DATABASE_URL` | local `raas_test` | Scratch database for the test suite (wiped + rebuilt per test — never production) |
 | `RAAS_SECRET` | random per-process | App secret. **Required** when `PRODUCTION=1` |
 | `PRODUCTION` | `0` | `1` refuses to start without `RAAS_SECRET` |
 | `HOST` / `PORT` | `127.0.0.1` / `5000` | Bind address and port |
@@ -47,36 +52,52 @@ username and per IP), per-key rate limits, audited auth events.
 
 See `.env.example` for a template.
 
-## Production (Waitress)
+## Production (online hosting)
+
+The app is stateless (all state in Postgres) and PaaS-ready. Set these env
+vars on your host: `DATABASE_URL` (Supabase session-pooler URI),
+`RAAS_SECRET` (generate: `python -c "import secrets; print(secrets.token_urlsafe(64))"`),
+`PRODUCTION=1`, `FORCE_HTTPS=1`, `COOKIE_SECURE=1`, and start with:
 
 ```bash
 pip install -r requirements.txt
-export RAAS_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(64))")
-export PRODUCTION=1 FORCE_HTTPS=1
-waitress-serve --host=0.0.0.0 --port=5000 --threads=4 wsgi:app
+waitress-serve --host=0.0.0.0 --port=$PORT --threads=4 wsgi:app
 ```
 
-Or with Docker (Linux images parse `.docx` only — Word COM `.doc`
-conversion needs Windows):
+(`$PORT` is provided by the host; default `5000` locally.) Behind a TLS
+proxy, HTTPS redirect and secure cookies are on by default (`COOKIE_SECURE=1`).
 
-```bash
-docker compose up --build
-```
+Docker files (`Dockerfile`, `docker-compose.yml`) are retained for future
+use; the current path is online hosting against Supabase (no DB container).
 
-SQLite, `uploads/` and `reports/` live in a named volume (`raas-tracker-data`).
-Compose defaults to plain HTTP (`COOKIE_SECURE=0`, `FORCE_HTTPS=0`); when
-serving HTTPS (directly or when your proxy doesn't set `X-Forwarded-Proto`),
-flip both to `1`.
+### Backups, restore, rotation, rollback
+
+- **Backup**: Supabase dashboard → Backups, plus `pg_dump` any time:
+  `pg_dump "$DATABASE_URL" -F custom -f raas-backup.dump` (needs a local
+  `pg_dump`; the portable bundle in git history has one, or install Postgres
+  tools). Back up before every deploy.
+- **Restore** to a scratch project first to verify, then to production.
+- **Password rotation**: reset the DB password in Supabase dashboard, then
+  update `DATABASE_URL` everywhere it is set (local shell, hosting env).
+  Never commit connection strings — they live in env only.
+- **Rollback**: redeploy the previous release commit; data stays in
+  Supabase. The archived `chem_stock.backup-*.db` SQLite files plus
+  `scripts/migrate_sqlite_to_pg.py` remain the offline fallback.
 
 ## Tests
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/ -q        # backend: 40+ tests, isolated temp DBs
+python -m pytest tests/ -q        # backend: 90+ tests, isolated PG DBs
 cd raas-tracker-frontend
 npm install && npx vitest run     # frontend unit tests
 npx oxlint && npx vite build      # lint + production build
 ```
+
+Backend tests run against PostgreSQL: embedded zero-install PG locally
+(`pgserver`, no `TEST_DATABASE_URL`), a `postgres:16` service in CI, or any
+`TEST_DATABASE_URL` (e.g. Supabase). Each test truncates and reseeds, so the
+target database must be scratch — never production.
 
 CI (`.github/workflows/ci.yml`) runs pytest, oxlint, vitest and the build
 on every push and pull request to `main`.
@@ -84,10 +105,10 @@ on every push and pull request to `main`.
 ## Layout
 
 ```
-flask_app.py          Flask API + gates + SPA hosting
+flask_app.py          Flask API + gates + SPA hosting (requires DATABASE_URL)
 wsgi.py               Waitress entry point
-raas_tracker/          Data layer (split from legacy chem_stock.py)
-  db.py               Connection, schema, migrations, settings
+raas_tracker/          Data layer (PostgreSQL via psycopg)
+  db.py               Connection, schema, migrations, settings (+fast-path probe)
   audit.py            Audit log + per-request actor
   auth.py             Users, sessions, API keys, throttle, setup tokens
   stock.py            Chemicals, units, reorder levels
@@ -96,10 +117,11 @@ raas_tracker/          Data layer (split from legacy chem_stock.py)
   sales.py            Pipeline, items, payments, summaries
   cli.py              python chem_stock.py <command> entry
 chem_stock.py         Compatibility shim (re-exports raas_tracker.*)
-parse_sales.py        PI parser (.docx direct, .doc via Word COM on Windows)
+scripts/              One-off ops scripts (e.g. SQLite -> Postgres migration)
+parse_sales.py        PI parser (PDF + .docx; legacy .doc via Word COM on Windows)
 parse_stock.py        Stock file parsers (PDF/Excel)
 raas-tracker-frontend/  React 19 + Vite + Tailwind 4 SPA
-tests/                pytest suite (temp DB per test, real DB untouched)
+tests/                pytest suite (isolated PG database per test)
 ```
 
 ## Notes

@@ -5,6 +5,7 @@ Usage:
     waitress-serve --host=0.0.0.0 --port=5000 --threads=4 wsgi:app
 
 Environment variables:
+    DATABASE_URL - Required. PostgreSQL (Supabase) connection string.
     RAAS_SECRET  - Required in production. Secret key for the app.
     HOST             - Bind address (default: 127.0.0.1 for dev, 0.0.0.0 for prod).
     PORT             - Port number (default: 5000).

@@ -438,6 +438,10 @@ def _req_float(data, field, default=0):
 
 
 def get_db():
+    if not os.getenv("DATABASE_URL"):
+        raise RuntimeError(
+            "DATABASE_URL is not set. Set it to your PostgreSQL (Supabase) "
+            "connection string; see README and .env.example.")
     return get_connection()
 
 
