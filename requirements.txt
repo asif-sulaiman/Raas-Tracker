@@ -1,4 +1,10 @@
-# RAAS Tracker (+ Sales Tracker) - direct dependencies
+# RAAS Tracker — shared dependencies (cross-platform)
+# Windows-only helpers (legacy .doc -> .docx via Word COM) are NOT here on
+# purpose: `uv lock` resolves universal wheels and pywin32 has no cp312
+# wheels, which broke the Vercel (Linux, Python 3.12) build.
+# The API already rejects .doc uploads (PDF + .docx only), so nothing on the
+# server needs these. To restore local legacy .doc parsing, install the
+# optional extra:  pip install -r requirements-win.txt
 Flask==3.1.3
 Flask-Limiter==4.1.1
 psycopg[binary]==3.3.6
@@ -9,5 +15,3 @@ pdfplumber==0.11.10
 PyMuPDF==1.28.2
 bcrypt==4.3.0
 waitress==3.0.2
-doc2docx==0.2.4; sys_platform == 'win32'
-pywin32==305; sys_platform == 'win32'
