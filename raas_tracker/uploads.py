@@ -180,7 +180,17 @@ def compare_stock_upload(conn: psycopg.Connection, upload_data: List[Dict[str, A
     total = len(matches) + len(last_month_mismatches) + len(this_month_mismatches) + len(both_mismatches) + len(not_in_db) + len(not_in_upload)
     matched_count = len(matches)
     match_percentage = (matched_count / total * 100) if total > 0 else 0
-    
+
+    # Rows whose units cannot be converted to the DB chemical's unit.
+    # These must never reach stock: approval/apply gates block them, and
+    # the saved upload is marked 'flagged' instead of 'completed'.
+    unmapped_units = [
+        {"name": row["name"], "upload_unit": row.get("upload_unit", ""),
+         "db_unit": row.get("db_unit", "")}
+        for row in (matches + last_month_mismatches + this_month_mismatches + both_mismatches)
+        if not row.get("unit_match", True)
+    ]
+
     return {
         "matches": matches,
         "last_month_mismatches": last_month_mismatches,
@@ -188,6 +198,7 @@ def compare_stock_upload(conn: psycopg.Connection, upload_data: List[Dict[str, A
         "both_mismatches": both_mismatches,
         "not_in_db": not_in_db,
         "not_in_upload": not_in_upload,
+        "unmapped_units": unmapped_units,
         "stats": {
             "total": total,
             "matched": matched_count,
@@ -213,12 +224,13 @@ def save_upload(conn: psycopg.Connection, filename: str, results: Dict[str, Any]
         Upload ID
     """
     stats = results["stats"]
+    status = "flagged" if results.get("unmapped_units") else "completed"
     cursor = conn.execute(
         """INSERT INTO uploads (filename, status, total_chemicals, matched, 
            last_month_mismatches, this_month_mismatches, both_mismatches, 
            not_in_db, not_in_upload, match_percentage)
-           VALUES (%s, 'completed', %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
-        (filename, stats["total"], stats["matched"], stats["last_month_mismatches"],
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+        (filename, status, stats["total"], stats["matched"], stats["last_month_mismatches"],
          stats["this_month_mismatches"], stats["both_mismatches"],
          stats["not_in_db"], stats["not_in_upload"], stats["match_percentage"])
     )
@@ -493,6 +505,25 @@ def export_comparison_report(results: Dict[str, Any], output_path: str) -> str:
 # ==================== APPROVAL WORKFLOW FUNCTIONS ====================
 
 
+def _row_unit_mappable(conn: psycopg.Connection, chemical_name: str,
+                       upload_unit: str) -> bool:
+    """True when an upload row's unit can be applied safely.
+
+    No unit given, or chemical not in DB (adjust skips those anyway), means
+    nothing to corrupt. Otherwise a conversion to the DB unit must exist.
+    """
+    if not (upload_unit or "").strip():
+        return True
+    row = conn.execute(
+        "SELECT unit FROM chemicals WHERE UPPER(name) = %s",
+        ((chemical_name or "").strip().upper(),)
+    ).fetchone()
+    if not row:
+        return True
+    return get_unit_conversion(conn, upload_unit.upper().strip(),
+                               (row[0] or "KG").upper().strip()) is not None
+
+
 def get_all_reason_codes(conn: psycopg.Connection) -> List[Dict[str, Any]]:
     """Return all reason codes."""
     cursor = conn.execute("SELECT id, code, description, category FROM reason_codes ORDER BY code")
@@ -533,6 +564,23 @@ def approve_upload_row(conn: psycopg.Connection, workflow_id: int, reason_code: 
         True if approved successfully
     """
     try:
+        # Atomic unit gate: refuse rows whose units cannot be converted.
+        info = conn.execute(
+            "SELECT upload_id, upload_row_id FROM approval_workflow WHERE id = %s",
+            (workflow_id,)
+        ).fetchone()
+        if info and info[1] is not None:
+            detail = conn.execute(
+                "SELECT chemical_name, upload_unit FROM upload_rows WHERE id = %s",
+                (info[1],)
+            ).fetchone()
+            if detail and not _row_unit_mappable(conn, detail[0], detail[1]):
+                conn.rollback()
+                log_audit_action(conn, "APPROVE_BLOCKED", "upload_row", info[1],
+                                 reviewed_by, None,
+                                 f"Unmapped unit cannot be approved: {detail[1]}")
+                conn.commit()
+                return False
         conn.execute(
             """UPDATE approval_workflow 
                SET status = 'approved', reason_code = %s, comments = %s, reviewed_by = %s, reviewed_at = %s
@@ -610,18 +658,29 @@ def approve_upload(conn: psycopg.Connection, upload_id: int, reviewed_by: str = 
         True if approved successfully
     """
     try:
+        # Atomic unit gate: scan every row first. If any row carries an
+        # unmapped unit, the whole batch is blocked (nothing approved,
+        # status untouched) so a source document can never half-apply.
+        rows = conn.execute(
+            "SELECT id, chemical_name, upload_unit FROM upload_rows WHERE upload_id = %s",
+            (upload_id,)
+        ).fetchall()
+        blocked = [r[0] for r in rows
+                   if not _row_unit_mappable(conn, r[1], r[2])]
+        if blocked:
+            log_audit_action(conn, "APPROVE_BLOCKED", "upload", upload_id,
+                             reviewed_by, None,
+                             f"{len(blocked)} row(s) with unmapped units; batch blocked")
+            conn.commit()
+            return False
+
         # Update upload status
         conn.execute(
             "UPDATE uploads SET status = 'approved' WHERE id = %s",
             (upload_id,)
         )
-        
+
         # Create workflow entries for all rows
-        rows = conn.execute(
-            "SELECT id FROM upload_rows WHERE upload_id = %s",
-            (upload_id,)
-        ).fetchall()
-        
         for row in rows:
             workflow_id = create_approval_workflow(conn, upload_id, row[0])
             approve_upload_row(conn, workflow_id,
@@ -774,6 +833,13 @@ def adjust_stock_from_upload(conn: psycopg.Connection, upload_id: int,
                     converted_qty = convert_quantity(conn, new_qty, upload_unit, chem_unit)
                     if converted_qty is not None:
                         new_qty = converted_qty
+                    else:
+                        # Defense in depth: never write unconvertible units
+                        # into stock (the approval gate should already have
+                        # blocked such rows).
+                        logger.warning("Skipping %s: cannot convert %s to %s",
+                                       chemical_name, upload_unit, chem_unit)
+                        continue
                 
                 # Update stock
                 conn.execute(

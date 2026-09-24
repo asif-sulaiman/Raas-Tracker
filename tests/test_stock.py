@@ -153,3 +153,21 @@ def test_recipe_crud_statuses(admin_client):
     assert admin_client.delete("/api/recipes/Ghost").status_code == 404
     assert admin_client.delete("/api/recipes/R1").status_code == 200
     assert admin_client.delete("/api/recipes/R1").status_code == 404
+
+
+def test_recipe_mutations_audited(admin_client, db):
+    admin_client.post("/api/chemicals", json={"name": "AudChem", "qty": 10, "unit": "KG"})
+    assert admin_client.post("/api/recipes", json={"name": "AudR", "yield": 5}).status_code == 200
+    assert admin_client.post("/api/recipes/AudR/items",
+                             json={"chemical": "AudChem", "percentage": 20}).status_code == 200
+    assert admin_client.put("/api/recipes/AudR/items/AudChem",
+                            json={"percentage": 25}).status_code == 200
+    assert admin_client.delete("/api/recipes/AudR/items/AudChem").status_code == 200
+    assert admin_client.delete("/api/recipes/AudR").status_code == 200
+    actions = {r[0] for r in db.execute(
+        "SELECT action FROM audit_logs WHERE entity_type LIKE 'recipe%'").fetchall()}
+    assert {"RECIPE_CREATE", "RECIPE_ITEM_ADD", "RECIPE_ITEM_UPDATE",
+            "RECIPE_ITEM_DELETE", "RECIPE_DELETE"} <= actions
+    actors = {r[0] for r in db.execute(
+        "SELECT DISTINCT user_id FROM audit_logs WHERE entity_type LIKE 'recipe%'").fetchall()}
+    assert actors == {"admin"}

@@ -24,7 +24,8 @@ import { useConfirm } from '../context/ConfirmContext';
 import { toast } from 'sonner';
 
 export default function Recipes() {
-  const { apiFetch } = useAuth();
+  const { apiFetch, user } = useAuth();
+  const isAdmin = user?.role === 'admin';
   const { confirm } = useConfirm();
   const [recipes, setRecipes] = useState([]);
   const [chemicals, setChemicals] = useState([]);
@@ -264,7 +265,9 @@ export default function Recipes() {
               setEditWater(String(selectedRecipe.water_percentage));
               setShowEditMeta(true);
             }}>Edit</Button>
-            <Button variant="danger" size="sm" icon={Trash2} onClick={() => handleDelete(selectedRecipe.name)}>Delete</Button>
+            {isAdmin && (
+              <Button variant="danger" size="sm" icon={Trash2} onClick={() => handleDelete(selectedRecipe.name)}>Delete</Button>
+            )}
           </div>
         </div>
 
@@ -354,13 +357,15 @@ export default function Recipes() {
                     </span>
                   </td>
                   <td className="px-4 py-3 text-right">
-                    <button
-                      onClick={() => handleDeleteItem(item.chemical_name)}
-                      className="p-1.5 rounded-md text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors cursor-pointer"
-                      title="Remove ingredient"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
+                    {isAdmin && (
+                      <button
+                        onClick={() => handleDeleteItem(item.chemical_name)}
+                        className="p-1.5 rounded-md text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors cursor-pointer"
+                        title="Remove ingredient"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    )}
                   </td>
                 </tr>
               ))}
@@ -503,13 +508,15 @@ export default function Recipes() {
                     <Button variant="ghost" size="sm" icon={Eye} onClick={() => fetchRecipeDetail(recipe.name)}>
                       View
                     </Button>
-                    <button
-                      onClick={() => handleDelete(recipe.name)}
-                      className="p-1.5 rounded-md text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors cursor-pointer"
-                      title="Delete recipe"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
+                    {isAdmin && (
+                      <button
+                        onClick={() => handleDelete(recipe.name)}
+                        className="p-1.5 rounded-md text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors cursor-pointer"
+                        title="Delete recipe"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    )}
                   </div>
                 </td>
               </tr>

@@ -1,6 +1,7 @@
 """Recipes plus production reports."""
 
 import psycopg
+from .audit import log_audit_action
 import json
 import os
 import re
@@ -24,12 +25,14 @@ def add_recipe(conn: psycopg.Connection, name: str, total_quantity: float = 1, w
         True if created, False if recipe already exists
     """
     try:
-        conn.execute(
-            "INSERT INTO recipes (name, total_quantity, water_percentage) VALUES (%s, %s, %s)",
+        cursor = conn.execute(
+            "INSERT INTO recipes (name, total_quantity, water_percentage) VALUES (%s, %s, %s) RETURNING id",
             (name, total_quantity, water_percentage)
         )
+        recipe_id = cursor.fetchone()[0]
         conn.commit()
         logger.info("Created recipe: '%s' (total quantity: %s)", name, total_quantity)
+        log_audit_action(conn, "RECIPE_CREATE", "recipe", recipe_id, new_value=name)
         return True
     except psycopg.IntegrityError:
         try:
@@ -90,12 +93,15 @@ def add_recipe_item(conn: psycopg.Connection, recipe_name: str, chemical_name: s
         return False
     
     required_qty_per_unit = percentage / 100.0
-    conn.execute(
-        "INSERT INTO recipe_items (recipe_id, chemical_id, percentage, required_qty_per_unit) VALUES (%s, %s, %s, %s)",
+    cursor = conn.execute(
+        "INSERT INTO recipe_items (recipe_id, chemical_id, percentage, required_qty_per_unit) VALUES (%s, %s, %s, %s) RETURNING id",
         (recipe["id"], chemical[0], percentage, required_qty_per_unit)
     )
+    item_id = cursor.fetchone()[0]
     conn.commit()
     logger.info("Added '%s' to recipe '%s': %s%%", chemical_name, recipe_name, percentage)
+    log_audit_action(conn, "RECIPE_ITEM_ADD", "recipe_item", item_id,
+                     new_value=f"{recipe_name}:{chemical_name}:{percentage}")
     return True
 
 
@@ -160,15 +166,25 @@ def update_recipe_item(conn: psycopg.Connection, recipe_name: str, chemical_name
         logger.warning("Chemical '%s' not found.", chemical_name)
         return False
 
+    old = conn.execute(
+        "SELECT id, percentage FROM recipe_items WHERE recipe_id = %s AND chemical_id = %s",
+        (recipe["id"], chemical[0])
+    ).fetchone()
+    if not old:
+        logger.warning("'%s' not found in recipe '%s'.", chemical_name, recipe_name)
+        return False
+
     new_qty_per_unit = new_percentage / 100.0
     result = conn.execute(
         "UPDATE recipe_items SET percentage = %s, required_qty_per_unit = %s WHERE recipe_id = %s AND chemical_id = %s",
         (new_percentage, new_qty_per_unit, recipe["id"], chemical[0])
     )
     conn.commit()
-    
+
     if result.rowcount > 0:
         logger.info("Updated '%s' in '%s': now %s%%", chemical_name, recipe_name, new_percentage)
+        log_audit_action(conn, "RECIPE_ITEM_UPDATE", "recipe_item", old[0],
+                         old_value=str(old[1]), new_value=str(new_percentage))
         return True
     else:
         logger.warning("'%s' not found in recipe '%s'.", chemical_name, recipe_name)
@@ -187,14 +203,24 @@ def delete_recipe_item(conn: psycopg.Connection, recipe_name: str, chemical_name
         logger.warning("Chemical '%s' not found.", chemical_name)
         return False
 
+    old = conn.execute(
+        "SELECT id, percentage FROM recipe_items WHERE recipe_id = %s AND chemical_id = %s",
+        (recipe["id"], chemical[0])
+    ).fetchone()
+    if not old:
+        logger.warning("'%s' was not in recipe '%s'.", chemical_name, recipe_name)
+        return False
+
     result = conn.execute(
         "DELETE FROM recipe_items WHERE recipe_id = %s AND chemical_id = %s",
         (recipe["id"], chemical[0])
     )
     conn.commit()
-    
+
     if result.rowcount > 0:
         logger.info("Removed '%s' from recipe '%s'", chemical_name, recipe_name)
+        log_audit_action(conn, "RECIPE_ITEM_DELETE", "recipe_item", old[0],
+                         old_value=f"{recipe_name}:{chemical_name}:{old[1]}")
         return True
     else:
         logger.warning("'%s' was not in recipe '%s'.", chemical_name, recipe_name)
@@ -212,6 +238,7 @@ def delete_recipe(conn: psycopg.Connection, name: str) -> bool:
     conn.execute("DELETE FROM recipes WHERE id = %s", (recipe["id"],))
     conn.commit()
     logger.info("Deleted recipe '%s' and all its items.", name)
+    log_audit_action(conn, "RECIPE_DELETE", "recipe", recipe["id"], old_value=name)
     return True
 
 
@@ -249,6 +276,8 @@ def update_recipe(conn: psycopg.Connection, name: str,
     conn.execute(f"UPDATE recipes SET {', '.join(updates)} WHERE id = %s", params)
     conn.commit()
     logger.info("Updated recipe '%s': %s", name, updates)
+    log_audit_action(conn, "RECIPE_UPDATE", "recipe", recipe["id"],
+                     old_value=name, new_value=",".join(updates))
     return True
 
 

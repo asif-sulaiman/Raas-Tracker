@@ -14,7 +14,8 @@ import { useConfirm } from '../context/ConfirmContext';
 import { toast } from 'sonner';
 
 export default function Sales() {
-  const { apiFetch } = useAuth();
+  const { apiFetch, user } = useAuth();
+  const isAdmin = user?.role === 'admin';
   const { confirm } = useConfirm();
   const [sales, setSales] = useState([]);
   const [summary, setSummary] = useState(null);
@@ -219,7 +220,7 @@ export default function Sales() {
               actionVariant={st.actionVariant}
               onAction={(sale) => handleCardAction(sale, st)}
               onView={(sale) => setDetailSaleId(sale.id)}
-              onDelete={handleDelete}
+              onDelete={isAdmin ? handleDelete : undefined}
             />
           ))}
         </div>

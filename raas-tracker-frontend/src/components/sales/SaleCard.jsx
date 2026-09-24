@@ -67,16 +67,18 @@ export default function SaleCard({ sale, actionLabel, actionVariant = 'primary',
         >
           {null}
         </Button>
-        <Button
-          variant="secondary"
-          size="sm"
-          icon={Trash2}
-          onClick={() => onDelete?.(sale)}
-          title="Delete sale"
-          className="!px-2 !text-rose-600 dark:!text-rose-400 hover:!bg-rose-50 dark:hover:!bg-rose-950/40"
-        >
-          {null}
-        </Button>
+        {onDelete && (
+          <Button
+            variant="secondary"
+            size="sm"
+            icon={Trash2}
+            onClick={() => onDelete?.(sale)}
+            title="Delete sale"
+            className="!px-2 !text-rose-600 dark:!text-rose-400 hover:!bg-rose-50 dark:hover:!bg-rose-950/40"
+          >
+            {null}
+          </Button>
+        )}
       </div>
     </div>
   );

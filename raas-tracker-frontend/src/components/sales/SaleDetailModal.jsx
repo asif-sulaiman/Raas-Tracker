@@ -24,7 +24,8 @@ function Field({ label, value, mono }) {
 }
 
 export default function SaleDetailModal({ saleId, onClose, onSaved }) {
-  const { apiFetch } = useAuth();
+  const { apiFetch, user } = useAuth();
+  const isAdmin = user?.role === 'admin';
   const { confirm } = useConfirm();
   const [sale, setSale] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -370,9 +371,11 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </button>
-                        <button onClick={() => handleDeletePayment(p.id)} className="p-1 text-slate-400 hover:text-rose-600 cursor-pointer" title="Delete payment">
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
+                        {isAdmin && (
+                          <button onClick={() => handleDeletePayment(p.id)} className="p-1 text-slate-400 hover:text-rose-600 cursor-pointer" title="Delete payment">
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        )}
                       </>
                     )}
                   </div>

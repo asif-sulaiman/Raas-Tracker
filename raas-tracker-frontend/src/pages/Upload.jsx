@@ -11,7 +11,8 @@ import { useConfirm } from '../context/ConfirmContext';
 import { toast } from 'sonner';
 
 export default function Upload() {
-  const { apiFetch } = useAuth();
+  const { apiFetch, user } = useAuth();
+  const isAdmin = user?.role === 'admin';
   const { confirm } = useConfirm();
   const [selectedFile, setSelectedFile] = useState(null);
   const [isUploading, setIsUploading] = useState(false);
@@ -229,7 +230,7 @@ export default function Upload() {
         onViewResults={handleViewHistory}
         onReview={handleViewHistory}
         onExport={handleExport}
-        onDelete={handleDelete}
+        onDelete={isAdmin ? handleDelete : undefined}
       />
     </div>
   );

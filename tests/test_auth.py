@@ -113,6 +113,39 @@ def test_non_admin_blocked_from_admin_paths(user_client):
     assert user_client.get("/api/chemicals").status_code == 200
 
 
+def test_cors_gated_by_allowlist(client, monkeypatch):
+    evil = client.get("/api/auth/status", headers={"Origin": "https://evil.example"})
+    assert "Access-Control-Allow-Origin" not in evil.headers
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS",
+                       "https://app.example, http://localhost:5173")
+    ok = client.get("/api/auth/status", headers={"Origin": "https://app.example/"})
+    assert ok.headers.get("Access-Control-Allow-Origin") == "https://app.example"
+    assert ok.headers.get("Access-Control-Allow-Credentials") == "true"
+    pre = client.open("/api/auth/status", method="OPTIONS",
+                      headers={"Origin": "http://localhost:5173"})
+    assert pre.status_code == 200
+    assert "DELETE" in pre.headers.get("Access-Control-Allow-Methods", "")
+
+
+def test_non_admin_and_key_delete_forbidden(user_client, db):
+    from chem_stock import create_api_key
+    uid = db.execute("SELECT id FROM users WHERE username = 'admin'").fetchone()[0]
+    raw = create_api_key(db, "nodelete", created_by=uid)
+    paths = [
+        "/api/recipes/Ghost/items/Chem",
+        "/api/recipes/Ghost",
+        "/api/uploads/999999",
+        "/api/sales/999999",
+        "/api/sales/999999/payments/888888",
+        "/api/sales/999999/items/888888",
+    ]
+    for path in paths:
+        r = user_client.open(path, method="DELETE")
+        assert r.status_code == 403, (path, r.status_code)
+        rk = user_client.open(path, method="DELETE", headers={"X-API-Key": raw})
+        assert rk.status_code == 403, ("key", path, rk.status_code)
+
+
 def test_admin_login_sets_secure_cookie(admin_client):
     assert admin_client.get("/api/auth/me").status_code == 200
 

@@ -116,6 +116,11 @@ def _actor() -> str:
 def _gate_api():
     if not request.path.startswith("/api"):
         return None
+    if request.method == "OPTIONS":
+        # CORS preflight carries no credentials by design; the route's
+        # automatic OPTIONS response plus after_request ACA headers
+        # complete it for allowed origins.
+        return None
     # Audited rejection of retired X-API-Token header — checked before everything.
     if request.headers.get("X-API-Token"):
         try:
@@ -157,6 +162,17 @@ def _gate_api():
 
 
 # ==================== SECURITY: HEADERS, CORS, HTTPS ====================
+def _cors_allowed_origins():
+    """Allowed CORS origins from CORS_ALLOWED_ORIGINS (comma-separated).
+
+    Empty by default: the SPA is served same-origin by Flask, so browsers
+    never need CORS. Add origins only for separate frontends or key-authed
+    cross-origin clients.
+    """
+    raw = os.getenv("CORS_ALLOWED_ORIGINS", "")
+    return {o.strip().rstrip("/") for o in raw.split(",") if o.strip()}
+
+
 @app.after_request
 def _set_security_headers(resp):
     resp.headers["X-Content-Type-Options"] = "nosniff"
@@ -166,10 +182,15 @@ def _set_security_headers(resp):
     resp.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     if os.getenv("FORCE_HTTPS") == "1":
         resp.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
-    origin = request.headers.get("Origin")
-    if origin:
-        resp.headers["Access-Control-Allow-Origin"] = request.host_url.rstrip("/")
+    origin = (request.headers.get("Origin") or "").rstrip("/")
+    if origin and origin in _cors_allowed_origins():
+        resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Access-Control-Allow-Credentials"] = "true"
+        resp.headers["Vary"] = "Origin"
+        if request.method == "OPTIONS":
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Key"
+            resp.headers["Access-Control-Max-Age"] = "86400"
     return resp
 
 
@@ -576,6 +597,7 @@ def api_add_recipe_item(name):
 
 
 @app.route("/api/recipes/<name>/items/<chem>", methods=["DELETE"])
+@admin_required
 def api_delete_recipe_item(name, chem):
     conn = get_db()
     success = delete_recipe_item(conn, name, chem)
@@ -586,6 +608,7 @@ def api_delete_recipe_item(name, chem):
 
 
 @app.route("/api/recipes/<name>", methods=["DELETE"])
+@admin_required
 def api_delete_recipe(name):
     conn = get_db()
     success = delete_recipe(conn, name)
@@ -701,6 +724,7 @@ def api_upload_detail(upload_id):
 
 
 @app.route("/api/uploads/<int:upload_id>", methods=["DELETE"])
+@admin_required
 def api_delete_upload(upload_id):
     conn = get_db()
     upload = conn.execute("SELECT id FROM uploads WHERE id = %s", (upload_id,)).fetchone()
@@ -1091,6 +1115,7 @@ def api_update_sale(sale_id):
 
 
 @app.route("/api/sales/<int:sale_id>", methods=["DELETE"])
+@admin_required
 def api_delete_sale(sale_id):
     conn = get_db()
     delete_sale(conn, sale_id)
@@ -1174,6 +1199,7 @@ def api_edit_payment(sale_id, payment_id):
 
 
 @app.route("/api/sales/<int:sale_id>/payments/<int:payment_id>", methods=["DELETE"])
+@admin_required
 def api_delete_payment(sale_id, payment_id):
     conn = get_db()
     ok = delete_sale_payment_record(conn, payment_id)
@@ -1214,6 +1240,7 @@ def api_update_item(sale_id, item_id):
 
 
 @app.route("/api/sales/<int:sale_id>/items/<int:item_id>", methods=["DELETE"])
+@admin_required
 def api_delete_item(sale_id, item_id):
     conn = get_db()
     count = conn.execute("SELECT COUNT(*) FROM sale_items WHERE sale_id = %s",
