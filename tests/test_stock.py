@@ -148,25 +148,37 @@ def test_upload_history_carries_dashboard_fields(admin_client, db):
     assert row["match_percentage"] == 33.33
 
 
-def test_recipe_crud_statuses(admin_client):
+def test_recipe_crud_statuses(admin_client, db):
+    admin_client.post("/api/companies", json={"name": "TestCo"})
+    cid = db.execute("SELECT id FROM companies WHERE name = 'TestCo'").fetchone()[0]
+    admin_client.post("/api/sales", json={
+        "sale": {"pi_number": "PI-TEST", "client_name": "TestCo", "company_id": cid},
+        "items": [{"product_name": "TestProduct", "quantity": 5, "unit_price": 10, "unit": "KG"}]
+    })
     assert admin_client.post("/api/recipes",
-                             json={"name": "R1", "yield": 5}).status_code == 200
+                             json={"name": "R1 -- TestCo", "yield": 5, "company_id": cid, "product_name": "TestProduct"}).status_code == 201
     assert admin_client.post("/api/recipes",
-                             json={"name": "R1", "yield": 5}).status_code == 409
+                             json={"name": "R1 -- TestCo", "yield": 5, "company_id": cid, "product_name": "TestProduct"}).status_code == 409
     assert admin_client.delete("/api/recipes/Ghost").status_code == 404
-    assert admin_client.delete("/api/recipes/R1").status_code == 200
-    assert admin_client.delete("/api/recipes/R1").status_code == 404
+    assert admin_client.delete("/api/recipes/R1 -- TestCo").status_code == 200
+    assert admin_client.delete("/api/recipes/R1 -- TestCo").status_code == 404
 
 
 def test_recipe_mutations_audited(admin_client, db):
+    admin_client.post("/api/companies", json={"name": "TestCo"})
+    cid = db.execute("SELECT id FROM companies WHERE name = 'TestCo'").fetchone()[0]
     admin_client.post("/api/chemicals", json={"name": "AudChem", "qty": 10, "unit": "KG"})
-    assert admin_client.post("/api/recipes", json={"name": "AudR", "yield": 5}).status_code == 200
-    assert admin_client.post("/api/recipes/AudR/items",
+    admin_client.post("/api/sales", json={
+        "sale": {"pi_number": "PI-AUD", "client_name": "TestCo", "company_id": cid},
+        "items": [{"product_name": "AudChem", "quantity": 10, "unit_price": 10, "unit": "KG"}]
+    })
+    assert admin_client.post("/api/recipes", json={"name": "AudR -- TestCo", "yield": 5, "company_id": cid, "product_name": "AudChem"}).status_code == 201
+    assert admin_client.post("/api/recipes/AudR -- TestCo/items",
                              json={"chemical": "AudChem", "percentage": 20}).status_code == 200
-    assert admin_client.put("/api/recipes/AudR/items/AudChem",
+    assert admin_client.put("/api/recipes/AudR -- TestCo/items/AudChem",
                             json={"percentage": 25}).status_code == 200
-    assert admin_client.delete("/api/recipes/AudR/items/AudChem").status_code == 200
-    assert admin_client.delete("/api/recipes/AudR").status_code == 200
+    assert admin_client.delete("/api/recipes/AudR -- TestCo/items/AudChem").status_code == 200
+    assert admin_client.delete("/api/recipes/AudR -- TestCo").status_code == 200
     actions = {r[0] for r in db.execute(
         "SELECT action FROM audit_logs WHERE entity_type LIKE 'recipe%'").fetchall()}
     assert {"RECIPE_CREATE", "RECIPE_ITEM_ADD", "RECIPE_ITEM_UPDATE",
@@ -178,8 +190,13 @@ def test_recipe_mutations_audited(admin_client, db):
 
 def test_recipe_percentage_cap(db):
     import pytest
-    from chem_stock import add_recipe, add_recipe_item, update_recipe, update_recipe_item
-    add_recipe(db, "Cap", 1, 10.0)
+    from chem_stock import add_recipe, add_recipe_item, update_recipe, update_recipe_item, add_sale_item
+    from raas_tracker.companies import create_company
+    from raas_tracker.sales import add_sale
+    cid = create_company(db, name="TestCo")
+    add_sale(db, {"pi_number": "PI-TEST", "client_name": "TestCo", "company_id": cid},
+             [{"product_name": "TestProduct", "quantity": 5, "unit_price": 10, "unit": "KG"}])
+    add_recipe(db, "Cap", 1, 10.0, company_id=cid, product_name="TestProduct")
     add_chemical(db, "CapA", 5, "KG")
     add_chemical(db, "CapB", 5, "KG")
     assert add_recipe_item(db, "Cap", "CapA", 60.0) is True
@@ -197,17 +214,26 @@ def test_recipe_percentage_cap(db):
         update_recipe_item(db, "Cap", "CapA", -1.0)
 
 
-def test_recipe_percentage_cap_api(admin_client):
+def test_recipe_percentage_cap_api(admin_client, db):
+    admin_client.post("/api/companies", json={"name": "TestCo"})
+    cid = db.execute("SELECT id FROM companies WHERE name = 'TestCo'").fetchone()[0]
+    admin_client.post("/api/sales", json={
+        "sale": {"pi_number": "PI-TEST", "client_name": "TestCo", "company_id": cid},
+        "items": [{"product_name": "CapC", "quantity": 5, "unit_price": 10, "unit": "KG"}]
+    })
     admin_client.post("/api/chemicals", json={"name": "CapC", "qty": 5, "unit": "KG"})
     admin_client.post("/api/chemicals", json={"name": "CapD", "qty": 5, "unit": "KG"})
-    assert admin_client.post("/api/recipes", json={"name": "CapR", "yield": 5}).status_code == 200
-    assert admin_client.post("/api/recipes/CapR/items",
+    r = admin_client.post("/api/recipes", json={
+        "name": "CapR -- TestCo", "yield": 5, "company_id": cid, "product_name": "CapC"
+    })
+    assert r.status_code == 201
+    assert admin_client.post("/api/recipes/CapR -- TestCo/items",
                              json={"chemical": "CapC", "percentage": 90}).status_code == 200
     # 90 + 11 exceeds 100% -> rejected, recipe unchanged.
-    r = admin_client.post("/api/recipes/CapR/items",
+    r = admin_client.post("/api/recipes/CapR -- TestCo/items",
                           json={"chemical": "CapD", "percentage": 11})
     assert r.status_code == 400
-    assert admin_client.put("/api/recipes/CapR", json={"water_percentage": 101}).status_code == 400
+    assert admin_client.put("/api/recipes/CapR -- TestCo", json={"water_percentage": 101}).status_code == 400
 
 
 def test_chemical_name_case_insensitive(db):

@@ -12,24 +12,45 @@ from .db import get_connection, logger
 from .stock import get_all_chemicals
 from .uploads import csv_safe
 
-def add_recipe(conn: psycopg.Connection, name: str, total_quantity: float = 1, water_percentage: float = 0) -> bool:
+def add_recipe(conn: psycopg.Connection, name: str, total_quantity: float = 1, water_percentage: float = 0,
+             company_id: int = None, product_name: str = None) -> bool:
     """Create a new recipe.
-    
+
     Args:
         conn: Database connection
         name: Recipe name (e.g. "Liquid Soap Batch A")
         total_quantity: Total quantity this recipe produces (e.g. 1000 liters, 15000 KG)
         water_percentage: Optional water percentage (default 0, calculated as 100 - sum(ingredient %) if left at 0)
-    
+        company_id: Owning company from the register (required for new masters)
+        product_name: Registered product name for that company
+
     Returns:
         True if created, False if recipe already exists
     """
     if water_percentage < 0 or water_percentage > 100:
         raise ValueError("water_percentage must be between 0 and 100")
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("name is required")
+    if company_id is None:
+        raise ValueError("company_id is required")
+    company = conn.execute("SELECT id FROM companies WHERE id = %s",
+                           (company_id,)).fetchone()
+    if not company:
+        raise ValueError("unknown company")
+    product_name = (product_name or "").strip()
+    if not product_name:
+        raise ValueError("product_name is required")
+    registered = conn.execute(
+        """SELECT 1 FROM sale_items si JOIN sales s ON s.id = si.sale_id
+           WHERE s.company_id = %s AND lower(si.product_name) = lower(%s)""",
+        (company_id, product_name)).fetchone()
+    if not registered:
+        raise ValueError(f"product '{product_name}' is not registered for this company")
     try:
         cursor = conn.execute(
-            "INSERT INTO recipes (name, total_quantity, water_percentage) VALUES (%s, %s, %s) RETURNING id",
-            (name, total_quantity, water_percentage)
+            "INSERT INTO recipes (name, total_quantity, water_percentage, company_id, product_name) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (name, total_quantity, water_percentage, company_id, product_name)
         )
         recipe_id = cursor.fetchone()[0]
         conn.commit()
@@ -48,12 +69,25 @@ def add_recipe(conn: psycopg.Connection, name: str, total_quantity: float = 1, w
 def get_recipe_by_name(conn: psycopg.Connection, name: str) -> Optional[Dict[str, Any]]:
     """Get recipe info by name."""
     cursor = conn.execute(
-        "SELECT id, name, total_quantity, water_percentage, created_date FROM recipes WHERE name = %s",
+        "SELECT r.id, r.name, r.total_quantity, r.water_percentage, r.created_date, "
+        "r.company_id, r.product_name, c.name FROM recipes r "
+        "LEFT JOIN companies c ON c.id = r.company_id WHERE r.name = %s",
         (name,)
     )
     row = cursor.fetchone()
     if row:
-        return {"id": row[0], "name": row[1], "total_quantity": row[2], "water_percentage": row[3], "created": row[4]}
+        return {"id": row[0], "name": row[1], "total_quantity": row[2], "water_percentage": row[3], "created": row[4],
+                "company_id": row[5], "product_name": row[6], "company_name": row[7]}
+    return None
+
+
+def find_recipe(conn: psycopg.Connection, company_id: int, name: str) -> Optional[Dict[str, Any]]:
+    """Find a company's master recipe by name (for duplicate deep-links)."""
+    row = conn.execute(
+        "SELECT id, name FROM recipes WHERE company_id = %s AND lower(name) = lower(%s)",
+        (company_id, (name or "").strip())).fetchone()
+    if row:
+        return {"id": row[0], "name": row[1]}
     return None
 
 
@@ -133,12 +167,16 @@ def add_recipe_item(conn: psycopg.Connection, recipe_name: str, chemical_name: s
 
 
 def list_recipes(conn: psycopg.Connection) -> List[Dict[str, Any]]:
-    """List all recipes with their total quantity info."""
+    """List all recipes with owning company."""
     cursor = conn.execute(
-        "SELECT id, name, total_quantity, water_percentage, created_date FROM recipes ORDER BY name"
+        "SELECT r.id, r.name, r.total_quantity, r.water_percentage, "
+        "r.created_date, r.company_id, r.product_name, c.name "
+        "FROM recipes r LEFT JOIN companies c ON c.id = r.company_id "
+        "ORDER BY r.name"
     )
     return [
-        {"id": row[0], "name": row[1], "total_quantity": row[2], "water_percentage": row[3], "created": row[4]}
+        {"id": row[0], "name": row[1], "total_quantity": row[2], "water_percentage": row[3], "created": row[4],
+         "company_id": row[5], "product_name": row[6], "company_name": row[7]}
         for row in cursor.fetchall()
     ]
 

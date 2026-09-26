@@ -251,6 +251,25 @@ def delete_shipment(conn: psycopg.Connection, sale_id: int,
     return cursor.rowcount > 0
 
 
+def get_register_products(conn: psycopg.Connection,
+                          company_id: int) -> List[Dict[str, Any]]:
+    """Distinct PI products for a company (newest PI ref as hint)."""
+    company = conn.execute("SELECT id FROM companies WHERE id = %s",
+                           (company_id,)).fetchone()
+    if not company:
+        raise ValueError("unknown company")
+    return [
+        {"product_name": r[0], "pi_number": r[1], "sale_id": r[2]}
+        for r in conn.execute(
+            """SELECT DISTINCT ON (lower(si.product_name)) si.product_name,
+                      s.pi_number, s.id
+               FROM sale_items si JOIN sales s ON s.id = si.sale_id
+               WHERE s.company_id = %s
+               ORDER BY lower(si.product_name), s.id DESC""",
+            (company_id,)).fetchall()
+    ]
+
+
 def get_sale_invoice_total(conn: psycopg.Connection, sale_id: int) -> float:
     """Sum of quantity * unit_price over all line items of a sale."""
     row = conn.execute(

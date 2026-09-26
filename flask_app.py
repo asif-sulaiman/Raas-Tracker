@@ -30,7 +30,7 @@ REACT_BUILD_DIR = os.path.join(os.path.dirname(__file__), "react_frontend")
 
 from chem_stock import (
     get_connection, get_all_chemicals, update_stock, add_chemical, set_reorder_level,
-    add_recipe, get_recipe_by_name, add_recipe_item, list_recipes,
+    add_recipe, get_recipe_by_name, add_recipe_item, list_recipes, find_recipe,
     list_recipe_items, update_recipe, update_recipe_item, delete_recipe_item,
     delete_recipe, generate_report, generate_multi_recipe_report, export_report_to_csv,
     compare_stock_upload, save_upload, get_upload_history, get_upload_results,
@@ -41,7 +41,8 @@ from chem_stock import (
     delete_sale_item, delete_sale, get_sales_summary, record_sale_payment,
     update_sale_payment_record, delete_sale_payment_record, update_sale_full,
     get_stock_movements, list_companies, create_company, update_company,
-    delete_company, get_company, add_shipment, list_shipments, delete_shipment
+    delete_company, get_company, add_shipment, list_shipments, delete_shipment,
+    get_register_products
 )
 
 # ---- AuthN/Z: sessions (humans) OR api_keys (scripts) ----
@@ -593,6 +594,25 @@ def api_list_companies():
     return jsonify(rows)
 
 
+@app.route("/api/register/products")
+def api_register_products():
+    company_id = request.args.get("company_id", type=int)
+    if company_id is None:
+        return jsonify({"error": "company_id is required"}), 400
+    conn = get_db()
+    company = get_company(conn, company_id)
+    if not company:
+        conn.close()
+        return jsonify({"error": "unknown company"}), 400
+    try:
+        rows = get_register_products(conn, company_id)
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
+    conn.close()
+    return jsonify(rows)
+
+
 @app.route("/api/companies", methods=["POST"])
 @admin_required
 def api_create_company():
@@ -790,21 +810,36 @@ def api_recipe_detail(name):
 def api_create_recipe():
     data = request.get_json() or {}
     try:
-        product_yield = _req_float(data, "yield", 1)
-        water_pct = _req_float(data, "water_percentage", 0)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    name = str(data.get("name", "")).strip()
+        payload = RecipeCreateIn.model_validate(data)
+    except ValidationError as e:
+        return _validation_error_response(e)
     conn = get_db()
     try:
-        success = add_recipe(conn, name, product_yield, water_pct)
+        success = add_recipe(conn, payload.name, payload.yield_qty, payload.water_percentage,
+                             payload.company_id, payload.product_name)
     except ValueError as e:
         conn.close()
         return jsonify({"error": str(e)}), 400
-    conn.close()
     if not success:
-        return jsonify({"success": success, "name": name}), 409
-    return jsonify({"success": success, "name": name})
+        # Connection may be in a bad state after IntegrityError rollback;
+        # get a fresh connection for the lookup.
+        conn.close()
+        conn = get_db()
+        existing = find_recipe(conn, payload.company_id, payload.name)
+        conn.close()
+        return jsonify({"success": False, "name": payload.name,
+                        "error": f"Recipe '{payload.name}' already exists",
+                        "existing": {"name": existing["name"]}}), 409
+    conn.close()
+    return jsonify({"success": True, "name": payload.name}), 201
+
+
+class RecipeCreateIn(_StrippedModel):
+    name: str = Field(min_length=1)
+    yield_qty: float = Field(default=1, gt=0)
+    water_percentage: float = Field(default=0, ge=0, le=100)
+    company_id: int
+    product_name: str = Field(min_length=1)
 
 
 @app.route("/api/recipes/<name>/items", methods=["POST"])
