@@ -28,7 +28,7 @@ describe('uploadMismatches', () => {
 describe('buildTrendData', () => {
   it('maps newest-first history to oldest-first points', () => {
     const out = buildTrendData([U({ id: 2, upload_date: '2026-09-05 10:00:00' }),
-                                U({ id: 1, upload_date: '2026-09-05 10:00:00', matched: 90 })]);
+                                U({ id: 1, upload_date: '2026-08-05 10:00:00', matched: 90 })]);
     expect(out).toHaveLength(2);
     expect(out[0].matched).toBe(90);
     expect(out[1].matched).toBe(100);

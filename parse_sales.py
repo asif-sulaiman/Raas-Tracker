@@ -57,7 +57,7 @@ def _parse_dayfirst(dt: str) -> Optional[str]:
     """Parse a date string to ISO format, preferring DD/MM/YYYY for slashes.
 
     RAAS PIs (Malaysia/Bangladesh) use day-first dates, so 05/09/2026 means
-    5 August — not May 8. Falls back to month-first when day-first is invalid.
+    5 September — not May 9. Falls back to month-first when day-first is invalid.
     """
     dt = dt.strip()
     if '-' in dt and len(dt.split('-')[0]) == 4:
