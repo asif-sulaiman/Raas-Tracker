@@ -211,6 +211,10 @@ def _enforce_https():
 def _not_found(_e):
     if request.path.startswith("/api"):
         return jsonify({"error": "not found"}), 404
+    # Missing static asset (e.g. /static/*): fail loudly with 404.
+    # Serving index.html as JS/CSS leaves the SPA permanently blank.
+    if "." in os.path.basename(request.path or ""):
+        return jsonify({"error": "not found"}), 404
     return send_from_directory(REACT_BUILD_DIR, "index.html")
 
 

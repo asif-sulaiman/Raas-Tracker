@@ -33,6 +33,15 @@ def test_missing_top_level_asset_returns_404(tmp_path, monkeypatch):
     assert r.status_code == 404
 
 
+def test_missing_builtin_static_returns_404(tmp_path, monkeypatch):
+    # Flask's built-in /static/* route 404s into the app 404 handler,
+    # which must not convert a missing asset back to index.html.
+    monkeypatch.setattr(flask_app, "REACT_BUILD_DIR", _fake_build_dir(tmp_path))
+    client = flask_app.app.test_client()
+    r = client.get("/static/missing.js")
+    assert r.status_code == 404
+
+
 def test_spa_route_still_serves_index(tmp_path, monkeypatch):
     monkeypatch.setattr(flask_app, "REACT_BUILD_DIR", _fake_build_dir(tmp_path))
     client = flask_app.app.test_client()
