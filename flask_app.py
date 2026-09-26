@@ -41,7 +41,7 @@ from chem_stock import (
     delete_sale_item, delete_sale, get_sales_summary, record_sale_payment,
     update_sale_payment_record, delete_sale_payment_record, update_sale_full,
     get_stock_movements, list_companies, create_company, update_company,
-    delete_company, get_company
+    delete_company, get_company, add_shipment, list_shipments, delete_shipment
 )
 
 # ---- AuthN/Z: sessions (humans) OR api_keys (scripts) ----
@@ -1222,6 +1222,7 @@ class SaleItemIn(_StrippedModel):
     product_name: str = Field(min_length=1)
     quantity: float = Field(ge=0)
     unit_price: float = Field(ge=0)
+    unit: str = Field(default="KG", min_length=1)
 
 
 class SaleHeaderIn(_StrippedModel):
@@ -1229,6 +1230,7 @@ class SaleHeaderIn(_StrippedModel):
     pi_date: str | None = None
     client_name: str | None = None
     pi_file_path: str | None = None
+    company_id: int | None = None
 
 
 class SaleCreateIn(BaseModel):
@@ -1339,6 +1341,12 @@ def api_create_sale():
     sale_data = payload.sale.model_dump()
     items = [i.model_dump() for i in payload.items]
     conn = get_db()
+    if sale_data.get("company_id") is not None:
+        company = get_company(conn, sale_data["company_id"])
+        if not company:
+            conn.close()
+            return jsonify({"error": "unknown company"}), 400
+        sale_data["client_name"] = company["name"]
     warning = _duplicate_pi_warning(conn, sale_data["pi_number"])
     sale_id = add_sale(conn, sale_data, items)
     conn.close()
@@ -1353,6 +1361,7 @@ class SaleHeaderPatchIn(_StrippedModel):
     pi_date: str | None = None
     client_name: str | None = None
     pi_file_path: str | None = None
+    comments: str | None = None
 
 
 class SaleFullItemIn(_StrippedModel):
@@ -1360,6 +1369,7 @@ class SaleFullItemIn(_StrippedModel):
     product_name: str = Field(min_length=1)
     quantity: float = Field(ge=0)
     unit_price: float = Field(ge=0)
+    unit: str = Field(default="KG", min_length=1)
 
 
 class SaleFullUpdateIn(BaseModel):
@@ -1400,7 +1410,8 @@ def api_update_sale(sale_id):
     data = patch.model_dump(exclude_none=True)
     conn = get_db()
     fields, vals = [], []
-    for key in ("pi_number", "pi_date", "client_name", "pi_file_path"):
+    for key in ("pi_number", "pi_date", "client_name", "pi_file_path",
+                "comments"):
         if key in data:
             fields.append(f"{key} = %s")
             vals.append(data[key])
@@ -1509,6 +1520,38 @@ def api_delete_payment(sale_id, payment_id):
     return jsonify({"message": "Payment deleted"})
 
 
+@app.route("/api/sales/<int:sale_id>/shipments", methods=["POST"])
+@admin_required
+def api_add_shipment(sale_id):
+    try:
+        payload = ShipmentIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        shipment_id = add_shipment(
+            conn, sale_id, payload.ship_date, payload.invoice_number,
+            payload.invoice_date, payload.notes)
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
+    conn.close()
+    if shipment_id is None:
+        return jsonify({"error": "Sale not found"}), 404
+    return jsonify({"id": shipment_id, "message": "Shipment recorded"}), 201
+
+
+@app.route("/api/sales/<int:sale_id>/shipments/<int:shipment_id>", methods=["DELETE"])
+@admin_required
+def api_delete_shipment(sale_id, shipment_id):
+    conn = get_db()
+    ok = delete_shipment(conn, sale_id, shipment_id)
+    conn.close()
+    if not ok:
+        return jsonify({"error": "Shipment not found"}), 404
+    return jsonify({"message": "Shipment deleted"})
+
+
 @app.route("/api/sales/<int:sale_id>/items", methods=["POST"])
 def api_add_item(sale_id):
     try:
@@ -1516,7 +1559,7 @@ def api_add_item(sale_id):
     except ValidationError as e:
         return _validation_error_response(e)
     conn = get_db()
-    item_id = add_sale_item(conn, sale_id, item.product_name, item.quantity, item.unit_price)
+    item_id = add_sale_item(conn, sale_id, item.product_name, item.quantity, item.unit_price, item.unit)
     conn.close()
     return jsonify({"id": item_id, "message": "Item added"}), 201
 
@@ -1525,6 +1568,14 @@ class SaleItemPatchIn(BaseModel):
     product_name: str | None = Field(default=None, min_length=1)
     quantity: float | None = Field(default=None, ge=0)
     unit_price: float | None = Field(default=None, ge=0)
+    unit: str | None = Field(default=None, min_length=1)
+
+
+class ShipmentIn(_StrippedModel):
+    ship_date: str = Field(min_length=1)
+    invoice_number: str | None = None
+    invoice_date: str | None = None
+    notes: str | None = None
 
 
 @app.route("/api/sales/<int:sale_id>/items/<int:item_id>", methods=["PUT"])
@@ -1534,7 +1585,7 @@ def api_update_item(sale_id, item_id):
     except ValidationError as e:
         return _validation_error_response(e)
     conn = get_db()
-    update_sale_item(conn, item_id, patch.product_name, patch.quantity, patch.unit_price)
+    update_sale_item(conn, item_id, patch.product_name, patch.quantity, patch.unit_price, patch.unit)
     conn.close()
     return jsonify({"message": "Item updated"})
 

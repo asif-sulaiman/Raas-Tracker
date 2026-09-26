@@ -3,6 +3,7 @@ import { Pencil, Trash2, Check, X, Plus, Loader2 } from 'lucide-react';
 import Modal from '../modals/Modal';
 import Badge from '../ui/Badge';
 import Button from '../ui/Button';
+import ShipmentModal from './ShipmentModal';
 import { formatNumber, formatDate, formatDateTime, sumLineTotals, lineTotal } from '../../utils/format';
 import { STAGE_LABELS, STAGE_BADGE } from '../../utils/sales';
 import { useAuth } from '../../context/AuthContext';
@@ -38,12 +39,16 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
   const [removedIds, setRemovedIds] = useState([]);
   const [savingSale, setSavingSale] = useState(false);
   const [saleError, setSaleError] = useState(null);
+  const [showShipmentModal, setShowShipmentModal] = useState(false);
+  const [comments, setComments] = useState('');
+  const [savingComments, setSavingComments] = useState(false);
 
   const refresh = async (id) => {
     try {
       const res = await apiFetch(`/api/sales/${id}`);
       const data = await res.json();
       setSale(data.error ? null : data);
+      setComments(data && !data.error ? (data.comments || '') : '');
     } catch {
       setSale(null);
     } finally {
@@ -73,6 +78,7 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
     setEditItems(sale.items.map((i) => ({
       key: `db-${i.id}`, id: i.id,
       product_name: i.product_name, quantity: i.quantity, unit_price: i.unit_price,
+      unit: i.unit || 'KG',
     })));
     setRemovedIds([]);
     setSaleError(null);
@@ -127,6 +133,7 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
             product_name: i.product_name.trim(),
             quantity: parseFloat(i.quantity) || 0,
             unit_price: parseFloat(i.unit_price) || 0,
+            unit: (i.unit || 'KG').toUpperCase(),
           })),
           removedIds,
         }),
@@ -141,6 +148,42 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
       setSaleError(detail || err.message || 'Failed to save changes');
     } finally {
       setSavingSale(false);
+    }
+  };
+
+  const handleDeleteShipment = async (shipmentId, label) => {
+    const ok = await confirm({
+      title: `Delete shipment ${label}?`,
+      message: 'The report will fall back to the remaining shipments.',
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await apiFetch(`/api/sales/${saleId}/shipments/${shipmentId}`, { method: 'DELETE' });
+      toast.success('Shipment deleted');
+      refresh(saleId);
+      onSaved?.();
+    } catch (err) {
+      toast.error(err.message || 'Could not delete shipment');
+    }
+  };
+
+  const handleSaveComments = async () => {
+    setSavingComments(true);
+    try {
+      await apiFetch(`/api/sales/${saleId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ comments: comments.trim() || null }),
+      });
+      toast.success('Comments saved');
+      refresh(saleId);
+      onSaved?.();
+    } catch (err) {
+      toast.error(err.message || 'Could not save comments');
+    } finally {
+      setSavingComments(false);
     }
   };
 
@@ -186,6 +229,7 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
   const total = sumLineTotals(sale?.items);
 
   return (
+    <>
     <Modal
       isOpen={!!saleId}
       onClose={onClose}
@@ -262,7 +306,7 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
                   variant="secondary"
                   size="sm"
                   icon={Plus}
-                  onClick={() => setEditItems((prev) => [...prev, { key: `new-${Date.now()}`, id: null, product_name: '', quantity: 0, unit_price: 0 }])}
+                  onClick={() => setEditItems((prev) => [...prev, { key: `new-${Date.now()}`, id: null, product_name: '', quantity: 0, unit_price: 0, unit: 'KG' }])}
                 >
                   Add Row
                 </Button>
@@ -274,6 +318,7 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
                   <tr>
                     <th className="px-2.5 py-2">Product</th>
                     <th className="px-2.5 py-2 text-right">Qty</th>
+                    <th className="px-2.5 py-2">Unit</th>
                     <th className="px-2.5 py-2 text-right">Unit Price</th>
                     <th className="px-2.5 py-2 text-right">Total</th>
                     {editing && <th className="px-2.5 py-2 w-10"></th>}
@@ -288,6 +333,9 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
                         </td>
                         <td className="px-2.5 py-1.5">
                           <input type="number" min="0" step="any" value={i.quantity} onChange={(e) => updateEditItem(i.key, 'quantity', e.target.value)} className={inputCls} />
+                        </td>
+                        <td className="px-2.5 py-1.5">
+                          <input value={i.unit || 'KG'} onChange={(e) => updateEditItem(i.key, 'unit', e.target.value.toUpperCase())} className={inputCls} aria-label="Unit" />
                         </td>
                         <td className="px-2.5 py-1.5">
                           <input type="number" min="0" step="any" value={i.unit_price} onChange={(e) => updateEditItem(i.key, 'unit_price', e.target.value)} className={inputCls} />
@@ -307,6 +355,7 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
                       <tr key={i.id}>
                         <td className="px-2.5 py-2 font-medium text-slate-900 dark:text-white">{i.product_name}</td>
                         <td className="px-2.5 py-2 text-right">{formatNumber(i.quantity)}</td>
+                        <td className="px-2.5 py-2 font-mono text-slate-500">{i.unit || 'KG'}</td>
                         <td className="px-2.5 py-2 text-right">${formatNumber(i.unit_price)}</td>
                         <td className="px-2.5 py-2 text-right font-semibold">
                           ${formatNumber((i.quantity || 0) * (i.unit_price || 0))}
@@ -384,6 +433,62 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
             </div>
           )}
 
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="text-sm font-semibold text-slate-800 dark:text-white">
+                Shipments ({(sale.shipments?.length ?? 0)})
+              </h4>
+              {isAdmin && (
+                <Button variant="secondary" size="sm" icon={Plus} onClick={() => setShowShipmentModal(true)}>
+                  Record shipment
+                </Button>
+              )}
+            </div>
+            {(sale.shipments?.length ?? 0) === 0 ? (
+              <p className="text-xs text-slate-400 dark:text-slate-500">No shipments recorded yet.</p>
+            ) : (
+              <div className="rounded-lg border border-slate-200 dark:border-slate-700 divide-y divide-slate-100 dark:divide-slate-800 text-xs">
+                {sale.shipments.map((s) => (
+                  <div key={s.id} className="flex items-center gap-2 px-2.5 py-1.5">
+                    <span className="text-slate-500 dark:text-slate-400">{formatDate(s.ship_date)}</span>
+                    {s.invoice_number && (
+                      <span className="font-mono font-medium text-slate-700 dark:text-slate-200">{s.invoice_number}</span>
+                    )}
+                    {s.notes && <span className="text-slate-400 truncate flex-1">{s.notes}</span>}
+                    <span className="flex-1" />
+                    {isAdmin && (
+                      <button
+                        onClick={() => handleDeleteShipment(s.id, s.invoice_number || s.ship_date)}
+                        className="p-1 text-slate-400 hover:text-rose-600 cursor-pointer"
+                        title="Delete shipment"
+                        aria-label={`Delete shipment ${s.invoice_number || s.ship_date}`}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div>
+            <h4 className="text-sm font-semibold text-slate-800 dark:text-white mb-2">Comments</h4>
+            <div className="flex items-start gap-2">
+              <textarea
+                aria-label="Sale comments"
+                value={comments}
+                onChange={(e) => setComments(e.target.value)}
+                rows={2}
+                placeholder="Free-form notes for the live report…"
+                className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500"
+              />
+              <Button variant="secondary" size="sm" onClick={handleSaveComments} loading={savingComments} disabled={savingComments}>
+                Save
+              </Button>
+            </div>
+          </div>
+
           {sale.history && sale.history.length > 0 && (
             <div>
               <h4 className="text-sm font-semibold text-slate-800 dark:text-white mb-2">Stage History</h4>
@@ -406,5 +511,12 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
         </div>
       )}
     </Modal>
+    <ShipmentModal
+      isOpen={showShipmentModal}
+      saleId={saleId}
+      onClose={() => setShowShipmentModal(false)}
+      onSaved={() => { refresh(saleId); onSaved?.(); }}
+    />
+    </>
   );
 }

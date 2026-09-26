@@ -32,17 +32,19 @@ def add_sale(conn: psycopg.Connection, sale_data: Dict[str, Any],
              items: List[Dict[str, Any]], initial_stage: str = "pi_issued") -> int:
     """Insert a new sale with line items. Returns the new sale ID."""
     cursor = conn.execute(
-        """INSERT INTO sales (stage, pi_number, pi_date, client_name, pi_file_path)
-           VALUES (%s, %s, %s, %s, %s) RETURNING id""",
+        """INSERT INTO sales (stage, pi_number, pi_date, client_name, pi_file_path, company_id)
+           VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
         (initial_stage, sale_data.get("pi_number"), sale_data.get("pi_date"),
-         sale_data.get("client_name"), sale_data.get("pi_file_path"))
+         sale_data.get("client_name"), sale_data.get("pi_file_path"),
+         sale_data.get("company_id"))
     )
     sale_id = cursor.fetchone()[0]
     for item in items:
+        unit = (item.get("unit") or "KG").strip().upper() or "KG"
         conn.execute(
-            """INSERT INTO sale_items (sale_id, product_name, quantity, unit_price)
-               VALUES (%s, %s, %s, %s)""",
-            (sale_id, item["product_name"], item.get("quantity", 0), item.get("unit_price", 0))
+            """INSERT INTO sale_items (sale_id, product_name, quantity, unit_price, unit)
+               VALUES (%s, %s, %s, %s, %s)""",
+            (sale_id, item["product_name"], item.get("quantity", 0), item.get("unit_price", 0), unit)
         )
     conn.execute(
         """INSERT INTO sales_stage_history (sale_id, from_stage, to_stage, notes)
@@ -64,13 +66,15 @@ def get_all_sales(conn: psycopg.Connection, stage: Optional[str] = None,
     query = """
         SELECT s.id, s.stage, s.pi_number, s.pi_date, s.client_name, s.pi_file_path,
                s.lc_number, s.lc_date, s.shipment_date, s.payment_date, s.payment_amount,
-               s.created_at, s.updated_at,
+               s.created_at, s.updated_at, s.company_id, s.maturity_date, s.comments,
+               COALESCE(c.name, s.client_name),
                 COALESCE(ROUND(SUM(si.quantity * si.unit_price)::numeric, 2)::float8, 0) AS total_value,
                 COUNT(si.id) AS item_count,
                 COALESCE((SELECT ROUND(SUM(sp.payment_amount)::numeric, 2)::float8 FROM sale_payments sp
                           WHERE sp.sale_id = s.id), 0) AS total_paid
         FROM sales s
         LEFT JOIN sale_items si ON si.sale_id = s.id
+        LEFT JOIN companies c ON c.id = s.company_id
     """
     params: list = []
     clauses = []
@@ -85,21 +89,29 @@ def get_all_sales(conn: psycopg.Connection, stage: Optional[str] = None,
         params.extend([like, like, like, like])
     if clauses:
         query += " WHERE " + " AND ".join(clauses)
-    query += " GROUP BY s.id ORDER BY s.created_at DESC, s.id DESC"
+    query += " GROUP BY s.id, c.id ORDER BY s.created_at DESC, s.id DESC"
     return [
         {"id": r[0], "stage": r[1], "pi_number": r[2], "pi_date": r[3],
          "client_name": r[4], "pi_file_path": r[5], "lc_number": r[6],
          "lc_date": r[7], "shipment_date": r[8], "payment_date": r[9],
          "payment_amount": r[10], "created_at": r[11], "updated_at": r[12],
-         "total_value": r[13], "item_count": r[14], "total_paid": r[15],
-         "balance": r[13] - r[15]}
+         "company_id": r[13], "maturity_date": r[14], "comments": r[15],
+         "company_name": r[16],
+         "total_value": r[17], "item_count": r[18], "total_paid": r[19],
+         "balance": r[17] - r[19]}
         for r in conn.execute(query, params).fetchall()
     ]
 
 
 def get_sale_by_id(conn: psycopg.Connection, sale_id: int) -> Optional[Dict[str, Any]]:
     """Return a single sale with its items and stage history."""
-    row = conn.execute("SELECT * FROM sales WHERE id = %s", (sale_id,)).fetchone()
+    row = conn.execute(
+        "SELECT s.id, s.stage, s.pi_number, s.pi_date, s.client_name, "
+        "s.pi_file_path, s.lc_number, s.lc_date, s.shipment_date, "
+        "s.payment_date, s.payment_amount, s.created_at, s.updated_at, "
+        "s.company_id, s.maturity_date, s.comments, c.name "
+        "FROM sales s LEFT JOIN companies c ON c.id = s.company_id "
+        "WHERE s.id = %s", (sale_id,)).fetchone()
     if not row:
         return None
     sale = {
@@ -107,12 +119,15 @@ def get_sale_by_id(conn: psycopg.Connection, sale_id: int) -> Optional[Dict[str,
         "client_name": row[4], "pi_file_path": row[5], "lc_number": row[6],
         "lc_date": row[7], "shipment_date": row[8], "payment_date": row[9],
         "payment_amount": row[10], "created_at": row[11], "updated_at": row[12],
+        "company_id": row[13], "maturity_date": row[14], "comments": row[15],
+        "company_name": row[16] or row[4],
     }
     sale["items"] = [
         {"id": r[0], "sale_id": r[1], "product_name": r[2],
-         "quantity": r[3], "unit_price": r[4]}
+         "quantity": r[3], "unit_price": r[4], "unit": r[5] or "KG"}
         for r in conn.execute(
-            "SELECT * FROM sale_items WHERE sale_id = %s ORDER BY id", (sale_id,)
+            "SELECT id, sale_id, product_name, quantity, unit_price, unit "
+            "FROM sale_items WHERE sale_id = %s ORDER BY id", (sale_id,)
         ).fetchall()
     ]
     sale["history"] = [
@@ -136,6 +151,7 @@ def get_sale_by_id(conn: psycopg.Connection, sale_id: int) -> Optional[Dict[str,
     )
     sale["total_paid"] = sum(p["payment_amount"] or 0 for p in sale["payments"])
     sale["balance"] = sale["invoice_total"] - sale["total_paid"]
+    sale["shipments"] = list_shipments(conn, sale_id)
     return sale
 
 
@@ -188,6 +204,51 @@ def update_sale_lc(conn: psycopg.Connection, sale_id: int, lc_number: str,
     log_audit_action(conn, "SALE_LC", "sale", sale_id, new_value=lc_number)
     conn.commit()
     return True
+
+
+def add_shipment(conn: psycopg.Connection, sale_id: int, ship_date: str,
+                 invoice_number: str = None, invoice_date: str = None,
+                 notes: str = None) -> Optional[int]:
+    """Record an actual (possibly partial) shipment. Returns id, None if no sale."""
+    if not (ship_date or "").strip():
+        raise ValueError("ship_date is required")
+    sale = conn.execute("SELECT id FROM sales WHERE id = %s", (sale_id,)).fetchone()
+    if not sale:
+        return None
+    row = conn.execute(
+        """INSERT INTO shipments (sale_id, ship_date, invoice_number, invoice_date, notes)
+           VALUES (%s, %s, %s, %s, %s) RETURNING id""",
+        (sale_id, ship_date.strip(), (invoice_number or "").strip() or None,
+         (invoice_date or "").strip() or None, (notes or "").strip() or None)
+    ).fetchone()
+    conn.commit()
+    log_audit_action(conn, "SHIPMENT_RECORD", "sale", sale_id,
+                     new_value=f"{ship_date.strip()}")
+    return row[0]
+
+
+def list_shipments(conn: psycopg.Connection, sale_id: int) -> List[Dict[str, Any]]:
+    """Shipments for a sale, oldest first."""
+    return [
+        {"id": r[0], "sale_id": r[1], "ship_date": r[2],
+         "invoice_number": r[3], "invoice_date": r[4], "notes": r[5],
+         "created_at": r[6]}
+        for r in conn.execute(
+            "SELECT id, sale_id, ship_date, invoice_number, invoice_date, "
+            "notes, created_at FROM shipments WHERE sale_id = %s "
+            "ORDER BY ship_date, id", (sale_id,)
+        ).fetchall()
+    ]
+
+
+def delete_shipment(conn: psycopg.Connection, sale_id: int,
+                    shipment_id: int) -> bool:
+    """Delete one shipment row. Returns False when not found."""
+    cursor = conn.execute(
+        "DELETE FROM shipments WHERE id = %s AND sale_id = %s",
+        (shipment_id, sale_id))
+    conn.commit()
+    return cursor.rowcount > 0
 
 
 def get_sale_invoice_total(conn: psycopg.Connection, sale_id: int) -> float:
@@ -344,12 +405,13 @@ def _revert_if_unpaid(conn: psycopg.Connection, sale_id: int) -> None:
 
 
 def add_sale_item(conn: psycopg.Connection, sale_id: int, product_name: str,
-                  quantity: float, unit_price: float) -> int:
+                  quantity: float, unit_price: float, unit: str = "KG") -> int:
     """Add a line item to an existing sale. Returns the new item ID."""
+    unit = (unit or "KG").strip().upper() or "KG"
     cursor = conn.execute(
-        """INSERT INTO sale_items (sale_id, product_name, quantity, unit_price)
-           VALUES (%s, %s, %s, %s) RETURNING id""",
-        (sale_id, product_name, quantity, unit_price)
+        """INSERT INTO sale_items (sale_id, product_name, quantity, unit_price, unit)
+           VALUES (%s, %s, %s, %s, %s) RETURNING id""",
+        (sale_id, product_name, quantity, unit_price, unit)
     )
     conn.commit()
     return cursor.fetchone()[0]
@@ -358,7 +420,8 @@ def add_sale_item(conn: psycopg.Connection, sale_id: int, product_name: str,
 def update_sale_item(conn: psycopg.Connection, item_id: int,
                      product_name: Optional[str] = None,
                      quantity: Optional[float] = None,
-                     unit_price: Optional[float] = None) -> bool:
+                     unit_price: Optional[float] = None,
+                     unit: Optional[str] = None) -> bool:
     """Update fields of a sale line item."""
     fields, vals = [], []
     if product_name is not None:
@@ -370,6 +433,9 @@ def update_sale_item(conn: psycopg.Connection, item_id: int,
     if unit_price is not None:
         fields.append("unit_price = %s")
         vals.append(unit_price)
+    if unit is not None:
+        fields.append("unit = %s")
+        vals.append((unit or "KG").strip().upper() or "KG")
     if not fields:
         return False
     vals.append(item_id)
@@ -397,7 +463,9 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
     """
     removed_ids = [int(r) for r in (removed_ids or [])]
     try:
-        row = conn.execute("SELECT id FROM sales WHERE id = %s", (sale_id,)).fetchone()
+        row = conn.execute(
+            "SELECT id, company_id, client_name FROM sales WHERE id = %s",
+            (sale_id,)).fetchone()
         if not row:
             conn.rollback()
             return None
@@ -409,6 +477,20 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
             raise ValueError("pi_number is required")
         if not items:
             raise ValueError("A sale must keep at least one product item")
+        company_id = header.get("company_id")
+        client_name = header.get("client_name")
+        if company_id is not None:
+            company = conn.execute(
+                "SELECT name FROM companies WHERE id = %s",
+                (company_id,)).fetchone()
+            if not company:
+                raise ValueError("unknown company")
+            client_name = company[0]
+        else:
+            # Absent fields keep their stored values (never NULL-wipe links).
+            company_id = row[1]
+            if client_name is None:
+                client_name = row[2]
 
         seen: List[Dict[str, Any]] = []
         for pos, it in enumerate(items):
@@ -422,6 +504,7 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
                 raise ValueError(f"items[{pos}] quantity/unit_price must be numbers")
             if qty < 0 or price < 0:
                 raise ValueError("Quantity and price cannot be negative")
+            unit = (it.get("unit") or "KG").strip().upper() or "KG"
             item_id = it.get("id")
             if item_id is not None:
                 item_id = int(item_id)
@@ -429,7 +512,7 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
                     raise ValueError(f"items[{pos}].id {item_id} does not belong to sale {sale_id}")
                 if item_id in removed_ids:
                     raise ValueError(f"item {item_id} is both updated and removed")
-            seen.append({"id": item_id, "product_name": name, "quantity": qty, "unit_price": price})
+            seen.append({"id": item_id, "product_name": name, "quantity": qty, "unit_price": price, "unit": unit})
 
         for rid in removed_ids:
             if rid not in existing_ids:
@@ -437,19 +520,20 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
 
         conn.execute(
             """UPDATE sales SET pi_number = %s, pi_date = %s, client_name = %s,
-               updated_at = %s WHERE id = %s""",
-            (pi_number, header.get("pi_date"), header.get("client_name"), _now_str(), sale_id)
+               company_id = %s, updated_at = %s WHERE id = %s""",
+            (pi_number, header.get("pi_date"), client_name, company_id,
+             _now_str(), sale_id)
         )
         for it in seen:
             if it["id"] is None:
                 conn.execute(
-                    "INSERT INTO sale_items (sale_id, product_name, quantity, unit_price) VALUES (%s, %s, %s, %s)",
-                    (sale_id, it["product_name"], it["quantity"], it["unit_price"])
+                    "INSERT INTO sale_items (sale_id, product_name, quantity, unit_price, unit) VALUES (%s, %s, %s, %s, %s)",
+                    (sale_id, it["product_name"], it["quantity"], it["unit_price"], it["unit"])
                 )
             else:
                 conn.execute(
-                    "UPDATE sale_items SET product_name = %s, quantity = %s, unit_price = %s WHERE id = %s",
-                    (it["product_name"], it["quantity"], it["unit_price"], it["id"])
+                    "UPDATE sale_items SET product_name = %s, quantity = %s, unit_price = %s, unit = %s WHERE id = %s",
+                    (it["product_name"], it["quantity"], it["unit_price"], it["unit"], it["id"])
                 )
         for rid in removed_ids:
             conn.execute("DELETE FROM sale_items WHERE id = %s", (rid,))

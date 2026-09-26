@@ -98,8 +98,11 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 | `reason_codes` | id, code (unique), description, category | Mismatch/approval reasons |
 | `approval_workflow` | id, upload_id, upload_row_id, status, reason_code, comments, reviewed_by, reviewed_at | Approval workflow |
 | `audit_logs` | id, action, entity_type, entity_id, user_id, old_value, new_value, timestamp, ip_address | Full audit trail |
-| `sales` | id, stage, pi_number, pi_date, client_name, pi_file_path, lc_number, lc_date, shipment_date, payment_date, payment_amount, created_at, updated_at | Sales header |
-| `sale_items` | id, sale_id (FK), product_name, quantity, unit_price | Sales line items |
+| `sales` | id, stage, pi_number, pi_date, client_name, pi_file_path, lc_number, lc_date, shipment_date, payment_date, payment_amount, company_id (FK), maturity_date, comments, created_at, updated_at | Sales header |
+| `sale_items` | id, sale_id (FK), product_name, quantity, unit_price, unit | Sales line items |
+| `companies` | id, name (unique), code, country, address, contact_person, swift, lc_bank | Customer master (P0) |
+| `shipments` | id, sale_id (FK), ship_date, invoice_number, invoice_date, notes | Actual shipments, partials as rows (P1) |
+| `production_runs` + `production_run_items` | run: recipe/order/batch/dates/notes; items: frozen formula + deducted qtys | Immutable batch log (P1 DDL, P3 executes) |
 | `sale_payments` | id, sale_id, payment_date, payment_amount, notes, created_at | Payment records |
 | `users` | id, username (unique), password_hash, role (admin/user), created_at | Users |
 | `sessions` | id, token_hash (unique), user_id, created_at, expires_at, revoked | Sessions |

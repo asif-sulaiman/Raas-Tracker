@@ -3,6 +3,7 @@ import { Plus, Trash2, AlertTriangle, Loader2 } from 'lucide-react';
 import Modal from '../modals/Modal';
 import Button from '../ui/Button';
 import { formatNumber, sumLineTotals, lineTotal } from '../../utils/format';
+import { COMMON_UNITS } from '../../utils/units';
 
 const inputCls =
   'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
@@ -11,6 +12,8 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
   const [piNumber, setPiNumber] = useState('');
   const [piDate, setPiDate] = useState('');
   const [clientName, setClientName] = useState('');
+  const [companies, setCompanies] = useState([]);
+  const [companyId, setCompanyId] = useState('');
   const [items, setItems] = useState([]);
   const [warnings, setWarnings] = useState([]);
   const [saving, setSaving] = useState(false);
@@ -27,11 +30,27 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
           product_name: i.product_name || '',
           quantity: i.quantity ?? 0,
           unit_price: i.unit_price ?? 0,
+          unit: (i.unit || 'KG').toUpperCase(),
         }))
       );
       setWarnings(initialData.warnings || []);
       setError(null);
       setSaving(false);
+      const preset = initialData.company_id != null ? String(initialData.company_id) : '';
+      setCompanyId(preset);
+      fetch('/api/companies')
+        .then((r) => (r.ok ? r.json() : []))
+        .then((list) => {
+          const rows = Array.isArray(list) ? list : [];
+          setCompanies(rows);
+          if (!preset && initialData.client_name) {
+            const match = rows.find(
+              (c) => c.name.toLowerCase() === initialData.client_name.trim().toLowerCase()
+            );
+            if (match) setCompanyId(String(match.id));
+          }
+        })
+        .catch(() => setCompanies([]));
     }
   }, [isOpen, initialData]);
 
@@ -46,7 +65,7 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
   const addItem = () => {
     setItems((prev) => [
       ...prev,
-      { key: `${Date.now()}-${prev.length}`, product_name: '', quantity: 0, unit_price: 0 },
+      { key: `${Date.now()}-${prev.length}`, product_name: '', quantity: 0, unit_price: 0, unit: 'KG' },
     ]);
   };
 
@@ -58,12 +77,17 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
       setError('PI number is required');
       return;
     }
+    if (companies.length > 0 && companyId === '') {
+      setError('Select a company (register it on the Companies page first)');
+      return;
+    }
     const cleanItems = items
       .filter((i) => i.product_name.trim())
       .map((i) => ({
         product_name: i.product_name.trim(),
         quantity: parseFloat(i.quantity) || 0,
         unit_price: parseFloat(i.unit_price) || 0,
+        unit: (i.unit || 'KG').toUpperCase(),
       }));
     if (cleanItems.length === 0) {
       setError('At least one product item is required');
@@ -72,7 +96,7 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
     setSaving(true);
     try {
       await onSave?.({
-        sale: { pi_number: piNumber.trim(), pi_date: piDate || null, client_name: clientName.trim() || null },
+        sale: { pi_number: piNumber.trim(), pi_date: piDate || null, client_name: clientName.trim() || null, company_id: companyId === '' ? null : Number(companyId) },
         items: cleanItems,
       });
     } catch {
@@ -123,8 +147,26 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
             <input type="date" value={piDate || ''} onChange={(e) => setPiDate(e.target.value)} className={inputCls} />
           </div>
           <div>
-            <label className="text-xs font-medium text-slate-600 dark:text-slate-300">Client Name</label>
-            <input value={clientName} onChange={(e) => setClientName(e.target.value)} className={inputCls} placeholder="Client company" />
+            <label className="text-xs font-medium text-slate-600 dark:text-slate-300">Company *</label>
+            {companies.length > 0 ? (
+              <select
+                aria-label="Company"
+                value={companyId}
+                onChange={(e) => {
+                  setCompanyId(e.target.value);
+                  const picked = companies.find((c) => String(c.id) === e.target.value);
+                  setClientName(picked ? picked.name : '');
+                }}
+                className={inputCls}
+              >
+                <option value="">Select company…</option>
+                {companies.map((c) => (
+                  <option key={c.id} value={c.id}>{c.name}</option>
+                ))}
+              </select>
+            ) : (
+              <input value={clientName} onChange={(e) => setClientName(e.target.value)} className={inputCls} placeholder="Client company" />
+            )}
           </div>
         </div>
 
@@ -144,6 +186,7 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
                 <tr>
                   <th className="px-2.5 py-2">Product</th>
                   <th className="px-2.5 py-2 w-24">Qty</th>
+                  <th className="px-2.5 py-2 w-20">Unit</th>
                   <th className="px-2.5 py-2 w-28">Unit Price ($)</th>
                   <th className="px-2.5 py-2 w-24 text-right">Total</th>
                   <th className="px-2.5 py-2 w-10"></th>
@@ -152,7 +195,7 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                 {items.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="px-2.5 py-4 text-center text-slate-400">
+                    <td colSpan={6} className="px-2.5 py-4 text-center text-slate-400">
                       No items — click “Add Row” to add products manually
                     </td>
                   </tr>
@@ -176,6 +219,18 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
                           onChange={(e) => updateItem(item.key, 'quantity', e.target.value)}
                           className={inputCls}
                         />
+                      </td>
+                      <td className="px-2.5 py-1.5">
+                        <select
+                          aria-label="Unit"
+                          value={item.unit || 'KG'}
+                          onChange={(e) => updateItem(item.key, 'unit', e.target.value)}
+                          className={inputCls}
+                        >
+                          {COMMON_UNITS.map((u) => (
+                            <option key={u} value={u}>{u}</option>
+                          ))}
+                        </select>
                       </td>
                       <td className="px-2.5 py-1.5">
                         <input
@@ -206,7 +261,7 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
               {items.length > 0 && (
                 <tfoot className="bg-slate-50 dark:bg-slate-800/60">
                   <tr>
-                    <td colSpan={3} className="px-2.5 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300">
+                    <td colSpan={4} className="px-2.5 py-2 text-right text-xs font-semibold text-slate-600 dark:text-slate-300">
                       Total Value (USD)
                     </td>
                     <td className="px-2.5 py-2 text-right text-sm font-bold text-emerald-600 dark:text-emerald-400">
