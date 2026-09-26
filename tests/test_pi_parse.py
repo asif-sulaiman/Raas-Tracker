@@ -14,10 +14,10 @@ from parse_sales import (
 
 
 RAAS_ITEMS = [
-    {"qty": "1,000", "item_no": "0201001", "desc": "SAMPLE DETERGENT\nDetergent",
-     "hs": "3402.90.10", "price": "2.65", "total": "2,500.00"},
-    {"qty": "4,000", "item_no": "0601002", "desc": "SAMPLE ENZYME T220\nEnzyme",
-     "hs": "3507.90.90", "price": "2.65", "total": "10,000.00"},
+    {"qty": "1,000", "item_no": "1001001", "desc": "SAMPLE DETERGENT\nDetergent",
+     "hs": "3402.90.10", "price": "2.50", "total": "2,500.00"},
+    {"qty": "4,000", "item_no": "1001002", "desc": "SAMPLE ENZYME T220\nEnzyme",
+     "hs": "3507.90.90", "price": "2.50", "total": "10,000.00"},
 ]
 
 
@@ -103,13 +103,13 @@ def _assert_raas(extraction):
     assert len(extraction.items) == 2
     first, second = extraction.items
     assert first.quantity == 1000.0
-    assert first.unit_price == 2.65
-    assert first.item_no == "0201001"
+    assert first.unit_price == 2.50
+    assert first.item_no == "1001001"
     assert first.line_total == 2500.0
     assert "SAMPLE DETERGENT" in first.product_name
     assert second.quantity == 4000.0
-    assert second.unit_price == 2.65
-    assert second.item_no == "0601002"
+    assert second.unit_price == 2.50
+    assert second.item_no == "1001002"
     assert second.line_total == 10000.0
     assert "SAMPLE ENZYME" in second.product_name
 
@@ -124,12 +124,12 @@ def test_raas_docx_extraction():
 def test_price_column_inferred_when_header_blank():
     from parse_sales import extract_items_from_tables
     tables = [[["Sr.", "Qty", "Item", "Description", "HS", "", "Total"],
-               ["1", "1,000", "0201001", "SAMPLE DETERGENT", "3402.90.10",
-                "2.65", "2,500.00"]]]
+               ["1", "1,000", "1001001", "SAMPLE DETERGENT", "3402.90.10",
+                "2.50", "2,500.00"]]]
     warnings: list = []
     items = extract_items_from_tables(tables, warnings)
     assert len(items) == 1
-    assert items[0].unit_price == 2.65
+    assert items[0].unit_price == 2.50
     assert any("recognized" in w for w in warnings)
 
 
@@ -141,10 +141,10 @@ def test_raas_pdf_extraction():
 
 def test_dayfirst_slash_dates():
     assert extract_pi_date("Invoice Date\n15/09/2026") == "2026-09-15"
-    # Ambiguous 05/09/2026 must read day-first (5 August), not May 8.
+    # Ambiguous 05/09/2026 must read day-first (5 September), not May 9.
     assert extract_pi_date("dated 05/09/2026") == "2026-09-05"
     # Labeled invoice date wins over an earlier stray date.
-    assert extract_pi_date("ref 2026-09-01\nInvoice Date\n15/09/2026") == "2026-09-15"
+    assert extract_pi_date("ref 2026-08-15\nInvoice Date\n15/09/2026") == "2026-09-15"
 
 
 def test_pi_number_from_invoice_label():
@@ -166,7 +166,7 @@ def test_mailing_address_client_and_dedupe():
 
 
 def test_header_row_labels_not_mistaken_for_values():
-    # Labels share one header row, values sit on the row below (real RAAS PDF).
+    # Labels share one header row, values sit on the row below (RAAS-format PDF).
     text = ("Mailing Address Delivery Address Invoice Number Invoice Date\n"
             "EXAMPLE CLIENT LTD EXAMPLE CLIENT LTD 99000001 15/09/2026")
     assert extract_client_name(text) == "EXAMPLE CLIENT LTD"
@@ -198,7 +198,7 @@ def test_delivery_address_fallback():
 def test_recover_pair_from_merged_cells():
     from parse_sales import extract_items_from_tables
     tables = [[["Sr.", "Qty", "Item", "Description", "HS", "Price", "Total"],
-               ["1", "", "0201001", "GENERIC APC Enzyme 11,000 2.65",
+               ["1", "", "1001001", "GENERIC APC Enzyme 11,000 2.65",
                 "3507.90.90", "", "29,150.00"]]]
     warnings: list = []
     items = extract_items_from_tables(tables, warnings)
@@ -223,7 +223,7 @@ def test_derive_price_from_total():
 def test_derive_qty_from_total():
     from parse_sales import extract_items_from_tables
     tables = [[["Qty", "Description", "Price", "Total"],
-               ["", "GENERIC APC Enzyme", "2.65", "2,500.00"]]]
+               ["", "GENERIC APC Enzyme", "2.50", "2,500.00"]]]
     warnings: list = []
     items = extract_items_from_tables(tables, warnings)
     assert items[0].quantity == pytest.approx(1000.0)
@@ -235,7 +235,7 @@ def test_recovery_ignores_dates_and_item_numbers():
     from parse_sales import extract_items_from_tables
     # No qty/price tokens anywhere: item no. and Sr. must not form a pair.
     tables = [[["Sr.", "Qty", "Item", "Description", "Price", "Total"],
-               ["3", "", "0601002", "ENZYME X", "", "10,000.00"]]]
+               ["3", "", "1001002", "ENZYME X", "", "10,000.00"]]]
     warnings: list = []
     items = extract_items_from_tables(tables, warnings)
     assert items[0].quantity == 0.0
@@ -246,9 +246,9 @@ def test_recovery_ignores_dates_and_item_numbers():
 def test_select_best_tables_prefers_valid():
     from parse_sales import _select_best_tables
     broken = [[["Sr.", "Qty", "Item", "Description", "Price", "Total"],
-               ["1", "", "0201001", "GENERIC APC Enzyme", "", "29,150.00"]]]
+               ["1", "", "1001001", "GENERIC APC Enzyme", "", "29,150.00"]]]
     good = [[["Sr.", "Qty", "Item", "Description", "Price", "Total"],
-             ["1", "11,000", "0201001", "GENERIC APC Enzyme", "2.65", "29,150.00"]]]
+             ["1", "11,000", "1001001", "GENERIC APC Enzyme", "2.65", "29,150.00"]]]
     tables, items, warnings = _select_best_tables([broken, good])
     assert tables == good
     assert items[0].quantity == 11000.0
@@ -264,15 +264,15 @@ def test_pdf_candidates_include_fitz_tables():
 
 
 def test_parse_number_space_thousands():
-    assert _parse_number("11 280") == 11000.0
-    assert _parse_number("15 360") == 1000.0
+    assert _parse_number("11 000") == 11000.0
+    assert _parse_number("15 000") == 15000.0
     assert _parse_number("1 11,000") is None
 
 
 def test_recover_pair_space_thousands():
     from parse_sales import extract_items_from_tables
     tables = [[["Sr.", "Qty", "Item", "Description", "HS", "Price", "Total"],
-               ["1", "", "0201001", "GENERIC APC Enzyme 11 280 2.65",
+               ["1", "", "1001001", "GENERIC APC Enzyme 11 000 2.65",
                 "3507.90.90", "", "29,150.00"]]]
     warnings: list = []
     items = extract_items_from_tables(tables, warnings)
@@ -302,7 +302,7 @@ def test_layout_block_tables_ignore_grid_and_notes():
 
 def test_parse_number_formats():
     assert _parse_number("1,000") == 1000.0
-    assert _parse_number("US$48,880.00") == 48880.0
+    assert _parse_number("US$1,234.50") == 1234.50
     assert _parse_number("2.65") == 2.65
     assert _parse_number("---") is None
     # Merged multi-number cells must not concatenate into a wrong value.

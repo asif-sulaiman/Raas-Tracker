@@ -550,7 +550,7 @@ export default function Recipes() {
               type="text"
               value={newName}
               onChange={e => setNewName(e.target.value)}
-              placeholder="e.g. Product X"
+              placeholder="e.g. Product name"
               className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             />
           </div>

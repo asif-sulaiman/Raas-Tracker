@@ -81,8 +81,8 @@ use; the current path is online hosting against Supabase (no DB container).
   update `DATABASE_URL` everywhere it is set (local shell, hosting env).
   Never commit connection strings — they live in env only.
 - **Rollback**: redeploy the previous release commit; data stays in
-  Supabase. The archived `chem_stock.backup-*.db` SQLite files plus
-  `scripts/migrate_sqlite_to_pg.py` remain the offline fallback.
+  Supabase. `scripts/migrate_sqlite_to_pg.py` remains available to
+  re-import from a SQLite export you provide.
 
 ## Tests
 

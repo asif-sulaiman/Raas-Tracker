@@ -16,7 +16,7 @@ def import_from_json(json_path: str = JSON_PATH) -> Dict[str, int]:
     
     Expected JSON structure from parse_stock.py:
     [
-        {"item_no": "1", "product_name": "PRODUCT A", "balance_last_month": 0, 
+        {"item_no": "1", "product_name": "PRODUCT A", "balance_last_month": 0,
          "last_month_unit": "KG", "balance_this_month": 0, "this_month_unit": "KG"},
         ...
     ]
