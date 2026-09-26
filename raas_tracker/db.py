@@ -353,6 +353,8 @@ def _create_tables(conn: psycopg.Connection) -> None:
         -- 'Acid' vs 'acid' duplicates that would split reconciliation.
         CREATE UNIQUE INDEX IF NOT EXISTS idx_chemicals_name_lower
             ON chemicals (lower(name));
+        CREATE INDEX IF NOT EXISTS idx_audit_chemical_time
+            ON audit_logs (entity_type, entity_id, timestamp);
         CREATE TABLE IF NOT EXISTS notification_reads (
             user_id INTEGER NOT NULL,
             notification_id INTEGER NOT NULL,

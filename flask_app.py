@@ -39,7 +39,8 @@ from chem_stock import (
     add_sale, get_all_sales, get_sale_by_id, move_sale_to_stage, advance_sale,
     update_sale_lc, update_sale_payment, add_sale_item, update_sale_item,
     delete_sale_item, delete_sale, get_sales_summary, record_sale_payment,
-    update_sale_payment_record, delete_sale_payment_record, update_sale_full
+    update_sale_payment_record, delete_sale_payment_record, update_sale_full,
+    get_stock_movements
 )
 
 # ---- AuthN/Z: sessions (humans) OR api_keys (scripts) ----
@@ -609,8 +610,9 @@ def api_update_chemical():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     name = str(data.get("name", "")).strip()
+    reason = (data.get("reason") or "").strip()[:120] or None
     conn = get_db()
-    success = update_stock(conn, name, delta)
+    success = update_stock(conn, name, delta, reason=reason)
     conn.close()
     if not success:
         return jsonify({"success": success, "name": name, "delta": delta}), 404
@@ -640,6 +642,20 @@ def api_set_reorder_level():
     if not success:
         return jsonify({"error": "Chemical not found"}), 404
     return jsonify({"success": True, "name": name, "reorder_level": level})
+
+
+@app.route("/api/chemicals/history")
+@admin_required
+def api_chemicals_history():
+    chemical_id = request.args.get("chemical_id", type=int)
+    since = request.args.get("since")
+    until = request.args.get("until")
+    limit = request.args.get("limit", 200, type=int)
+    conn = get_db()
+    rows = get_stock_movements(conn, chemical_id=chemical_id,
+                               since=since, until=until, limit=limit)
+    conn.close()
+    return jsonify(rows)
 
 
 # ==================== API: RECIPES ====================

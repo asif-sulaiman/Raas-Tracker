@@ -34,6 +34,9 @@ function installFetch({ role = 'admin', chemicals = SEED, posts = [], postHandle
     if (u.includes('/api/auth/me')) {
       return jsonResponse({ id: 1, username: role, role });
     }
+    if (u.includes('/api/chemicals/history')) {
+      return jsonResponse([]);
+    }
     if (u.includes('/api/chemicals')) {
       if (options && options.method === 'POST') {
         const body = JSON.parse(options.body);
@@ -110,6 +113,17 @@ describe('Chemicals add flow', () => {
     await waitFor(() => expect(toast.error).toHaveBeenCalled());
     expect(toast.error.mock.calls[0][0]).toMatch(/already exists/i);
     expect(screen.getByLabelText('Chemical name')).toBeTruthy();
+  });
+
+  it('sends the selected reason with stock adjustments', async () => {
+    const posts = [];
+    renderChemicals({ posts });
+    fireEvent.click(await screen.findByRole('button', { name: 'Adjust' }));
+    fireEvent.change(screen.getByLabelText('New quantity'), { target: { value: '15' } });
+    fireEvent.change(screen.getByLabelText('Reason'), { target: { value: 'Supplier delivery' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Adjustment' }));
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0]).toMatchObject({ name: 'Acid', delta: 5, reason: 'Supplier delivery' });
   });
 
   it('offers an add CTA in the empty state for admins', async () => {

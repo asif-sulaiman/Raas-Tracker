@@ -105,3 +105,55 @@ def test_reorder_anon_unauthorized():
     r = c.put(
         "/api/chemicals/reorder", json={"name": "AdjAcid", "reorder_level": 3})
     assert r.status_code == 401
+
+
+def test_update_stock_persists_reason_in_audit(admin_client, db):
+    admin_client.post("/api/chemicals", json={"name": "ReasonAcid", "qty": 10})
+    r = admin_client.post("/api/chemicals/update", json={
+        "name": "ReasonAcid", "delta": 5, "reason": "Supplier delivery"})
+    assert r.status_code == 200
+    row = db.execute(
+        "SELECT old_value, new_value, ip_address FROM audit_logs "
+        "WHERE action = 'ADJUST_STOCK' ORDER BY id DESC LIMIT 1").fetchone()
+    assert (row[0], row[1], row[2]) == ("10.0", "15.0", "Supplier delivery")
+
+
+def test_add_chemical_logs_birth_audit(admin_client, db):
+    admin_client.post(
+        "/api/chemicals", json={"name": "BirthAcid", "qty": 7, "unit": "G"})
+    row = db.execute(
+        "SELECT entity_type, new_value FROM audit_logs "
+        "WHERE action = 'ADD_CHEMICAL' ORDER BY id DESC LIMIT 1").fetchone()
+    assert row is not None
+    assert (row[0], row[1]) == ("chemical", "7.0")
+
+
+def test_chemicals_history(admin_client):
+    admin_client.post("/api/chemicals", json={"name": "HistAcid", "qty": 10})
+    admin_client.post("/api/chemicals/update", json={
+        "name": "HistAcid", "delta": -3, "reason": "Disposal / expiry"})
+    r = admin_client.get("/api/chemicals/history")
+    assert r.status_code == 200
+    rows = r.get_json()
+    kinds = {(m["action"], m["chemical"]) for m in rows}
+    assert ("ADD_CHEMICAL", "HistAcid") in kinds
+    adj = [m for m in rows
+           if m["action"] == "ADJUST_STOCK" and m["chemical"] == "HistAcid"][0]
+    assert adj["delta"] == -3
+    assert adj["purpose"] == "Disposal / expiry"
+    assert adj["actor"] == "admin"
+    chem_id = adj["chemical_id"]
+    r2 = admin_client.get(f"/api/chemicals/history?chemical_id={chem_id}")
+    assert r2.status_code == 200
+    assert r2.get_json()
+    assert all(m["chemical_id"] == chem_id for m in r2.get_json())
+
+
+def test_chemicals_history_forbidden(user_client):
+    r = user_client.get("/api/chemicals/history")
+    assert r.status_code == 403
+
+
+def test_chemicals_history_anon():
+    c = flask_app.app.test_client()
+    assert c.get("/api/chemicals/history").status_code == 401

@@ -64,6 +64,7 @@ from raas_tracker.stock import (
     delete_unit_conversion,
     get_all_chemicals,
     get_all_unit_conversions,
+    get_stock_movements,
     get_unit_conversion,
     import_from_json,
     set_reorder_level,

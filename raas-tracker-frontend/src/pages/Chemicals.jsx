@@ -14,6 +14,7 @@ import Badge from '../components/ui/Badge';
 import Button from '../components/ui/Button';
 import Modal from '../components/modals/Modal';
 import KpiCard from '../components/cards/KpiCard';
+import StockHistory from '../components/stock/StockHistory';
 import { COMMON_UNITS } from '../utils/units';
 import { formatNumber } from '../utils/format';
 import { useAuth } from '../context/AuthContext';
@@ -32,6 +33,7 @@ export default function Chemicals() {
   const [showDetailModal, setShowDetailModal] = useState(false);
   const [adjustQty, setAdjustQty] = useState('');
   const [adjustReorder, setAdjustReorder] = useState('');
+  const [adjustReason, setAdjustReason] = useState('Physical count correction');
   const [adjustSaving, setAdjustSaving] = useState(false);
   const [showAddModal, setShowAddModal] = useState(false);
   const [addName, setAddName] = useState('');
@@ -44,6 +46,7 @@ export default function Chemicals() {
     setSelectedChemical(row);
     setAdjustQty(String(row.qty ?? ''));
     setAdjustReorder(String(row.reorder_level ?? 0));
+    setAdjustReason('Physical count correction');
     setShowAdjustModal(true);
   };
 
@@ -70,7 +73,7 @@ export default function Chemicals() {
       await apiFetch('/api/chemicals/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: selectedChemical.name, delta }),
+        body: JSON.stringify({ name: selectedChemical.name, delta, reason: adjustReason }),
       });
       await apiFetch('/api/chemicals/reorder', {
         method: 'PUT',
@@ -340,6 +343,10 @@ export default function Chemicals() {
         />
       )}
 
+      {isAdmin && !loading && !error && chemicals.length > 0 && (
+        <StockHistory chemicals={chemicals} />
+      )}
+
       <Modal
         isOpen={showAddModal}
         onClose={() => { setShowAddModal(false); resetAdd(); }}
@@ -404,7 +411,7 @@ export default function Chemicals() {
             </div>
             <div>
               <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">New Quantity ({selectedChemical.unit})</label>
-              <input type="number" value={adjustQty} onChange={(e) => setAdjustQty(e.target.value)} className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500" />
+              <input aria-label="New quantity" type="number" value={adjustQty} onChange={(e) => setAdjustQty(e.target.value)} className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500" />
             </div>
             <div>
               <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Reorder Level ({selectedChemical.unit}, 0 = off)</label>
@@ -412,7 +419,7 @@ export default function Chemicals() {
             </div>
             <div>
               <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Reason</label>
-              <select className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500">
+              <select aria-label="Reason" value={adjustReason} onChange={(e) => setAdjustReason(e.target.value)} className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500">
                 <option>Physical count correction</option>
                 <option>Transfer from another warehouse</option>
                 <option>Disposal / expiry</option>

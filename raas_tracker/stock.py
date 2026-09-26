@@ -180,7 +180,8 @@ def delete_unit_conversion(conn: psycopg.Connection, from_unit: str, to_unit: st
         return False
 
 
-def update_stock(conn: psycopg.Connection, name: str, delta: float, unit: str = "KG") -> bool:
+def update_stock(conn: psycopg.Connection, name: str, delta: float, unit: str = "KG",
+                 reason: str = None) -> bool:
     """Update chemical stock by delta (positive or negative).
     
     Args:
@@ -188,6 +189,8 @@ def update_stock(conn: psycopg.Connection, name: str, delta: float, unit: str = 
         name: Chemical name
         delta: Quantity change (positive = add, negative = remove)
         unit: Unit of delta (must match chemical's unit or be 'KG')
+        reason: Free-text purpose (e.g. 'Supplier delivery'), stored on the
+            audit row's note channel (same convention as upload adjustments).
     
     Returns:
         True if updated successfully, False if chemical not found
@@ -223,7 +226,8 @@ def update_stock(conn: psycopg.Connection, name: str, delta: float, unit: str = 
     )
     conn.commit()
     log_audit_action(conn, "ADJUST_STOCK", "chemical", chem_id,
-                     old_value=str(current_qty), new_value=str(new_qty))
+                     old_value=str(current_qty), new_value=str(new_qty),
+                     ip_address=(reason or "").strip()[:120] or None)
     notify_reorder_status(conn, chem_id, chem_name, new_qty, reorder_level)
 
     logger.info("Updated '%s': %s %s -> %s %s (change: %s %s)",
@@ -264,11 +268,13 @@ def add_chemical(conn: psycopg.Connection, name: str, qty: float, unit: str = "K
         logger.warning("Chemical '%s' already exists (case-insensitive). Use update_stock instead.", name)
         return False
     try:
-        conn.execute(
-            "INSERT INTO chemicals (name, current_qty, unit, last_updated) VALUES (%s, %s, %s, %s)",
+        row = conn.execute(
+            "INSERT INTO chemicals (name, current_qty, unit, last_updated) VALUES (%s, %s, %s, %s) RETURNING id",
             (name, qty, unit, date.isoformat(date.today()))
-        )
+        ).fetchone()
         conn.commit()
+        log_audit_action(conn, "ADD_CHEMICAL", "chemical", row[0],
+                         new_value=str(qty))
         logger.info("Added chemical: %s = %s %s", name, qty, unit)
         return True
     except psycopg.IntegrityError:
@@ -278,6 +284,72 @@ def add_chemical(conn: psycopg.Connection, name: str, qty: float, unit: str = "K
             pass
         logger.warning("Chemical '%s' already exists. Use update_stock instead.", name)
         return False
+
+
+_QTY_ACTIONS = ("ADJUST_STOCK", "ADD_CHEMICAL")
+
+
+def _to_float(value) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_ip(note: str) -> bool:
+    return bool(re.match(r"^(\d{1,3}\.){3}\d{1,3}$", note or "")) or (note or "") in ("::1", "localhost")
+
+
+def get_stock_movements(conn: psycopg.Connection, chemical_id: int = None,
+                        actions=None, since: str = None, until: str = None,
+                        limit: int = 200) -> List[Dict[str, Any]]:
+    """Datewise chemical inventory movements for the stock history feed.
+
+    Reads quantity-affecting audit rows (adjustments, upload applies, adds)
+    with chemical names/units joined in. `since`/`until` are 'YYYY-MM-DD'
+    bounds on the audit timestamp. Returns newest first.
+    """
+    actions = tuple(actions) if actions else _QTY_ACTIONS
+    try:
+        limit = max(1, min(int(limit or 200), 500))
+    except (TypeError, ValueError):
+        limit = 200
+    query = (
+        "SELECT a.id, a.action, a.entity_id, c.name, c.unit, "
+        "a.old_value, a.new_value, a.user_id, a.ip_address, a.timestamp "
+        "FROM audit_logs a LEFT JOIN chemicals c ON c.id = a.entity_id "
+        "WHERE a.entity_type = 'chemical' AND a.action = ANY(%s)"
+    )
+    params: list = [list(actions)]
+    if chemical_id is not None:
+        query += " AND a.entity_id = %s"
+        params.append(chemical_id)
+    if since:
+        query += " AND substring(a.timestamp, 1, 10) >= %s"
+        params.append(since)
+    if until:
+        query += " AND substring(a.timestamp, 1, 10) <= %s"
+        params.append(until)
+    query += " ORDER BY a.timestamp DESC, a.id DESC LIMIT %s"
+    params.append(limit)
+    out = []
+    for row in conn.execute(query, params).fetchall():
+        old, new = _to_float(row[5]), _to_float(row[6])
+        delta = (new - old) if old is not None and new is not None else new
+        note = row[8] if row[8] and not _is_ip(row[8]) else None
+        if row[1] == "ADD_CHEMICAL":
+            purpose, source = "New registration", "registration"
+        elif note and re.search(r"upload", note, re.IGNORECASE):
+            purpose, source = note, "upload"
+        else:
+            purpose, source = note or "Manual adjustment", "manual"
+        out.append({
+            "id": row[0], "action": row[1], "chemical_id": row[2],
+            "chemical": row[3], "unit": row[4], "old": old, "new": new,
+            "delta": delta, "actor": row[7], "purpose": purpose,
+            "source": source, "timestamp": row[9],
+        })
+    return out
 
 
 # ============================================================

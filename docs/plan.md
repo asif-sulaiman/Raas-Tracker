@@ -54,6 +54,7 @@ Vertical slices, each independently testable.
 | M7.6 | **Vercel `public/` Assets Verify** — Ensure `favicon.svg`, `icons.svg` served with correct MIME | `vercel.json` (buildCommand), `public/` | `/favicon.svg` → `image/svg+xml` |
 | M7.7 | **OpenAPI Spec Generation** — Add `flask-openapi3` or manual `openapi.json` for client SDKs | New file `openapi.json` (generated) | Valid OpenAPI 3.0 spec for all `/api/*` |
 | M7.8 | **Add Chemical UI (admin-only)** — Add Chemical modal on `/chemicals` (name, qty, unit, reorder); Pydantic validation + 403 backstop on `POST /api/chemicals`; Adjust button + `update`/`reorder` endpoints admin-only | `flask_app.py`, `Chemicals.jsx`, `utils/units.js`, `tests/test_chemicals_api.py`, `Chemicals.test.jsx` | Admin adds/adjusts stock end-to-end; 400/403/409 covered; gate green |
+| M7.9 | **Stock History (admin-only)** — Datewise inventory movements on `/chemicals` (range calendar + Day/Week/Month tabs, chart + feed with purpose); reason persistence, `ADD_CHEMICAL` birth audit, `GET /api/chemicals/history` | `stock.py`, `db.py`, `flask_app.py`, `StockHistory.jsx`, `utils/history.js`, `Chemicals.jsx` | Movements with purpose render grouped; filters work; gate green |
 
 ---
 
