@@ -154,6 +154,7 @@ def test_chemical_name_unique_index(clean_pg):
         conn.close()
 
 
+@requires_pg
 def test_schema_fast_path_skips_ddl(clean_pg, monkeypatch):
     dbmod.get_connection(TEST_DSN).close()
 
