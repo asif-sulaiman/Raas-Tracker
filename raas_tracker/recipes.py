@@ -9,7 +9,7 @@ from datetime import date, datetime
 from typing import Optional, List, Dict, Any, Union
 
 from .db import get_connection, logger
-from .stock import get_all_chemicals
+from .stock import get_all_chemicals, update_stock
 from .uploads import csv_safe
 
 def add_recipe(conn: psycopg.Connection, name: str, total_quantity: float = 1, water_percentage: float = 0,
@@ -468,9 +468,120 @@ def generate_multi_recipe_report(conn: psycopg.Connection, recipe_selections: Li
             "status": status,
             "recipes": data["recipes"]
         })
-    
     report.sort(key=lambda x: x["chemical_name"])
     return report
+
+
+def create_production_run(
+    conn: psycopg.Connection,
+    recipe_name: str,
+    production_qty: float,
+    order_number: str = None,
+    batch_number: str = None,
+    production_date: str = None,
+    notes: str = None,
+    created_by: int = None,
+) -> dict:
+    """
+    Create a production run by snapshotting the recipe formula and deducting stock.
+
+    Args:
+        conn: Database connection
+        recipe_name: Name of the recipe to produce
+        production_qty: Quantity to produce
+        order_number: Optional order reference (e.g., sale order number)
+        batch_number: Optional batch number
+        production_date: Production date (ISO format, defaults to today)
+        notes: Optional notes
+        created_by: User ID who initiated the run
+
+    Returns:
+        Dict with run_id, shortage_report, and any warnings
+    """
+    from datetime import date as _date
+    from raas_tracker.stock import update_stock
+
+    # Validate inputs
+    if production_qty <= 0:
+        raise ValueError("production_qty must be positive")
+
+    # Get recipe
+    recipe = get_recipe_by_name(conn, recipe_name)
+    if not recipe:
+        raise ValueError(f"Recipe '{recipe_name}' not found")
+
+    # Get recipe items for snapshotting
+    items = list_recipe_items(conn, recipe_name)
+    if not items:
+        raise ValueError(f"Recipe '{recipe_name}' has no ingredients")
+
+    # Generate shortage report (preview)
+    shortage_report = generate_report(conn, recipe_name, production_qty)
+
+    # Calculate required quantities for each ingredient
+    run_items = []
+    total_required = 0
+    for item in list_recipe_items(conn, recipe_name):
+        required_qty = item["required_per_unit"] * production_qty
+        total_required += required_qty
+        run_items.append({
+            "chemical_id": item.get("chemical_id"),
+            "chemical_name": item["chemical_name"],
+            "required_qty": required_qty,
+            "unit": item["unit"],
+        })
+
+    # Create production run record
+    prod_date = production_date or _date.today().isoformat()
+    cursor = conn.execute(
+        """INSERT INTO production_runs
+           (recipe_id, order_number, batch_number, production_date, qty_produced, notes, created_by)
+           VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+        (recipe["id"], order_number, batch_number, prod_date, production_qty, notes, created_by)
+    )
+    run_id = cursor.fetchone()[0]
+
+    # Snapshot formula and deduct stock
+    for item in run_items:
+        required = item["required_qty"]
+        chem_name = item["chemical_name"]
+
+        # Deduce stock (warn-and-allow: clamps at zero)
+        success = update_stock(conn, chem_name, -item["required_qty"],
+                               reason=f"Production {batch_number or run_id} for {recipe_name}")
+        if not success:
+            logger.warning("Chemical '%s' not found for deduction", chem_name)
+            # Still record with deducted=0
+            deducted = 0
+        else:
+            deducted = item["required_qty"]
+
+        # Snapshot the formula (required and actual deducted)
+        conn.execute(
+            """INSERT INTO production_run_items
+               (run_id, chemical_id, chemical_name, required_qty, deducted_qty, unit)
+               VALUES (%s, %s, %s, %s, %s, %s)""",
+            (run_id, item.get("chemical_id"), item["chemical_name"],
+             item["required_qty"], deducted, item["unit"])
+        )
+
+    conn.commit()
+
+    # Re-generate shortage report after deduction for accuracy
+    final_shortage_report = generate_report(conn, recipe_name, production_qty)
+
+    logger.info("Created production run %s for recipe '%s' (qty: %s)",
+                run_id, recipe_name, production_qty)
+    log_audit_action(conn, "PRODUCTION_RUN_CREATE", "production_run", run_id,
+                     new_value=f"{recipe_name} x{production_qty}")
+
+    return {
+        "run_id": run_id,
+        "recipe_name": recipe_name,
+        "production_qty": production_qty,
+        "shortage_report": final_shortage_report,
+        "warnings": [item for item in final_shortage_report if item["status"] == "SHORTAGE"],
+    }
 
 
 def print_report(report_data: List[Dict[str, Any]], recipe_name: str, production_qty: float) -> None:

@@ -42,7 +42,7 @@ from chem_stock import (
     update_sale_payment_record, delete_sale_payment_record, update_sale_full,
     get_stock_movements, list_companies, create_company, update_company,
     delete_company, get_company, add_shipment, list_shipments, delete_shipment,
-    get_register_products
+    create_production_run, get_register_products
 )
 
 # ---- AuthN/Z: sessions (humans) OR api_keys (scripts) ----
@@ -1248,6 +1248,97 @@ def api_create_conversion():
         return jsonify({"error": "Could not save conversion"}), 500
     return jsonify({"success": True, "from_unit": from_unit.upper(),
                     "to_unit": to_unit.upper(), "factor": factor})
+
+
+# ==================== API: PRODUCTION RUNS ====================
+class ProductionRunCreateIn(_StrippedModel):
+    production_qty: float = Field(gt=0)
+    order_number: str | None = None
+    batch_number: str | None = None
+    production_date: str | None = None
+    notes: str | None = None
+
+
+@app.route("/api/recipes/<name>/produce", methods=["POST"])
+@admin_required
+def api_produce_recipe(name):
+    try:
+        payload = ProductionRunCreateIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        result = create_production_run(
+            conn, name, payload.production_qty,
+            order_number=payload.order_number,
+            batch_number=payload.batch_number,
+            production_date=payload.production_date,
+            notes=payload.notes,
+            created_by=getattr(g, "current_identity", {}).get("id"),
+        )
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
+    except Exception:
+        conn.close()
+        app.logger.exception("Production run failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    if not result:
+        return jsonify({"error": "Recipe not found"}), 404
+    return jsonify(result), 201
+
+
+@app.route("/api/recipes/<name>/runs")
+def api_list_production_runs(name):
+    conn = get_db()
+    # Verify recipe exists
+    recipe = get_recipe_by_name(conn, name)
+    if not recipe:
+        conn.close()
+        return jsonify({"error": "Recipe not found"}), 404
+    runs = conn.execute(
+        """SELECT id, order_number, batch_number, production_date, qty_produced, notes, created_at
+           FROM production_runs WHERE recipe_id = %s ORDER BY created_at DESC""",
+        (recipe["id"],)
+    ).fetchall()
+    conn.close()
+    return jsonify([
+        {"id": r[0], "order_number": r[1], "batch_number": r[2],
+         "production_date": r[3], "qty_produced": r[3], "notes": r[5], "created_at": r[6]}
+        for r in runs
+    ])
+
+
+@app.route("/api/recipes/<name>/runs/<int:run_id>")
+def api_get_production_run(name, run_id):
+    conn = get_db()
+    recipe = get_recipe_by_name(conn, name)
+    if not recipe:
+        conn.close()
+        return jsonify({"error": "Recipe not found"}), 404
+    run = conn.execute(
+        """SELECT id, order_number, batch_number, production_date, qty_produced, notes, created_at
+           FROM production_runs WHERE id = %s AND recipe_id = %s""",
+        (run_id, recipe["id"])
+    ).fetchone()
+    if not run:
+        conn.close()
+        return jsonify({"error": "Run not found"}), 404
+    items = conn.execute(
+        """SELECT chemical_name, required_qty, deducted_qty, unit
+           FROM production_run_items WHERE run_id = %s""",
+        (run_id,)
+    ).fetchall()
+    conn.close()
+    return jsonify({
+        "id": run[0], "order_number": run[1], "batch_number": run[1],
+        "production_date": run[2], "qty_produced": run[2], "notes": run[4], "created_at": run[5],
+        "items": [
+            {"chemical_name": i[0], "required_qty": i[1], "deducted_qty": i[2], "unit": i[3]}
+            for i in items
+        ]
+    })
 
 
 # ==================== API: SALES TRACKER ====================
