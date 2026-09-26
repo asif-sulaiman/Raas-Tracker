@@ -240,12 +240,14 @@ export default function Chemicals() {
       sortable: false,
       render: (_val, row) => (
         <div className="flex items-center gap-1.5">
-          <button
-            onClick={(e) => { e.stopPropagation(); openAdjust(row); }}
-            className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-semibold bg-blue-50 text-blue-700 hover:bg-blue-100 dark:bg-blue-950/40 dark:text-blue-400 dark:hover:bg-blue-900/60 transition-colors cursor-pointer"
-          >
-            <Settings className="h-3 w-3" /> Adjust
-          </button>
+          {isAdmin && (
+            <button
+              onClick={(e) => { e.stopPropagation(); openAdjust(row); }}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-semibold bg-blue-50 text-blue-700 hover:bg-blue-100 dark:bg-blue-950/40 dark:text-blue-400 dark:hover:bg-blue-900/60 transition-colors cursor-pointer"
+            >
+              <Settings className="h-3 w-3" /> Adjust
+            </button>
+          )}
           <button
             onClick={(e) => { e.stopPropagation(); setSelectedChemical(row); setShowDetailModal(true); }}
             className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-semibold bg-slate-100 text-slate-700 hover:bg-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700 transition-colors cursor-pointer"

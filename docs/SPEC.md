@@ -364,8 +364,8 @@ CREATE TABLE app_settings (
 |---|---|---|---|
 | GET | `/api/chemicals` | Session/Key | List all |
 | POST | `/api/chemicals` | Admin | Create (name, qty, unit, reorder_level); 400 validation, 409 duplicate |
-| POST | `/api/chemicals/update` | Session/Key | Delta stock update |
-| PUT | `/api/chemicals/reorder` | Session/Key | Set reorder level |
+| POST | `/api/chemicals/update` | Admin | Delta stock update |
+| PUT | `/api/chemicals/reorder` | Admin | Set reorder level |
 
 ### Recipes
 | Method | Path | Auth | Description |

@@ -69,6 +69,17 @@ describe('Chemicals add flow', () => {
     expect(screen.queryByRole('button', { name: 'Add Chemical' })).toBeNull();
   });
 
+  it('shows the Adjust button for admins only', async () => {
+    renderChemicals({ role: 'admin' });
+    expect(await screen.findByRole('button', { name: 'Adjust' })).toBeTruthy();
+    cleanup();
+
+    renderChemicals({ role: 'user' });
+    await screen.findByText('Acid');
+    expect(screen.queryByRole('button', { name: 'Adjust' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Info' })).toBeTruthy();
+  });
+
   it('opens the add modal and posts the new chemical', async () => {
     const posts = [];
     renderChemicals({ posts });

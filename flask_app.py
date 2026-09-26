@@ -75,6 +75,14 @@ _PUBLIC_API = {
 _ADMIN_PATHS = ("/api/users", "/api/keys")
 
 
+def _require_admin():
+    """403 unless the caller is a human admin. Returns None when allowed."""
+    ident = getattr(g, "current_identity", None) or {}
+    if ident.get("type") != "human" or ident.get("role") != "admin":
+        return jsonify({"error": "admin required"}), 403
+    return None
+
+
 def _key_rate_ok(key_id: int) -> bool:
     """DB-backed per-key throttle (survives restarts, works across processes)."""
     conn = get_db()
@@ -565,9 +573,9 @@ class ChemicalCreateIn(_StrippedModel):
 
 @app.route("/api/chemicals", methods=["POST"])
 def api_add_chemical():
-    ident = getattr(g, "current_identity", None) or {}
-    if ident.get("type") != "human" or ident.get("role") != "admin":
-        return jsonify({"error": "admin required"}), 403
+    denied = _require_admin()
+    if denied:
+        return denied
     try:
         payload = ChemicalCreateIn.model_validate(request.get_json() or {})
     except ValidationError as e:
@@ -592,6 +600,9 @@ def api_add_chemical():
 
 @app.route("/api/chemicals/update", methods=["POST"])
 def api_update_chemical():
+    denied = _require_admin()
+    if denied:
+        return denied
     data = request.get_json() or {}
     try:
         delta = _req_float(data, "delta", 0)
@@ -608,6 +619,9 @@ def api_update_chemical():
 
 @app.route("/api/chemicals/reorder", methods=["PUT"])
 def api_set_reorder_level():
+    denied = _require_admin()
+    if denied:
+        return denied
     data = request.get_json() or {}
     name = str(data.get("name", "")).strip()
     if not name:

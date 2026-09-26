@@ -51,3 +51,57 @@ def test_add_chemical_validation_400(admin_client):
         "/api/chemicals", json={"name": "NegR", "reorder_level": -2})
     assert r.status_code == 400
     assert r.get_json()["details"]
+
+
+def _seed_chem(admin_client, name="AdjAcid"):
+    r = admin_client.post(
+        "/api/chemicals", json={"name": name, "qty": 10, "unit": "KG"})
+    assert r.status_code == 200
+
+
+def test_update_chemical_admin_ok(admin_client, db):
+    _seed_chem(admin_client)
+    r = admin_client.post(
+        "/api/chemicals/update", json={"name": "AdjAcid", "delta": 5})
+    assert r.status_code == 200
+    assert r.get_json()["success"] is True
+    row = db.execute("SELECT current_qty FROM chemicals WHERE name = %s",
+                     ("AdjAcid",)).fetchone()
+    assert row[0] == 15
+
+
+def test_update_chemical_user_forbidden(user_client):
+    r = user_client.post(
+        "/api/chemicals/update", json={"name": "AdjAcid", "delta": 5})
+    assert r.status_code == 403
+    assert r.get_json()["error"] == "admin required"
+
+
+def test_update_chemical_anon_unauthorized():
+    c = flask_app.app.test_client()
+    r = c.post("/api/chemicals/update", json={"name": "AdjAcid", "delta": 5})
+    assert r.status_code == 401
+
+
+def test_reorder_admin_ok(admin_client, db):
+    _seed_chem(admin_client)
+    r = admin_client.put(
+        "/api/chemicals/reorder", json={"name": "AdjAcid", "reorder_level": 3})
+    assert r.status_code == 200
+    row = db.execute("SELECT reorder_level FROM chemicals WHERE name = %s",
+                     ("AdjAcid",)).fetchone()
+    assert row[0] == 3
+
+
+def test_reorder_user_forbidden(user_client):
+    r = user_client.put(
+        "/api/chemicals/reorder", json={"name": "AdjAcid", "reorder_level": 3})
+    assert r.status_code == 403
+    assert r.get_json()["error"] == "admin required"
+
+
+def test_reorder_anon_unauthorized():
+    c = flask_app.app.test_client()
+    r = c.put(
+        "/api/chemicals/reorder", json={"name": "AdjAcid", "reorder_level": 3})
+    assert r.status_code == 401
