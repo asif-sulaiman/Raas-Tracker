@@ -32,9 +32,10 @@ export default function Chemicals() {
   const [showAdjustModal, setShowAdjustModal] = useState(false);
   const [showDetailModal, setShowDetailModal] = useState(false);
   const [adjustQty, setAdjustQty] = useState('');
-  const [adjustReorder, setAdjustReorder] = useState('');
   const [adjustReason, setAdjustReason] = useState('Physical count correction');
   const [adjustSaving, setAdjustSaving] = useState(false);
+  const [alarmValue, setAlarmValue] = useState('');
+  const [alarmSaving, setAlarmSaving] = useState(false);
   const [showAddModal, setShowAddModal] = useState(false);
   const [addName, setAddName] = useState('');
   const [addQty, setAddQty] = useState('');
@@ -45,9 +46,14 @@ export default function Chemicals() {
   const openAdjust = (row) => {
     setSelectedChemical(row);
     setAdjustQty(String(row.qty ?? ''));
-    setAdjustReorder(String(row.reorder_level ?? 0));
     setAdjustReason('Physical count correction');
     setShowAdjustModal(true);
+  };
+
+  const openInfo = (row) => {
+    setSelectedChemical(row);
+    setAlarmValue(String(row.reorder_level ?? 0));
+    setShowDetailModal(true);
   };
 
   const handleSaveAdjustment = async () => {
@@ -63,22 +69,12 @@ export default function Chemicals() {
       setSelectedChemical(null);
       return;
     }
-    const reorder = parseFloat(adjustReorder);
-    if (Number.isNaN(reorder) || reorder < 0) {
-      toast.error('Reorder level must be 0 or greater');
-      return;
-    }
     setAdjustSaving(true);
     try {
       await apiFetch('/api/chemicals/update', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: selectedChemical.name, delta, reason: adjustReason }),
-      });
-      await apiFetch('/api/chemicals/reorder', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: selectedChemical.name, reorder_level: reorder }),
       });
       toast.success(`Stock updated for ${selectedChemical.name}`);
       setShowAdjustModal(false);
@@ -116,7 +112,7 @@ export default function Chemicals() {
     }
     const reorder = addReorder === '' ? 0 : parseFloat(addReorder);
     if (Number.isNaN(reorder) || reorder < 0) {
-      toast.error('Reorder level must be 0 or greater');
+      toast.error('Low-stock alarm must be 0 or greater');
       return;
     }
     setAddSaving(true);
@@ -135,6 +131,31 @@ export default function Chemicals() {
       toast.error(err.message || 'Could not add chemical');
     } finally {
       setAddSaving(false);
+    }
+  };
+
+  const handleSaveAlarm = async () => {
+    if (!selectedChemical) return;
+    const level = alarmValue === '' ? 0 : parseFloat(alarmValue);
+    if (Number.isNaN(level) || level < 0) {
+      toast.error('Low-stock alarm must be 0 or greater');
+      return;
+    }
+    setAlarmSaving(true);
+    try {
+      await apiFetch('/api/chemicals/reorder', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: selectedChemical.name, reorder_level: level }),
+      });
+      toast.success(`Low-stock alarm set for ${selectedChemical.name}`);
+      setShowDetailModal(false);
+      setSelectedChemical(null);
+      loadChemicals();
+    } catch (err) {
+      toast.error(err.message || 'Could not save alarm');
+    } finally {
+      setAlarmSaving(false);
     }
   };
 
@@ -252,7 +273,7 @@ export default function Chemicals() {
             </button>
           )}
           <button
-            onClick={(e) => { e.stopPropagation(); setSelectedChemical(row); setShowDetailModal(true); }}
+            onClick={(e) => { e.stopPropagation(); openInfo(row); }}
             className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-semibold bg-slate-100 text-slate-700 hover:bg-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700 transition-colors cursor-pointer"
           >
             <Info className="h-3 w-3" /> Info
@@ -379,8 +400,8 @@ export default function Chemicals() {
             </div>
           </div>
           <div>
-            <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Reorder level (0 = off)</label>
-            <input aria-label="Reorder level" type="number" min="0" value={addReorder} onChange={(e) => setAddReorder(e.target.value)} placeholder="0" className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500" />
+              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Low-stock alarm (0 = off)</label>
+              <input aria-label="Low-stock alarm" type="number" min="0" value={addReorder} onChange={(e) => setAddReorder(e.target.value)} placeholder="0" className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500" />
           </div>
         </div>
       </Modal>
@@ -414,10 +435,6 @@ export default function Chemicals() {
               <input aria-label="New quantity" type="number" value={adjustQty} onChange={(e) => setAdjustQty(e.target.value)} className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500" />
             </div>
             <div>
-              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Reorder Level ({selectedChemical.unit}, 0 = off)</label>
-              <input type="number" min="0" value={adjustReorder} onChange={(e) => setAdjustReorder(e.target.value)} className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500" />
-            </div>
-            <div>
               <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Reason</label>
               <select aria-label="Reason" value={adjustReason} onChange={(e) => setAdjustReason(e.target.value)} className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500">
                 <option>Physical count correction</option>
@@ -437,13 +454,13 @@ export default function Chemicals() {
         subtitle={selectedChemical?.name || ''}
       >
         {selectedChemical && (
+          <>
           <div className="grid grid-cols-2 gap-3 text-xs">
             {[
               ['ID', selectedChemical.id],
               ['Unit', selectedChemical.unit],
               ['Balance Last Month', `${formatNumber(selectedChemical.balance_last_month)} ${selectedChemical.unit}`],
               ['Balance This Month', `${formatNumber(selectedChemical.qty)} ${selectedChemical.unit}`],
-              ['Reorder Level', `${formatNumber(selectedChemical.reorder_level || 0)} ${selectedChemical.unit}`],
               ['Status', getStockStatus(selectedChemical) === 'matched' ? 'Reconciled' : getStockStatus(selectedChemical) === 'low' ? 'Low Stock' : 'Out of Stock'],
               ['Last Updated', selectedChemical.last_updated]
             ].map(([label, value]) => (
@@ -453,6 +470,19 @@ export default function Chemicals() {
               </div>
             ))}
           </div>
+          <div className="mt-3 rounded-lg border border-slate-200 dark:border-slate-700 p-3">
+            <span className="text-slate-500 dark:text-slate-400 block mb-1.5 text-xs">Low-stock alarm</span>
+            {isAdmin ? (
+              <div className="flex items-center gap-2">
+                <input aria-label="Low-stock alarm" type="number" min="0" value={alarmValue} onChange={(e) => setAlarmValue(e.target.value)} placeholder="0" className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500" />
+                <span className="text-xs text-slate-500 dark:text-slate-400 shrink-0">{selectedChemical.unit}</span>
+                <Button variant="primary" size="sm" onClick={handleSaveAlarm} loading={alarmSaving} disabled={alarmSaving}>Save</Button>
+              </div>
+            ) : (
+              <span className="font-semibold text-slate-800 dark:text-white text-xs">{formatNumber(selectedChemical.reorder_level || 0)} {selectedChemical.unit}</span>
+            )}
+          </div>
+          </>
         )}
       </Modal>
     </div>

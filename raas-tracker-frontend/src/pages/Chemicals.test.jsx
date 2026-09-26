@@ -28,7 +28,7 @@ function jsonResponse(data, ok = true, status = 200) {
   return { ok, status, json: async () => data, headers: { get: () => null } };
 }
 
-function installFetch({ role = 'admin', chemicals = SEED, posts = [], postHandler } = {}) {
+function installFetch({ role = 'admin', chemicals = SEED, posts = [], puts = [], postHandler } = {}) {
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
     const u = String(url);
     if (u.includes('/api/auth/me')) {
@@ -43,6 +43,10 @@ function installFetch({ role = 'admin', chemicals = SEED, posts = [], postHandle
         posts.push(body);
         if (postHandler) return postHandler(body);
         return jsonResponse({ success: true, name: body.name });
+      }
+      if (options && options.method === 'PUT' && u.includes('/reorder')) {
+        puts.push(JSON.parse(options.body));
+        return jsonResponse({ success: true });
       }
       return jsonResponse(chemicals);
     }
@@ -91,7 +95,7 @@ describe('Chemicals add flow', () => {
     fireEvent.change(screen.getByLabelText('Chemical name'), { target: { value: 'NewAcid' } });
     fireEvent.change(screen.getByLabelText('Opening quantity'), { target: { value: '10' } });
     fireEvent.change(screen.getByLabelText('Unit'), { target: { value: 'L' } });
-    fireEvent.change(screen.getByLabelText('Reorder level'), { target: { value: '2' } });
+    fireEvent.change(screen.getByLabelText('Low-stock alarm'), { target: { value: '2' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 
     await waitFor(() => expect(posts).toHaveLength(1));
@@ -124,6 +128,33 @@ describe('Chemicals add flow', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save Adjustment' }));
     await waitFor(() => expect(posts).toHaveLength(1));
     expect(posts[0]).toMatchObject({ name: 'Acid', delta: 5, reason: 'Supplier delivery' });
+  });
+
+  it('lets admins set the alarm from the Info modal', async () => {
+    const puts = [];
+    renderChemicals({ puts });
+    fireEvent.click(await screen.findByRole('button', { name: 'Info' }));
+    const input = screen.getByLabelText('Low-stock alarm');
+    expect(input.value).toBe('2');
+    fireEvent.change(input, { target: { value: '5' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(puts).toHaveLength(1));
+    expect(puts[0]).toMatchObject({ name: 'Acid', reorder_level: 5 });
+    expect(toast.success).toHaveBeenCalled();
+  });
+
+  it('shows the alarm read-only to non-admins', async () => {
+    renderChemicals({ role: 'user' });
+    fireEvent.click(await screen.findByRole('button', { name: 'Info' }));
+    expect(screen.queryByLabelText('Low-stock alarm')).toBeNull();
+    expect(screen.getByText('Low-stock alarm')).toBeTruthy();
+  });
+
+  it('adjust modal no longer edits the alarm', async () => {
+    renderChemicals({ role: 'admin' });
+    fireEvent.click(await screen.findByRole('button', { name: 'Adjust' }));
+    expect(screen.queryByLabelText('Low-stock alarm')).toBeNull();
+    expect(screen.queryByText(/reorder/i)).toBeNull();
   });
 
   it('offers an add CTA in the empty state for admins', async () => {

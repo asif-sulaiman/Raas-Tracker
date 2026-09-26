@@ -157,3 +157,31 @@ def test_chemicals_history_forbidden(user_client):
 def test_chemicals_history_anon():
     c = flask_app.app.test_client()
     assert c.get("/api/chemicals/history").status_code == 401
+
+
+def _latest_stock_notification(db):
+    return db.execute(
+        "SELECT type, severity FROM notifications "
+        "WHERE entity_type = 'chemical' ORDER BY id DESC LIMIT 1").fetchone()
+
+
+def test_add_chemical_notifies_when_below_alarm(admin_client, db):
+    admin_client.post("/api/chemicals",
+                      json={"name": "AlarmAcid", "qty": 2, "reorder_level": 5})
+    row = _latest_stock_notification(db)
+    assert row is not None
+    assert (row[0], row[1]) == ("stock_low", "warning")
+
+
+def test_add_chemical_notifies_when_zero(admin_client, db):
+    admin_client.post("/api/chemicals", json={"name": "ZeroAcid", "qty": 0})
+    row = _latest_stock_notification(db)
+    assert row is not None
+    assert (row[0], row[1]) == ("stock_out", "critical")
+
+
+def test_add_chemical_no_notify_when_healthy(admin_client, db):
+    admin_client.post("/api/chemicals",
+                      json={"name": "OkAcid", "qty": 50, "reorder_level": 5})
+    assert db.execute("SELECT COUNT(*) FROM notifications "
+                      "WHERE entity_type = 'chemical'").fetchone()[0] == 0

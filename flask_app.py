@@ -56,7 +56,8 @@ from chem_stock import (get_session_user, validate_api_key,
                         create_first_admin, ensure_setup_token, check_setup_token,
                         log_audit_action, check_api_key_rate_limit, record_api_key_hit)
 from raas_tracker.notifications import (
-    list_notifications_for, unread_count, mark_read, mark_read_all_for
+    list_notifications_for, unread_count, mark_read, mark_read_all_for,
+    notify_reorder_status
 )
 
 SESSION_COOKIE = "raas_session"
@@ -595,6 +596,14 @@ def api_add_chemical():
         except ValueError as e:
             conn.close()
             return jsonify({"error": str(e)}), 400
+    # New chemicals born at/below their alarm (or at zero with none set)
+    # would otherwise stay silent: raise the buy alert explicitly.
+    # Deduped against the set_reorder_level call above when one fired.
+    row = conn.execute("SELECT id FROM chemicals WHERE name = %s",
+                       (name,)).fetchone()
+    if row:
+        notify_reorder_status(conn, row[0], name, payload.qty,
+                              payload.reorder_level)
     conn.close()
     return jsonify({"success": True, "name": name})
 
