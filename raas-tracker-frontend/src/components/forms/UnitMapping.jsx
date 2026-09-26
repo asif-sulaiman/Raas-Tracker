@@ -3,9 +3,8 @@ import { AlertTriangle, ArrowRight, CheckCircle2, Loader2 } from 'lucide-react';
 import Button from '../ui/Button';
 import { useAuth } from '../../context/AuthContext';
 import { formatNumber } from '../../utils/format';
+import { COMMON_UNITS } from '../../utils/units';
 import { toast } from 'sonner';
-
-const COMMON_UNITS = ['KG', 'G', 'L', 'ML', 'PCS', 'DRUM', 'BOTTLE', 'BOX'];
 
 function parseFactor(raw) {
   const v = parseFloat(raw);

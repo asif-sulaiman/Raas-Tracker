@@ -511,6 +511,13 @@ def _req_float(data, field, default=0):
         raise ValueError(f"{field} must be a number")
 
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+
+class _StrippedModel(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+
 
 def get_db():
     if not os.getenv("DATABASE_URL"):
@@ -549,21 +556,38 @@ def api_chemicals():
     return jsonify(chemicals)
 
 
+class ChemicalCreateIn(_StrippedModel):
+    name: str = Field(min_length=1)
+    qty: float = Field(default=0, ge=0)
+    unit: str = Field(default="KG", min_length=1)
+    reorder_level: float = Field(default=0, ge=0)
+
+
 @app.route("/api/chemicals", methods=["POST"])
 def api_add_chemical():
-    data = request.get_json() or {}
+    ident = getattr(g, "current_identity", None) or {}
+    if ident.get("type") != "human" or ident.get("role") != "admin":
+        return jsonify({"error": "admin required"}), 403
     try:
-        qty = _req_float(data, "qty", 0)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    name = str(data.get("name", "")).strip()
-    unit = str(data.get("unit", "KG"))
+        payload = ChemicalCreateIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    name = payload.name
+    unit = payload.unit.strip().upper()
     conn = get_db()
-    success = add_chemical(conn, name, qty, unit)
-    conn.close()
+    success = add_chemical(conn, name, payload.qty, unit)
     if not success:
-        return jsonify({"success": success, "name": name}), 409
-    return jsonify({"success": success, "name": name})
+        conn.close()
+        return jsonify({"success": False, "name": name,
+                        "error": f"Chemical '{name}' already exists"}), 409
+    if payload.reorder_level:
+        try:
+            set_reorder_level(conn, name, payload.reorder_level)
+        except ValueError as e:
+            conn.close()
+            return jsonify({"error": str(e)}), 400
+    conn.close()
+    return jsonify({"success": True, "name": name})
 
 
 @app.route("/api/chemicals/update", methods=["POST"])
@@ -1054,11 +1078,6 @@ def api_create_conversion():
 
 
 # ==================== API: SALES TRACKER ====================
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
-
-
-class _StrippedModel(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
 
 
 class SaleItemIn(_StrippedModel):

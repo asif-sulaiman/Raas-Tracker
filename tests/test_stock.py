@@ -71,7 +71,10 @@ def test_add_duplicate_chemical_409(admin_client):
                              json={"name": "Dup", "qty": 1, "unit": "KG"}).status_code == 200
     r = admin_client.post("/api/chemicals", json={"name": "Dup", "qty": 1, "unit": "KG"})
     assert r.status_code == 409
-    assert r.get_json() == {"success": False, "name": "Dup"}
+    body = r.get_json()
+    assert body["success"] is False
+    assert body["name"] == "Dup"
+    assert "already exists" in body["error"]
 
 
 def test_update_missing_chemical_404(admin_client):

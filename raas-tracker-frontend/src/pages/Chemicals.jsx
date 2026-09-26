@@ -5,7 +5,8 @@ import {
   Settings,
   Info,
   AlertTriangle,
-  TrendingDown
+  TrendingDown,
+  Plus
 } from 'lucide-react';
 import clsx from 'clsx';
 import DataTable from '../components/tables/DataTable';
@@ -13,6 +14,7 @@ import Badge from '../components/ui/Badge';
 import Button from '../components/ui/Button';
 import Modal from '../components/modals/Modal';
 import KpiCard from '../components/cards/KpiCard';
+import { COMMON_UNITS } from '../utils/units';
 import { formatNumber } from '../utils/format';
 import { useAuth } from '../context/AuthContext';
 import { toast } from 'sonner';
@@ -20,7 +22,8 @@ import { toast } from 'sonner';
 import { stockStatus } from '../utils/stock';
 
 export default function Chemicals() {
-  const { apiFetch } = useAuth();
+  const { apiFetch, user } = useAuth();
+  const isAdmin = user?.role === 'admin';
   const [chemicals, setChemicals] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -30,6 +33,12 @@ export default function Chemicals() {
   const [adjustQty, setAdjustQty] = useState('');
   const [adjustReorder, setAdjustReorder] = useState('');
   const [adjustSaving, setAdjustSaving] = useState(false);
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [addName, setAddName] = useState('');
+  const [addQty, setAddQty] = useState('');
+  const [addUnit, setAddUnit] = useState('KG');
+  const [addReorder, setAddReorder] = useState('');
+  const [addSaving, setAddSaving] = useState(false);
 
   const openAdjust = (row) => {
     setSelectedChemical(row);
@@ -76,6 +85,53 @@ export default function Chemicals() {
       toast.error(err.message || 'Could not save adjustment');
     } finally {
       setAdjustSaving(false);
+    }
+  };
+
+  const resetAdd = () => {
+    setAddName('');
+    setAddQty('');
+    setAddUnit('KG');
+    setAddReorder('');
+  };
+
+  const openAdd = () => {
+    resetAdd();
+    setShowAddModal(true);
+  };
+
+  const handleSaveNew = async () => {
+    const name = addName.trim();
+    if (!name) {
+      toast.error('Enter a chemical name');
+      return;
+    }
+    const qty = addQty === '' ? 0 : parseFloat(addQty);
+    if (Number.isNaN(qty) || qty < 0) {
+      toast.error('Opening quantity must be 0 or greater');
+      return;
+    }
+    const reorder = addReorder === '' ? 0 : parseFloat(addReorder);
+    if (Number.isNaN(reorder) || reorder < 0) {
+      toast.error('Reorder level must be 0 or greater');
+      return;
+    }
+    setAddSaving(true);
+    try {
+      const res = await apiFetch('/api/chemicals', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, qty, unit: addUnit, reorder_level: reorder }),
+      });
+      const data = await res.json().catch(() => ({}));
+      toast.success(`Added ${data.name || name} to stock`);
+      setShowAddModal(false);
+      resetAdd();
+      loadChemicals();
+    } catch (err) {
+      toast.error(err.message || 'Could not add chemical');
+    } finally {
+      setAddSaving(false);
     }
   };
 
@@ -209,6 +265,9 @@ export default function Chemicals() {
           <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">Complete catalog of all registered chemicals</p>
         </div>
         <div className="flex items-center gap-2">
+          {isAdmin && !loading && !error && (
+            <Button variant="primary" size="sm" icon={Plus} onClick={openAdd}>Add Chemical</Button>
+          )}
           {loading || error ? (
             <Badge variant="default">Unavailable</Badge>
           ) : (
@@ -259,6 +318,11 @@ export default function Chemicals() {
           </div>
           <p className="text-sm font-semibold text-slate-800 dark:text-white">No chemicals registered yet</p>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">Upload a monthly stock file or add chemicals to get started.</p>
+          {isAdmin && (
+            <Button variant="primary" size="sm" icon={Plus} onClick={openAdd} className="mt-4">
+              Add your first chemical
+            </Button>
+          )}
         </div>
       ) : (
         <DataTable
@@ -273,6 +337,44 @@ export default function Chemicals() {
           initialPageSize={15}
         />
       )}
+
+      <Modal
+        isOpen={showAddModal}
+        onClose={() => { setShowAddModal(false); resetAdd(); }}
+        title="Add Chemical"
+        subtitle="Register a new chemical in stock"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => { setShowAddModal(false); resetAdd(); }} disabled={addSaving}>Cancel</Button>
+            <Button variant="primary" onClick={handleSaveNew} loading={addSaving} disabled={addSaving}>Save</Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <div>
+            <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Chemical name</label>
+            <input aria-label="Chemical name" type="text" value={addName} onChange={(e) => setAddName(e.target.value)} placeholder="e.g. Citric Acid" className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500" />
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Opening quantity</label>
+              <input aria-label="Opening quantity" type="number" min="0" value={addQty} onChange={(e) => setAddQty(e.target.value)} placeholder="0" className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500" />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Unit</label>
+              <select aria-label="Unit" value={addUnit} onChange={(e) => setAddUnit(e.target.value)} className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500">
+                {COMMON_UNITS.map((u) => (
+                  <option key={u} value={u}>{u}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Reorder level (0 = off)</label>
+            <input aria-label="Reorder level" type="number" min="0" value={addReorder} onChange={(e) => setAddReorder(e.target.value)} placeholder="0" className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500" />
+          </div>
+        </div>
+      </Modal>
 
       <Modal
         isOpen={showAdjustModal}
