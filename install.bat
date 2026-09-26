@@ -19,8 +19,6 @@ if not exist "C:\ChemicalStockTracker" mkdir "C:\ChemicalStockTracker"
 
 echo [2/4] Copying files...
 copy /Y "%~dp0dist\ChemicalStockTracker.exe" "C:\ChemicalStockTracker\" >nul
-copy /Y "%~dp0chem_stock.db" "C:\ChemicalStockTracker\" >nul
-copy /Y "%~dp0stock_data.json" "C:\ChemicalStockTracker\" >nul
 
 echo [3/4] Creating launcher...
 (
