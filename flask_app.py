@@ -526,6 +526,13 @@ def serve_root():
 def serve_static(path):
     if path and os.path.exists(os.path.join(REACT_BUILD_DIR, path)):
         return send_from_directory(REACT_BUILD_DIR, path)
+    # Missing file with an extension (e.g. a stale /assets/*.js bundle):
+    # fail loudly with 404. Serving index.html here makes the browser
+    # execute HTML as JS (MIME error) and leaves the SPA permanently blank.
+    # Returned directly (not via abort) so the 404 error handler — which
+    # maps unknown routes to index.html — does not convert it back.
+    if "." in os.path.basename(path or ""):
+        return jsonify({"error": "not found"}), 404
     return send_from_directory(REACT_BUILD_DIR, "index.html")
 
 
