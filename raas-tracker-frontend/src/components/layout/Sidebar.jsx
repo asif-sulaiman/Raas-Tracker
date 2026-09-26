@@ -8,6 +8,7 @@ import {
   ClipboardList,
   DollarSign,
   Users,
+  Building2,
   Menu,
   X
 } from 'lucide-react';
@@ -23,6 +24,7 @@ const navItems = [
   { path: '/audit-logs', label: 'Audit Logs', icon: ClipboardList },
   { path: '/sales', label: 'Sales Pipeline', icon: DollarSign },
   { path: '/users', label: 'Users & Keys', icon: Users, adminOnly: true },
+  { path: '/companies', label: 'Companies', icon: Building2, adminOnly: true },
 ];
 
 export default function Sidebar() {

@@ -57,6 +57,14 @@ from raas_tracker.auth import (
     verify_user,
 )
 
+from raas_tracker.companies import (
+    backfill_company_links,
+    create_company,
+    delete_company,
+    get_company,
+    list_companies,
+    update_company,
+)
 from raas_tracker.stock import (
     add_chemical,
     add_unit_conversion,

@@ -59,6 +59,24 @@ Vertical slices, each independently testable.
 
 ---
 
+## 🚀 Phase M9: Sales–Production–Live Epic (Current)
+
+Locked: USD only · admin-only financials/history/mutations · partial shipments real ·
+warn-and-allow shortages · manual master recipes (no auto-create) · frozen batch
+snapshots · companies master · single shipment header per record.
+
+| Task | Description | Files Touched | Acceptance |
+|---|---|---|---|
+| P0 | **Companies master** — `companies` table (name required, rest optional), `sales.company_id` FK RESTRICT, idempotent backfill merging case variants, CRUD UI + API (mutations admin) | `db.py`, `companies.py`, `chem_stock.py`, `flask_app.py`, `Companies.jsx`, `tests/test_companies.py` | CRUD + gates + backfill green; gate green |
+| P1 | **Capture fields** — `sales.maturity_date/comments`, `sale_items.unit`, `shipments` table, `production_runs` + `run_items`; company/product selects on PI entry; maturity/invoice/shipment forms | `db.py`, `flask_app.py`, `Sales.jsx`, LC/shipment modals | New fields round-trip; gate green |
+| P2 | **Master recipe from register** — company→product selects, auto-name, `UNIQUE(company_id, name)`, 409 → existing; `recipes.company_id/product_name` | `flask_app.py`, `Recipes.jsx`, register endpoints | One master per company×product; gate green |
+| P3 | **Snapshot production** — run form (order/batch/date/qty/notes) → formula snapshot → atomic deduction → run record | `flask_app.py`, `recipes.py`, `stock.py`, Recipes UI | Deduction + snapshot + audit; gate green |
+| P4 | **Live commercial report** — USD KPIs + 13-col table + export, admin-only Commercial tab | `flask_app.py`, `Reports.jsx` | KPIs/rows/export correct; gate green |
+| P5 | **Consistency lock** — pipeline mutations admin-only; every write dated + actor | `flask_app.py`, sales UI | Non-admin blocked; gate green |
+| P6 | **Maturity reminders** — maturity at payment entry + daily cron → bell (maturity + 7-day escalation, dedupe) | `flask_app.py`, `vercel.json`, sales UI | Reminders fire, escalation fires, paid silent; gate green |
+
+---
+
 ## 🔮 Phase M8: Future Features (Backlog)
 
 Not yet sliced — awaiting prioritization.

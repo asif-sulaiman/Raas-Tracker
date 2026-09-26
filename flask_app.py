@@ -40,7 +40,8 @@ from chem_stock import (
     update_sale_lc, update_sale_payment, add_sale_item, update_sale_item,
     delete_sale_item, delete_sale, get_sales_summary, record_sale_payment,
     update_sale_payment_record, delete_sale_payment_record, update_sale_full,
-    get_stock_movements
+    get_stock_movements, list_companies, create_company, update_company,
+    delete_company, get_company
 )
 
 # ---- AuthN/Z: sessions (humans) OR api_keys (scripts) ----
@@ -555,6 +556,104 @@ def serve_static(path):
     if "." in os.path.basename(path or ""):
         return jsonify({"error": "not found"}), 404
     return send_from_directory(REACT_BUILD_DIR, "index.html")
+
+
+# ==================== API: COMPANIES (P0 master) ====================
+class CompanyIn(_StrippedModel):
+    name: str = Field(min_length=1)
+    code: str | None = None
+    country: str | None = None
+    address: str | None = None
+    contact_person: str | None = None
+    swift: str | None = None
+    lc_bank: str | None = None
+
+
+class CompanyPatchIn(_StrippedModel):
+    name: str | None = Field(default=None, min_length=1)
+    code: str | None = None
+    country: str | None = None
+    address: str | None = None
+    contact_person: str | None = None
+    swift: str | None = None
+    lc_bank: str | None = None
+
+
+def _clean_company(payload) -> dict:
+    data = payload.model_dump()
+    return {k: (v.strip() or None) if isinstance(v, str) else v
+            for k, v in data.items()}
+
+
+@app.route("/api/companies")
+def api_list_companies():
+    conn = get_db()
+    rows = list_companies(conn)
+    conn.close()
+    return jsonify(rows)
+
+
+@app.route("/api/companies", methods=["POST"])
+@admin_required
+def api_create_company():
+    try:
+        payload = CompanyIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        cid = create_company(conn, **_clean_company(payload))
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
+    conn.close()
+    if cid is None:
+        return jsonify({"success": False,
+                        "error": f"Company '{payload.name}' already exists"}), 409
+    return jsonify({"success": True, "id": cid,
+                    **_clean_company(payload)}), 201
+
+
+@app.route("/api/companies/<int:cid>", methods=["PUT"])
+@admin_required
+def api_update_company(cid):
+    try:
+        payload = CompanyPatchIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    fields = {k: v for k, v in _clean_company(payload).items()
+              if k in (request.get_json() or {})}
+    if not fields:
+        return jsonify({"error": "nothing to update"}), 400
+    conn = get_db()
+    try:
+        result = update_company(conn, cid, fields)
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
+    if result is None:
+        conn.close()
+        return jsonify({"error": "company not found"}), 404
+    if result is False:
+        conn.close()
+        return jsonify({"error": "Company name already exists"}), 409
+    row = get_company(conn, cid)
+    conn.close()
+    return jsonify({"success": True, **row})
+
+
+@app.route("/api/companies/<int:cid>", methods=["DELETE"])
+@admin_required
+def api_delete_company(cid):
+    conn = get_db()
+    result = delete_company(conn, cid)
+    conn.close()
+    if result == "linked":
+        return jsonify({"error": "Company is linked to sales and cannot be deleted. "
+                                 "Rename it instead."}), 409
+    if not result:
+        return jsonify({"error": "company not found"}), 404
+    return jsonify({"success": True})
 
 
 # ==================== API: CHEMICALS ====================

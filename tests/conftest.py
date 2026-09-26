@@ -25,7 +25,7 @@ from chem_stock import get_connection, create_first_admin, ensure_setup_token, c
 
 _TABLES = (
     "api_key_rate_limits api_keys approval_workflow audit_logs "
-    "chemicals login_attempts notification_reads notifications reason_codes "
+    "chemicals companies login_attempts notification_reads notifications reason_codes "
     "recipe_items recipes reconciliation_periods sale_items sale_payments sales "
     "sales_stage_history sessions unit_conversions upload_rows uploads users"
 ).split()

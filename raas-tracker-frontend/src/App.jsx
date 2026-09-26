@@ -14,6 +14,7 @@ import Reports from './pages/Reports';
 import AuditLogs from './pages/AuditLogs';
 import Sales from './pages/Sales';
 import Users from './pages/Users';
+import Companies from './pages/Companies';
 import Login from './pages/Login';
 import Setup from './pages/Setup';
 
@@ -38,6 +39,7 @@ function App() {
                   <Route path="audit-logs" element={<ErrorBoundary><AuditLogs /></ErrorBoundary>} />
                   <Route path="sales" element={<ErrorBoundary><Sales /></ErrorBoundary>} />
                   <Route path="users" element={<ErrorBoundary><Users /></ErrorBoundary>} />
+                  <Route path="companies" element={<ErrorBoundary><Companies /></ErrorBoundary>} />
                 </Route>
               </Route>
             </Routes>
