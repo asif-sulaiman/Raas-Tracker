@@ -3,7 +3,8 @@
 import os
 import sys
 import io
-from flask import Flask, request, jsonify, send_from_directory, g
+import hashlib
+from flask import Flask, request, jsonify, send_from_directory, g, redirect
 from datetime import date, timedelta
 from functools import wraps
 
@@ -229,10 +230,12 @@ def _enforce_https():
         # If the proxy says HTTP, redirect to HTTPS regardless of remote_addr.
         proto = request.headers.get("X-Forwarded-Proto")
         if proto == "http":
-            return jsonify({"error": "HTTPS required"}), 301
+            https_url = request.url.replace("http://", "https://", 1)
+            return redirect(https_url, code=301)
         # Without a proxy header, only redirect non-localhost direct requests.
         if proto is None and request.scheme != "https" and request.remote_addr not in ("127.0.0.1", "::1"):
-            return jsonify({"error": "HTTPS required"}), 301
+            https_url = request.url.replace("http://", "https://", 1)
+            return redirect(https_url, code=301)
 
 
 @app.errorhandler(404)
@@ -522,8 +525,9 @@ def api_forgot_password():
                            (payload.username.strip(),)).fetchone()
         if row:
             raw = issue_reset_token(conn, row[0])
-            app.logger.info("password reset requested for user_id=%s link=/reset?token=%s",
-                            row[0], raw)
+            token_hash = hashlib.sha256(raw.encode()).hexdigest()
+            app.logger.info("password reset requested for user_id=%s token_hash=%s",
+                            row[0], token_hash[:8])
     finally:
         conn.close()
     remaining = 0.2 - (_time.monotonic() - start)
@@ -641,6 +645,9 @@ def api_admin_reset_token(user_id):
         if not exists:
             return jsonify({"error": "user not found"}), 404
         raw = issue_reset_token(conn, user_id)
+        token_hash = hashlib.sha256(raw.encode()).hexdigest()
+        app.logger.info("admin reset token issued for user_id=%s token_hash=%s",
+                        user_id, token_hash[:8])
         conn.execute("UPDATE users SET must_change_password = 1 WHERE id = %s", (user_id,))
         conn.commit()
     finally:
@@ -1206,6 +1213,7 @@ def api_delete_upload(upload_id):
 
 
 @app.route("/api/uploads/<int:upload_id>/approve", methods=["POST"])
+@admin_required
 @limiter.limit("15 per minute")
 def api_approve_upload(upload_id):
     from chem_stock import approve_upload, get_unmapped_rows
@@ -1225,6 +1233,7 @@ def api_approve_upload(upload_id):
 
 
 @app.route("/api/uploads/<int:upload_id>/apply", methods=["POST"])
+@admin_required
 @limiter.limit("15 per minute")
 def api_apply_upload(upload_id):
     from chem_stock import adjust_stock_from_upload
