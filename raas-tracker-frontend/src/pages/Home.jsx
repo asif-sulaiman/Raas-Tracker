@@ -12,18 +12,16 @@ import {
   Layers,
   History,
   ShieldCheck,
-  BookOpen,
-  DollarSign,
-  ChevronDown,
-  ChevronUp
+  BookOpen
 } from 'lucide-react';
 import KpiCard from '../components/cards/KpiCard';
 import ReconciliationChart from '../components/cards/ReconciliationChart';
 import StockDistributionChart from '../components/cards/StockDistributionChart';
+import SalesPipelineOverview from '../components/cards/SalesPipelineOverview';
 import Badge from '../components/ui/Badge';
 import Button from '../components/ui/Button';
 import { formatNumber, formatDate, formatDateTime } from '../utils/format';
-import { STAGES, STAGE_LABELS, STAGE_BADGE, isOverdue, countOverdue } from '../utils/sales';
+import { countOverdue } from '../utils/sales';
 import { buildTrendData, buildDistribution, uploadMismatches } from '../utils/dashboard';
 import { useAuth } from '../context/AuthContext';
 
@@ -210,6 +208,18 @@ export default function Home() {
         <div className="absolute -right-12 -bottom-12 w-64 h-64 rounded-full bg-white/10 blur-2xl pointer-events-none" />
       </div>
 
+      {/* Sales Pipeline Overview — hero section, first under the banner */}
+      <SalesPipelineOverview
+        sales={sales}
+        salesSummary={salesSummary}
+        visibleSales={visibleSales}
+        salesExpanded={salesExpanded}
+        onToggleExpanded={() => setSalesExpanded((v) => !v)}
+        overdueCount={overdueCount}
+        recentDefault={RECENT_DEFAULT}
+        recentMax={RECENT_MAX}
+      />
+
       {/* KPI Cards Grid */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
         <KpiCard
@@ -277,127 +287,6 @@ export default function Home() {
           color="blue"
           trendLabel="Active recipes"
         />
-      </div>
-
-      {/* Sales Pipeline Overview */}
-      <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 shadow-xs">
-        <div className="flex items-center justify-between mb-4">
-          <div>
-            <h3 className="text-base font-semibold text-slate-900 dark:text-white flex items-center gap-2">
-              <DollarSign className="h-4 w-4 text-emerald-600" />
-              Sales Pipeline Overview
-            </h3>
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              Live PI → LC → shipment → payment tracking
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            {overdueCount > 0 && (
-              <Badge variant="error" dot>
-                {overdueCount} overdue
-              </Badge>
-            )}
-            <Link
-              to="/sales"
-              className="text-xs font-semibold text-blue-600 dark:text-blue-400 hover:underline inline-flex items-center gap-1"
-            >
-              Open Pipeline <ArrowRight className="h-3.5 w-3.5" />
-            </Link>
-          </div>
-        </div>
-
-        {sales.length === 0 ? (
-          <div className="flex flex-col items-center gap-2 py-6 text-center">
-            <p className="text-sm text-slate-500 dark:text-slate-400">
-              No sales yet — upload your first PI to start tracking.
-            </p>
-            <Link to="/sales">
-              <Button variant="primary" size="sm" icon={UploadCloud}>
-                Go to Sales Pipeline
-              </Button>
-            </Link>
-          </div>
-        ) : (
-          <>
-            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 mb-4">
-              <div className="rounded-lg bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 px-3 py-2.5">
-                <p className="text-[11px] uppercase tracking-wider text-emerald-600 dark:text-emerald-400 font-semibold">Pipeline Value</p>
-                <p className="text-lg font-bold text-emerald-700 dark:text-emerald-300">
-                  ${(salesSummary?.total_pipeline_value || 0).toLocaleString('en-US', { maximumFractionDigits: 0 })}
-                </p>
-                <p className="text-[11px] text-emerald-600/70 dark:text-emerald-400/70">
-                  {salesSummary?.total_sales || sales.length} sales
-                </p>
-              </div>
-              {STAGES.map((st) => (
-                <div key={st.key} className="rounded-lg bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 px-3 py-2.5">
-                  <p className="text-[11px] uppercase tracking-wider text-slate-500 dark:text-slate-400 font-semibold">{st.title}</p>
-                  <p className="text-lg font-bold text-slate-900 dark:text-white">
-                    {salesSummary?.[st.key]?.count ?? sales.filter((s) => s.stage === st.key).length}
-                  </p>
-                  <p className="text-[11px] text-slate-500 dark:text-slate-400">
-                    ${((salesSummary?.[st.key]?.value) ?? 0).toLocaleString('en-US', { maximumFractionDigits: 0 })}
-                  </p>
-                </div>
-              ))}
-            </div>
-
-            <div className="overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-700">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-slate-50 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400 font-semibold uppercase tracking-wider">
-                  <tr>
-                    <th className="px-3 py-2.5">PI Number</th>
-                    <th className="px-3 py-2.5">Client</th>
-                    <th className="px-3 py-2.5 text-right">Value (USD)</th>
-                    <th className="px-3 py-2.5">Stage</th>
-                    <th className="px-3 py-2.5">PI Date</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100 dark:divide-slate-800/60">
-                  {visibleSales.map((s) => (
-                    <tr key={s.id} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40 transition-colors">
-                      <td className="px-3 py-2.5 font-medium text-slate-900 dark:text-white">
-                        {s.pi_number || `#${s.id}`}
-                      </td>
-                      <td className="px-3 py-2.5 text-slate-500 dark:text-slate-400">
-                        {s.client_name || '—'}
-                      </td>
-                      <td className="px-3 py-2.5 text-right font-bold text-slate-800 dark:text-slate-100">
-                        ${formatNumber(s.total_value || 0)}
-                      </td>
-                      <td className="px-3 py-2.5">
-                        <span className="inline-flex items-center gap-1.5">
-                          <Badge variant={STAGE_BADGE[s.stage] || 'default'}>
-                            {STAGE_LABELS[s.stage] || s.stage}
-                          </Badge>
-                          {isOverdue(s) && (
-                            <Badge variant="error" dot>Overdue</Badge>
-                          )}
-                        </span>
-                      </td>
-                      <td className="px-3 py-2.5 text-slate-500 dark:text-slate-400">
-                        {formatDate(s.pi_date)}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-
-            {sales.length > RECENT_DEFAULT && (
-              <button
-                onClick={() => setSalesExpanded((v) => !v)}
-                className="mt-3 inline-flex items-center gap-1 text-xs font-semibold text-blue-600 dark:text-blue-400 hover:underline cursor-pointer"
-              >
-                {salesExpanded ? (
-                  <>Show less <ChevronUp className="h-3.5 w-3.5" /></>
-                ) : (
-                  <>Show {Math.min(sales.length, RECENT_MAX) - RECENT_DEFAULT} more <ChevronDown className="h-3.5 w-3.5" /></>
-                )}
-              </button>
-            )}
-          </>
-        )}
       </div>
 
       {/* Charts Section */}
