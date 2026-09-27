@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Users as UsersIcon, Plus, Trash2, KeyRound, Ban, Copy, Check, Dices, Link2 } from 'lucide-react';
 import Button from '../components/ui/Button';
 import Badge from '../components/ui/Badge';
@@ -32,7 +32,7 @@ export default function Users() {
   const [oneTime, setOneTime] = useState(null);
   const [copiedSecret, setCopiedSecret] = useState(false);
 
-  const fetchAll = async () => {
+  const fetchAll = useCallback(async () => {
     try {
       const [uRes, kRes] = await Promise.all([
         apiFetch('/api/users'),
@@ -44,9 +44,13 @@ export default function Users() {
     } catch {
       // Lists stay as-is on failure; mutations surface their own errors.
     }
-  };
+  }, [apiFetch]);
 
-  useEffect(() => { fetchAll(); }, []);
+  useEffect(() => {
+    (async () => {
+      await fetchAll();
+    })();
+  }, [fetchAll]);
 
   if (user && user.role !== 'admin') {
     return <p className="text-sm text-rose-500 p-6">Admins only.</p>;

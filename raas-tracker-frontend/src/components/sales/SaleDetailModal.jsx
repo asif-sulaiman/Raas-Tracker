@@ -58,6 +58,9 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
 
   useEffect(() => {
     if (saleId) {
+      // Always mounted (saleId toggles visibility) and the parent's open handler lives
+      // in pages/Sales.jsx, so loading/editing state has to resync from the prop here.
+      // oxlint-disable-next-line react/set-state-in-effect
       setLoading(true);
       setEditingPaymentId(null);
       setEditing(false);
@@ -66,6 +69,8 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
     } else {
       setSale(null);
     }
+    // `refresh` is a plain per-render function — adding it would refetch on every render.
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [saleId]);
 
   const startEditing = () => {

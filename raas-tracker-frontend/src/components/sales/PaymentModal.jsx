@@ -32,6 +32,8 @@ export default function PaymentModal({ isOpen, sale, onClose, onSaved }) {
           // Detail stays null; totals fall back to the card's values.
         }
       })();
+      // Always mounted (isOpen toggles visibility) — reset the form on every open.
+      // oxlint-disable-next-line react/set-state-in-effect
       setPaymentDate(new Date().toISOString().slice(0, 10));
       setNotes('');
       setError(null);
@@ -39,6 +41,9 @@ export default function PaymentModal({ isOpen, sale, onClose, onSaved }) {
     } else {
       setDetail(null);
     }
+    // apiFetch is not referentially stable (its useCallback chain bottoms out in
+    // react-router's navigate, which depends on location) — adding it would refetch.
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, sale]);
 
   const invoiceTotal = detail?.invoice_total ?? sale?.total_value ?? 0;

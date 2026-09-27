@@ -25,10 +25,16 @@ export function NotificationProvider({ children }) {
     }
   });
   const seenRef = useRef(null);
+  // Mirror state into refs for load()/announce() readers — kept in effects (same
+  // position as the old render-time writes) so every reader runs after commit.
   const nativeRef = useRef(nativeEnabled);
-  nativeRef.current = nativeEnabled;
+  useEffect(() => {
+    nativeRef.current = nativeEnabled;
+  }, [nativeEnabled]);
   const userRef = useRef(user);
-  userRef.current = user;
+  useEffect(() => {
+    userRef.current = user;
+  }, [user]);
 
   // Surface new arrivals: stacked toasts + chime while the tab is visible;
   // browser-native notifications (opt-in) while it is hidden.
@@ -95,6 +101,9 @@ export function NotificationProvider({ children }) {
 
   useEffect(() => {
     if (!user) return undefined;
+    // `loading` initializes true and `load` awaits before its first setState;
+    // oxlint conservatively flags any loader containing a try/catch, so suppress here.
+    // oxlint-disable-next-line react/set-state-in-effect
     load({ initial: true });
     const timer = setInterval(() => load(), POLL_MS);
     const onVisible = () => {

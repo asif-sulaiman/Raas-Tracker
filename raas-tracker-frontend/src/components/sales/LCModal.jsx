@@ -17,6 +17,8 @@ export default function LCModal({ isOpen, sale, onClose, onSaved }) {
 
   useEffect(() => {
     if (isOpen && sale) {
+      // Modal is always mounted (isOpen toggles visibility), so form fields must resync from props here.
+      // oxlint-disable-next-line react/set-state-in-effect
       setLcNumber(sale.lc_number || '');
       setLcDate(sale.lc_date || '');
       setShipmentDate(sale.shipment_date || '');

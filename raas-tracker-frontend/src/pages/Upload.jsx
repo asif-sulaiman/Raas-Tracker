@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { UploadCloud, FileText, AlertCircle, CheckCircle2, Loader2, ArrowRight } from 'lucide-react';
 import UploadArea from '../components/forms/UploadArea';
 import UnitMapping from '../components/forms/UnitMapping';
@@ -17,7 +17,6 @@ export default function Upload() {
   const { confirm } = useConfirm();
   const [selectedFile, setSelectedFile] = useState(null);
   const [isUploading, setIsUploading] = useState(false);
-  const [uploadComplete, setUploadComplete] = useState(false);
   const [showResults, setShowResults] = useState(false);
   const [currentResults, setCurrentResults] = useState(null);
   const [uploadHistory, setUploadHistory] = useState([]);
@@ -25,7 +24,7 @@ export default function Upload() {
   const [resolvedUnits, setResolvedUnits] = useState([]);
   const [approving, setApproving] = useState(false);
 
-  const loadHistory = async () => {
+  const loadHistory = useCallback(async () => {
     try {
       const res = await apiFetch('/api/uploads');
       const data = await res.json();
@@ -33,15 +32,16 @@ export default function Upload() {
     } catch {
       // History stays as-is on failure; upload/delete surface their own errors.
     }
-  };
+  }, [apiFetch]);
 
   useEffect(() => {
-    loadHistory();
-  }, []);
+    (async () => {
+      await loadHistory();
+    })();
+  }, [loadHistory]);
 
   const handleFileSelect = (file) => {
     setSelectedFile(file);
-    setUploadComplete(false);
     setShowResults(false);
     setCurrentResults(null);
     setUploadId(null);
@@ -59,7 +59,6 @@ export default function Upload() {
       const response = await apiFetch('/api/upload', { method: 'POST', body: formData });
       const data = await response.json();
       if (data.success) {
-        setUploadComplete(true);
         setCurrentResults(data.results);
         setUploadId(data.upload_id ?? null);
         setResolvedUnits([]);

@@ -1,8 +1,6 @@
 import { useState } from 'react';
 import clsx from 'clsx';
-import Badge from '../ui/Badge';
 import { formatNumber } from '../../utils/format';
-import { ChevronDown, ChevronRight } from 'lucide-react';
 
 const TABS = [
   { key: 'matches', label: 'Matched', variant: 'matched' },
@@ -13,7 +11,7 @@ const TABS = [
   { key: 'not_in_upload', label: 'Not in Upload', variant: 'default' }
 ];
 
-function ComparisonRow({ row, type }) {
+function ComparisonRow({ row }) {
   const diff = row.diff_last || row.diff_this || 0;
   
   return (
@@ -58,21 +56,6 @@ function ComparisonRow({ row, type }) {
 
 export default function ComparisonResults({ results = {} }) {
   const [activeTab, setActiveTab] = useState('matches');
-  const [expandedSections, setExpandedSections] = useState({
-    matches: true,
-    last_month_mismatches: true,
-    this_month_mismatches: true,
-    both_mismatches: true,
-    not_in_db: true,
-    not_in_upload: true
-  });
-
-  const toggleSection = (key) => {
-    setExpandedSections(prev => ({
-      ...prev,
-      [key]: !prev[key]
-    }));
-  };
 
   const getTabCount = (key) => {
     const data = results[key];
@@ -143,7 +126,7 @@ export default function ComparisonResults({ results = {} }) {
           <tbody className="divide-y divide-slate-100 dark:divide-slate-800/80">
             {Array.isArray(results[activeTab]) && results[activeTab].length > 0 ? (
               results[activeTab].map((row, idx) => (
-                <ComparisonRow key={row.name || idx} row={row} type={activeTab} />
+                <ComparisonRow key={row.name || idx} row={row} />
               ))
             ) : (
               <tr>

@@ -8,7 +8,7 @@ import ReviewModal from '../components/sales/ReviewModal';
 import LCModal from '../components/sales/LCModal';
 import PaymentModal from '../components/sales/PaymentModal';
 import SaleDetailModal from '../components/sales/SaleDetailModal';
-import { STAGES, isOverdue } from '../utils/sales';
+import { STAGES } from '../utils/sales';
 import { useAuth } from '../context/AuthContext';
 import { useConfirm } from '../context/ConfirmContext';
 import { toast } from 'sonner';
@@ -52,9 +52,12 @@ export default function Sales() {
     }
   }, [apiFetch]);
 
+  // loading starts true; the mount fetch only ever clears it (async), and a
+  // fetchData identity change means a route change, which remounts this page.
   useEffect(() => {
-    setLoading(true);
-    fetchData();
+    (async () => {
+      await fetchData();
+    })();
   }, [fetchData]);
 
   const firstRender = useRef(true);

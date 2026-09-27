@@ -32,9 +32,9 @@ export default function Companies() {
   const [form, setForm] = useState(EMPTY);
   const [saving, setSaving] = useState(false);
 
+  // Fetch only — no synchronous setState here so the mount effect stays clean;
+  // event-handler refreshers turn the spinner on themselves before calling this.
   const loadCompanies = useCallback(async () => {
-    setLoading(true);
-    setError(null);
     try {
       const res = await apiFetch('/api/companies');
       const data = await res.json();
@@ -48,7 +48,11 @@ export default function Companies() {
     }
   }, [apiFetch]);
 
-  useEffect(() => { loadCompanies(); }, [loadCompanies]);
+  useEffect(() => {
+    (async () => {
+      await loadCompanies();
+    })();
+  }, [loadCompanies]);
 
   if (user && user.role !== 'admin') {
     return <p className="text-sm text-rose-500 p-6">Admins only.</p>;
@@ -99,6 +103,8 @@ export default function Companies() {
       setShowModal(false);
       setEditing(null);
       setForm(EMPTY);
+      setLoading(true);
+      setError(null);
       loadCompanies();
     } catch (err) {
       toast.error(err.message || 'Could not save company');
@@ -118,6 +124,8 @@ export default function Companies() {
     try {
       await apiFetch(`/api/companies/${row.id}`, { method: 'DELETE' });
       toast.success(`Company "${row.name}" deleted`);
+      setLoading(true);
+      setError(null);
       loadCompanies();
     } catch (err) {
       toast.error(err.message || 'Could not delete company');

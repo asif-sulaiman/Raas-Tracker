@@ -131,19 +131,22 @@ export default function Reports() {
     fetchCommercialReport();
   }, [isAdmin, activeTab, fetchCommercialReport]);
 
-  useEffect(() => {
-    if (autoCalc && selectedRecipes.length > 0) {
-      const total = recipes
-        .filter(r => selectedRecipes.includes(r.name))
-        .reduce((sum, r) => sum + (r.total_quantity || 0), 0);
-      setProductionQty(String(total));
-    }
-  }, [selectedRecipes, autoCalc, recipes]);
+  // Auto-calc quantity derives from the selection. It is recomputed in the
+  // event handlers that change the inputs — recipes load exactly once in the
+  // mount fetch while the loading skeleton (and no selection UI) is showing,
+  // so selection/checkbox changes are the only post-load triggers, matching
+  // the old [selectedRecipes, autoCalc, recipes] effect 1:1.
+  const computeAutoQty = (selected) =>
+    String(recipes
+      .filter(r => selected.includes(r.name))
+      .reduce((sum, r) => sum + (r.total_quantity || 0), 0));
 
   const toggleRecipe = (name) => {
-    setSelectedRecipes(prev =>
-      prev.includes(name) ? prev.filter(n => n !== name) : [...prev, name]
-    );
+    const next = selectedRecipes.includes(name)
+      ? selectedRecipes.filter(n => n !== name)
+      : [...selectedRecipes, name];
+    setSelectedRecipes(next);
+    if (autoCalc && next.length > 0) setProductionQty(computeAutoQty(next));
   };
 
   const handleGenerate = async () => {
@@ -603,7 +606,13 @@ export default function Reports() {
                   <input
                     type="checkbox"
                     checked={autoCalc}
-                    onChange={e => setAutoCalc(e.target.checked)}
+                    onChange={e => {
+                      const checked = e.target.checked;
+                      setAutoCalc(checked);
+                      if (checked && selectedRecipes.length > 0) {
+                        setProductionQty(computeAutoQty(selectedRecipes));
+                      }
+                    }}
                     className="h-4 w-4 rounded border-slate-300 dark:border-slate-600 text-blue-600 focus:ring-blue-500"
                   />
                   <span className="text-sm text-slate-700 dark:text-slate-300">Auto-calculate from recipes</span>

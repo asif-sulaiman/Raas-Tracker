@@ -50,9 +50,14 @@ export default function StockHistory({ chemicals = [] }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  const loadHistory = useCallback(async () => {
+  // Event-driven refreshes flip the spinner up front (mount starts `loading` true),
+  // so loadHistory's first setState only ever happens after `await`.
+  const startRefresh = () => {
     setLoading(true);
     setError(null);
+  };
+
+  const loadHistory = useCallback(async () => {
     try {
       const params = new URLSearchParams({
         since: range.since,
@@ -73,6 +78,10 @@ export default function StockHistory({ chemicals = [] }) {
   }, [apiFetch, range, chemicalId]);
 
   useEffect(() => {
+    // Loading starts true and event handlers flip it up front; every setState in
+    // loadHistory now happens after its first `await` — oxlint still flags loaders
+    // that contain a try/catch, so this call site is suppressed for that residual.
+    // oxlint-disable-next-line react/set-state-in-effect
     loadHistory();
   }, [loadHistory]);
 
@@ -107,11 +116,11 @@ export default function StockHistory({ chemicals = [] }) {
       <div className="flex flex-wrap items-end gap-3 mb-4">
         <div>
           <label className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1">From date</label>
-          <input aria-label="From date" type="date" value={range.since} onChange={(e) => setRange((r) => ({ ...r, since: e.target.value }))} className="px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20" />
+          <input aria-label="From date" type="date" value={range.since} onChange={(e) => { startRefresh(); setRange((r) => ({ ...r, since: e.target.value })); }} className="px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20" />
         </div>
         <div>
           <label className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1">To date</label>
-          <input aria-label="To date" type="date" value={range.until} onChange={(e) => setRange((r) => ({ ...r, until: e.target.value }))} className="px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20" />
+          <input aria-label="To date" type="date" value={range.until} onChange={(e) => { startRefresh(); setRange((r) => ({ ...r, until: e.target.value })); }} className="px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20" />
         </div>
         <div>
           <span className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1">Group by</span>
@@ -130,7 +139,7 @@ export default function StockHistory({ chemicals = [] }) {
         </div>
         <div>
           <label className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1">Chemical</label>
-          <select aria-label="Chemical" value={chemicalId} onChange={(e) => setChemicalId(e.target.value)} className="px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20">
+          <select aria-label="Chemical" value={chemicalId} onChange={(e) => { startRefresh(); setChemicalId(e.target.value); }} className="px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20">
             <option value="all">All chemicals</option>
             {chemicals.map((c) => (
               <option key={c.id} value={c.id}>{c.name}</option>
@@ -149,7 +158,7 @@ export default function StockHistory({ chemicals = [] }) {
       ) : error ? (
         <div className="py-6 text-center">
           <p className="text-xs text-rose-600 dark:text-rose-400 mb-3">{error}</p>
-          <Button variant="secondary" size="sm" onClick={loadHistory}>Retry</Button>
+          <Button variant="secondary" size="sm" onClick={() => { startRefresh(); loadHistory(); }}>Retry</Button>
         </div>
       ) : movements.length === 0 ? (
         <p className="py-8 text-center text-xs text-slate-500 dark:text-slate-400">

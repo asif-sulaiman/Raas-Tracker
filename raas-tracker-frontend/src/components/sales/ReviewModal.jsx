@@ -21,6 +21,9 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
 
   useEffect(() => {
     if (isOpen && initialData) {
+      // Always mounted (isOpen toggles visibility), so the form must resync from
+      // initialData — including live prop updates — whenever it opens.
+      // oxlint-disable-next-line react/set-state-in-effect
       setPiNumber(initialData.pi_number || '');
       setPiDate(initialData.pi_date || '');
       setClientName(initialData.client_name || '');

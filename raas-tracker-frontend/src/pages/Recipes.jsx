@@ -1,4 +1,4 @@
-﻿import { useState, useEffect } from 'react';
+﻿import { useState, useEffect, useCallback } from 'react';
 import {
   BookOpen,
   FlaskConical,
@@ -15,7 +15,6 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import Button from '../components/ui/Button';
-import Badge from '../components/ui/Badge';
 import Modal from '../components/modals/Modal';
 import KpiCard from '../components/cards/KpiCard';
 import { formatNumber } from '../utils/format';
@@ -50,8 +49,9 @@ export default function Recipes() {
   const [editItemId, setEditItemId] = useState(null);
   const [editItemPct, setEditItemPct] = useState('');
 
-  const fetchData = async () => {
-    setLoading(true);
+  // Fetch only — loading is already true on mount; event-handler refreshers
+  // flip the spinner on themselves before calling this.
+  const fetchData = useCallback(async () => {
     try {
       const [recsRes, chemsRes] = await Promise.all([
         apiFetch('/api/recipes'),
@@ -65,9 +65,13 @@ export default function Recipes() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [apiFetch]);
 
-  useEffect(() => { fetchData(); }, []);
+  useEffect(() => {
+    (async () => {
+      await fetchData();
+    })();
+  }, [fetchData]);
 
   const fetchRecipeDetail = async (name) => {
     try {
@@ -102,6 +106,7 @@ export default function Recipes() {
         setNewYield('');
         setNewWater('');
         toast.success(`Recipe "${newName.trim()}" created`);
+        setLoading(true);
         fetchData();
       } else {
         toast.error('Failed to create recipe');
@@ -125,6 +130,7 @@ export default function Recipes() {
       if (data.success) {
         if (showDetail && selectedRecipe?.name === name) setShowDetail(false);
         toast.success(`Recipe "${name}" deleted`);
+        setLoading(true);
         fetchData();
       }
     } catch (err) {
@@ -148,6 +154,7 @@ export default function Recipes() {
         setShowEditMeta(false);
         toast.success('Recipe updated');
         fetchRecipeDetail(selectedRecipe.name);
+        setLoading(true);
         fetchData();
       }
     } catch (err) {
@@ -244,7 +251,7 @@ export default function Recipes() {
       <div className="space-y-6 max-w-7xl mx-auto">
         <div className="flex items-center gap-4">
           <button
-            onClick={() => { setShowDetail(false); setSelectedRecipe(null); fetchData(); }}
+            onClick={() => { setShowDetail(false); setSelectedRecipe(null); setLoading(true); fetchData(); }}
             className="p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
           >
             <ArrowLeft className="h-5 w-5 text-slate-600 dark:text-slate-400" />

@@ -40,9 +40,9 @@ export default function Home() {
   const [activity, setActivity] = useState([]);
   const [activityHidden, setActivityHidden] = useState(false);
 
+  // Fetch only — chemLoading starts true and chemError starts null; the Retry
+  // handler flips the loading/error state itself before calling this.
   const loadChemicals = useCallback(async () => {
-    setChemLoading(true);
-    setChemError(null);
     try {
       const res = await apiFetch('/api/chemicals');
       const chems = await res.json();
@@ -61,11 +61,13 @@ export default function Home() {
   }, [apiFetch]);
 
   useEffect(() => {
-    loadChemicals();
+    (async () => {
+      await loadChemicals();
+    })();
   }, [loadChemicals]);
 
+  // Fetch only — the Retry handler clears uploadsError before calling this.
   const loadUploads = useCallback(async () => {
-    setUploadsError(null);
     try {
       const res = await apiFetch('/api/uploads');
       const data = await res.json();
@@ -77,7 +79,9 @@ export default function Home() {
   }, [apiFetch]);
 
   useEffect(() => {
-    loadUploads();
+    (async () => {
+      await loadUploads();
+    })();
   }, [loadUploads]);
 
   useEffect(() => {
@@ -244,7 +248,7 @@ export default function Home() {
         <div className="rounded-xl border border-rose-200 dark:border-rose-800 bg-rose-50 dark:bg-rose-950/30 p-6 text-center" role="alert">
           <p className="text-sm font-semibold text-rose-700 dark:text-rose-300">Could not load stock checks</p>
           <p className="text-xs text-rose-600/80 dark:text-rose-400/80 mt-1">{uploadsError}</p>
-          <Button variant="primary" size="sm" onClick={loadUploads} className="mt-3">
+          <Button variant="primary" size="sm" onClick={() => { setUploadsError(null); loadUploads(); }} className="mt-3">
             Retry
           </Button>
         </div>
@@ -303,7 +307,7 @@ export default function Home() {
             <div className="rounded-lg border border-rose-200 dark:border-rose-800 bg-rose-50 dark:bg-rose-950/30 p-5 text-center" role="alert">
               <p className="text-xs font-semibold text-rose-700 dark:text-rose-300">Could not load chemical stock</p>
               <p className="text-[11px] text-rose-600/80 dark:text-rose-400/80 mt-1">{chemError} — no stock figures are shown.</p>
-              <Button variant="primary" size="sm" onClick={loadChemicals} className="mt-3">
+              <Button variant="primary" size="sm" onClick={() => { setChemLoading(true); setChemError(null); loadChemicals(); }} className="mt-3">
                 Retry
               </Button>
             </div>

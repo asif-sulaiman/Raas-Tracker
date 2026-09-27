@@ -1,6 +1,5 @@
 import { useState, useEffect } from 'react';
 import {
-  ClipboardList,
   CheckCircle2,
   XCircle,
   UploadCloud,
@@ -46,7 +45,7 @@ export default function AuditLogs() {
         setLoading(false);
       }
     })();
-  }, []);
+  }, [apiFetch]);
 
   const filteredLogs = logs.filter(log => {
     if (filterAction !== 'all' && log.action !== filterAction) return false;

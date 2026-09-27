@@ -93,7 +93,7 @@ describe('ChangePassword page', () => {
   });
 
   it('surfaces a wrong-current-password error and stays put', async () => {
-    vi.stubGlobal('fetch', vi.fn(async (url, options) => {
+    vi.stubGlobal('fetch', vi.fn(async (url, _options) => {
       const u = String(url);
       if (u.includes('/api/auth/me')) {
         return jsonResponse({ id: 1, username: 'bob', role: 'user', must_change_password: true });

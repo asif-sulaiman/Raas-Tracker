@@ -11,7 +11,11 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(true);
   const navigate = useNavigate();
   const userRef = useRef(null);
-  userRef.current = user;
+  // Mirror into a ref for apiFetch/poll/visibility readers (all post-commit);
+  // written in an effect at the same position as the old render-time write.
+  useEffect(() => {
+    userRef.current = user;
+  }, [user]);
 
   const refresh = useCallback(async ({ silent = true } = {}) => {
     try {
@@ -99,6 +103,9 @@ export function AuthProvider({ children }) {
 
   // Initial check.
   useEffect(() => {
+    // `loading` initializes true and `refresh` awaits before its first setState;
+    // oxlint conservatively flags any loader containing a try/catch, so suppress here.
+    // oxlint-disable-next-line react/set-state-in-effect
     refresh();
   }, [refresh]);
 

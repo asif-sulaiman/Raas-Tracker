@@ -4,6 +4,9 @@ import './index.css'
 import App from './App.jsx'
 import ErrorBoundary from './components/ui/ErrorBoundary.jsx'
 
+// main.jsx is the Vite entry module: editing it always forces a full reload,
+// so Fast Refresh never applies here and exporting this fallback is pointless.
+// oxlint-disable-next-line react/only-export-components
 function GlobalFallback() {
   return (
     <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-slate-950 p-6">
