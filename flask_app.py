@@ -1410,6 +1410,7 @@ class SaleHeaderIn(_StrippedModel):
     client_name: str | None = None
     pi_file_path: str | None = None
     company_id: int | None = None
+    comments: str | None = None
 
 
 class SaleCreateIn(BaseModel):
@@ -1558,6 +1559,7 @@ class SaleFullUpdateIn(BaseModel):
 
 
 @app.route("/api/sales/<int:sale_id>", methods=["PUT"])
+@admin_required
 def api_update_sale(sale_id):
     raw = request.get_json() or {}
     if "items" in raw:
@@ -1614,6 +1616,7 @@ def api_delete_sale(sale_id):
 
 
 @app.route("/api/sales/<int:sale_id>/move", methods=["POST"])
+@admin_required
 def api_move_sale(sale_id):
     data = request.get_json() or {}
     notes = data.get("notes")
@@ -1626,6 +1629,7 @@ def api_move_sale(sale_id):
 
 
 @app.route("/api/sales/<int:sale_id>/lc", methods=["PUT"])
+@admin_required
 def api_update_lc(sale_id):
     data = request.get_json() or {}
     # V5: require the LC number instead of KeyError-500 on missing keys.
@@ -1652,6 +1656,7 @@ class PaymentPatchIn(_StrippedModel):
 
 
 @app.route("/api/sales/<int:sale_id>/payment", methods=["PUT"])
+@admin_required
 def api_update_payment(sale_id):
     try:
         payment = PaymentIn(**(request.get_json() or {}))
@@ -1670,6 +1675,7 @@ def api_update_payment(sale_id):
 
 
 @app.route("/api/sales/<int:sale_id>/payments/<int:payment_id>", methods=["PUT"])
+@admin_required
 def api_edit_payment(sale_id, payment_id):
     try:
         patch = PaymentPatchIn(**(request.get_json() or {}))
@@ -1732,6 +1738,7 @@ def api_delete_shipment(sale_id, shipment_id):
 
 
 @app.route("/api/sales/<int:sale_id>/items", methods=["POST"])
+@admin_required
 def api_add_item(sale_id):
     try:
         item = SaleItemIn(**(request.get_json() or {}))
@@ -1758,6 +1765,7 @@ class ShipmentIn(_StrippedModel):
 
 
 @app.route("/api/sales/<int:sale_id>/items/<int:item_id>", methods=["PUT"])
+@admin_required
 def api_update_item(sale_id, item_id):
     try:
         patch = SaleItemPatchIn(**(request.get_json() or {}))

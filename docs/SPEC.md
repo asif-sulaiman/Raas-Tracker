@@ -486,15 +486,15 @@ CREATE TABLE app_settings (
 | GET | `/api/sales/summary` | Session/Key | Stage-wise summary |
 | GET | `/api/sales/<id>` | Session/Key | Detail |
 | POST | `/api/sales` | Session/Key | Create (header + items; company_id, unit) |
-| PUT | `/api/sales/<id>` | Session/Key | Full update (header+items+removals) or patch header (incl. comments) |
+| PUT | `/api/sales/<id>` | Admin | Full update (header+items+removals) or patch header (incl. comments) |
 | DELETE | `/api/sales/<id>` | Admin | Delete |
-| POST | `/api/sales/<id>/move` | Session/Key | Advance stage (with notes) |
-| PUT | `/api/sales/<id>/lc` | Session/Key | LC details + move to `lc_received` |
-| PUT | `/api/sales/<id>/payment` | Session/Key | Record payment |
-| PUT | `/api/sales/<id>/payments/<pid>` | Session/Key | Edit payment |
+| POST | `/api/sales/<id>/move` | Admin | Advance stage (with notes) |
+| PUT | `/api/sales/<id>/lc` | Admin | LC details + move to `lc_received` |
+| PUT | `/api/sales/<id>/payment` | Admin | Record payment |
+| PUT | `/api/sales/<id>/payments/<pid>` | Admin | Edit payment |
 | DELETE | `/api/sales/<id>/payments/<pid>` | Admin | Delete payment |
-| POST | `/api/sales/<id>/items` | Session/Key | Add item (product, qty, price, unit) |
-| PUT | `/api/sales/<id>/items/<iid>` | Session/Key | Update item (incl. unit) |
+| POST | `/api/sales/<id>/items` | Admin | Add item (product, qty, price, unit) |
+| PUT | `/api/sales/<id>/items/<iid>` | Admin | Update item (incl. unit) |
 | DELETE | `/api/sales/<id>/items/<iid>` | Admin | Delete item (min 1 item) |
 | POST | `/api/sales/<id>/shipments` | Admin | Record shipment (date required) |
 | DELETE | `/api/sales/<id>/shipments/<shid>` | Admin | Delete shipment |

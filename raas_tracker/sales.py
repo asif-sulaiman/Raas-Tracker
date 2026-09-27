@@ -432,8 +432,13 @@ def add_sale_item(conn: psycopg.Connection, sale_id: int, product_name: str,
            VALUES (%s, %s, %s, %s, %s) RETURNING id""",
         (sale_id, product_name, quantity, unit_price, unit)
     )
+    item_id = cursor.fetchone()[0]
     conn.commit()
-    return cursor.fetchone()[0]
+    log_audit_action(conn, "SALE_ITEM_ADD", "sale_item", item_id,
+                     new_value=json.dumps({"sale_id": sale_id, "product_name": product_name,
+                                           "quantity": quantity, "unit_price": unit_price, "unit": unit},
+                                          default=str))
+    return item_id
 
 
 def update_sale_item(conn: psycopg.Connection, item_id: int,
@@ -442,6 +447,15 @@ def update_sale_item(conn: psycopg.Connection, item_id: int,
                      unit_price: Optional[float] = None,
                      unit: Optional[str] = None) -> bool:
     """Update fields of a sale line item."""
+    # Fetch old item for audit
+    old_row = conn.execute(
+        "SELECT product_name, quantity, unit_price, unit FROM sale_items WHERE id = %s",
+        (item_id,)).fetchone()
+    if not old_row:
+        return False
+    old_item = {"product_name": old_row[0], "quantity": old_row[1],
+                "unit_price": old_row[2], "unit": old_row[3]}
+    
     fields, vals = [], []
     if product_name is not None:
         fields.append("product_name = %s")
@@ -460,6 +474,13 @@ def update_sale_item(conn: psycopg.Connection, item_id: int,
     vals.append(item_id)
     conn.execute(f"UPDATE sale_items SET {', '.join(fields)} WHERE id = %s", vals)
     conn.commit()
+    
+    # Audit log
+    new_item = {"product_name": product_name, "quantity": quantity,
+                "unit_price": unit_price, "unit": unit}
+    log_audit_action(conn, "SALE_ITEM_UPDATE", "sale_item", item_id,
+                     old_value=json.dumps(old_item, default=str),
+                     new_value=json.dumps(new_item, default=str))
     return True
 
 
@@ -488,6 +509,23 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
         if not row:
             conn.rollback()
             return None
+        
+        # Fetch old snapshot for audit
+        old_sale = get_sale_by_id(conn, sale_id)
+        old_snapshot = {
+            "pi_number": old_sale.get("pi_number"),
+            "lc_number": old_sale.get("lc_number"),
+            "lc_date": old_sale.get("lc_date"),
+            "shipment_date": old_sale.get("shipment_date"),
+            "maturity_date": old_sale.get("maturity_date"),
+            "comments": old_sale.get("comments"),
+            "stage": old_sale.get("stage"),
+            "items": [
+                {"product_name": i["product_name"], "quantity": i["quantity"],
+                 "unit_price": i["unit_price"], "unit": i["unit"]}
+                for i in old_sale.get("items", [])
+            ],
+        }
         existing_ids = {r[0] for r in conn.execute(
             "SELECT id FROM sale_items WHERE sale_id = %s", (sale_id,)).fetchall()}
 
@@ -539,9 +577,9 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
 
         conn.execute(
             """UPDATE sales SET pi_number = %s, pi_date = %s, client_name = %s,
-               company_id = %s, updated_at = %s WHERE id = %s""",
+               company_id = %s, comments = %s, updated_at = %s WHERE id = %s""",
             (pi_number, header.get("pi_date"), client_name, company_id,
-             _now_str(), sale_id)
+             header.get("comments"), _now_str(), sale_id)
         )
         for it in seen:
             if it["id"] is None:
@@ -557,6 +595,17 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
         for rid in removed_ids:
             conn.execute("DELETE FROM sale_items WHERE id = %s", (rid,))
         conn.commit()
+        
+        # Audit log
+        new_snapshot = {
+            "header": header,
+            "items": items,
+            "removed_ids": removed_ids,
+        }
+        log_audit_action(conn, "SALE_UPDATE", "sale", sale_id,
+                         old_value=json.dumps(old_snapshot, default=str),
+                         new_value=json.dumps(new_snapshot, default=str))
+        
         return get_sale_by_id(conn, sale_id)
     except Exception:
         try:

@@ -72,7 +72,7 @@ snapshots · companies master · single shipment header per record.
 | P2 ✅ | **Master recipe from register** — company→product selects, auto-name, `UNIQUE(company_id, name)`, 409 → existing; `recipes.company_id/product_name` | `flask_app.py`, `Recipes.jsx`, register endpoints | One master per company×product; gate green |
 | P3 ✅ | **Snapshot production** — run form (order/batch/date/qty/notes) → formula snapshot → atomic deduction → run record | `flask_app.py`, `recipes.py`, `stock.py`, Recipes UI | Deduction + snapshot + audit; gate green |
 | P4 ✅ | **Live commercial report** — USD KPIs + 13-col table + export, admin-only Commercial tab | `flask_app.py`, `Reports.jsx` | KPIs/rows/export correct; gate green |
-| P5 | **Consistency lock** — pipeline mutations admin-only; every write dated + actor | `flask_app.py`, sales UI | Non-admin blocked; gate green |
+| P5 ✅ | **Consistency lock** — pipeline mutations admin-only; every write dated + actor | `flask_app.py`, `raas_tracker/sales.py`, sales UI | Non-admin blocked; gate green |
 | P6 | **Maturity reminders** — maturity at payment entry + daily cron → bell (maturity + 7-day escalation, dedupe) | `flask_app.py`, `vercel.json`, sales UI | Reminders fire, escalation fires, paid silent; gate green |
 
 ---
