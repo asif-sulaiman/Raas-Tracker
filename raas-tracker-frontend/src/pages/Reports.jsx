@@ -1,8 +1,6 @@
-﻿import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import {
-  FileText,
   Download,
-  FileSpreadsheet,
   FlaskConical,
   CheckCircle2,
   AlertTriangle,
@@ -10,17 +8,72 @@ import {
   BookOpen,
   TrendingDown,
   TrendingUp,
-  Minus
+  Minus,
+  Building2,
+  DollarSign,
+  CreditCard,
+  ClipboardList
 } from 'lucide-react';
 import clsx from 'clsx';
 import Button from '../components/ui/Button';
 import Badge from '../components/ui/Badge';
-import { formatNumber } from '../utils/format';
+import { formatNumber, formatDate } from '../utils/format';
 import { useAuth } from '../context/AuthContext';
 import { toast } from 'sonner';
 
+/**
+ * Commercial report rows are per sale-item.
+ * - Item-level fields (quantity, unit_price, total_price) sum across every row.
+ * - Sale-level fields (received_amount, due_amount, receive_date, maturity_date,
+ *   payment_status) are repeated on each row of the same sale, so they must be
+ *   deduped by sale_id before summing.
+ */
+function dedupeSales(rows) {
+  const seen = new Set();
+  const sales = [];
+  let prevSaleTuple = null;
+  rows.forEach(row => {
+    if (row.sale_id != null) {
+      const key = `sale:${row.sale_id}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      prevSaleTuple = null;
+      sales.push(row);
+      return;
+    }
+    // Fallback when a row carries no sale_id: rows of one sale are contiguous
+    // and repeat the same sale-level fields, so compare against the previous row.
+    const tuple = [
+      row.customer_name, row.pi_number, row.pi_date,
+      row.lc_number, row.lc_date, row.maturity_date,
+      row.receive_date, row.received_amount, row.due_amount, row.payment_status
+    ].join('|');
+    if (tuple === prevSaleTuple) return;
+    prevSaleTuple = tuple;
+    sales.push(row);
+  });
+  return sales;
+}
+
+/** Paid = green, Partial = amber, Due = blue, Overdue = red, Pending = slate. */
+function paymentBadgeVariant(status) {
+  switch (status) {
+    case 'Paid': return 'success';
+    case 'Partial': return 'warning';
+    case 'Due': return 'info';
+    case 'Overdue': return 'error';
+    default: return 'default';
+  }
+}
+
+const TH = 'px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider whitespace-nowrap';
+const TD = 'px-4 py-3 whitespace-nowrap';
+
 export default function Reports() {
-  const { apiFetch } = useAuth();
+  const { apiFetch, user } = useAuth();
+  const isAdmin = user?.role === 'admin';
+  const [activeTab, setActiveTab] = useState('production');
+
   const [recipes, setRecipes] = useState([]);
   const [loading, setLoading] = useState(true);
 
@@ -30,6 +83,13 @@ export default function Reports() {
 
   const [report, setReport] = useState(null);
   const [generating, setGenerating] = useState(false);
+
+  // Commercial report (admin tab)
+  const [commercialReport, setCommercialReport] = useState([]);
+  const [commercialLoading, setCommercialLoading] = useState(false);
+  const [commercialError, setCommercialError] = useState(null);
+  const [commercialExporting, setCommercialExporting] = useState(false);
+  const commercialFetchedRef = useRef(false);
 
   useEffect(() => {
     (async () => {
@@ -43,7 +103,33 @@ export default function Reports() {
         setLoading(false);
       }
     })();
-  }, []);
+  }, [apiFetch]);
+
+  const fetchCommercialReport = useCallback(async () => {
+    setCommercialError(null);
+    setCommercialLoading(true);
+    try {
+      const res = await apiFetch('/api/reports/live');
+      const data = await res.json();
+      if (Array.isArray(data)) {
+        setCommercialReport(data);
+      } else {
+        setCommercialError((data && data.error) || 'Failed to load the commercial report');
+      }
+    } catch (err) {
+      setCommercialError((err && err.message) || 'Failed to load the commercial report');
+    } finally {
+      setCommercialLoading(false);
+    }
+  }, [apiFetch]);
+
+  // Fetch once when the admin opens the tab. commercialFetchedRef guards against
+  // refetch loops; Retry calls fetchCommercialReport directly.
+  useEffect(() => {
+    if (!isAdmin || activeTab !== 'commercial' || commercialFetchedRef.current) return;
+    commercialFetchedRef.current = true;
+    fetchCommercialReport();
+  }, [isAdmin, activeTab, fetchCommercialReport]);
 
   useEffect(() => {
     if (autoCalc && selectedRecipes.length > 0) {
@@ -100,8 +186,238 @@ export default function Reports() {
     }
   };
 
+  const handleCommercialExport = async () => {
+    if (commercialExporting || commercialLoading || commercialReport.length === 0) return;
+    setCommercialExporting(true);
+    try {
+      const res = await apiFetch('/api/reports/live/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      const data = await res.json();
+      if (data.content) {
+        const blob = new Blob([data.content], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.setAttribute('download', data.filename || 'commercial_report.csv');
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+        toast.success('Exported to: ' + (data.filename || 'commercial_report.csv'));
+      } else {
+        toast.error(data.error || 'Export failed');
+      }
+    } catch (err) {
+      toast.error(err.message || 'Export failed');
+    } finally {
+      setCommercialExporting(false);
+    }
+  };
+
   const totalShortage = report ? report.report.filter(r => r.status === 'SHORTAGE').length : 0;
   const totalOk = report ? report.report.filter(r => r.status !== 'SHORTAGE').length : 0;
+
+  const renderCommercialTab = () => {
+    if (!isAdmin) return null;
+
+    if (commercialLoading) {
+      return (
+        <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 shadow-xs">
+          <div className="flex items-center justify-center h-40">
+            <div className="inline-flex items-center gap-2 text-slate-500 dark:text-slate-400">
+              <div className="h-5 w-5 animate-spin rounded-full border-2 border-slate-300 border-t-blue-600" />
+              Loading commercial report...
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    if (commercialError) {
+      return (
+        <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 shadow-xs text-center">
+          <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-rose-100 dark:bg-rose-950/40">
+            <AlertTriangle className="h-6 w-6 text-rose-500" />
+          </div>
+          <p className="text-sm font-semibold text-slate-900 dark:text-white">Could not load the commercial report</p>
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">{commercialError}</p>
+          <Button variant="secondary" size="sm" onClick={fetchCommercialReport} className="mt-4">
+            Retry
+          </Button>
+        </div>
+      );
+    }
+
+    const rows = commercialReport;
+
+    if (rows.length === 0) {
+      return (
+        <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 shadow-xs text-center">
+          <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-slate-100 dark:bg-slate-800">
+            <ClipboardList className="h-6 w-6 text-slate-400 dark:text-slate-500" />
+          </div>
+          <p className="text-sm font-semibold text-slate-800 dark:text-white">No commercial rows yet</p>
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+            Create sales orders, record shipments, and payments to populate this report.
+          </p>
+        </div>
+      );
+    }
+
+    const sales = dedupeSales(rows);
+    const grossSales = rows.reduce((sum, r) => sum + (Number(r.total_price) || 0), 0);
+    const receivedTotal = sales.reduce((sum, r) => sum + (Number(r.received_amount) || 0), 0);
+    const dueTotal = sales.reduce((sum, r) => sum + (Number(r.due_amount) || 0), 0);
+    const overdueSales = sales.filter(r => r.payment_status === 'Overdue');
+    const overdueTotal = overdueSales.reduce((sum, r) => sum + (Number(r.due_amount) || 0), 0);
+
+    const kpis = [
+      {
+        label: 'Gross Sales',
+        value: grossSales,
+        caption: `${rows.length} sale line${rows.length !== 1 ? 's' : ''} · USD`,
+        icon: DollarSign,
+        box: 'bg-blue-100 dark:bg-blue-950/50',
+        iconCls: 'text-blue-600 dark:text-blue-400',
+        valueCls: 'text-slate-900 dark:text-white'
+      },
+      {
+        label: 'Received',
+        value: receivedTotal,
+        caption: `${sales.length} sale${sales.length !== 1 ? 's' : ''} · USD`,
+        icon: CreditCard,
+        box: 'bg-emerald-100 dark:bg-emerald-950/50',
+        iconCls: 'text-emerald-600 dark:text-emerald-400',
+        valueCls: 'text-emerald-600 dark:text-emerald-400'
+      },
+      {
+        label: 'Due',
+        value: dueTotal,
+        caption: `${sales.length} sale${sales.length !== 1 ? 's' : ''} · USD`,
+        icon: CreditCard,
+        box: 'bg-sky-100 dark:bg-sky-950/50',
+        iconCls: 'text-sky-600 dark:text-sky-400',
+        valueCls: 'text-sky-600 dark:text-sky-400'
+      },
+      {
+        label: 'Overdue',
+        value: overdueTotal,
+        caption: `${overdueSales.length} sale${overdueSales.length !== 1 ? 's' : ''} past maturity`,
+        icon: AlertTriangle,
+        box: 'bg-rose-100 dark:bg-rose-950/50',
+        iconCls: 'text-rose-600 dark:text-rose-400',
+        valueCls: 'text-rose-600 dark:text-rose-400'
+      }
+    ];
+
+    return (
+      <div className="space-y-6">
+        {/* KPI Cards (USD) */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          {kpis.map(kpi => (
+            <div key={kpi.label} className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 shadow-xs">
+              <div className="flex items-center gap-3">
+                <div className={clsx('flex h-9 w-9 shrink-0 items-center justify-center rounded-lg', kpi.box)}>
+                  <kpi.icon className={clsx('h-4 w-4', kpi.iconCls)} />
+                </div>
+                <div className="min-w-0">
+                  <p className="text-xs text-slate-500 dark:text-slate-400">{kpi.label}</p>
+                  <p className={clsx('text-xl font-bold truncate', kpi.valueCls)}>${formatNumber(kpi.value, 2)}</p>
+                </div>
+              </div>
+              <p className="text-[11px] text-slate-400 dark:text-slate-500 mt-2">{kpi.caption}</p>
+            </div>
+          ))}
+        </div>
+
+        {/* Commercial Report Table */}
+        <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs overflow-hidden">
+          <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Commercial Pipeline</h3>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                {rows.length} line{rows.length !== 1 ? 's' : ''} across {sales.length} sale{sales.length !== 1 ? 's' : ''}
+              </p>
+            </div>
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={Download}
+              onClick={handleCommercialExport}
+              loading={commercialExporting}
+              disabled={commercialLoading}
+            >
+              Export CSV
+            </Button>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-slate-100 dark:border-slate-800">
+                  <th className={TH}>Customer</th>
+                  <th className={TH}>PI No</th>
+                  <th className={TH}>PI Date</th>
+                  <th className={TH}>LC No</th>
+                  <th className={TH}>LC Date</th>
+                  <th className={TH}>Product</th>
+                  <th className={TH}>Unit</th>
+                  <th className={TH}>Qty</th>
+                  <th className={TH}>Unit Price</th>
+                  <th className={TH}>Total ($)</th>
+                  <th className={TH}>Invoice Date</th>
+                  <th className={TH}>Latest Ship</th>
+                  <th className={TH}>Actual Ship</th>
+                  <th className={TH}>Maturity</th>
+                  <th className={TH}>Receive Date</th>
+                  <th className={TH}>Received ($)</th>
+                  <th className={TH}>Due ($)</th>
+                  <th className={TH}>Status</th>
+                  <th className={TH}>Comment</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-50 dark:divide-slate-800/50">
+                {rows.map((row, idx) => (
+                  <tr key={row.sale_id != null ? `${row.sale_id}-${idx}` : idx} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40">
+                    <td className={clsx(TD, 'font-medium text-slate-900 dark:text-white')}>{row.customer_name || '-'}</td>
+                    <td className={TD}>{row.pi_number || '-'}</td>
+                    <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.pi_date)}</td>
+                    <td className={TD}>{row.lc_number || '-'}</td>
+                    <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.lc_date)}</td>
+                    <td className={clsx(TD, 'font-medium text-slate-900 dark:text-white')}>{row.product_name || '-'}</td>
+                    <td className={TD}>{row.unit || '-'}</td>
+                    <td className={clsx(TD, 'text-right font-mono text-slate-700 dark:text-slate-300')}>{formatNumber(row.quantity || 0)}</td>
+                    <td className={clsx(TD, 'text-right font-mono text-slate-700 dark:text-slate-300')}>{formatNumber(row.unit_price || 0)}</td>
+                    <td className={clsx(TD, 'text-right font-mono font-semibold text-slate-900 dark:text-white')}>{formatNumber(row.total_price || 0)}</td>
+                    <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.invoice_date)}</td>
+                    <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.latest_ship_date)}</td>
+                    <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.actual_ship_date)}</td>
+                    <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.maturity_date)}</td>
+                    <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.receive_date)}</td>
+                    <td className={clsx(TD, 'text-right font-mono text-emerald-600 dark:text-emerald-400')}>{formatNumber(row.received_amount || 0)}</td>
+                    <td className={clsx(TD, 'text-right font-mono', Number(row.due_amount) > 0 ? 'text-rose-600 dark:text-rose-400' : 'text-slate-400 dark:text-slate-500')}>
+                      {formatNumber(row.due_amount || 0)}
+                    </td>
+                    <td className={TD}>
+                      <Badge variant={paymentBadgeVariant(row.payment_status)} size="xs">
+                        {row.payment_status || 'Pending'}
+                      </Badge>
+                    </td>
+                    <td className="px-4 py-3 text-xs text-slate-500 dark:text-slate-400 max-w-[18rem]">
+                      {row.payment_comment || '-'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   if (loading) {
     return (
@@ -116,226 +432,267 @@ export default function Reports() {
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
-      <div>
-        <h2 className="text-2xl font-bold text-slate-900 dark:text-white tracking-tight">Production Reports</h2>
-        <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">Check stock availability against recipe requirements</p>
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className="lg:col-span-2 space-y-4">
-          {/* Recipe Selection */}
-          <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 shadow-xs">
-            <h3 className="text-base font-semibold text-slate-900 dark:text-white mb-4">Select Recipes</h3>
-            {recipes.length === 0 ? (
-              <p className="text-sm text-slate-400 dark:text-slate-500 py-4 text-center">
-                No recipes found. Create recipes first.
-              </p>
-            ) : (
-              <div className="space-y-2">
-                {recipes.map(recipe => {
-                  const isSelected = selectedRecipes.includes(recipe.name);
-                  return (
-                    <button
-                      key={recipe.name}
-                      onClick={() => toggleRecipe(recipe.name)}
-                      className={clsx(
-                        'w-full flex items-center gap-3 p-3.5 rounded-xl border-2 text-left transition-all cursor-pointer',
-                        isSelected
-                          ? 'border-blue-500 bg-blue-50/50 dark:bg-blue-950/20 dark:border-blue-600'
-                          : 'border-slate-200 dark:border-slate-700 hover:border-slate-300 dark:hover:border-slate-600'
-                      )}
-                    >
-                      <div className={clsx(
-                        'flex h-5 w-5 shrink-0 items-center justify-center rounded-md border-2',
-                        isSelected
-                          ? 'border-blue-500 bg-blue-500'
-                          : 'border-slate-300 dark:border-slate-600'
-                      )}>
-                        {isSelected && <CheckCircle2 className="h-3 w-3 text-white" />}
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <BookOpen className={clsx('h-4 w-4', isSelected ? 'text-blue-600 dark:text-blue-400' : 'text-slate-400')} />
-                          <span className={clsx('text-sm font-semibold', isSelected ? 'text-blue-700 dark:text-blue-300' : 'text-slate-800 dark:text-white')}>
-                            {recipe.name}
-                          </span>
-                        </div>
-                        <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 ml-6">
-                          Qty: {formatNumber(recipe.total_quantity)} {recipe.water_percentage > 0 ? ` | Water: ${recipe.water_percentage}%` : ''}
-                        </p>
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
+      {/* Tab Navigation */}
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+        <div>
+          <h2 className="text-2xl font-bold text-slate-900 dark:text-white tracking-tight">
+            {activeTab === 'production' ? 'Production Reports' : 'Commercial Report'}
+          </h2>
+          <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
+            {activeTab === 'production'
+              ? 'Check stock availability against recipe requirements'
+              : 'Live commercial pipeline — orders, shipments, payments, and due amounts'}
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setActiveTab('production')}
+            className={clsx(
+              'inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-colors cursor-pointer',
+              activeTab === 'production'
+                ? 'bg-blue-600 text-white'
+                : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
             )}
-          </div>
-
-          {/* Report Results */}
-          {report && (
-            <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs overflow-hidden">
-              <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
-                <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Stock Availability</h3>
-                <div className="flex gap-2">
-                  <Badge variant={totalShortage === 0 ? 'success' : 'error'} dot>
-                    {totalShortage === 0 ? 'All OK' : `${totalShortage} shortage${totalShortage !== 1 ? 's' : ''}`}
-                  </Badge>
-                </div>
-              </div>
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-slate-100 dark:border-slate-800">
-                    <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Chemical</th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Current Stock</th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Required</th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Difference</th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Status</th>
-                    <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Recipes</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-50 dark:divide-slate-800/50">
-                  {report.report.map((item) => (
-                    <tr key={item.chemical_name} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40">
-                      <td className="px-4 py-3">
-                        <div className="flex items-center gap-2">
-                          <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-slate-100 dark:bg-slate-800">
-                            <FlaskConical className="h-3.5 w-3.5 text-slate-500 dark:text-slate-400" />
-                          </div>
-                          <span className="font-medium text-slate-900 dark:text-white">{item.chemical_name}</span>
-                        </div>
-                      </td>
-                      <td className="px-4 py-3 text-slate-700 dark:text-slate-300 font-mono">{formatNumber(item.current_stock)} {item.unit}</td>
-                      <td className="px-4 py-3 text-slate-700 dark:text-slate-300 font-mono">{formatNumber(item.required_total)} {item.unit}</td>
-                      <td className="px-4 py-3">
-                        <span className={clsx('font-mono font-semibold flex items-center gap-1', {
-                          'text-emerald-600 dark:text-emerald-400': item.shortage > 0,
-                          'text-slate-500 dark:text-slate-400': item.shortage === 0,
-                          'text-rose-600 dark:text-rose-400': item.shortage < 0
-                        })}>
-                          {item.shortage > 0 ? <TrendingUp className="h-3 w-3" /> : item.shortage < 0 ? <TrendingDown className="h-3 w-3" /> : <Minus className="h-3 w-3" />}
-                          {item.shortage > 0 ? '+' : ''}{formatNumber(item.shortage)} {item.unit}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3">
-                        <Badge variant={
-                          item.status === 'SHORTAGE' ? 'error' : item.status === 'EXACT' ? 'info' : 'success'
-                        } dot>
-                          {item.status}
-                        </Badge>
-                      </td>
-                      <td className="px-4 py-3">
-                        <div className="flex flex-wrap gap-1">
-                          {item.recipes && item.recipes.map((r, i) => (
-                            <span key={i} className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">
-                              {r.recipe_name}: {formatNumber(r.qty_from_this_recipe)}
-                            </span>
-                          ))}
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+          >
+            <BookOpen className="h-4 w-4" /> Production
+          </button>
+          {isAdmin && (
+            <button
+              onClick={() => setActiveTab('commercial')}
+              className={clsx(
+                'inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-colors cursor-pointer',
+                activeTab === 'commercial'
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
+              )}
+            >
+              <Building2 className="h-4 w-4" /> Commercial
+            </button>
           )}
         </div>
+      </div>
 
-        {/* Sidebar */}
-        <div className="space-y-4">
-          {/* Production Quantity */}
-          <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 shadow-xs">
-            <h3 className="text-base font-semibold text-slate-900 dark:text-white mb-3">Production Quantity</h3>
-            <div className="space-y-3">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={autoCalc}
-                  onChange={e => setAutoCalc(e.target.checked)}
-                  className="h-4 w-4 rounded border-slate-300 dark:border-slate-600 text-blue-600 focus:ring-blue-500"
-                />
-                <span className="text-sm text-slate-700 dark:text-slate-300">Auto-calculate from recipes</span>
-              </label>
-              <input
-                type="number"
-                value={productionQty}
-                onChange={e => { setAutoCalc(false); setProductionQty(e.target.value); }}
-                placeholder="0"
-                disabled={autoCalc}
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
-              />
-              <p className="text-[11px] text-slate-400 dark:text-slate-500">
-                {selectedRecipes.length} recipe{selectedRecipes.length !== 1 ? 's' : ''} selected
-              </p>
-            </div>
-          </div>
-
-          {/* Summary */}
-          {report && (
+      {/* Production Reports Tab */}
+      {activeTab === 'production' && (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <div className="lg:col-span-2 space-y-4">
+            {/* Recipe Selection */}
             <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 shadow-xs">
-              <h3 className="text-base font-semibold text-slate-900 dark:text-white mb-3">Summary</h3>
-              <div className="space-y-2 text-sm">
-                <div className="flex justify-between py-1.5 border-b border-slate-100 dark:border-slate-800">
-                  <span className="text-slate-500 dark:text-slate-400">Recipes</span>
-                  <span className="font-semibold text-slate-800 dark:text-white">{report.recipes.length}</span>
-                </div>
-                <div className="flex justify-between py-1.5 border-b border-slate-100 dark:border-slate-800">
-                  <span className="text-slate-500 dark:text-slate-400">Production Qty</span>
-                  <span className="font-semibold text-slate-800 dark:text-white">{formatNumber(report.qty)}</span>
-                </div>
-                <div className="flex justify-between py-1.5 border-b border-slate-100 dark:border-slate-800">
-                  <span className="text-slate-500 dark:text-slate-400">Total Chemicals</span>
-                  <span className="font-semibold text-slate-800 dark:text-white">{report.report.length}</span>
-                </div>
-                <div className="flex justify-between py-1.5 border-b border-slate-100 dark:border-slate-800">
-                  <span className="text-slate-500 dark:text-slate-400">Available</span>
-                  <span className="font-semibold text-emerald-600 dark:text-emerald-400">{totalOk}</span>
-                </div>
-                <div className="flex justify-between py-1.5">
-                  <span className="text-slate-500 dark:text-slate-400">Shortages</span>
-                  <span className={clsx('font-semibold', totalShortage > 0 ? 'text-rose-600 dark:text-rose-400' : 'text-emerald-600 dark:text-emerald-400')}>
-                    {totalShortage}
-                  </span>
-                </div>
-              </div>
-              {totalShortage > 0 && (
-                <div className="mt-3 p-3 rounded-lg bg-rose-50 dark:bg-rose-950/30 border border-rose-200 dark:border-rose-800">
-                  <div className="flex items-start gap-2">
-                    <AlertTriangle className="h-4 w-4 text-rose-500 mt-0.5 shrink-0" />
-                    <p className="text-xs text-rose-700 dark:text-rose-300">
-                      {totalShortage} chemical{totalShortage !== 1 ? 's' : ''} with insufficient stock for production.
-                    </p>
-                  </div>
+              <h3 className="text-base font-semibold text-slate-900 dark:text-white mb-4">Select Recipes</h3>
+              {recipes.length === 0 ? (
+                <p className="text-sm text-slate-400 dark:text-slate-500 py-4 text-center">
+                  No recipes found. Create recipes first.
+                </p>
+              ) : (
+                <div className="space-y-2">
+                  {recipes.map(recipe => {
+                    const isSelected = selectedRecipes.includes(recipe.name);
+                    return (
+                      <button
+                        key={recipe.name}
+                        onClick={() => toggleRecipe(recipe.name)}
+                        className={clsx(
+                          'w-full flex items-center gap-3 p-3.5 rounded-xl border-2 text-left transition-all cursor-pointer',
+                          isSelected
+                            ? 'border-blue-500 bg-blue-50/50 dark:bg-blue-950/20 dark:border-blue-600'
+                            : 'border-slate-200 dark:border-slate-700 hover:border-slate-300 dark:hover:border-slate-600'
+                        )}
+                      >
+                        <div className={clsx(
+                          'flex h-5 w-5 shrink-0 items-center justify-center rounded-md border-2',
+                          isSelected
+                            ? 'border-blue-500 bg-blue-500'
+                            : 'border-slate-300 dark:border-slate-600'
+                        )}>
+                          {isSelected && <CheckCircle2 className="h-3 w-3 text-white" />}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2">
+                            <BookOpen className={clsx('h-4 w-4', isSelected ? 'text-blue-600 dark:text-blue-400' : 'text-slate-400')} />
+                            <span className={clsx('text-sm font-semibold', isSelected ? 'text-blue-700 dark:text-blue-300' : 'text-slate-800 dark:text-white')}>
+                              {recipe.name}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 ml-6">
+                            Qty: {formatNumber(recipe.total_quantity)} {recipe.water_percentage > 0 ? ` | Water: ${recipe.water_percentage}%` : ''}
+                          </p>
+                        </div>
+                      </button>
+                    );
+                  })}
                 </div>
               )}
             </div>
-          )}
 
-          {/* Actions */}
-          <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 shadow-xs space-y-3">
-            <h3 className="text-base font-semibold text-slate-900 dark:text-white">Actions</h3>
-            <Button
-              variant="primary"
-              className="w-full justify-center"
-              icon={BarChart3}
-              loading={generating}
-              onClick={handleGenerate}
-              disabled={selectedRecipes.length === 0}
-            >
-              Generate Report
-            </Button>
+            {/* Report Results */}
             {report && (
-              <Button
-                variant="secondary"
-                className="w-full justify-center"
-                icon={Download}
-                onClick={handleExport}
-              >
-                Export as CSV
-              </Button>
+              <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs overflow-hidden">
+                <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
+                  <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Stock Availability</h3>
+                  <div className="flex gap-2">
+                    <Badge variant={totalShortage === 0 ? 'success' : 'error'} dot>
+                      {totalShortage === 0 ? 'All OK' : `${totalShortage} shortage${totalShortage !== 1 ? 's' : ''}`}
+                    </Badge>
+                  </div>
+                </div>
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-slate-100 dark:border-slate-800">
+                      <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Chemical</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Current Stock</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Required</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Difference</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Status</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Recipes</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-50 dark:divide-slate-800/50">
+                    {report.report.map((item) => (
+                      <tr key={item.chemical_name} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40">
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-slate-100 dark:bg-slate-800">
+                              <FlaskConical className="h-3.5 w-3.5 text-slate-500 dark:text-slate-400" />
+                            </div>
+                            <span className="font-medium text-slate-900 dark:text-white">{item.chemical_name}</span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-slate-700 dark:text-slate-300 font-mono">{formatNumber(item.current_stock)} {item.unit}</td>
+                        <td className="px-4 py-3 text-slate-700 dark:text-slate-300 font-mono">{formatNumber(item.required_total)} {item.unit}</td>
+                        <td className="px-4 py-3">
+                          <span className={clsx('font-mono font-semibold flex items-center gap-1', {
+                            'text-emerald-600 dark:text-emerald-400': item.shortage > 0,
+                            'text-slate-500 dark:text-slate-400': item.shortage === 0,
+                            'text-rose-600 dark:text-rose-400': item.shortage < 0
+                          })}>
+                            {item.shortage > 0 ? <TrendingUp className="h-3 w-3" /> : item.shortage < 0 ? <TrendingDown className="h-3 w-3" /> : <Minus className="h-3 w-3" />}
+                            {item.shortage > 0 ? '+' : ''}{formatNumber(item.shortage)} {item.unit}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3">
+                          <Badge variant={
+                            item.status === 'SHORTAGE' ? 'error' : item.status === 'EXACT' ? 'info' : 'success'
+                          } dot>
+                            {item.status}
+                          </Badge>
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex flex-wrap gap-1">
+                            {item.recipes && item.recipes.map((r, i) => (
+                              <span key={i} className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">
+                                {r.recipe_name}: {formatNumber(r.qty_from_this_recipe)}
+                              </span>
+                            ))}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
           </div>
+
+          {/* Sidebar */}
+          <div className="space-y-4">
+            {/* Production Quantity */}
+            <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 shadow-xs">
+              <h3 className="text-base font-semibold text-slate-900 dark:text-white mb-3">Production Quantity</h3>
+              <div className="space-y-3">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={autoCalc}
+                    onChange={e => setAutoCalc(e.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300 dark:border-slate-600 text-blue-600 focus:ring-blue-500"
+                  />
+                  <span className="text-sm text-slate-700 dark:text-slate-300">Auto-calculate from recipes</span>
+                </label>
+                <input
+                  type="number"
+                  value={productionQty}
+                  onChange={e => { setAutoCalc(false); setProductionQty(e.target.value); }}
+                  placeholder="0"
+                  disabled={autoCalc}
+                  className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
+                />
+                <p className="text-[11px] text-slate-400 dark:text-slate-500">
+                  {selectedRecipes.length} recipe{selectedRecipes.length !== 1 ? 's' : ''} selected
+                </p>
+              </div>
+            </div>
+
+            {/* Summary */}
+            {report && (
+              <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 shadow-xs">
+                <h3 className="text-base font-semibold text-slate-900 dark:text-white mb-3">Summary</h3>
+                <div className="space-y-2 text-sm">
+                  <div className="flex justify-between py-1.5 border-b border-slate-100 dark:border-slate-800">
+                    <span className="text-slate-500 dark:text-slate-400">Recipes</span>
+                    <span className="font-semibold text-slate-800 dark:text-white">{report.recipes.length}</span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-slate-100 dark:border-slate-800">
+                    <span className="text-slate-500 dark:text-slate-400">Production Qty</span>
+                    <span className="font-semibold text-slate-800 dark:text-white">{formatNumber(report.qty)}</span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-slate-100 dark:border-slate-800">
+                    <span className="text-slate-500 dark:text-slate-400">Total Chemicals</span>
+                    <span className="font-semibold text-slate-800 dark:text-white">{report.report.length}</span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-slate-100 dark:border-slate-800">
+                    <span className="text-slate-500 dark:text-slate-400">Available</span>
+                    <span className="font-semibold text-emerald-600 dark:text-emerald-400">{totalOk}</span>
+                  </div>
+                  <div className="flex justify-between py-1.5">
+                    <span className="text-slate-500 dark:text-slate-400">Shortages</span>
+                    <span className={clsx('font-semibold', totalShortage > 0 ? 'text-rose-600 dark:text-rose-400' : 'text-emerald-600 dark:text-emerald-400')}>
+                      {totalShortage}
+                    </span>
+                  </div>
+                </div>
+                {totalShortage > 0 && (
+                  <div className="mt-3 p-3 rounded-lg bg-rose-50 dark:bg-rose-950/30 border border-rose-200 dark:border-rose-800">
+                    <div className="flex items-start gap-2">
+                      <AlertTriangle className="h-4 w-4 text-rose-500 mt-0.5 shrink-0" />
+                      <p className="text-xs text-rose-700 dark:text-rose-300">
+                        {totalShortage} chemical{totalShortage !== 1 ? 's' : ''} with insufficient stock for production.
+                      </p>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Actions */}
+            <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 shadow-xs space-y-3">
+              <h3 className="text-base font-semibold text-slate-900 dark:text-white">Actions</h3>
+              <Button
+                variant="primary"
+                className="w-full justify-center"
+                icon={BarChart3}
+                loading={generating}
+                onClick={handleGenerate}
+                disabled={selectedRecipes.length === 0}
+              >
+                Generate Report
+              </Button>
+              {report && (
+                <Button
+                  variant="secondary"
+                  className="w-full justify-center"
+                  icon={Download}
+                  onClick={handleExport}
+                >
+                  Export as CSV
+                </Button>
+              )}
+            </div>
+          </div>
         </div>
-      </div>
+      )}
+
+      {/* Commercial Report Tab (admin only) */}
+      {isAdmin && activeTab === 'commercial' && renderCommercialTab()}
     </div>
   );
 }

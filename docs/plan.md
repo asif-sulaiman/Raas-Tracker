@@ -69,9 +69,9 @@ snapshots · companies master · single shipment header per record.
 |---|---|---|---|
 | P0 ✅ | **Companies master** — `companies` table (name required, rest optional), `sales.company_id` FK RESTRICT, idempotent backfill merging case variants, CRUD UI + API (mutations admin) | `db.py`, `companies.py`, `chem_stock.py`, `flask_app.py`, `Companies.jsx`, `tests/test_companies.py` | CRUD + gates + backfill green; gate green |
 | P1 ✅ | **Capture fields** — `sales.maturity_date/comments` (columns; maturity wired in P6), `sale_items.unit`, `shipments` table + record/delete UI, `production_runs` + `run_items` DDL; company select + unit inputs on PI entry; comments editor | `db.py`, `sales.py`, `flask_app.py`, `ReviewModal.jsx`, `ShipmentModal.jsx`, `SaleDetailModal.jsx` | New fields round-trip; gate green |
-| P2 | **Master recipe from register** — company→product selects, auto-name, `UNIQUE(company_id, name)`, 409 → existing; `recipes.company_id/product_name` | `flask_app.py`, `Recipes.jsx`, register endpoints | One master per company×product; gate green |
-| P3 | **Snapshot production** — run form (order/batch/date/qty/notes) → formula snapshot → atomic deduction → run record | `flask_app.py`, `recipes.py`, `stock.py`, Recipes UI | Deduction + snapshot + audit; gate green |
-| P4 | **Live commercial report** — USD KPIs + 13-col table + export, admin-only Commercial tab | `flask_app.py`, `Reports.jsx` | KPIs/rows/export correct; gate green |
+| P2 ✅ | **Master recipe from register** — company→product selects, auto-name, `UNIQUE(company_id, name)`, 409 → existing; `recipes.company_id/product_name` | `flask_app.py`, `Recipes.jsx`, register endpoints | One master per company×product; gate green |
+| P3 ✅ | **Snapshot production** — run form (order/batch/date/qty/notes) → formula snapshot → atomic deduction → run record | `flask_app.py`, `recipes.py`, `stock.py`, Recipes UI | Deduction + snapshot + audit; gate green |
+| P4 ✅ | **Live commercial report** — USD KPIs + 13-col table + export, admin-only Commercial tab | `flask_app.py`, `Reports.jsx` | KPIs/rows/export correct; gate green |
 | P5 | **Consistency lock** — pipeline mutations admin-only; every write dated + actor | `flask_app.py`, sales UI | Non-admin blocked; gate green |
 | P6 | **Maturity reminders** — maturity at payment entry + daily cron → bell (maturity + 7-day escalation, dedupe) | `flask_app.py`, `vercel.json`, sales UI | Reminders fire, escalation fires, paid silent; gate green |
 

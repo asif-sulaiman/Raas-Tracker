@@ -2,6 +2,7 @@
 
 import os
 import sys
+import io
 from flask import Flask, request, jsonify, send_from_directory, g
 from datetime import date
 from functools import wraps
@@ -42,7 +43,7 @@ from chem_stock import (
     update_sale_payment_record, delete_sale_payment_record, update_sale_full,
     get_stock_movements, list_companies, create_company, update_company,
     delete_company, get_company, add_shipment, list_shipments, delete_shipment,
-    create_production_run, get_register_products
+    create_production_run, get_register_products, get_commercial_report
 )
 
 # ---- AuthN/Z: sessions (humans) OR api_keys (scripts) ----
@@ -1150,6 +1151,58 @@ def api_report_export():
         export_report_to_csv(report, ", ".join(recipe_names), qty, output_path)
         return jsonify({"success": True, "filename": f"report_{safe_name}_{qty_int}.csv"})
     return jsonify({"error": "Could not generate report"}), 500
+
+
+# ==================== API: LIVE COMMERCIAL REPORT ====================
+@app.route("/api/reports/live")
+@admin_required
+def api_commercial_report():
+    conn = get_db()
+    rows = get_commercial_report(conn)
+    conn.close()
+    return jsonify(rows)
+
+
+@app.route("/api/reports/live/export", methods=["POST"])
+@admin_required
+@limiter.limit("15 per minute")
+def api_commercial_report_export():
+    conn = get_db()
+    rows = get_commercial_report(conn)
+    conn.close()
+    if not rows:
+        return jsonify({"error": "No data to export"}), 400
+    import csv
+    import io
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Customer Name", "PI No", "PI Date", "LC No", "LC Date",
+        "Product Name", "Unit", "Quantity", "Unit Price", "Total Price ($)",
+        "Invoice Date", "Latest Ship Date", "Actual Ship Date",
+        "Maturity Date", "Receive Date", "Received Amount ($)",
+        "Due Amount ($)", "Payment Status", "Payment Comment"
+    ])
+    for r in rows:
+        writer.writerow([
+            r.get("customer_name", ""),
+            r.get("pi_number", ""), r.get("pi_date", ""),
+            r.get("lc_number", ""), r.get("lc_date", ""),
+            r.get("product_name", ""),
+            r.get("unit", ""), r.get("quantity", 0),
+            r.get("unit_price", 0), r.get("total_price", 0),
+            r.get("invoice_date", ""),
+            r.get("latest_ship_date", ""), r.get("actual_ship_date", ""),
+            r.get("maturity_date", ""),
+            r.get("receive_date", ""),
+            r.get("received_amount", 0),
+            r.get("due_amount", 0),
+            r.get("payment_status", ""), r.get("payment_comment", "")
+        ])
+    from datetime import date as _date
+    filename = f"commercial_report_{_date.today().isoformat()}.csv"
+    output.seek(0)
+    return jsonify({"success": True, "filename": filename, "content": output.getvalue()})
 
 
 # ==================== API: AUDIT LOGS ====================

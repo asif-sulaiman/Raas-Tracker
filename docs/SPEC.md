@@ -20,7 +20,7 @@
 ## 2. Folder Structure
 
 ```
-ChemCalc/
+Raas-Tracker/
 ├── .github/workflows/ci.yml       # CI pipeline
 ├── .opencode/
 │   ├── commands/                  # Custom opencode commands
@@ -439,6 +439,10 @@ CREATE TABLE app_settings (
 | DELETE | `/api/recipes/<name>` | Admin | Delete recipe |
 | PUT | `/api/recipes/<name>` | Session/Key | Update yield/water% |
 | PUT | `/api/recipes/<name>/items/<chem>` | Session/Key | Update item % |
+| GET | `/api/register/products` | Session/Key | Registered products for a company (master-recipe source, P2) |
+| POST | `/api/recipes/<name>/produce` | Admin | Create production run: formula snapshot + atomic stock deduction (warn-and-allow) (P3) |
+| GET | `/api/recipes/<name>/runs` | Session/Key | List production runs for a recipe (P3) |
+| GET | `/api/recipes/<name>/runs/<id>` | Session/Key | Production run detail with snapshot (P3) |
 
 ### Uploads & Reconciliation
 | Method | Path | Auth | Description |
@@ -456,6 +460,8 @@ CREATE TABLE app_settings (
 |---|---|---|---|
 | POST | `/api/reports/generate` | Session/Key (15/min) | Multi-recipe report JSON |
 | POST | `/api/reports/export` | Session/Key (15/min) | CSV export |
+| GET | `/api/reports/live` | Admin | Live commercial report — one row per sale item, sale-level payment fields repeated (P4) |
+| POST | `/api/reports/live/export` | Admin (15/min) | Commercial report CSV `{success, filename, content}` (P4) |
 
 ### Audit & Notifications
 | Method | Path | Auth | Description |

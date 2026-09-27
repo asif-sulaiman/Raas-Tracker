@@ -596,4 +596,107 @@ def get_sales_summary(conn: psycopg.Connection) -> Dict[str, Any]:
     return summary
 
 
-# ==================== USER AUTH FUNCTIONS ====================
+def _parse_date(value: Any) -> Optional[date]:
+    """TEXT/`date` column → `date`, or None when unset/unparseable."""
+    if not value:
+        return None
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def _payment_status(due_amount: float, maturity_date: Any,
+                    received_amount: float) -> str:
+    """Paid → Overdue → Partial → Due → Pending (contract precedence order)."""
+    if due_amount <= 0:
+        return "Paid"
+    mat = _parse_date(maturity_date)
+    if mat and mat < date.today():
+        return "Overdue"
+    if received_amount > 0:
+        return "Partial"
+    if mat:
+        return "Due"
+    return "Pending"
+
+
+def get_commercial_report(conn: psycopg.Connection) -> List[Dict[str, Any]]:
+    """Live commercial report — one output row per sale_item, USD only.
+
+    Item-level columns (product, qty, price, total_price, dates on the
+    shipment) vary per row. Sale-level payment columns — received_amount,
+    due_amount, receive_date, maturity_date, payment_status,
+    payment_comment — are computed per SALE and repeated identically on
+    every row of that sale. Sale total and sale paid are aggregated in
+    scalar subqueries so item x shipment x payment joins can never
+    double count.
+    """
+    query = """
+        SELECT
+            s.id AS sale_id,
+            COALESCE(c.name, s.client_name) AS customer_name,
+            s.pi_number, s.pi_date,
+            s.lc_number, s.lc_date,
+            si.product_name, si.unit, si.quantity, si.unit_price,
+            ROUND((si.quantity * si.unit_price)::numeric, 2)::float8 AS total_price,
+            (SELECT MAX(sh.invoice_date)
+               FROM shipments sh WHERE sh.sale_id = s.id) AS invoice_date,
+            (SELECT MAX(sh.ship_date)
+               FROM shipments sh WHERE sh.sale_id = s.id) AS latest_ship_date,
+            s.shipment_date AS actual_ship_date,
+            s.maturity_date,
+            (SELECT MAX(sp.payment_date)
+               FROM sale_payments sp WHERE sp.sale_id = s.id) AS receive_date,
+            (SELECT COALESCE(ROUND(SUM(sp.payment_amount)::numeric, 2), 0)::float8
+               FROM sale_payments sp WHERE sp.sale_id = s.id) AS received_amount,
+            (SELECT COALESCE(ROUND(SUM(si2.quantity * si2.unit_price)::numeric, 2), 0)::float8
+               FROM sale_items si2 WHERE si2.sale_id = s.id) AS sale_total,
+            s.comments
+        FROM sales s
+        LEFT JOIN sale_items si ON si.sale_id = s.id
+        LEFT JOIN companies c ON c.id = s.company_id
+        ORDER BY s.created_at DESC
+    """
+    rows = conn.execute(query).fetchall()
+
+    report = []
+    for r in rows:
+        (sale_id, customer_name, pi_number, pi_date, lc_number, lc_date,
+         product_name, unit, quantity, unit_price, total_price,
+         invoice_date, latest_ship_date, actual_ship_date,
+         maturity_date, receive_date, received_amount, sale_total,
+         comments) = r
+
+        received = round(float(received_amount or 0), 2)
+        # due = ROUND(sale_total, 2) - sale_paid, clamped at 0.
+        due_amount = round(max(round(float(sale_total or 0), 2) - received, 0.0), 2)
+        pay_status = _payment_status(due_amount, maturity_date, received)
+        pay_comment = (comments or "").strip()
+
+        report.append({
+            "sale_id": sale_id,
+            "customer_name": customer_name,
+            "pi_number": pi_number,
+            "pi_date": pi_date,
+            "lc_number": lc_number,
+            "lc_date": lc_date,
+            "product_name": product_name,
+            "unit": unit,
+            "quantity": quantity,
+            "unit_price": unit_price,
+            "total_price": total_price,
+            "invoice_date": invoice_date,
+            "latest_ship_date": latest_ship_date,
+            "actual_ship_date": actual_ship_date,
+            "maturity_date": maturity_date,
+            "receive_date": receive_date,
+            "received_amount": received,
+            "due_amount": due_amount,
+            "payment_status": pay_status,
+            "payment_comment": pay_comment,
+        })
+
+    return report

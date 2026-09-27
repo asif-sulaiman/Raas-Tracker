@@ -138,6 +138,7 @@ from raas_tracker.sales import (
     get_sale_invoice_total,
     get_sale_total_paid,
     get_sales_summary,
+    get_commercial_report,
     list_shipments,
     move_sale_to_stage,
     record_sale_payment,
@@ -146,6 +147,8 @@ from raas_tracker.sales import (
     update_sale_lc,
     update_sale_payment,
     update_sale_payment_record,
+    delete_sale_payment_record,
+    update_sale_full,
 )
 
 from raas_tracker.cli import main
