@@ -63,6 +63,26 @@ Flask 3 + psycopg3 backend, React 19/Vite/Tailwind 4 frontend, PostgreSQL (Supab
 - **Audit** every mutating action with actor + old/new values.
 - **Secrets live in env only** — never in git, never in chat.
 
+## Auth & Password Security Rules
+
+- **bcrypt-only hashing** — passwords via `_hash_password` (bcrypt-13 over
+  SHA256 pre-hash). Never use werkzeug or any other hasher.
+- **Constant-time + generic-200 anti-enumeration** — unknown-username logins
+  burn `_dummy_hash` bcrypt work; forgot-password returns an identical generic
+  200 for known and unknown accounts with a ~200ms delay floor (no dummy-hash
+  there — single-sided bcrypt would invert the oracle). Reset tokens are
+  256-bit unguessable; only hashes are stored.
+- **Admin resets audit + must_change** — force-resets audit
+  `ADMIN_FORCE_PASSWORD_RESET`, set `must_change_password=1`, and return the
+  temp secret / token exactly once (hash stored, raw never persisted).
+- **TTL ≤ 60 min** — reset tokens expire (`reset_token_expires_at`, UTC text);
+  redeem uses `SELECT ... FOR UPDATE` so double-redeem loses the race.
+- **Sessions revoked** — every password write revokes sessions (voluntary
+  change keeps the current session via `except_token_hash`; resets and admin
+  force-resets revoke all).
+- **`_gate_api` enforcement** — `must_change_password==1` human sessions get
+  403 on all `/api/*` except change-password, me, and logout; API keys exempt.
+
 ## Off-limits without explicit approval
 
 - `.env` / `.env.*`

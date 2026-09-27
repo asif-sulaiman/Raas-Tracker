@@ -11,7 +11,7 @@ from .audit import log_audit_action
 
 import hashlib as _hashlib
 import secrets as _secrets
-from datetime import datetime as _datetime, timedelta as _timedelta
+from datetime import datetime as _datetime, timedelta as _timedelta, timezone as _timezone
 
 
 BCRYPT_ROUNDS = 13
@@ -214,7 +214,8 @@ def _dummy_hash() -> str:
 def verify_user(conn: psycopg.Connection, username: str, password: str) -> Optional[Dict[str, Any]]:
     """Check credentials. Returns the public user dict or None (generic failure)."""
     row = conn.execute(
-        "SELECT id, username, password_hash, role, created_at FROM users WHERE username = %s",
+        "SELECT id, username, password_hash, role, created_at, must_change_password "
+        "FROM users WHERE username = %s",
         ((username or "").strip(),)
     ).fetchone()
     if not row:
@@ -222,14 +223,19 @@ def verify_user(conn: psycopg.Connection, username: str, password: str) -> Optio
         return None
     if not _check_password(password or "", row[2]):
         return None
-    return {"id": row[0], "username": row[1], "role": row[3], "created_at": row[4]}
+    return {"id": row[0], "username": row[1], "role": row[3], "created_at": row[4],
+            "must_change_password": bool(row[5])}
 
 
 def list_users(conn: psycopg.Connection) -> List[Dict[str, Any]]:
-    """All users, public fields only."""
+    """All users, public fields only (plus reset-state booleans, never hashes)."""
     return [
-        {"id": r[0], "username": r[1], "role": r[2], "created_at": r[3]}
-        for r in conn.execute("SELECT id, username, role, created_at FROM users ORDER BY id").fetchall()
+        {"id": r[0], "username": r[1], "role": r[2], "created_at": r[3],
+         "must_change_password": bool(r[4]),
+         "has_pending_reset": bool(r[5]) and not _reset_token_expired_at(r[6])}
+        for r in conn.execute(
+            "SELECT id, username, role, created_at, must_change_password, "
+            "reset_token_hash, reset_token_expires_at FROM users ORDER BY id").fetchall()
     ]
 
 
@@ -272,7 +278,8 @@ def get_session_user(conn: psycopg.Connection, token: Optional[str]) -> Optional
         return None
     token_hash = _hashlib.sha256(token.encode("utf-8")).hexdigest()
     row = conn.execute(
-        """SELECT u.id, u.username, u.role, u.created_at, s.expires_at, s.revoked
+        """SELECT u.id, u.username, u.role, u.created_at, s.expires_at, s.revoked,
+                  u.must_change_password
            FROM sessions s JOIN users u ON u.id = s.user_id
            WHERE s.token_hash = %s
            AND s.expires_at > to_char(clock_timestamp(), 'YYYY-MM-DD HH:MM:SS')""",
@@ -280,7 +287,8 @@ def get_session_user(conn: psycopg.Connection, token: Optional[str]) -> Optional
     ).fetchone()
     if not row or row[5]:
         return None
-    return {"id": row[0], "username": row[1], "role": row[2], "created_at": row[3]}
+    return {"id": row[0], "username": row[1], "role": row[2], "created_at": row[3],
+            "must_change_password": bool(row[6])}
 
 
 def revoke_session(conn: psycopg.Connection, token: Optional[str]) -> None:
@@ -292,10 +300,102 @@ def revoke_session(conn: psycopg.Connection, token: Optional[str]) -> None:
     conn.commit()
 
 
-def revoke_user_sessions(conn: psycopg.Connection, user_id: int) -> None:
-    """Revoke all sessions of a user."""
-    conn.execute("UPDATE sessions SET revoked = 1 WHERE user_id = %s", (user_id,))
+def revoke_user_sessions(conn: psycopg.Connection, user_id: int,
+                         except_token_hash: Optional[str] = None) -> None:
+    """Revoke sessions of a user, optionally keeping one (voluntary change)."""
+    if except_token_hash:
+        conn.execute("UPDATE sessions SET revoked = 1 WHERE user_id = %s AND token_hash != %s",
+                     (user_id, except_token_hash))
+    else:
+        conn.execute("UPDATE sessions SET revoked = 1 WHERE user_id = %s", (user_id,))
     conn.commit()
+
+
+def _reset_token_hash(raw_token: str) -> str:
+    """SHA-256 hex of a reset token (only the hash is ever stored)."""
+    return _hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+
+def _reset_expiry_text(ttl_min: int) -> str:
+    """UTC 'YYYY-MM-DD HH:MM:SS' expiry for a freshly issued reset token."""
+    return (_datetime.now(_timezone.utc) + _timedelta(minutes=ttl_min)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _reset_token_expired_at(expires_at: Optional[str]) -> bool:
+    """True when a stored UTC expiry text is missing, unparseable, or past."""
+    try:
+        exp = _datetime.strptime((expires_at or "")[:19], "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=_timezone.utc)
+    except ValueError:
+        return True
+    return _datetime.now(_timezone.utc) >= exp
+
+
+def set_password(conn: psycopg.Connection, user_id: int, new_password: str,
+                 *, must_change: bool = False,
+                 except_token_hash: Optional[str] = None) -> None:
+    """Atomically replace a password: validate → bcrypt-13 hash → single
+    UPDATE (hash, token cleared, flag) → revoke sessions → audit → commit."""
+    validate_password(new_password)
+    conn.execute(
+        "UPDATE users SET password_hash = %s, reset_token_hash = NULL, "
+        "reset_token_expires_at = NULL, must_change_password = %s WHERE id = %s",
+        (_hash_password(new_password), 1 if must_change else 0, user_id)
+    )
+    row = conn.execute("SELECT username FROM users WHERE id = %s", (user_id,)).fetchone()
+    revoke_user_sessions(conn, user_id, except_token_hash=except_token_hash)
+    log_audit_action(conn, "PASSWORD_CHANGED", "user", user_id,
+                     new_value=row[0] if row else None)
+    conn.commit()
+
+
+def issue_reset_token(conn: psycopg.Connection, user_id: int, ttl_min: int = 60) -> str:
+    """Mint a single-use reset token. Returns the raw token ONCE (hash stored)."""
+    raw = _secrets.token_urlsafe(32)
+    conn.execute(
+        "UPDATE users SET reset_token_hash = %s, reset_token_expires_at = %s WHERE id = %s",
+        (_reset_token_hash(raw), _reset_expiry_text(ttl_min), user_id)
+    )
+    row = conn.execute("SELECT username FROM users WHERE id = %s", (user_id,)).fetchone()
+    log_audit_action(conn, "PASSWORD_RESET_REQUESTED", "user", user_id,
+                     new_value=row[0] if row else None)
+    conn.commit()
+    return raw
+
+
+def redeem_reset_token(conn: psycopg.Connection, raw_token: str, new_password: str) -> int:
+    """Redeem a reset token for a new password. Returns the user id.
+
+    Row lock (FOR UPDATE) serializes concurrent redeems: the loser finds the
+    hash already cleared and gets the generic failure. Raises ValueError with
+    a generic message on any token problem.
+    """
+    import hmac as _hmac
+    if not raw_token:
+        raise ValueError("invalid or expired reset token")
+    digest = _reset_token_hash(raw_token)
+    row = conn.execute(
+        "SELECT id, username, reset_token_hash, reset_token_expires_at FROM users "
+        "WHERE reset_token_hash = %s FOR UPDATE",
+        (digest,)
+    ).fetchone()
+    if not row or not _hmac.compare_digest(digest, row[2] or ""):
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise ValueError("invalid or expired reset token")
+    if _reset_token_expired_at(row[3]):
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise ValueError("invalid or expired reset token")
+    validate_password(new_password)
+    set_password(conn, row[0], new_password, must_change=False)
+    log_audit_action(conn, "PASSWORD_RESET_SUCCESS", "user", row[0], new_value=row[1])
+    conn.commit()
+    return row[0]
 
 
 def cleanup_expired_sessions(conn: psycopg.Connection) -> int:

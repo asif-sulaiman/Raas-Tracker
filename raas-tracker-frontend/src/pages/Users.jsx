@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Users as UsersIcon, Plus, Trash2, KeyRound, Ban, Copy, Check } from 'lucide-react';
+import { Users as UsersIcon, Plus, Trash2, KeyRound, Ban, Copy, Check, Dices, Link2 } from 'lucide-react';
 import Button from '../components/ui/Button';
 import Badge from '../components/ui/Badge';
 import Modal from '../components/modals/Modal';
@@ -25,6 +25,12 @@ export default function Users() {
   const [freshKey, setFreshKey] = useState(null);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState(null);
+  const [resetTarget, setResetTarget] = useState(null);
+  const [tempInput, setTempInput] = useState('');
+  const [resetBusy, setResetBusy] = useState(false);
+  const [resetError, setResetError] = useState(null);
+  const [oneTime, setOneTime] = useState(null);
+  const [copiedSecret, setCopiedSecret] = useState(false);
 
   const fetchAll = async () => {
     try {
@@ -140,6 +146,90 @@ export default function Users() {
     } catch { /* ignore */ }
   };
 
+  const openReset = (u) => {
+    setResetTarget(u);
+    setTempInput('');
+    setResetError(null);
+    setOneTime(null);
+    setCopiedSecret(false);
+    setResetBusy(false);
+  };
+
+  const closeReset = () => {
+    setResetTarget(null);
+    setTempInput('');
+    setResetError(null);
+    setOneTime(null);
+    setCopiedSecret(false);
+    setResetBusy(false);
+  };
+
+  const genTemp = () => {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%&*';
+    let out = '';
+    try {
+      const buf = new Uint32Array(12);
+      crypto.getRandomValues(buf);
+      out = Array.from(buf, (n) => chars[n % chars.length]).join('');
+    } catch {
+      for (let i = 0; i < 12; i += 1) {
+        out += chars[Math.floor(Math.random() * chars.length)];
+      }
+    }
+    setTempInput(out);
+  };
+
+  const handleSetTemp = async () => {
+    if (!resetTarget) return;
+    setResetError(null);
+    if (tempInput && tempInput.length < 8) {
+      setResetError('Temp password must be at least 8 characters');
+      return;
+    }
+    setResetBusy(true);
+    try {
+      const res = await apiFetch(`/api/users/${resetTarget.id}/password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(tempInput ? { temp_password: tempInput } : {}),
+      });
+      const data = await res.json().catch(() => ({}));
+      // Shown once: clearing it on modal close keeps it out of state.
+      setOneTime({ kind: 'password', user: resetTarget.username, value: data.temp_password });
+      setCopiedSecret(false);
+      fetchAll();
+    } catch (err) {
+      setResetError(err.message || 'Could not set temp password');
+    } finally {
+      setResetBusy(false);
+    }
+  };
+
+  const handleIssueToken = async () => {
+    if (!resetTarget) return;
+    setResetError(null);
+    setResetBusy(true);
+    try {
+      const res = await apiFetch(`/api/users/${resetTarget.id}/reset-token`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      setOneTime({ kind: 'link', user: resetTarget.username, value: data.link || data.token });
+      setCopiedSecret(false);
+      fetchAll();
+    } catch (err) {
+      setResetError(err.message || 'Could not issue reset link');
+    } finally {
+      setResetBusy(false);
+    }
+  };
+
+  const copySecret = async () => {
+    if (!oneTime?.value) return;
+    try {
+      await navigator.clipboard.writeText(oneTime.value);
+      setCopiedSecret(true);
+    } catch { /* ignore */ }
+  };
+
   return (
     <div className="space-y-6 max-w-5xl mx-auto">
       <h2 className="text-xl font-bold text-slate-900 dark:text-white flex items-center gap-2">
@@ -162,13 +252,24 @@ export default function Users() {
             <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
               {users.map((u) => (
                 <tr key={u.id}>
-                  <td className="px-3 py-2 font-medium text-slate-900 dark:text-white">{u.username}</td>
+                  <td className="px-3 py-2">
+                    <span className="font-medium text-slate-900 dark:text-white">{u.username}</span>
+                    {(u.must_change_password || u.has_pending_reset) && (
+                      <span className="mt-1 flex flex-wrap gap-1">
+                        {u.must_change_password && <Badge variant="warning">must change password</Badge>}
+                        {u.has_pending_reset && <Badge variant="pending">reset pending</Badge>}
+                      </span>
+                    )}
+                  </td>
                   <td className="px-3 py-2">
                     <Badge variant={u.role === 'admin' ? 'new' : 'default'}>{u.role}</Badge>
                   </td>
                   <td className="px-3 py-2 text-slate-500">{formatDateTime(u.created_at)}</td>
                   <td className="px-3 py-2">
                     <div className="flex justify-end gap-1.5">
+                      <Button variant="secondary" size="sm" icon={KeyRound} onClick={() => openReset(u)} title="Reset password / issue link">
+                        {null}
+                      </Button>
                       <Button variant="secondary" size="sm" icon={Ban} onClick={() => handleRevokeSessions(u)} title="Log out everywhere">
                         {null}
                       </Button>
@@ -243,6 +344,74 @@ export default function Users() {
           <Button variant="primary" size="sm" icon={KeyRound} onClick={handleCreateKey}>Create Key</Button>
         </div>
       </div>
+
+      <Modal
+        isOpen={!!resetTarget}
+        onClose={closeReset}
+        title={resetTarget ? `Reset password — ${resetTarget.username}` : 'Reset password'}
+        subtitle="They must set a new password at next login"
+        maxWidth="max-w-md"
+      >
+        {oneTime ? (
+          <div className="space-y-3">
+            <p className="text-sm text-slate-600 dark:text-slate-300">
+              {oneTime.kind === 'password' ? (
+                <>Temporary password for <span className="font-semibold">{oneTime.user}</span>:</>
+              ) : (
+                <>Reset link for <span className="font-semibold">{oneTime.user}</span>:</>
+              )}
+            </p>
+            <div className="flex items-center gap-2 rounded-lg bg-slate-100 dark:bg-slate-800 px-3 py-2.5 font-mono text-xs break-all">
+              <span className="flex-1">{oneTime.value}</span>
+              <button onClick={copySecret} className="p-1.5 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-700 cursor-pointer" title="Copy">
+                {copiedSecret ? <Check className="h-4 w-4 text-emerald-600" /> : <Copy className="h-4 w-4 text-slate-500" />}
+              </button>
+            </div>
+            <p className="text-xs font-medium text-amber-600 dark:text-amber-400">
+              Shown once — copy it now. Closing this loses it.
+            </p>
+            <Button variant="secondary" size="sm" onClick={closeReset} className="w-full justify-center">
+              Done
+            </Button>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div className="rounded-xl border border-slate-200 dark:border-slate-700 p-3.5">
+              <p className="text-sm font-semibold text-slate-800 dark:text-white">Set a temporary password</p>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 mb-2.5">
+                Leave blank to auto-generate, or type one (min 8 characters).
+              </p>
+              <div className="flex gap-2">
+                <input
+                  value={tempInput}
+                  onChange={(e) => setTempInput(e.target.value)}
+                  className={inputCls}
+                  placeholder="Auto-generate if blank"
+                  autoComplete="off"
+                />
+                <Button variant="secondary" size="sm" icon={Dices} onClick={genTemp} title="Generate password">
+                  {null}
+                </Button>
+              </div>
+              <Button variant="primary" size="sm" icon={KeyRound} loading={resetBusy} onClick={handleSetTemp} className="w-full justify-center mt-2.5">
+                Set temp password
+              </Button>
+            </div>
+            <div className="rounded-xl border border-slate-200 dark:border-slate-700 p-3.5">
+              <p className="text-sm font-semibold text-slate-800 dark:text-white">Issue a reset link</p>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 mb-2.5">
+                They open the link and choose their own password.
+              </p>
+              <Button variant="secondary" size="sm" icon={Link2} loading={resetBusy} onClick={handleIssueToken} className="w-full justify-center">
+                Issue reset link
+              </Button>
+            </div>
+            {resetError && (
+              <p className="text-xs font-medium text-rose-600 dark:text-rose-400">{resetError}</p>
+            )}
+          </div>
+        )}
+      </Modal>
 
       <Modal isOpen={!!freshKey} onClose={() => setFreshKey(null)} title="API Key Created" subtitle="Copy it now — it will never be shown again">
         <div className="flex items-center gap-2 rounded-lg bg-slate-100 dark:bg-slate-800 px-3 py-2.5 font-mono text-xs break-all">

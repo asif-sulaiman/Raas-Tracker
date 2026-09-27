@@ -1,7 +1,8 @@
 import { useState } from 'react';
 import { Link, useNavigate, useLocation } from 'react-router-dom';
-import { LogIn, AlertTriangle, Clock } from 'lucide-react';
+import { LogIn, AlertTriangle, Clock, KeyRound } from 'lucide-react';
 import Button from '../components/ui/Button';
+import Modal from '../components/modals/Modal';
 import { useAuth } from '../context/AuthContext';
 
 const inputCls =
@@ -12,6 +13,11 @@ export default function Login() {
   const [password, setPassword] = useState('');
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [forgotOpen, setForgotOpen] = useState(false);
+  const [forgotName, setForgotName] = useState('');
+  const [forgotBusy, setForgotBusy] = useState(false);
+  const [forgotSent, setForgotSent] = useState(false);
+  const [forgotError, setForgotError] = useState(null);
   const { login } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
@@ -36,6 +42,44 @@ export default function Login() {
         setError(err.message || 'Login failed');
       }
       setBusy(false);
+    }
+  };
+
+  const openForgot = () => {
+    setForgotName(username.trim());
+    setForgotError(null);
+    setForgotSent(false);
+    setForgotBusy(false);
+    setForgotOpen(true);
+  };
+
+  const closeForgot = () => {
+    setForgotOpen(false);
+    setForgotError(null);
+    setForgotSent(false);
+  };
+
+  const handleForgot = async (e) => {
+    e.preventDefault();
+    setForgotError(null);
+    if (!forgotName.trim()) {
+      setForgotError('Enter your username');
+      return;
+    }
+    setForgotBusy(true);
+    try {
+      // Any HTTP response means "accepted" — the server never reveals
+      // whether the account exists, and neither do we.
+      await fetch('/api/auth/forgot-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: forgotName.trim() }),
+      });
+      setForgotSent(true);
+    } catch {
+      setForgotError('Network error — is the server running?');
+    } finally {
+      setForgotBusy(false);
     }
   };
 
@@ -72,10 +116,58 @@ export default function Login() {
           </Button>
         </form>
 
-        <p className="text-xs text-slate-500 dark:text-slate-400 mt-4 text-center">
+        <p className="mt-3 text-center">
+          <button type="button" onClick={openForgot} className="text-xs font-semibold text-blue-600 dark:text-blue-400 hover:underline cursor-pointer">
+            Forgot password?
+          </button>
+        </p>
+
+        <p className="text-xs text-slate-500 dark:text-slate-400 mt-2 text-center">
           First run? <Link to="/setup" className="text-blue-600 dark:text-blue-400 font-semibold hover:underline">Create admin account</Link>
         </p>
       </div>
+
+      <Modal
+        isOpen={forgotOpen}
+        onClose={closeForgot}
+        title="Forgot password?"
+        subtitle="Enter your username to request a reset"
+        maxWidth="max-w-sm"
+      >
+        {forgotSent ? (
+          <div className="space-y-3">
+            <p className="text-sm text-slate-600 dark:text-slate-300">
+              If an account with that username exists, reset instructions are on their way.
+              Contact your admin if you need help.
+            </p>
+            <Button variant="secondary" size="sm" onClick={closeForgot} className="w-full justify-center">
+              Back to login
+            </Button>
+          </div>
+        ) : (
+          <form onSubmit={handleForgot} className="space-y-3">
+            <div>
+              <label className="text-xs font-medium text-slate-600 dark:text-slate-300">Username</label>
+              <input
+                value={forgotName}
+                onChange={(e) => setForgotName(e.target.value)}
+                className={inputCls}
+                autoComplete="username"
+                autoFocus
+                placeholder="e.g. storekeeper"
+              />
+            </div>
+            {forgotError && (
+              <p className="flex items-center gap-1.5 text-xs font-medium text-rose-600 dark:text-rose-400">
+                <AlertTriangle className="h-3.5 w-3.5" /> {forgotError}
+              </p>
+            )}
+            <Button variant="primary" size="sm" icon={KeyRound} loading={forgotBusy} className="w-full justify-center" type="submit">
+              Send reset request
+            </Button>
+          </form>
+        )}
+      </Modal>
     </div>
   );
 }

@@ -431,6 +431,13 @@ def _create_tables(conn: psycopg.Connection) -> None:
         conn.execute("ALTER TABLE sales ADD COLUMN maturity_date TEXT")
     if "unit" not in _table_columns(conn, "sale_items"):
         conn.execute("ALTER TABLE sale_items ADD COLUMN unit TEXT NOT NULL DEFAULT 'KG'")
+    # M10: password reset/change (no email column, no new table).
+    if "reset_token_hash" not in _table_columns(conn, "users"):
+        conn.execute("ALTER TABLE users ADD COLUMN reset_token_hash TEXT")
+    if "reset_token_expires_at" not in _table_columns(conn, "users"):
+        conn.execute("ALTER TABLE users ADD COLUMN reset_token_expires_at TEXT")
+    if "must_change_password" not in _table_columns(conn, "users"):
+        conn.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
     # P2: master recipe linkage (company x product, no auto-create).
     if "company_id" not in _table_columns(conn, "recipes"):
         conn.execute("ALTER TABLE recipes ADD COLUMN company_id INTEGER "

@@ -312,6 +312,9 @@ CREATE TABLE users (
     username TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'user',
+    reset_token_hash TEXT,                       -- M10: SHA-256 of single-use reset token (raw shown once)
+    reset_token_expires_at TEXT,                 -- M10: UTC 'YYYY-MM-DD HH:MM:SS' expiry (TTL ≤ 60 min)
+    must_change_password INTEGER NOT NULL DEFAULT 0,  -- M10: forced-change flag, enforced in _gate_api
     created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS'))
 );
 
@@ -394,7 +397,10 @@ CREATE TABLE app_settings (
 | POST | `/api/auth/setup` | Public (token) | First-admin creation (single-use token) |
 | POST | `/api/auth/login` | Public | Session cookie mint |
 | POST | `/api/auth/logout` | Public | Revoke session cookie |
-| GET | `/api/auth/me` | Session/Key | Current identity details |
+| GET | `/api/auth/me` | Session/Key | Current identity details + `must_change_password`, `has_pending_reset` |
+| PUT | `/api/auth/password` | Session (human) | Voluntary change (`current_password`, `new_password`); keeps current session, revokes others |
+| POST | `/api/auth/forgot-password` | Public (5/min) | Reset request (`username`); always generic 200; raw token server-logged once |
+| POST | `/api/auth/reset-password` | Public (10/min) | Single-use redeem (`token`, `new_password`); 200 or generic 400 |
 
 ### Users (admin only)
 | Method | Path | Auth | Description |
@@ -403,6 +409,8 @@ CREATE TABLE app_settings (
 | POST | `/api/users` | Admin | Create user |
 | DELETE | `/api/users/<id>` | Admin | Delete user (not last admin) |
 | POST | `/api/users/<id>/revoke` | Admin | Revoke all sessions |
+| POST | `/api/users/<id>/password` | Admin | Force-reset (`temp_password?`, generated if absent); temp returned ONCE; sets `must_change_password` |
+| POST | `/api/users/<id>/reset-token` | Admin | Issue reset token; `{token, link}` returned ONCE; sets `must_change_password` |
 
 ### API Keys (admin only)
 | Method | Path | Auth | Description |
@@ -525,11 +533,12 @@ CREATE TABLE app_settings (
 - Header: `X-API-Key`
 
 ### Gates (`flask_app.py:_gate_api`)
-- `/api/*` → identity required (except `_PUBLIC_API`: login, setup, logout, status)
+- `/api/*` → identity required (except `_PUBLIC_API`: login, setup, logout, status, cron, forgot/reset-password)
 - `OPTIONS` → pass through (CORS preflight)
 - `X-API-Token` (legacy) → 401 + audit
 - Admin paths (`/api/users`, `/api/keys`) → human admin only
 - API keys → per-key rate limit (300/min, DB-backed)
+- `must_change_password==1` human sessions → 403 `password change required` on all `/api/*` except `PUT /api/auth/password`, `GET /api/auth/me`, `POST /api/auth/logout` (API keys exempt)
 
 ### Rate Limiting (Flask-Limiter)
 - Default: 300/min per identity (user/key/IP)

@@ -77,6 +77,16 @@ snapshots · companies master · single shipment header per record.
 
 ---
 
+## 🔐 Phase M10: Password Reset & Forced Change (Current)
+
+Backend only (frontend is a separate design lane).
+
+| Task | Description | Files Touched | Acceptance |
+|---|---|---|---|
+| M10 ✅ | **Password reset/change** — voluntary change (keeps current session), forgot-password with generic-200 anti-enumeration + delay floor, single-use redeem (`FOR UPDATE`), admin force-reset + admin token (one-time secrets, `must_change_password`), `_gate_api` 403 enforcement (API keys exempt), login/me/users surface flags | `raas_tracker/db.py`, `raas_tracker/auth.py`, `chem_stock.py`, `flask_app.py`, `tests/test_password_reset.py`, `docs/SPEC.md`, `AGENTS.md` | 27 new tests green; full gate green |
+
+---
+
 ## 🔮 Phase M8: Future Features (Backlog)
 
 Not yet sliced — awaiting prioritization.

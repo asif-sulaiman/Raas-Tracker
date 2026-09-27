@@ -27,5 +27,10 @@ export default function ProtectedRoute() {
     if (setupNeeded) return <Navigate to="/setup" replace />;
     return <Navigate to="/login" replace state={{ from: location.pathname }} />;
   }
+  // Forced password change: the backend 403s everything else until the
+  // flag clears, so hold the user here until they set a new password.
+  if (user.must_change_password && location.pathname !== '/change-password') {
+    return <Navigate to="/change-password" replace state={{ forced: true }} />;
+  }
   return <Outlet />;
 }

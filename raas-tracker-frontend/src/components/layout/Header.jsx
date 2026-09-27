@@ -1,4 +1,5 @@
-import { User, LogOut } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { User, LogOut, KeyRound } from 'lucide-react';
 import Badge from '../ui/Badge';
 import NotificationBell from '../notifications/NotificationBell';
 import { useAuth } from '../../context/AuthContext';
@@ -31,6 +32,13 @@ export default function Header() {
           {user?.role === 'admin' && (
             <Badge variant="new" size="xs">admin</Badge>
           )}
+          <Link
+            to="/change-password"
+            className="p-2 rounded-lg hover:bg-gray-100 text-gray-500 hover:text-blue-600 transition-colors"
+            title="Change password"
+          >
+            <KeyRound size={18} />
+          </Link>
           <button
             onClick={logout}
             className="p-2 rounded-lg hover:bg-gray-100 text-gray-500 hover:text-rose-600 transition-colors cursor-pointer"

@@ -17,6 +17,8 @@ import Users from './pages/Users';
 import Companies from './pages/Companies';
 import Login from './pages/Login';
 import Setup from './pages/Setup';
+import ResetPassword from './pages/ResetPassword';
+import ChangePassword from './pages/ChangePassword';
 
 function App() {
   return (
@@ -29,7 +31,9 @@ function App() {
             <Routes>
               <Route path="/login" element={<Login />} />
               <Route path="/setup" element={<Setup />} />
+              <Route path="/reset" element={<ResetPassword />} />
               <Route element={<ProtectedRoute />}>
+                <Route path="/change-password" element={<ErrorBoundary><ChangePassword /></ErrorBoundary>} />
                 <Route path="/" element={<Layout />}>
                   <Route index element={<ErrorBoundary><Home /></ErrorBoundary>} />
                   <Route path="upload" element={<ErrorBoundary><Upload /></ErrorBoundary>} />

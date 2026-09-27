@@ -57,7 +57,8 @@ from chem_stock import (get_session_user, validate_api_key,
                         record_login_attempt, is_login_blocked, create_api_key,
                         list_api_keys, revoke_api_key, set_audit_actor,
                         create_first_admin, ensure_setup_token, check_setup_token,
-                        log_audit_action, check_api_key_rate_limit, record_api_key_hit)
+                        log_audit_action, check_api_key_rate_limit, record_api_key_hit,
+                        set_password, issue_reset_token, redeem_reset_token)
 from raas_tracker.notifications import (
     list_notifications_for, unread_count, mark_read, mark_read_all_for,
     notify_reorder_status, notify_maturity_initial, notify_maturity_escalation
@@ -75,6 +76,8 @@ _PUBLIC_API = {
     ("POST", "/api/auth/logout"),
     ("GET", "/api/auth/status"),
     ("POST", "/api/cron/maturity-check"),
+    ("POST", "/api/auth/forgot-password"),
+    ("POST", "/api/auth/reset-password"),
 }
 
 # Human-admin-only paths. API keys never pass these (scripts can't manage users).
@@ -108,7 +111,8 @@ def _resolve_identity():
         user = get_session_user(conn, request.cookies.get(SESSION_COOKIE))
         if user:
             return {"type": "human", "id": user["id"],
-                    "username": user["username"], "role": user["role"]}
+                    "username": user["username"], "role": user["role"],
+                    "must_change_password": bool(user.get("must_change_password"))}
         key = validate_api_key(conn, request.headers.get(API_KEY_HEADER),
                                request.remote_addr)
         if key:
@@ -166,6 +170,16 @@ def _gate_api():
     if any(request.path == p or request.path.startswith(p + "/") for p in _ADMIN_PATHS):
         if ident.get("type") != "human" or ident.get("role") != "admin":
             return jsonify({"error": "admin required"}), 403
+    # M10: forced-password-change enforcement. Human sessions flagged
+    # must_change_password may only change password, check identity, or log
+    # out. API-key identities are exempt (scripts can't change passwords).
+    if ident.get("type") == "human" and ident.get("must_change_password"):
+        if (request.method, request.path) not in {
+            ("PUT", "/api/auth/password"),
+            ("GET", "/api/auth/me"),
+            ("POST", "/api/auth/logout"),
+        }:
+            return jsonify({"error": "password change required"}), 403
     g.current_identity = ident
     # U1.7: thread-local audit actor for this request's thread.
     try:
@@ -428,7 +442,113 @@ def api_auth_me():
         return jsonify({"error": "authentication required"}), 401
     if ident.get("type") == "api-key":
         return jsonify({"type": "api-key", "name": ident.get("name")})
-    return jsonify({"id": ident["id"], "username": ident["username"], "role": ident["role"]})
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT must_change_password, reset_token_hash, reset_token_expires_at "
+            "FROM users WHERE id = %s", (ident["id"],)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return jsonify({"error": "authentication required"}), 401
+    return jsonify({"id": ident["id"], "username": ident["username"], "role": ident["role"],
+                    "must_change_password": bool(row[0]),
+                    "has_pending_reset": bool(row[1]) and not _reset_expired(row[2])})
+
+
+def _reset_expired(expires_at) -> bool:
+    """Stored UTC expiry text missing/unparseable/past → treated as expired."""
+    from datetime import datetime as _dt, timezone as _tz
+    try:
+        exp = _dt.strptime((expires_at or "")[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=_tz.utc)
+    except ValueError:
+        return True
+    return _dt.now(_tz.utc) >= exp
+
+
+@app.route("/api/auth/password", methods=["PUT"])
+def api_change_password():
+    """Voluntary change: verify current password, keep this session, kill others."""
+    ident = _human_identity()
+    if not ident:
+        return jsonify({"error": "authentication required"}), 401
+    try:
+        payload = PasswordChangeIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    import hashlib as _hl
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT password_hash FROM users WHERE id = %s",
+                           (ident["id"],)).fetchone()
+        if not row:
+            return jsonify({"error": "authentication required"}), 401
+        from chem_stock import _check_password
+        if not _check_password(payload.current_password, row[0]):
+            return jsonify({"error": "invalid credentials"}), 401
+        current_hash = _hl.sha256(
+            (request.cookies.get(SESSION_COOKIE) or "").encode("utf-8")).hexdigest()
+        try:
+            set_password(conn, ident["id"], payload.new_password,
+                         must_change=False, except_token_hash=current_hash)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        fresh = conn.execute("SELECT id, username, role, must_change_password FROM users "
+                             "WHERE id = %s", (ident["id"],)).fetchone()
+    finally:
+        conn.close()
+    return jsonify({"user": {"id": fresh[0], "username": fresh[1], "role": fresh[2],
+                             "must_change_password": bool(fresh[3])}})
+
+
+@app.route("/api/auth/forgot-password", methods=["POST"])
+@limiter.limit("5 per minute")
+def api_forgot_password():
+    """Public reset request. Generic 200 either way (no account oracle).
+
+    Both paths do one cheap lookup; a ~200ms delay floor masks residual
+    timing. The raw token is server-logged (setup-token precedent), never
+    returned.
+    """
+    import time as _time
+    try:
+        payload = ForgotPasswordIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    start = _time.monotonic()
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT id, username FROM users WHERE username = %s",
+                           (payload.username.strip(),)).fetchone()
+        if row:
+            raw = issue_reset_token(conn, row[0])
+            app.logger.info("password reset requested for user_id=%s link=/reset?token=%s",
+                            row[0], raw)
+    finally:
+        conn.close()
+    remaining = 0.2 - (_time.monotonic() - start)
+    if remaining > 0:
+        _time.sleep(remaining)
+    return jsonify({"message": "if the account exists, a reset link has been issued"})
+
+
+@app.route("/api/auth/reset-password", methods=["POST"])
+@limiter.limit("10 per minute")
+def api_reset_password():
+    """Public single-use redeem. Success → 200; any token problem → 400."""
+    try:
+        payload = ResetPasswordIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        try:
+            redeem_reset_token(conn, payload.token, payload.new_password)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+    finally:
+        conn.close()
+    return jsonify({"message": "password has been reset"})
 
 
 # ==================== API: USERS (human-admin only) ====================
@@ -475,6 +595,57 @@ def api_revoke_user_sessions(user_id):
     revoke_user_sessions(conn, user_id)
     conn.close()
     return jsonify({"message": "sessions revoked"})
+
+
+@app.route("/api/users/<int:user_id>/password", methods=["POST"])
+@admin_required
+def api_admin_set_password(user_id):
+    """Admin force-reset: set a temp password, flag must-change, revoke all target sessions.
+
+    The temp secret is returned ONCE (hash stored, never the raw value).
+    """
+    try:
+        payload = AdminSetPasswordIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    temp = payload.temp_password
+    if not temp:
+        import secrets as _secrets
+        temp = _secrets.token_urlsafe(10)
+    conn = get_db()
+    try:
+        exists = conn.execute("SELECT id, username FROM users WHERE id = %s",
+                              (user_id,)).fetchone()
+        if not exists:
+            return jsonify({"error": "user not found"}), 404
+        try:
+            set_password(conn, user_id, temp, must_change=True)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        log_audit_action(conn, "ADMIN_FORCE_PASSWORD_RESET", "user", user_id,
+                         new_value=exists[1])
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"id": user_id, "username": exists[1],
+                    "temp_password": temp, "must_change_password": True})
+
+
+@app.route("/api/users/<int:user_id>/reset-token", methods=["POST"])
+@admin_required
+def api_admin_reset_token(user_id):
+    """Admin-issued reset token: raw token + link returned ONCE, must-change set."""
+    conn = get_db()
+    try:
+        exists = conn.execute("SELECT id FROM users WHERE id = %s", (user_id,)).fetchone()
+        if not exists:
+            return jsonify({"error": "user not found"}), 404
+        raw = issue_reset_token(conn, user_id)
+        conn.execute("UPDATE users SET must_change_password = 1 WHERE id = %s", (user_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"id": user_id, "token": raw, "link": f"/reset?token={raw}"})
 
 
 # ==================== API: KEYS (human-admin only) ====================
@@ -530,6 +701,24 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 class _StrippedModel(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
+
+
+class PasswordChangeIn(_StrippedModel):
+    current_password: str = Field(min_length=1)
+    new_password: str = Field(min_length=1)
+
+
+class ForgotPasswordIn(_StrippedModel):
+    username: str = Field(min_length=1)
+
+
+class ResetPasswordIn(_StrippedModel):
+    token: str = Field(min_length=1)
+    new_password: str = Field(min_length=1)
+
+
+class AdminSetPasswordIn(_StrippedModel):
+    temp_password: str | None = Field(default=None, min_length=1)
 
 
 
