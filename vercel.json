@@ -6,5 +6,11 @@
   ],
   "functions": {
     "wsgi.py": { "maxDuration": 60 }
-  }
+  },
+  "crons": [
+    {
+      "path": "/api/cron/maturity-check",
+      "schedule": "0 9 * * *"
+    }
+  ]
 }

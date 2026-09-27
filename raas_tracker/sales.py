@@ -8,7 +8,7 @@ from datetime import date, datetime
 from typing import Optional, List, Dict, Any, Union
 
 from .audit import log_audit_action
-from .notifications import notify_sale_stage
+from .notifications import notify_sale_stage, clear_dedupe, clear_maturity_dedupe
 
 
 def _now_str() -> str:
@@ -32,11 +32,11 @@ def add_sale(conn: psycopg.Connection, sale_data: Dict[str, Any],
              items: List[Dict[str, Any]], initial_stage: str = "pi_issued") -> int:
     """Insert a new sale with line items. Returns the new sale ID."""
     cursor = conn.execute(
-        """INSERT INTO sales (stage, pi_number, pi_date, client_name, pi_file_path, company_id)
-           VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+        """INSERT INTO sales (stage, pi_number, pi_date, client_name, pi_file_path, company_id, maturity_date, comments)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
         (initial_stage, sale_data.get("pi_number"), sale_data.get("pi_date"),
          sale_data.get("client_name"), sale_data.get("pi_file_path"),
-         sale_data.get("company_id"))
+         sale_data.get("company_id"), sale_data.get("maturity_date"), sale_data.get("comments"))
     )
     sale_id = cursor.fetchone()[0]
     for item in items:
@@ -303,11 +303,27 @@ def _sync_sale_payment_totals(conn: psycopg.Connection, sale_id: int) -> None:
 
 
 def record_sale_payment(conn: psycopg.Connection, sale_id: int, payment_date: str,
-                        payment_amount: float, notes: Optional[str] = None) -> Dict[str, Any]:
+                        payment_amount: float, notes: Optional[str] = None,
+                        maturity_date: Optional[str] = None) -> Dict[str, Any]:
     """Append a (possibly partial) payment. Auto-completes from payment_due
-    when total paid reaches the invoice total. Returns totals + stage."""
+    when total paid reaches the invoice total. Returns totals + stage.
+    
+    If maturity_date is provided and non-empty, updates the sale's maturity_date
+    when it is NULL or different from the provided value.
+    Clears maturity notification dedupe keys when the sale becomes fully paid.
+    """
     if payment_amount is None or payment_amount <= 0:
         raise ValueError("payment_amount must be positive")
+    
+    # Update maturity_date on sale header if provided and changed
+    if maturity_date and str(maturity_date).strip():
+        maturity_date = str(maturity_date).strip()
+        row = conn.execute("SELECT maturity_date FROM sales WHERE id = %s", (sale_id,)).fetchone()
+        current_maturity = row[0] if row else None
+        if current_maturity != maturity_date:
+            conn.execute("UPDATE sales SET maturity_date = %s, updated_at = %s WHERE id = %s",
+                         (maturity_date, _now_str(), sale_id))
+    
     cursor = conn.execute(
         """INSERT INTO sale_payments (sale_id, payment_date, payment_amount, notes)
            VALUES (%s, %s, %s, %s) RETURNING id""",
@@ -325,8 +341,15 @@ def record_sale_payment(conn: psycopg.Connection, sale_id: int, payment_date: st
                                f"invoice_total={invoice_total:g}")
     row = conn.execute("SELECT stage FROM sales WHERE id = %s", (sale_id,)).fetchone()
     stage = row[0] if row else None
-    if _complete_if_paid(conn, sale_id, stage, total_paid, invoice_total):
+    was_completed = _complete_if_paid(conn, sale_id, stage, total_paid, invoice_total)
+    if was_completed:
         stage = "completed"
+    
+    # Clear maturity notification dedupe keys when sale becomes fully paid
+    # (regardless of stage transition)
+    if total_paid >= invoice_total and invoice_total > 0:
+        clear_maturity_dedupe(conn, sale_id)
+    
     conn.commit()
     return {"payment_id": payment_id, "total_paid": total_paid,
             "balance": invoice_total - total_paid, "stage": stage}

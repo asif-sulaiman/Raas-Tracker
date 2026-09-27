@@ -4,7 +4,7 @@ import os
 import sys
 import io
 from flask import Flask, request, jsonify, send_from_directory, g
-from datetime import date
+from datetime import date, timedelta
 from functools import wraps
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -60,7 +60,7 @@ from chem_stock import (get_session_user, validate_api_key,
                         log_audit_action, check_api_key_rate_limit, record_api_key_hit)
 from raas_tracker.notifications import (
     list_notifications_for, unread_count, mark_read, mark_read_all_for,
-    notify_reorder_status
+    notify_reorder_status, notify_maturity_initial, notify_maturity_escalation
 )
 
 SESSION_COOKIE = "raas_session"
@@ -74,6 +74,7 @@ _PUBLIC_API = {
     ("POST", "/api/auth/setup"),
     ("POST", "/api/auth/logout"),
     ("GET", "/api/auth/status"),
+    ("POST", "/api/cron/maturity-check"),
 }
 
 # Human-admin-only paths. API keys never pass these (scripts can't manage users).
@@ -1647,6 +1648,7 @@ class PaymentIn(_StrippedModel):
     payment_date: str | None = None
     payment_amount: float = Field(gt=0)
     notes: str | None = None
+    maturity_date: str | None = None
 
 
 class PaymentPatchIn(_StrippedModel):
@@ -1665,7 +1667,8 @@ def api_update_payment(sale_id):
     conn = get_db()
     try:
         result = record_sale_payment(conn, sale_id, payment.payment_date,
-                                     payment.payment_amount, payment.notes)
+                                     payment.payment_amount, payment.notes,
+                                     payment.maturity_date)
     except ValueError as e:
         conn.close()
         return jsonify({"error": str(e)}), 400
@@ -1789,6 +1792,63 @@ def api_delete_item(sale_id, item_id):
     delete_sale_item(conn, item_id)
     conn.close()
     return jsonify({"message": "Item deleted"})
+
+
+# ==================== API: CRON JOBS ====================
+@app.route("/api/cron/maturity-check", methods=["POST"])
+def api_cron_maturity_check():
+    """Daily cron job to check for maturity due/escalated sales.
+    
+    Auth: Requires Authorization: Bearer <CRON_SECRET> header.
+    Checks all unpaid sales with maturity_date <= today and creates notifications.
+    """
+    cron_secret = os.getenv("CRON_SECRET")
+    auth_header = request.headers.get("Authorization", "")
+    if not cron_secret:
+        return jsonify({"error": "CRON_SECRET not configured"}), 500
+    if auth_header != f"Bearer {cron_secret}":
+        return jsonify({"error": "unauthorized"}), 401
+    
+    conn = get_db()
+    try:
+        today = date.today()
+        # Find sales with maturity_date not null, not fully paid
+        rows = conn.execute("""
+            SELECT s.id, s.client_name, s.maturity_date, s.company_id,
+                   COALESCE(SUM(sp.payment_amount), 0) AS paid,
+                   COALESCE(ROUND(SUM(si.quantity * si.unit_price)::numeric, 2)::float8, 0) AS total
+            FROM sales s
+            LEFT JOIN sale_payments sp ON sp.sale_id = s.id
+            LEFT JOIN sale_items si ON si.sale_id = s.id
+            WHERE s.maturity_date IS NOT NULL
+            GROUP BY s.id, s.client_name, s.maturity_date, s.company_id
+            HAVING COALESCE(SUM(sp.payment_amount), 0) < COALESCE(ROUND(SUM(si.quantity * si.unit_price)::numeric, 2)::float8, 0)
+        """).fetchall()
+        
+        notified = 0
+        for row in rows:
+            sale_id, client_name, maturity_date = row[0], row[1], row[2]
+            # Parse maturity_date
+            mat = None
+            if maturity_date:
+                try:
+                    mat = date.fromisoformat(str(maturity_date)[:10])
+                except ValueError:
+                    continue
+            if not mat:
+                continue
+            if mat <= today:
+                notify_maturity_initial(conn, sale_id, client_name, maturity_date)
+                notified += 1
+                if mat <= today - timedelta(days=7):
+                    notify_maturity_escalation(conn, sale_id, client_name, maturity_date, (today - mat).days)
+                    notified += 1
+        return jsonify({"success": True, "checked": len(rows), "notified": notified})
+    except Exception as e:
+        app.logger.exception("cron maturity check failed")
+        return jsonify({"error": "internal server error"}), 500
+    finally:
+        conn.close()
 
 
 # ==================== MAIN ====================

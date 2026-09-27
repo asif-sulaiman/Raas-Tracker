@@ -48,14 +48,14 @@ def list_notifications_for(conn: psycopg.Connection, user_id: int, user_role: st
     """Recent notifications visible to this user, newest first, with read flags."""
     rows = conn.execute(
         """SELECT n.id, n.type, n.title, n.body, n.severity, n.role_scope,
-                  n.entity_type, n.entity_id, n.created_at,
+                  n.entity_type, n.entity_id, n.created_at, n.dedupe_key,
                   CASE WHEN r.notification_id IS NULL THEN 0 ELSE 1 END AS is_read
            FROM notifications n
             LEFT JOIN notification_reads r
               ON r.notification_id = n.id AND r.user_id = %s
-            WHERE n.role_scope = 'all' OR %s = 'admin'
-            ORDER BY n.id DESC
-            LIMIT %s""",
+           WHERE n.role_scope = 'all' OR %s = 'admin'
+           ORDER BY n.id DESC
+           LIMIT %s""",
         (user_id, user_role, limit),
     )
     return [_row_to_dict(row) for row in rows]
@@ -150,9 +150,32 @@ def notify_sale_stage(conn: psycopg.Connection, sale_id: int, client_name: str,
                dedupe_key=f"sale:{sale_id}:completed")
 
 
+def notify_maturity_initial(conn: psycopg.Connection, sale_id: int, client_name: str, maturity_date: Any) -> None:
+    """Notify on maturity date (due/overdue). Dedupe key: maturity:{sale_id}:initial"""
+    key = f"maturity:{sale_id}:initial"
+    notify(conn, type="maturity_due", title=f"Maturity due: {client_name}",
+           body=f"Sale #{sale_id} ({client_name}) maturity date reached ({maturity_date}).",
+           severity="warning", entity_type="sale", entity_id=sale_id, dedupe_key=key)
+
+
+def notify_maturity_escalation(conn: psycopg.Connection, sale_id: int, client_name: str, maturity_date: Any, days_overdue: int) -> None:
+    """Escalation at 7+ days overdue. Dedupe key: maturity:{sale_id}:escalated"""
+    key = f"maturity:{sale_id}:escalated"
+    notify(conn, type="maturity_escalated", title=f"Maturity escalated: {client_name}",
+           body=f"Sale #{sale_id} ({client_name}) is {days_overdue} days overdue (maturity {maturity_date}).",
+           severity="critical", entity_type="sale", entity_id=sale_id, dedupe_key=key)
+
+
+def clear_maturity_dedupe(conn: psycopg.Connection, sale_id: int) -> None:
+    """Clear both maturity dedupe keys so future breaches can notify again."""
+    clear_dedupe(conn, f"maturity:{sale_id}:initial")
+    clear_dedupe(conn, f"maturity:{sale_id}:escalated")
+
+
 def _row_to_dict(row: Any) -> Dict[str, Any]:
     return {
         "id": row[0], "type": row[1], "title": row[2], "body": row[3],
         "severity": row[4], "role_scope": row[5], "entity_type": row[6],
-        "entity_id": row[7], "created_at": row[8], "is_read": bool(row[9]),
+        "entity_id": row[7], "created_at": row[8], "dedupe_key": row[9],
+        "is_read": bool(row[10]),
     }

@@ -537,6 +537,15 @@ CREATE TABLE app_settings (
 - Tier 1: Login throttle (5 fails/10 min per username+IP, DB-backed)
 - Test bypass: `RAAS_RATE_LIMITS=off`
 
+### Cron Jobs (Vercel)
+- `POST /api/cron/maturity-check` — daily 09:00 UTC; checks sales with `maturity_date <= today` and unpaid; creates `maturity_due` (warning) and `maturity_escalated` (critical, at 7+ days overdue) notifications with dedupe; clears dedupe on full payment. Auth: `Authorization: Bearer <CRON_SECRET>`.
+
+### Notifications
+- In-app notifications with dedupe (`notifications.py:notify`)
+- Types: `stock_out` (critical), `stock_low` (warning), `sale_payment_due` (warning), `sale_completed` (info), `maturity_due` (warning), `maturity_escalated` (critical)
+- Role scopes: `all` or `admin`
+- Dedupe keys cleared when condition resolves (stock recovery, payment recorded, full payment clears maturity keys)
+
 ### Setup Token
 - Single-use, 60-min TTL, printed to console on first need
 - Stored: `sha256(token):timestamp` in `app_settings`
