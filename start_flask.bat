@@ -1,5 +1,5 @@
 @echo off
-cd /d "O:\Study  Career\Python\ChemCalc"
+cd /d "O:\Projects\Raas-Tracker"
 if "%DATABASE_URL%"=="" (
   echo ============================================================
   echo   ERROR: DATABASE_URL is not set. The app cannot start.

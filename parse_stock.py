@@ -514,5 +514,5 @@ if __name__ == "__main__":
     else:
         # Default: parse the original TXT file
         txt_path = r'O:\Logistics\Malaysia\Malaysia\Balance Product List\2026\AUGUST_2026.txt'
-        output_path = r'O:\Study  Career\Python\ChemCalc\stock_data.json'
+        output_path = r'O:\Projects\Raas-Tracker\stock_data.json'
         parse_txt_file(txt_path, output_path)
