@@ -1,21 +1,11 @@
-"""WSGI entry point for production deployment with Waitress.
+"""WSGI entry point - imports app from flask_app (which already has ProxyFix)."""
 
-Usage:
-    pip install waitress
-    waitress-serve --host=0.0.0.0 --port=5000 --threads=4 wsgi:app
-
-Environment variables:
-    DATABASE_URL - Required. PostgreSQL (Supabase) connection string.
-    RAAS_SECRET  - Required in production. Secret key for the app.
-    HOST             - Bind address (default: 127.0.0.1 for dev, 0.0.0.0 for prod).
-    PORT             - Port number (default: 5000).
-    FORCE_HTTPS      - Set to "1" to enable HSTS + HTTPS redirect.
-    COOKIE_SECURE    - Set to "0" to disable Secure flag on cookies (dev only).
-    PRODUCTION       - Set to "1" to require RAAS_SECRET.
-    DISABLE_SETUP    - Set to "true" to disable the /setup endpoint.
-    FLASK_ENV        - Set to "production" for production mode.
-"""
+import os
 from flask_app import app
 
 if __name__ == "__main__":
-    app.run()
+    # Allow running wsgi.py directly for testing
+    host = os.getenv("HOST", "127.0.0.1")
+    port = int(os.getenv("PORT", "5000"))
+    debug = os.getenv("FLASK_DEBUG") == "1"
+    app.run(debug=debug, host=host, port=port)

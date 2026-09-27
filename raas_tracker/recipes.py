@@ -66,13 +66,13 @@ def add_recipe(conn: psycopg.Connection, name: str, total_quantity: float = 1, w
         return False
 
 
-def get_recipe_by_name(conn: psycopg.Connection, name: str) -> Optional[Dict[str, Any]]:
-    """Get recipe info by name."""
+def get_recipe_by_name(conn: psycopg.Connection, company_id: int, name: str) -> Optional[Dict[str, Any]]:
+    """Get recipe info by name for a specific company."""
     cursor = conn.execute(
         "SELECT r.id, r.name, r.total_quantity, r.water_percentage, r.created_date, "
         "r.company_id, r.product_name, c.name FROM recipes r "
-        "LEFT JOIN companies c ON c.id = r.company_id WHERE r.name = %s",
-        (name,)
+        "LEFT JOIN companies c ON c.id = r.company_id WHERE r.company_id = %s AND lower(r.name) = lower(%s)",
+        (company_id, name)
     )
     row = cursor.fetchone()
     if row:
@@ -112,12 +112,13 @@ def _items_percentage_total(conn: psycopg.Connection, recipe_id: int) -> float:
     return float(row[0] or 0)
 
 
-def add_recipe_item(conn: psycopg.Connection, recipe_name: str, chemical_name: str, 
+def add_recipe_item(conn: psycopg.Connection, company_id: int, recipe_name: str, chemical_name: str, 
                     percentage: float) -> bool:
     """Add a chemical to a recipe with percentage of total product yield.
     
     Args:
         conn: Database connection
+        company_id: Company ID (required for isolation)
         recipe_name: Recipe name
         chemical_name: Chemical name
         percentage: Percentage of total batch (e.g., 20.0 for 20%)
@@ -126,9 +127,9 @@ def add_recipe_item(conn: psycopg.Connection, recipe_name: str, chemical_name: s
         True if added successfully
     """
     # Check recipe exists
-    recipe = get_recipe_by_name(conn, recipe_name)
+    recipe = get_recipe_by_name(conn, company_id, recipe_name)
     if not recipe:
-        logger.warning("Recipe '%s' not found. Create it first.", recipe_name)
+        logger.warning("Recipe '%s' not found for company %s. Create it first.", recipe_name, company_id)
         return False
     
     # Check chemical exists
@@ -181,23 +182,23 @@ def list_recipes(conn: psycopg.Connection) -> List[Dict[str, Any]]:
     ]
 
 
-def list_recipe_items(conn: psycopg.Connection, recipe_name: str) -> List[Dict[str, Any]]:
+def list_recipe_items(conn: psycopg.Connection, company_id: int, recipe_name: str) -> List[Dict[str, Any]]:
     """List all chemicals in a recipe with percentages and required quantities."""
-    recipe = get_recipe_by_name(conn, recipe_name)
+    recipe = get_recipe_by_name(conn, company_id, recipe_name)
     if not recipe:
-        logger.warning("Recipe '%s' not found.", recipe_name)
+        logger.warning("Recipe '%s' not found for company %s.", recipe_name, company_id)
         return []
     
     cursor = conn.execute("""
         SELECT r.name as recipe_name, r.total_quantity, 
                c.name as chemical_name, c.current_qty, c.unit,
                ri.required_qty_per_unit, ri.percentage
-         FROM recipe_items ri
-         JOIN recipes r ON ri.recipe_id = r.id
-         JOIN chemicals c ON ri.chemical_id = c.id
-         WHERE r.name = %s
-         ORDER BY c.name
-     """, (recipe_name,))
+          FROM recipe_items ri
+          JOIN recipes r ON ri.recipe_id = r.id
+          JOIN chemicals c ON ri.chemical_id = c.id
+          WHERE r.company_id = %s AND r.name = %s
+          ORDER BY c.name
+      """, (company_id, recipe_name))
     
     items = []
     for row in cursor.fetchall():
@@ -218,12 +219,12 @@ def list_recipe_items(conn: psycopg.Connection, recipe_name: str) -> List[Dict[s
     return items
 
 
-def update_recipe_item(conn: psycopg.Connection, recipe_name: str, chemical_name: str,
+def update_recipe_item(conn: psycopg.Connection, company_id: int, recipe_name: str, chemical_name: str,
                        new_percentage: float) -> bool:
     """Update the percentage of a chemical in a recipe."""
-    recipe = get_recipe_by_name(conn, recipe_name)
+    recipe = get_recipe_by_name(conn, company_id, recipe_name)
     if not recipe:
-        logger.warning("Recipe '%s' not found.", recipe_name)
+        logger.warning("Recipe '%s' not found for company %s.", recipe_name, company_id)
         return False
     
     chemical = conn.execute("SELECT id FROM chemicals WHERE name = %s", (chemical_name,)).fetchone()
@@ -261,11 +262,11 @@ def update_recipe_item(conn: psycopg.Connection, recipe_name: str, chemical_name
         return False
 
 
-def delete_recipe_item(conn: psycopg.Connection, recipe_name: str, chemical_name: str) -> bool:
+def delete_recipe_item(conn: psycopg.Connection, company_id: int, recipe_name: str, chemical_name: str) -> bool:
     """Remove a chemical from a recipe."""
-    recipe = get_recipe_by_name(conn, recipe_name)
+    recipe = get_recipe_by_name(conn, company_id, recipe_name)
     if not recipe:
-        logger.warning("Recipe '%s' not found.", recipe_name)
+        logger.warning("Recipe '%s' not found for company %s.", recipe_name, company_id)
         return False
     
     chemical = conn.execute("SELECT id FROM chemicals WHERE name = %s", (chemical_name,)).fetchone()
@@ -297,11 +298,11 @@ def delete_recipe_item(conn: psycopg.Connection, recipe_name: str, chemical_name
         return False
 
 
-def delete_recipe(conn: psycopg.Connection, name: str) -> bool:
+def delete_recipe(conn: psycopg.Connection, company_id: int, name: str) -> bool:
     """Delete a recipe and all its items."""
-    recipe = get_recipe_by_name(conn, name)
+    recipe = get_recipe_by_name(conn, company_id, name)
     if not recipe:
-        logger.warning("Recipe '%s' not found.", name)
+        logger.warning("Recipe '%s' not found for company %s.", name, company_id)
         return False
     
     conn.execute("DELETE FROM recipe_items WHERE recipe_id = %s", (recipe["id"],))
@@ -312,12 +313,13 @@ def delete_recipe(conn: psycopg.Connection, name: str) -> bool:
     return True
 
 
-def update_recipe(conn: psycopg.Connection, name: str, 
+def update_recipe(conn: psycopg.Connection, company_id: int, name: str, 
                   total_quantity: float = None, water_percentage: float = None) -> bool:
     """Update recipe metadata (total_quantity and/or water_percentage).
     
     Args:
         conn: Database connection
+        company_id: Company ID (required for isolation)
         name: Recipe name
         total_quantity: New total quantity (or None to keep current)
         water_percentage: New water percentage (or None to keep current)
@@ -325,9 +327,9 @@ def update_recipe(conn: psycopg.Connection, name: str,
     Returns:
         True if updated, False if recipe not found
     """
-    recipe = get_recipe_by_name(conn, name)
+    recipe = get_recipe_by_name(conn, company_id, name)
     if not recipe:
-        logger.warning("Recipe '%s' not found.", name)
+        logger.warning("Recipe '%s' not found for company %s.", name, company_id)
         return False
     
     updates = []
@@ -360,11 +362,12 @@ def update_recipe(conn: psycopg.Connection, name: str,
 # ============================================================
 
 
-def generate_report(conn: psycopg.Connection, recipe_name: str, production_qty: float) -> List[Dict[str, Any]]:
+def generate_report(conn: psycopg.Connection, company_id: int, recipe_name: str, production_qty: float) -> List[Dict[str, Any]]:
     """Generate a production report showing have vs need for each chemical.
     
     Args:
         conn: Database connection
+        company_id: Company ID (required for isolation)
         recipe_name: Name of the recipe to report on
         production_qty: How many units to produce
     
@@ -377,11 +380,11 @@ def generate_report(conn: psycopg.Connection, recipe_name: str, production_qty: 
         - shortage: float (negative = not enough, positive = surplus)
         - status: str ("OK", "SHORTAGE", "EXACT", "SURPLUS")
     """
-    recipe = get_recipe_by_name(conn, recipe_name)
+    recipe = get_recipe_by_name(conn, company_id, recipe_name)
     if not recipe:
         return []
     
-    items = list_recipe_items(conn, recipe_name)
+    items = list_recipe_items(conn, company_id, recipe_name)
     if not items:
         return []
     
@@ -415,7 +418,7 @@ def generate_multi_recipe_report(conn: psycopg.Connection, recipe_selections: Li
     
     Args:
         conn: Database connection
-        recipe_selections: List of dicts with {"recipe_name": str, "production_qty": float}
+        recipe_selections: List of dicts with {"company_id": int, "recipe_name": str, "production_qty": float}
     
     Returns:
         Combined list of report items with same chemicals merged together.
@@ -423,10 +426,11 @@ def generate_multi_recipe_report(conn: psycopg.Connection, recipe_selections: Li
     combined = {}
     
     for selection in recipe_selections:
+        company_id = selection["company_id"]
         recipe_name = selection["recipe_name"]
         production_qty = selection["production_qty"]
         
-        items = list_recipe_items(conn, recipe_name)
+        items = list_recipe_items(conn, company_id, recipe_name)
         for item in items:
             chem_name = item["chemical_name"]
             required = item["required_per_unit"] * production_qty
@@ -474,6 +478,7 @@ def generate_multi_recipe_report(conn: psycopg.Connection, recipe_selections: Li
 
 def create_production_run(
     conn: psycopg.Connection,
+    company_id: int,
     recipe_name: str,
     production_qty: float,
     order_number: str = None,
@@ -487,6 +492,7 @@ def create_production_run(
 
     Args:
         conn: Database connection
+        company_id: Company ID (required for isolation)
         recipe_name: Name of the recipe to produce
         production_qty: Quantity to produce
         order_number: Optional order reference (e.g., sale order number)
@@ -506,22 +512,22 @@ def create_production_run(
         raise ValueError("production_qty must be positive")
 
     # Get recipe
-    recipe = get_recipe_by_name(conn, recipe_name)
+    recipe = get_recipe_by_name(conn, company_id, recipe_name)
     if not recipe:
-        raise ValueError(f"Recipe '{recipe_name}' not found")
+        raise ValueError(f"Recipe '{recipe_name}' not found for company {company_id}")
 
     # Get recipe items for snapshotting
-    items = list_recipe_items(conn, recipe_name)
+    items = list_recipe_items(conn, company_id, recipe_name)
     if not items:
         raise ValueError(f"Recipe '{recipe_name}' has no ingredients")
 
     # Generate shortage report (preview)
-    shortage_report = generate_report(conn, recipe_name, production_qty)
+    shortage_report = generate_report(conn, company_id, recipe_name, production_qty)
 
     # Calculate required quantities for each ingredient
     run_items = []
     total_required = 0
-    for item in list_recipe_items(conn, recipe_name):
+    for item in list_recipe_items(conn, company_id, recipe_name):
         required_qty = item["required_per_unit"] * production_qty
         total_required += required_qty
         run_items.append({
@@ -568,7 +574,7 @@ def create_production_run(
     conn.commit()
 
     # Re-generate shortage report after deduction for accuracy
-    final_shortage_report = generate_report(conn, recipe_name, production_qty)
+    final_shortage_report = generate_report(conn, company_id, recipe_name, production_qty)
 
     logger.info("Created production run %s for recipe '%s' (qty: %s)",
                 run_id, recipe_name, production_qty)

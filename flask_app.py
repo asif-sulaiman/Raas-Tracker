@@ -30,6 +30,10 @@ app.secret_key = _secret
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 REACT_BUILD_DIR = os.path.join(os.path.dirname(__file__), "react_frontend")
 
+# ProxyFix for correct remote_addr behind proxy (e.g., nginx, Cloudflare)
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
 from chem_stock import (
     get_connection, get_all_chemicals, update_stock, add_chemical, set_reorder_level,
     add_recipe, get_recipe_by_name, add_recipe_item, list_recipes, find_recipe,
@@ -938,7 +942,11 @@ def api_update_chemical():
     name = str(data.get("name", "")).strip()
     reason = (data.get("reason") or "").strip()[:120] or None
     conn = get_db()
-    success = update_stock(conn, name, delta, reason=reason)
+    try:
+        success = update_stock(conn, name, delta, reason=reason)
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
     conn.close()
     if not success:
         return jsonify({"success": success, "name": name, "delta": delta}), 404
@@ -993,11 +1001,14 @@ def api_recipes():
     return jsonify(recipes)
 
 
-@app.route("/api/recipes/<name>")
+@app.route("/api/recipes/<path:name>")
 def api_recipe_detail(name):
+    company_id = request.args.get("company_id", type=int)
+    if company_id is None:
+        return jsonify({"error": "company_id is required"}), 400
     conn = get_db()
-    recipe = get_recipe_by_name(conn, name)
-    items = list_recipe_items(conn, name)
+    recipe = get_recipe_by_name(conn, company_id, name)
+    items = list_recipe_items(conn, company_id, name)
     conn.close()
     if not recipe:
         return jsonify({"error": "Recipe not found"}), 404
@@ -1040,7 +1051,7 @@ class RecipeCreateIn(_StrippedModel):
     product_name: str = Field(min_length=1)
 
 
-@app.route("/api/recipes/<name>/items", methods=["POST"])
+@app.route("/api/recipes/<path:name>/items", methods=["POST"])
 def api_add_recipe_item(name):
     data = request.get_json() or {}
     try:
@@ -1048,9 +1059,16 @@ def api_add_recipe_item(name):
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     chem_name = str(data.get("chemical", "")).strip()
+    company_id = data.get("company_id")
+    if company_id is None:
+        return jsonify({"error": "company_id is required"}), 400
+    try:
+        company_id = int(company_id)
+    except (TypeError, ValueError):
+        return jsonify({"error": "company_id must be an integer"}), 400
     conn = get_db()
     try:
-        success = add_recipe_item(conn, name, chem_name, pct)
+        success = add_recipe_item(conn, company_id, name, chem_name, pct)
     except ValueError as e:
         conn.close()
         return jsonify({"error": str(e)}), 400
@@ -1060,36 +1078,49 @@ def api_add_recipe_item(name):
     return jsonify({"success": success})
 
 
-@app.route("/api/recipes/<name>/items/<chem>", methods=["DELETE"])
+@app.route("/api/recipes/<path:name>/items/<chem>", methods=["DELETE"])
 @admin_required
 def api_delete_recipe_item(name, chem):
+    company_id = request.args.get("company_id", type=int)
+    if company_id is None:
+        return jsonify({"error": "company_id is required"}), 400
     conn = get_db()
-    success = delete_recipe_item(conn, name, chem)
+    success = delete_recipe_item(conn, company_id, name, chem)
     conn.close()
     if not success:
         return jsonify({"success": success}), 404
     return jsonify({"success": success})
 
 
-@app.route("/api/recipes/<name>", methods=["DELETE"])
+@app.route("/api/recipes/<path:name>", methods=["DELETE"])
 @admin_required
 def api_delete_recipe(name):
+    company_id = request.args.get("company_id", type=int)
+    if company_id is None:
+        return jsonify({"error": "company_id is required"}), 400
     conn = get_db()
-    success = delete_recipe(conn, name)
+    success = delete_recipe(conn, company_id, name)
     conn.close()
     if not success:
         return jsonify({"success": success}), 404
     return jsonify({"success": success})
 
 
-@app.route("/api/recipes/<name>", methods=["PUT"])
+@app.route("/api/recipes/<path:name>", methods=["PUT"])
 def api_update_recipe(name):
     data = request.get_json() or {}
     total_qty = data.get("total_quantity")
     water_pct = data.get("water_percentage")
+    company_id = data.get("company_id")
+    if company_id is None:
+        return jsonify({"error": "company_id is required"}), 400
+    try:
+        company_id = int(company_id)
+    except (TypeError, ValueError):
+        return jsonify({"error": "company_id must be an integer"}), 400
     conn = get_db()
     try:
-        success = update_recipe(conn, name, total_quantity=total_qty, water_percentage=water_pct)
+        success = update_recipe(conn, company_id, name, total_quantity=total_qty, water_percentage=water_pct)
     except ValueError as e:
         conn.close()
         return jsonify({"error": str(e)}), 400
@@ -1099,16 +1130,23 @@ def api_update_recipe(name):
     return jsonify({"success": True})
 
 
-@app.route("/api/recipes/<name>/items/<chem>", methods=["PUT"])
+@app.route("/api/recipes/<path:name>/items/<chem>", methods=["PUT"])
 def api_update_recipe_item(name, chem):
     data = request.get_json() or {}
     try:
         pct = _req_float(data, "percentage", 0)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    company_id = data.get("company_id")
+    if company_id is None:
+        return jsonify({"error": "company_id is required"}), 400
+    try:
+        company_id = int(company_id)
+    except (TypeError, ValueError):
+        return jsonify({"error": "company_id must be an integer"}), 400
     conn = get_db()
     try:
-        success = update_recipe_item(conn, name, chem, pct)
+        success = update_recipe_item(conn, company_id, name, chem, pct)
     except ValueError as e:
         conn.close()
         return jsonify({"error": str(e)}), 400
@@ -1293,53 +1331,86 @@ def api_upload_export(upload_id):
 @limiter.limit("15 per minute")
 def api_report_generate():
     data = request.get_json() or {}
-    recipe_names = data.get("recipes", [])
+    # recipes is now a list of {"company_id": int, "recipe_name": str}
+    recipe_selections = data.get("recipes", [])
     try:
         qty = _req_float(data, "qty", 0)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
-    if not recipe_names:
+    if not recipe_selections:
         return jsonify({"error": "No recipes selected"}), 400
+
+    # Validate each selection has company_id and recipe_name
+    for sel in recipe_selections:
+        if "company_id" not in sel or "recipe_name" not in sel:
+            return jsonify({"error": "Each recipe selection must have company_id and recipe_name"}), 400
 
     conn = get_db()
     recipes_list = list_recipes(conn)
 
     if qty == 0:
-        for name in recipe_names:
-            recipe = next((r for r in recipes_list if r["name"] == name), None)
+        for sel in recipe_selections:
+            recipe = next((r for r in recipes_list if r["name"] == sel["recipe_name"] and r["company_id"] == sel["company_id"]), None)
             if recipe:
                 qty += recipe["total_quantity"]
 
-    recipe_selections = [{"recipe_name": name, "production_qty": qty} for name in recipe_names]
-    report = generate_multi_recipe_report(conn, recipe_selections)
+    # Use the qty from request or fall back to recipe total_quantity for each
+    final_selections = []
+    for sel in recipe_selections:
+        production_qty = qty if qty > 0 else next((r["total_quantity"] for r in recipes_list if r["name"] == sel["recipe_name"] and r["company_id"] == sel["company_id"]), 1)
+        final_selections.append({"company_id": sel["company_id"], "recipe_name": sel["recipe_name"], "production_qty": production_qty})
+    
+    report = generate_multi_recipe_report(conn, final_selections)
     conn.close()
 
-    return jsonify({"report": report, "recipes": recipe_names, "qty": qty})
+    return jsonify({"report": report, "recipes": recipe_selections, "qty": qty})
 
 
 @app.route("/api/reports/export", methods=["POST"])
 @limiter.limit("15 per minute")
 def api_report_export():
     data = request.get_json() or {}
-    recipe_names = data.get("recipes", [])
+    # recipes is now a list of {"company_id": int, "recipe_name": str}
+    recipe_selections = data.get("recipes", [])
     try:
         qty = _req_float(data, "qty", 0)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
+    if not recipe_selections:
+        return jsonify({"error": "No recipes selected"}), 400
+
+    # Validate each selection has company_id and recipe_name
+    for sel in recipe_selections:
+        if "company_id" not in sel or "recipe_name" not in sel:
+            return jsonify({"error": "Each recipe selection must have company_id and recipe_name"}), 400
+
     conn = get_db()
-    recipe_selections = [{"recipe_name": name, "production_qty": qty} for name in recipe_names]
-    report = generate_multi_recipe_report(conn, recipe_selections)
+    recipes_list = list_recipes(conn)
+
+    if qty == 0:
+        for sel in recipe_selections:
+            recipe = next((r for r in recipes_list if r["name"] == sel["recipe_name"] and r["company_id"] == sel["company_id"]), None)
+            if recipe:
+                qty += recipe["total_quantity"]
+
+    # Use the qty from request or fall back to recipe total_quantity for each
+    final_selections = []
+    for sel in recipe_selections:
+        production_qty = qty if qty > 0 else next((r["total_quantity"] for r in recipes_list if r["name"] == sel["recipe_name"] and r["company_id"] == sel["company_id"]), 1)
+        final_selections.append({"company_id": sel["company_id"], "recipe_name": sel["recipe_name"], "production_qty": production_qty})
+    
+    report = generate_multi_recipe_report(conn, final_selections)
     conn.close()
 
     if report:
         # V4: recipe names are free-text input — strip path separators/traversal.
         import re as _re
-        if len(recipe_names) > 1:
+        if len(recipe_selections) > 1:
             safe_name = "Combined"
         else:
-            safe_name = _re.sub(r"[^A-Za-z0-9_-]", "_", recipe_names[0])[:50] or "report"
+            safe_name = _re.sub(r"[^A-Za-z0-9_-]", "_", recipe_selections[0]["recipe_name"])[:50] or "report"
         try:
             qty_int = int(qty)
         except (TypeError, ValueError):
@@ -1347,7 +1418,7 @@ def api_report_export():
         from raas_tracker.db import data_dir as _data_dir
         output_path = os.path.join(_data_dir(), "reports", f"report_{safe_name}_{qty_int}.csv")
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        export_report_to_csv(report, ", ".join(recipe_names), qty, output_path)
+        export_report_to_csv(report, ", ".join(s["recipe_name"] for s in recipe_selections), qty, output_path)
         return jsonify({"success": True, "filename": f"report_{safe_name}_{qty_int}.csv"})
     return jsonify({"error": "Could not generate report"}), 500
 
@@ -1511,17 +1582,25 @@ class ProductionRunCreateIn(_StrippedModel):
     notes: str | None = None
 
 
-@app.route("/api/recipes/<name>/produce", methods=["POST"])
+@app.route("/api/recipes/<path:name>/produce", methods=["POST"])
 @admin_required
 def api_produce_recipe(name):
     try:
         payload = ProductionRunCreateIn.model_validate(request.get_json() or {})
     except ValidationError as e:
         return _validation_error_response(e)
+    data = request.get_json() or {}
+    company_id = data.get("company_id")
+    if company_id is None:
+        return jsonify({"error": "company_id is required"}), 400
+    try:
+        company_id = int(company_id)
+    except (TypeError, ValueError):
+        return jsonify({"error": "company_id must be an integer"}), 400
     conn = get_db()
     try:
         result = create_production_run(
-            conn, name, payload.production_qty,
+            conn, company_id, name, payload.production_qty,
             order_number=payload.order_number,
             batch_number=payload.batch_number,
             production_date=payload.production_date,
@@ -1541,11 +1620,14 @@ def api_produce_recipe(name):
     return jsonify(result), 201
 
 
-@app.route("/api/recipes/<name>/runs")
+@app.route("/api/recipes/<path:name>/runs")
 def api_list_production_runs(name):
+    company_id = request.args.get("company_id", type=int)
+    if company_id is None:
+        return jsonify({"error": "company_id is required"}), 400
     conn = get_db()
     # Verify recipe exists
-    recipe = get_recipe_by_name(conn, name)
+    recipe = get_recipe_by_name(conn, company_id, name)
     if not recipe:
         conn.close()
         return jsonify({"error": "Recipe not found"}), 404
@@ -1562,10 +1644,13 @@ def api_list_production_runs(name):
     ])
 
 
-@app.route("/api/recipes/<name>/runs/<int:run_id>")
+@app.route("/api/recipes/<path:name>/runs/<int:run_id>")
 def api_get_production_run(name, run_id):
+    company_id = request.args.get("company_id", type=int)
+    if company_id is None:
+        return jsonify({"error": "company_id is required"}), 400
     conn = get_db()
-    recipe = get_recipe_by_name(conn, name)
+    recipe = get_recipe_by_name(conn, company_id, name)
     if not recipe:
         conn.close()
         return jsonify({"error": "Recipe not found"}), 404

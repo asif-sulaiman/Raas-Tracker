@@ -194,10 +194,13 @@ def update_stock(conn: psycopg.Connection, name: str, delta: float, unit: str = 
     
     Returns:
         True if updated successfully, False if chemical not found
+    
+    Raises:
+        ValueError: If the delta would result in negative stock ("insufficient stock")
     """
-    # Get chemical info
+    # Get chemical info with FOR UPDATE to lock the row
     chemical = conn.execute(
-        "SELECT id, name, current_qty, unit, reorder_level FROM chemicals WHERE name = %s",
+        "SELECT id, name, current_qty, unit, reorder_level FROM chemicals WHERE name = %s FOR UPDATE",
         (name,)
     ).fetchone()
     
@@ -217,8 +220,7 @@ def update_stock(conn: psycopg.Connection, name: str, delta: float, unit: str = 
     
     new_qty = current_qty + delta
     if new_qty < 0:
-        logger.warning("Stock would go negative (%s %s). Setting to 0.", new_qty, chem_unit)
-        new_qty = 0
+        raise ValueError("insufficient stock")
     
     conn.execute(
         "UPDATE chemicals SET current_qty = %s, last_updated = %s WHERE id = %s",

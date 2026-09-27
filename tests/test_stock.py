@@ -159,9 +159,9 @@ def test_recipe_crud_statuses(admin_client, db):
                              json={"name": "R1 -- TestCo", "yield": 5, "company_id": cid, "product_name": "TestProduct"}).status_code == 201
     assert admin_client.post("/api/recipes",
                              json={"name": "R1 -- TestCo", "yield": 5, "company_id": cid, "product_name": "TestProduct"}).status_code == 409
-    assert admin_client.delete("/api/recipes/Ghost").status_code == 404
-    assert admin_client.delete("/api/recipes/R1 -- TestCo").status_code == 200
-    assert admin_client.delete("/api/recipes/R1 -- TestCo").status_code == 404
+    assert admin_client.delete(f"/api/recipes/Ghost?company_id={cid}").status_code == 404
+    assert admin_client.delete(f"/api/recipes/R1 -- TestCo?company_id={cid}").status_code == 200
+    assert admin_client.delete(f"/api/recipes/R1 -- TestCo?company_id={cid}").status_code == 404
 
 
 def test_recipe_mutations_audited(admin_client, db):
@@ -174,11 +174,11 @@ def test_recipe_mutations_audited(admin_client, db):
     })
     assert admin_client.post("/api/recipes", json={"name": "AudR -- TestCo", "yield": 5, "company_id": cid, "product_name": "AudChem"}).status_code == 201
     assert admin_client.post("/api/recipes/AudR -- TestCo/items",
-                             json={"chemical": "AudChem", "percentage": 20}).status_code == 200
+                             json={"chemical": "AudChem", "percentage": 20, "company_id": cid}).status_code == 200
     assert admin_client.put("/api/recipes/AudR -- TestCo/items/AudChem",
-                            json={"percentage": 25}).status_code == 200
-    assert admin_client.delete("/api/recipes/AudR -- TestCo/items/AudChem").status_code == 200
-    assert admin_client.delete("/api/recipes/AudR -- TestCo").status_code == 200
+                            json={"percentage": 25, "company_id": cid}).status_code == 200
+    assert admin_client.delete(f"/api/recipes/AudR -- TestCo/items/AudChem?company_id={cid}").status_code == 200
+    assert admin_client.delete(f"/api/recipes/AudR -- TestCo?company_id={cid}").status_code == 200
     actions = {r[0] for r in db.execute(
         "SELECT action FROM audit_logs WHERE entity_type LIKE 'recipe%'").fetchall()}
     assert {"RECIPE_CREATE", "RECIPE_ITEM_ADD", "RECIPE_ITEM_UPDATE",
@@ -199,19 +199,19 @@ def test_recipe_percentage_cap(db):
     add_recipe(db, "Cap", 1, 10.0, company_id=cid, product_name="TestProduct")
     add_chemical(db, "CapA", 5, "KG")
     add_chemical(db, "CapB", 5, "KG")
-    assert add_recipe_item(db, "Cap", "CapA", 60.0) is True
+    assert add_recipe_item(db, cid, "Cap", "CapA", 60.0) is True
     with pytest.raises(ValueError):
-        add_recipe_item(db, "Cap", "CapB", 31.0)
-    assert add_recipe_item(db, "Cap", "CapB", 30.0) is True
+        add_recipe_item(db, cid, "Cap", "CapB", 31.0)
+    assert add_recipe_item(db, cid, "Cap", "CapB", 30.0) is True
     with pytest.raises(ValueError):
-        update_recipe_item(db, "Cap", "CapA", 71.0)
-    assert update_recipe_item(db, "Cap", "CapB", 20.0) is True
+        update_recipe_item(db, cid, "Cap", "CapA", 71.0)
+    assert update_recipe_item(db, cid, "Cap", "CapB", 20.0) is True
     # Boundary: water 10 + items 90 = exactly 100% total is allowed.
-    assert update_recipe_item(db, "Cap", "CapA", 70.0) is True
+    assert update_recipe_item(db, cid, "Cap", "CapA", 70.0) is True
     with pytest.raises(ValueError):
-        update_recipe(db, "Cap", water_percentage=41.0)
+        update_recipe(db, cid, "Cap", water_percentage=41.0)
     with pytest.raises(ValueError):
-        update_recipe_item(db, "Cap", "CapA", -1.0)
+        update_recipe_item(db, cid, "Cap", "CapA", -1.0)
 
 
 def test_recipe_percentage_cap_api(admin_client, db):
@@ -228,12 +228,12 @@ def test_recipe_percentage_cap_api(admin_client, db):
     })
     assert r.status_code == 201
     assert admin_client.post("/api/recipes/CapR -- TestCo/items",
-                             json={"chemical": "CapC", "percentage": 90}).status_code == 200
+                             json={"chemical": "CapC", "percentage": 90, "company_id": cid}).status_code == 200
     # 90 + 11 exceeds 100% -> rejected, recipe unchanged.
     r = admin_client.post("/api/recipes/CapR -- TestCo/items",
-                          json={"chemical": "CapD", "percentage": 11})
+                          json={"chemical": "CapD", "percentage": 11, "company_id": cid})
     assert r.status_code == 400
-    assert admin_client.put("/api/recipes/CapR -- TestCo", json={"water_percentage": 101}).status_code == 400
+    assert admin_client.put("/api/recipes/CapR -- TestCo", json={"water_percentage": 101, "company_id": cid}).status_code == 400
 
 
 def test_chemical_name_case_insensitive(db):
