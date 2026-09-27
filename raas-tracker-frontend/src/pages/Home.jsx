@@ -5,13 +5,11 @@ import {
   CheckCircle2,
   AlertTriangle,
   UploadCloud,
-  FileSpreadsheet,
   Clock,
   ArrowRight,
   TrendingDown,
   Layers,
   History,
-  ShieldCheck,
   BookOpen
 } from 'lucide-react';
 import KpiCard from '../components/cards/KpiCard';
@@ -141,71 +139,23 @@ export default function Home() {
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
-      {/* CRM Welcome & Status Banner */}
-      <div className="relative overflow-hidden rounded-2xl bg-gradient-to-r from-blue-600 via-indigo-600 to-blue-700 p-6 text-white shadow-lg">
-        <div className="relative z-10 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-          <div>
-            <div className="flex items-center gap-2 mb-2">
-              {latestUpload ? (
-                <>
-                  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-white/20 backdrop-blur-md text-white">
-                    <ShieldCheck className="h-3.5 w-3.5" /> Last checked {latestUpload.filename || 'upload'}
-                  </span>
-                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-500/30 text-emerald-200">
-                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" /> {Number(latestMatch).toFixed(1)}% match
-                  </span>
-                </>
-              ) : (
-                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-white/20 backdrop-blur-md text-white">
-                  <ShieldCheck className="h-3.5 w-3.5" /> No stock check yet
-                </span>
-              )}
-            </div>
-            <h2 className="text-2xl md:text-3xl font-bold tracking-tight">
-              Warehouse Stock Accountability CRM
-            </h2>
-            <p className="text-sm text-blue-100 mt-1 max-w-2xl">
-              Real-time monitoring of monthly chemical inventories, storekeeper reconciliations,
-              batch validations, and mismatch audits.
-            </p>
-          </div>
-
-          <div className="flex items-center gap-2.5 shrink-0">
-            <Link to="/upload">
-              <Button
-                variant="secondary"
-                size="md"
-                icon={UploadCloud}
-                className="bg-white text-blue-700 hover:bg-blue-50 border-transparent shadow-sm"
-              >
-                Upload Monthly Stock
-              </Button>
-            </Link>
-            <Link to="/recipes">
-              <Button
-                variant="ghost"
-                size="md"
-                icon={BookOpen}
-                className="text-white hover:bg-white/15"
-              >
-                Recipes
-              </Button>
-            </Link>
-            <Link to="/reports">
-              <Button
-                variant="ghost"
-                size="md"
-                icon={FileSpreadsheet}
-                className="text-white hover:bg-white/15"
-              >
-                Reports
-              </Button>
-            </Link>
-          </div>
+      {/* Command strip */}
+      <div className="flex flex-col gap-3 rounded-xl border border-slate-200/80 bg-white px-4 py-3 sm:flex-row sm:items-center sm:justify-between dark:border-slate-800 dark:bg-slate-900">
+        <div className="min-w-0">
+          <h1 className="text-base font-bold tracking-tight text-slate-900 dark:text-white">
+            RAAS Tracker
+          </h1>
+          <p className="mt-0.5 truncate text-xs text-slate-500 dark:text-slate-400">
+            {latestUpload
+              ? `${formatDate(latestUpload.upload_date)} · Last stock check ${latestUpload.filename || 'upload'} · ${Number(latestMatch).toFixed(1)}% match`
+              : 'No stock check yet'}
+          </p>
         </div>
-
-        {/* Ambient decorative circle */}
-        <div className="absolute -right-12 -bottom-12 w-64 h-64 rounded-full bg-white/10 blur-2xl pointer-events-none" />
+        <Link to="/upload" className="shrink-0">
+          <Button variant="primary" size="sm" icon={UploadCloud}>
+            Upload Monthly Stock
+          </Button>
+        </Link>
       </div>
 
       {/* Sales Pipeline Overview — hero section, first under the banner */}
