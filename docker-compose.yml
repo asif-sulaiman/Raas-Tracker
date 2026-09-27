@@ -8,9 +8,4 @@ services:
       PRODUCTION: "1"
       FORCE_HTTPS: "0"
       COOKIE_SECURE: "0"
-    volumes:
-      - raas-tracker-data:/data
     restart: unless-stopped
-
-volumes:
-  raas-tracker-data:

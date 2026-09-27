@@ -13,8 +13,8 @@ from .notifications import notify_sale_stage, clear_dedupe, clear_maturity_dedup
 
 def _now_str() -> str:
     """Current UTC time as 'YYYY-MM-DD HH:MM:SS' for TEXT datetime columns."""
-    from datetime import datetime as _dt
-    return _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    from datetime import datetime as _dt, timezone
+    return _dt.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 SALE_STAGE_ORDER = ["pi_issued", "lc_received", "shipment_ongoing", "payment_due", "completed"]
 

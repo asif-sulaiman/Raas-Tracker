@@ -52,6 +52,24 @@ username and per IP), per-key rate limits, audited auth events.
 
 See `.env.example` for a template.
 
+## Database Connection Pooling
+
+The app uses `psycopg_pool` for PostgreSQL connection pooling. The pool is configured with:
+- **min connections**: 1
+- **max connections**: 10 (configurable via `DB_POOL_MAX`)
+
+For high-concurrency workloads, increase `DB_POOL_MAX` (e.g., `DB_POOL_MAX=20`). Each worker process maintains its own pool.
+
+## Optional Redis for Rate Limiting
+
+Flask-Limiter uses in-memory storage by default (suitable for single-worker deployments). For multi-worker or distributed deployments, set `REDIS_URL` to enable Redis-backed rate limiting:
+
+```bash
+REDIS_URL=redis://localhost:6379/0
+```
+
+Without Redis, rate limits are per-process only — not shared across workers.
+
 ## Production (online hosting)
 
 The app is stateless (all state in Postgres) and PaaS-ready. Set these env

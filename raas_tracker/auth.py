@@ -4,14 +4,14 @@ import psycopg
 import json
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional, List, Dict, Any, Union
 
 from .audit import log_audit_action
 
 import hashlib as _hashlib
 import secrets as _secrets
-from datetime import datetime as _datetime, timedelta as _timedelta, timezone as _timezone
+from datetime import datetime as _datetime, timedelta as _timedelta
 
 
 BCRYPT_ROUNDS = 13
@@ -87,12 +87,13 @@ def _split_setup_token_value(value: str):
 
     Legacy rows without a timestamp return (value, None) and are treated
     as expired, forcing a fresh token.
+    Returns timezone-aware UTC datetime for the created timestamp.
     """
     digest, sep, ts = (value or "").partition(":")
     if not sep:
         return digest, None
     try:
-        return digest, _datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        return digest, _datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
     except ValueError:
         return digest, None
 
@@ -100,7 +101,7 @@ def _split_setup_token_value(value: str):
 def _setup_token_expired(created) -> bool:
     if created is None:
         return True
-    age = _datetime.utcnow() - created
+    age = _datetime.now(timezone.utc) - created
     return age.total_seconds() > SETUP_TOKEN_TTL_MINUTES * 60
 
 
@@ -118,7 +119,7 @@ def ensure_setup_token(conn: psycopg.Connection) -> Optional[str]:
         return None
     raw = _secrets.token_urlsafe(32)
     stamped = (_hashlib.sha256(raw.encode("utf-8")).hexdigest()
-               + ":" + _datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+               + ":" + _datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
     conn.execute("INSERT INTO app_settings (key, value) VALUES ('setup_token_hash', %s) "
                  "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
                  (stamped,))
@@ -259,11 +260,11 @@ def delete_user(conn: psycopg.Connection, user_id: int) -> bool:
 
 
 def create_session(conn: psycopg.Connection, user_id: int,
-                   ttl_hours: int = SESSION_TTL_HOURS) -> str:
+                    ttl_hours: int = SESSION_TTL_HOURS) -> str:
     """Mint a session token. Returns the raw token (only time it is visible)."""
     token = _secrets.token_urlsafe(32)
     token_hash = _hashlib.sha256(token.encode("utf-8")).hexdigest()
-    expires = (_datetime.utcnow() + _timedelta(hours=ttl_hours)).strftime("%Y-%m-%d %H:%M:%S")
+    expires = (_datetime.now(timezone.utc) + _timedelta(hours=ttl_hours)).strftime("%Y-%m-%d %H:%M:%S")
     conn.execute(
         "INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (%s, %s, %s)",
         (token_hash, user_id, expires)
@@ -318,17 +319,17 @@ def _reset_token_hash(raw_token: str) -> str:
 
 def _reset_expiry_text(ttl_min: int) -> str:
     """UTC 'YYYY-MM-DD HH:MM:SS' expiry for a freshly issued reset token."""
-    return (_datetime.now(_timezone.utc) + _timedelta(minutes=ttl_min)).strftime("%Y-%m-%d %H:%M:%S")
+    return (_datetime.now(timezone.utc) + _timedelta(minutes=ttl_min)).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _reset_token_expired_at(expires_at: Optional[str]) -> bool:
     """True when a stored UTC expiry text is missing, unparseable, or past."""
     try:
         exp = _datetime.strptime((expires_at or "")[:19], "%Y-%m-%d %H:%M:%S").replace(
-            tzinfo=_timezone.utc)
+            tzinfo=timezone.utc)
     except ValueError:
         return True
-    return _datetime.now(_timezone.utc) >= exp
+    return _datetime.now(timezone.utc) >= exp
 
 
 def set_password(conn: psycopg.Connection, user_id: int, new_password: str,

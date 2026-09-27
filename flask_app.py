@@ -347,8 +347,8 @@ def _notify_login_failures(conn, username, ip) -> None:
     try:
         from raas_tracker.notifications import notify
         who = (username or "").strip() or "unknown"
-        from datetime import datetime as _dt
-        bucket = _dt.utcnow().strftime("%Y%m%d%H")
+        from datetime import datetime as _dt, timezone
+        bucket = _dt.now(timezone.utc).strftime("%Y%m%d%H")
         notify(conn, type="login_failures",
                title=f"Repeated failed logins: {who}",
                body=f"Failed-login threshold reached for '{who}' from {ip} within 10 minutes.",
@@ -1924,8 +1924,8 @@ def api_update_sale(sale_id):
             fields.append(f"{key} = %s")
             vals.append(data[key])
     if fields:
-        from datetime import datetime as _dt
-        vals.append(_dt.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+        from datetime import datetime as _dt, timezone
+        vals.append(_dt.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
         vals.append(sale_id)
         conn.execute(f"UPDATE sales SET {', '.join(fields)}, updated_at = %s WHERE id = %s", vals)
         conn.commit()

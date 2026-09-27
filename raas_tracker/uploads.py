@@ -14,8 +14,8 @@ from .stock import convert_quantity, get_unit_conversion
 
 def _now_str() -> str:
     """Current UTC time as 'YYYY-MM-DD HH:MM:SS' for TEXT datetime columns."""
-    from datetime import datetime
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 def validate_expiry_date(expiry_date_str: str) -> tuple:
     """Validate expiry date format and check if expired.
