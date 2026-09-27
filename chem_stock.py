@@ -8,6 +8,8 @@ from raas_tracker.db import (
     DB_PATH,
     JSON_PATH,
     _create_tables,
+    close_pool,
+    data_dir,
     get_connection,
     logger,
 )

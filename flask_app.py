@@ -213,6 +213,19 @@ def _set_security_headers(resp):
     resp.headers["X-XSS-Protection"] = "0"
     resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     resp.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    # Content Security Policy
+    csp = (
+        "default-src 'self'; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "font-src 'self'; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    )
+    resp.headers["Content-Security-Policy"] = csp
     if os.getenv("FORCE_HTTPS") == "1":
         resp.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
     origin = (request.headers.get("Origin") or "").rstrip("/")
@@ -270,11 +283,14 @@ def _limit_key():
     return get_remote_address()
 
 
+# Redis-backed limiter fallback: uses REDIS_URL if set, else in-memory
+_limiter_storage_uri = os.getenv("REDIS_URL", "memory://")
+
 limiter = Limiter(
     _limit_key,
     app=app,
     default_limits=["300 per minute"],
-    storage_uri="memory://",
+    storage_uri=_limiter_storage_uri,
     headers_enabled=True,
 )
 
@@ -1288,6 +1304,33 @@ def api_apply_upload(upload_id):
     if not ok:
         return jsonify({"error": "Could not apply upload"}), 500
     return jsonify({"adjusted": True})
+
+
+@app.route("/api/uploads/<int:upload_id>/download")
+@admin_required
+def api_upload_download(upload_id):
+    """Download the generated report file for an upload."""
+    from raas_tracker.db import data_dir as _data_dir
+    conn = get_db()
+    upload = conn.execute(
+        "SELECT id, filename FROM uploads WHERE id = %s", (upload_id,)
+    ).fetchone()
+    conn.close()
+    if not upload:
+        return jsonify({"error": "Upload not found"}), 404
+
+    # Look for generated report files in data/reports/<upload_id>/
+    reports_dir = os.path.join(_data_dir(), "reports", str(upload_id))
+    if not os.path.isdir(reports_dir):
+        return jsonify({"error": "no generated report for this upload"}), 404
+
+    files = [f for f in os.listdir(reports_dir) if os.path.isfile(os.path.join(reports_dir, f))]
+    if not files:
+        return jsonify({"error": "no generated report for this upload"}), 404
+
+    # Serve the most recent file by mtime
+    files.sort(key=lambda f: os.path.getmtime(os.path.join(reports_dir, f)), reverse=True)
+    return send_from_directory(reports_dir, files[0], as_attachment=True)
 
 
 @app.route("/api/uploads/<int:upload_id>/export")

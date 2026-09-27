@@ -9,11 +9,47 @@ Column style is intentionally conservative: datetimes stay TEXT
 so all Python-side comparisons and sorting work unchanged.
 """
 
+import atexit
 import logging as _logging
 import os
 from typing import Optional, Set
 
 import psycopg
+from psycopg_pool import ConnectionPool
+
+
+class _PooledConnection:
+    """Wrapper that returns connection to pool on close() instead of closing it."""
+
+    __slots__ = ("_conn", "_pool")
+
+    def __init__(self, conn: psycopg.Connection, pool: ConnectionPool):
+        self._conn = conn
+        self._pool = pool
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+    def close(self):
+        """Return connection to pool instead of closing it. Commit any pending transaction first."""
+        if self._conn is not None:
+            try:
+                # Commit any pending transaction to avoid "INTRANS" rollback warnings
+                self._conn.commit()
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+            self._pool.putconn(self._conn)
+            self._conn = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
 logger = _logging.getLogger("raas")
 if not logger.handlers:
@@ -28,6 +64,10 @@ DEFAULT_TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/raas_
 
 # app_settings key holding the schema signature (see _schema_signature).
 _SCHEMA_SIG_KEY = "raas_schema_sig"
+
+# Connection pool (initialized lazily on first get_connection call)
+_pool: Optional[ConnectionPool] = None
+_pool_dsn: Optional[str] = None
 
 
 def data_dir() -> str:
@@ -50,8 +90,25 @@ def resolve_dsn(dsn: Optional[str] = None) -> str:
     return dsn or os.getenv("DATABASE_URL") or DEFAULT_DATABASE_URL
 
 
+def _get_pool(dsn: Optional[str] = None) -> ConnectionPool:
+    """Get or create the global connection pool."""
+    global _pool, _pool_dsn
+    effective_dsn = resolve_dsn(dsn)
+    if _pool is None or _pool_dsn != effective_dsn:
+        if _pool is not None:
+            _pool.close()
+        _pool = ConnectionPool(
+            conninfo=effective_dsn,
+            min_size=1,
+            max_size=10,
+            kwargs={"prepare_threshold": None},
+        )
+        _pool_dsn = effective_dsn
+    return _pool
+
+
 def get_connection(dsn: Optional[str] = None) -> psycopg.Connection:
-    """Connect to PostgreSQL, ensuring schema/migrations/seeds, and return it.
+    """Get a connection from the pool, ensuring schema/migrations/seeds.
 
     The connection runs in transactional mode: DML requires conn.commit()
     (or rolls back with conn.rollback()), matching previous backend semantics.
@@ -62,12 +119,35 @@ def get_connection(dsn: Optional[str] = None) -> psycopg.Connection:
     signature (missing tables/columns after an upgrade or a manual DROP):
     the common case is a single probe query, which keeps per-request (and
     per-test) overhead to one round trip instead of the full DDL.
+
+    The returned connection is wrapped so that close() returns it to the pool
+    instead of closing it, maintaining compatibility with existing code.
     """
-    conn = psycopg.connect(resolve_dsn(dsn), prepare_threshold=None)
-    if not _schema_current(conn):
-        _create_tables(conn)
-    _ensure_seeds(conn)
-    return conn
+    pool = _get_pool(dsn)
+    conn = pool.getconn()
+    # Run schema check and seeds on each connection (cheap: one probe + two COUNTs)
+    # This maintains the original behavior where schema drift is detected per-request.
+    try:
+        if not _schema_current(conn):
+            _create_tables(conn)
+        _ensure_seeds(conn)
+    except Exception:
+        # If schema check fails, return connection to pool and re-raise
+        pool.putconn(conn)
+        raise
+    return _PooledConnection(conn, pool)
+
+
+def close_pool() -> None:
+    """Close the global connection pool. Called at shutdown."""
+    global _pool, _pool_dsn
+    if _pool is not None:
+        _pool.close()
+        _pool = None
+        _pool_dsn = None
+
+
+atexit.register(close_pool)
 
 
 def _schema_signature_live(conn: psycopg.Connection) -> str:
