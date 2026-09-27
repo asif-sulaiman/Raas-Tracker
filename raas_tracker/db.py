@@ -102,6 +102,7 @@ def _get_pool(dsn: Optional[str] = None) -> ConnectionPool:
             min_size=1,
             max_size=10,
             kwargs={"prepare_threshold": None},
+            open=True,
         )
         _pool_dsn = effective_dsn
     return _pool

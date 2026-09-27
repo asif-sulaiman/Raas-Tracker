@@ -145,3 +145,26 @@ def test_connection_pool_close_on_shutdown():
     # New pool should be created
     from raas_tracker.db import _pool
     assert _pool is not None
+
+
+def test_env_dsn_pinned_to_test_db(pg_dsn):
+    """No test may resolve to the remote DB: session pins DATABASE_URL."""
+    import os
+    from raas_tracker import db as dbmod
+    assert os.environ.get("DATABASE_URL") == pg_dsn
+    assert dbmod.resolve_dsn(None) == pg_dsn
+
+
+def test_pool_open_is_explicit_no_deprecation(pg_dsn):
+    """Pool must be constructed with open=True (psycopg_pool deprecation)."""
+    import warnings as _w
+    from raas_tracker import db as dbmod
+    dbmod.close_pool()
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        pool = dbmod._get_pool(pg_dsn)
+        conn = pool.getconn()
+        pool.putconn(conn)
+    dep = [w for w in caught
+           if issubclass(w.category, DeprecationWarning) and "open" in str(w.message)]
+    assert not dep, [str(w.message) for w in dep]

@@ -60,6 +60,22 @@ def pg_dsn():
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _pin_database_url(pg_dsn):
+    """Pin DATABASE_URL to the test DSN for the whole session.
+
+    Tests that bypass the client fixture (bare test_client()) must never
+    resolve the real remote DSN via env.
+    """
+    old = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = pg_dsn
+    yield
+    if old is None:
+        os.environ.pop("DATABASE_URL", None)
+    else:
+        os.environ["DATABASE_URL"] = old
+
+
 @pytest.fixture(autouse=True)
 def _fast_bcrypt(monkeypatch):
     """Lower bcrypt cost for tests only (hash plumbing identical, ~10x faster).
