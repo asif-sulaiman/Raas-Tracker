@@ -63,3 +63,6 @@ build/
 dist/
 *.nsi
 *.exe
+
+# === Real client PI samples (never commit) ===
+samples/

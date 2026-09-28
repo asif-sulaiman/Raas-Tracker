@@ -320,6 +320,127 @@ def test_total_mismatch_warns():
     assert any("does not match" in w for w in warnings)
 
 
+def test_recover_pair_ignores_alphanumeric_codes():
+    from parse_sales import extract_items_from_tables
+    tables = [[["Sr.", "Qty", "Item", "Description", "HS", "Price", "Total"],
+               ["1", "", "0201001", "ANDROMA LO2 Detergent", "3402.90.10",
+                "", "40,704.00"]]]
+    warnings: list = []
+    items = extract_items_from_tables(tables, warnings)
+    assert len(items) == 1
+    assert items[0].quantity == 0.0
+    assert items[0].unit_price == 0.0
+    assert any("does not match" in w for w in warnings)
+    assert not any("filled in" in w for w in warnings)
+
+
+def test_recover_pair_pure_numeric_still_recovers():
+    from parse_sales import extract_items_from_tables
+    tables = [[["Sr.", "Qty", "Item", "Description", "HS", "Price", "Total"],
+               ["1", "", "1001001", "GENERIC APC Enzyme 11,000 2.65",
+                "3507.90.90", "", "29,150.00"]]]
+    warnings: list = []
+    items = extract_items_from_tables(tables, warnings)
+    assert len(items) == 1
+    assert items[0].quantity == 11000.0
+    assert items[0].unit_price == 2.65
+
+
+def test_grand_total_mismatch_warns():
+    from parse_sales import extract_items_from_tables
+    tables = [[["Sr.", "Qty", "Item", "Description", "HS", "Price", "Total"],
+               ["1", "10,000", "1001001", "PRODUCT A", "3402.90.10",
+                "2.50", "25,000.00"],
+               ["2", "10,352", "1001002", "PRODUCT B", "3507.90.90",
+                "2.50", "25,880.00"],
+               ["", "", "", "", "", "Total USD", "50,000.00"]]]
+    warnings: list = []
+    items = extract_items_from_tables(tables, warnings)
+    assert len(items) == 2
+    assert any("grand total" in w for w in warnings)
+
+
+def test_grand_total_match_silent():
+    from parse_sales import extract_items_from_tables
+    tables = [[["Sr.", "Qty", "Item", "Description", "HS", "Price", "Total"],
+               ["1", "10,000", "1001001", "PRODUCT A", "3402.90.10",
+                "2.50", "25,000.00"],
+               ["2", "10,352", "1001002", "PRODUCT B", "3507.90.90",
+                "2.50", "25,880.00"],
+               ["", "", "", "", "", "Total USD", "50,880.00"]]]
+    warnings: list = []
+    items = extract_items_from_tables(tables, warnings)
+    assert len(items) == 2
+    assert not any("grand total" in w for w in warnings)
+
+
+def _make_alt_order_pdf() -> io.BytesIO:
+    """Build a synthetic PDF with FARIHA column order.
+
+    Sr.|Item|Description|HS|Qty|Price|Total (qty sits after HS, unlike RAAS).
+    """
+    import pymupdf
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    y = 40
+    for line in ["DEMO SUPPLIER SDN. BHD.", "Mailing Address",
+                 "EXAMPLE CLIENT LTD", "12, SAMPLE STREET",
+                 "SAMPLE CITY, SAMPLE COUNTRY",
+                 "Invoice Number", "99000001",
+                 "Invoice Date", "15/09/2026"]:
+        page.insert_text((40, y), line, fontsize=10)
+        y += 14
+    cols = [40, 70, 140, 290, 360, 440, 500, 575]
+    rows = [["Sr. No.", "Item No.", "Description", "HS Code",
+             "Quantity in Kg", "Unit Price", "Total in USD"],
+            ["1", "1001001", "SAMPLE DETERGENT", "3402.90.10",
+             "1,000", "2.50", "2,500.00"],
+            ["2", "1001002", "SAMPLE ENZYME", "3507.90.90",
+             "4,000", "2.50", "10,000.00"]]
+    y += 10
+    row_h = 22
+    for r, row in enumerate(rows):
+        for c, val in enumerate(row):
+            rect = pymupdf.Rect(cols[c], y, cols[c + 1], y + row_h)
+            page.draw_rect(rect, color=(0, 0, 0), width=0.5)
+            page.insert_textbox(rect + pymupdf.Rect(2, 2, -2, -2), val, fontsize=8)
+        y += row_h
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def test_alt_column_order_pdf_extraction():
+    extraction = parse_pi_stream(_make_alt_order_pdf(), "99000001.pdf")
+    assert len(extraction.items) == 2
+    first, second = extraction.items
+    assert first.quantity == 1000.0
+    assert first.unit_price == 2.50
+    assert first.line_total == 2500.0
+    assert first.item_no == "1001001"
+    assert "SAMPLE" in first.product_name
+    assert second.quantity == 4000.0
+    assert second.unit_price == 2.50
+    assert second.line_total == 10000.0
+    assert second.item_no == "1001002"
+    assert "SAMPLE" in second.product_name
+    assert not any("does not match" in w for w in extraction.warnings)
+
+
+def test_same_column_qty_price_rejected():
+    from parse_sales import _map_product_columns
+    assert _map_product_columns(["Sr.", "Quantity in Unit Price in"]) is None
+
+
+def test_inspector_tables_shape():
+    pytest.importorskip("pdf_inspector")
+    from parse_sales import _inspector_markdown_tables
+    tables = _inspector_markdown_tables(_make_raas_pdf().getvalue())
+    assert len(tables) >= 1
+    assert any(any("Quantity" in c for c in t[0]) for t in tables)
+
+
 def test_generic_pi_filename_still_works():
     buf = _make_raas_docx()
     extraction = parse_pi_stream(buf, "PI-2026-001_Client.docx")

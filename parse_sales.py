@@ -272,6 +272,8 @@ def _recover_pair(row: List[str], total_col: Optional[int],
         for tpos, tok in enumerate(toks):
             if '/' in tok:
                 continue  # dates like 15/09/2026
+            if re.search(r'[A-Za-z]', tok):
+                continue
             v = _parse_number(tok)
             if v is None or v == 0:
                 continue
@@ -329,6 +331,8 @@ def _map_product_columns(header_cells: List[str]) -> Optional[dict]:
         price = find('price', exclude=('total',))
     if desc is None and price is None:
         return None
+    if qty is not None and price is not None and qty == price:
+        return None  # degenerate: same column matched both (fragmented header)
     return {
         'qty': qty,
         'desc': desc,
@@ -377,8 +381,29 @@ def extract_items_from_tables(tables: List[List[List[str]]],
         def cell(row, idx):
             return row[idx] if idx is not None and idx < len(row) else ''
 
+        footer_total = None
+        table_start = len(items)
         for lineno, row in enumerate(rows[header_idx + 1:], start=1):
             row = row + [''] * (width - len(row))
+            is_footer = False
+            for c in row:
+                cl = _clean_cell(c).lower()
+                if cl in _TOTAL_NAMES or cl.startswith('total '):
+                    is_footer = True
+                    break
+            if is_footer:
+                amt = None
+                if colmap['total'] is not None:
+                    amt = _parse_last_number(cell(row, colmap['total']))
+                if amt is None:
+                    for c in reversed(row):
+                        v = _parse_number(_clean_cell(c))
+                        if v is not None and v != 0:
+                            amt = v
+                            break
+                if amt is not None and amt != 0:
+                    footer_total = amt
+                continue
             raw_name = cell(row, colmap['desc']) if colmap['desc'] is not None else row[0]
             name = _clean_cell(raw_name)
             if not name:
@@ -415,6 +440,14 @@ def extract_items_from_tables(tables: List[List[List[str]]],
             items.append(PIItem(product_name=name, quantity=qty,
                                 unit_price=price, item_no=item_no,
                                 line_total=total))
+        if footer_total is not None:
+            line_totals = [it.line_total for it in items[table_start:]
+                           if it.line_total is not None]
+            if line_totals:
+                grand = sum(line_totals)
+                if abs(grand - footer_total) > max(1.0, 0.005 * abs(footer_total)):
+                    warnings.append(
+                        "Item totals do not match the invoice grand total.")
     return items
 
 
@@ -454,15 +487,66 @@ def _layout_block_tables(layout_text: str):
     return tables
 
 
+def _inspector_markdown_tables(raw_bytes: bytes):
+    """Rebuild tables from pdf-inspector Markdown output.
+
+    Runs pdf_inspector.extract_pages_markdown over the PDF bytes, takes each
+    page's ``markdown``, groups consecutive ``|``-prefixed lines into blocks
+    (``>= 2`` rows each), and splits rows on ``|`` (dropping the outer-pipe
+    empties). Returns ``[]`` on ANY failure so the other candidates compete
+    unaffected.
+    """
+    try:
+        import pdf_inspector
+        extractor = getattr(pdf_inspector, 'extract_pages_markdown_bytes', None)
+        if extractor is not None:
+            result = extractor(raw_bytes)
+        else:
+            with tempfile.NamedTemporaryFile(suffix='.pdf',
+                                             delete=False) as tmp:
+                tmp.write(raw_bytes)
+                tmp_path = tmp.name
+            try:
+                result = pdf_inspector.extract_pages_markdown(tmp_path)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        tables = []
+        for page in result.pages:
+            block = []
+            for line in (page.markdown or '').split('\n'):
+                if line.strip().startswith('|'):
+                    cells = [c.strip() for c in line.strip().split('|')]
+                    if cells and not cells[0]:
+                        cells = cells[1:]
+                    if cells and not cells[-1]:
+                        cells = cells[:-1]
+                    if cells and all(
+                            re.fullmatch(r':?-{1,}:?', c or '') for c in cells):
+                        continue  # markdown alignment separator row
+                    block.append(cells)
+                else:
+                    if len(block) >= 2:
+                        tables.append(block)
+                    block = []
+            if len(block) >= 2:
+                tables.append(block)
+        return tables
+    except Exception:
+        return []
+
+
 def _pdf_table_candidates(raw_bytes: bytes):
-    """Return (full_text, [tables_lines, tables_text, tables_fitz, tables_layout]).
+    """Return (full_text, [tables_lines, tables_text, tables_fitz, tables_layout, tables_inspector]).
 
     Different real-world PIs rule their tables differently (full grid,
     partial lines, shading without lines), so no single detection strategy
     fits all. Each candidate is a tables list in row-list format; empty
     lists are allowed and simply lose the selection vote.
     """
-    candidates: List[List[List[List[str]]]] = [[], [], [], []]
+    candidates: List[List[List[List[str]]]] = [[], [], [], [], []]
     text = ''
     try:
         import pdfplumber
@@ -510,6 +594,10 @@ def _pdf_table_candidates(raw_bytes: bytes):
                              for row in tbl.extract()])
                 except Exception:
                     continue
+    except Exception:
+        pass
+    try:
+        candidates[4].extend(_inspector_markdown_tables(raw_bytes))
     except Exception:
         pass
     return text, candidates
