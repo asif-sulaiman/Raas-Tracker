@@ -4,6 +4,8 @@ import Modal from '../modals/Modal';
 import Button from '../ui/Button';
 import { formatNumber, sumLineTotals, lineTotal } from '../../utils/format';
 import { COMMON_UNITS } from '../../utils/units';
+import { useAuth } from '../../context/AuthContext';
+import { toast } from 'sonner';
 
 const inputCls =
   'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
@@ -18,6 +20,41 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
   const [warnings, setWarnings] = useState([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
+
+  const { apiFetch } = useAuth();
+
+  const findBestMatch = (piName, companies) => {
+    if (!piName || !companies?.length) return null;
+    const pi = piName.trim().toLowerCase();
+
+    // Tier 1: exact
+    let matches = companies.filter(c => c.name.toLowerCase() === pi);
+    if (matches.length === 1) return matches[0];
+
+    // Tier 2: prefix (either direction)
+    matches = companies.filter(c => {
+      const db = c.name.toLowerCase();
+      return pi.startsWith(db) || db.startsWith(pi);
+    });
+    if (matches.length === 1) return matches[0];
+
+    // Tier 3: word-boundary contains (whole words only)
+    const piWords = pi.split(/\s+/).filter(w => w.length > 1);
+    matches = companies.filter(c => {
+      const db = c.name.toLowerCase();
+      return piWords.every(w => new RegExp(`\\b${w}\\b`).test(db));
+    });
+    if (matches.length === 1) return matches[0];
+
+    // Tier 3: multiple word-boundary matches → warn, no auto-select
+    if (matches.length > 1) {
+      toast.warning(`Multiple matches for "${piName}" — please select manually`);
+      return null;
+    }
+
+    // No match
+    return null;
+  };
 
   useEffect(() => {
     if (isOpen && initialData) {
@@ -41,21 +78,24 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
       setSaving(false);
       const preset = initialData.company_id != null ? String(initialData.company_id) : '';
       setCompanyId(preset);
-      fetch('/api/companies')
-        .then((r) => (r.ok ? r.json() : []))
-        .then((list) => {
-          const rows = Array.isArray(list) ? list : [];
+      const loadCompanies = async () => {
+        try {
+          const res = await apiFetch('/api/companies');
+          const data = await res.json();
+          const rows = Array.isArray(data) ? data : [];
           setCompanies(rows);
           if (!preset && initialData.client_name) {
-            const match = rows.find(
-              (c) => c.name.toLowerCase() === initialData.client_name.trim().toLowerCase()
-            );
+            const match = findBestMatch(initialData.client_name, rows);
             if (match) setCompanyId(String(match.id));
           }
-        })
-        .catch(() => setCompanies([]));
+        } catch {
+          toast.error('Could not load companies');
+          setCompanies([]);
+        }
+      };
+      loadCompanies();
     }
-  }, [isOpen, initialData]);
+  }, [isOpen, initialData, apiFetch]);
 
   const updateItem = (key, field, value) => {
     setItems((prev) => prev.map((i) => (i.key === key ? { ...i, [field]: value } : i)));
@@ -120,7 +160,14 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
           <Button variant="secondary" size="sm" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
-          <Button variant="success" size="sm" icon={Loader2} loading={saving} onClick={handleSave}>
+          <Button
+            variant="success"
+            size="sm"
+            icon={Loader2}
+            loading={saving}
+            disabled={companies.length === 0}
+            onClick={handleSave}
+          >
             Save to PI Issued
           </Button>
         </>
@@ -168,7 +215,7 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
                 ))}
               </select>
             ) : (
-              <input value={clientName} onChange={(e) => setClientName(e.target.value)} className={inputCls} placeholder="Client company" />
+              <p className="text-xs text-slate-500 dark:text-slate-400 italic">No companies registered</p>
             )}
           </div>
         </div>
@@ -199,7 +246,7 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
                 {items.length === 0 ? (
                   <tr>
                     <td colSpan={6} className="px-2.5 py-4 text-center text-slate-400">
-                      No items — click “Add Row” to add products manually
+                      No items — click "Add Row" to add products manually
                     </td>
                   </tr>
                 ) : (
