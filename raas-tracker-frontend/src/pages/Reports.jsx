@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   Download,
   FlaskConical,
@@ -20,6 +21,7 @@ import Badge from '../components/ui/Badge';
 import { formatNumber, formatDate } from '../utils/format';
 import { useAuth } from '../context/AuthContext';
 import { toast } from 'sonner';
+import CommercialFilters from '../components/reports/CommercialFilters';
 
 /**
  * Commercial report rows are per sale-item.
@@ -73,6 +75,7 @@ export default function Reports() {
   const { apiFetch, user } = useAuth();
   const isAdmin = user?.role === 'admin';
   const [activeTab, setActiveTab] = useState('production');
+  const [searchParams] = useSearchParams();
 
   const [recipes, setRecipes] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -89,6 +92,7 @@ export default function Reports() {
   const [commercialLoading, setCommercialLoading] = useState(false);
   const [commercialError, setCommercialError] = useState(null);
   const [commercialExporting, setCommercialExporting] = useState(false);
+  const [companies, setCompanies] = useState([]);
   const commercialFetchedRef = useRef(false);
 
   useEffect(() => {
@@ -105,11 +109,26 @@ export default function Reports() {
     })();
   }, [apiFetch]);
 
+  // Fetch companies for the filter dropdown
+  useEffect(() => {
+    if (!isAdmin) return;
+    (async () => {
+      try {
+        const res = await apiFetch('/api/companies');
+        const data = await res.json();
+        if (Array.isArray(data)) setCompanies(data);
+      } catch {
+        // Companies list stays empty on failure
+      }
+    })();
+  }, [apiFetch, isAdmin]);
+
   const fetchCommercialReport = useCallback(async () => {
     setCommercialError(null);
     setCommercialLoading(true);
     try {
-      const res = await apiFetch('/api/reports/live');
+      const params = new URLSearchParams(searchParams);
+      const res = await apiFetch(`/api/reports/live/filtered?${params.toString()}`);
       const data = await res.json();
       if (Array.isArray(data)) {
         setCommercialReport(data);
@@ -121,15 +140,40 @@ export default function Reports() {
     } finally {
       setCommercialLoading(false);
     }
-  }, [apiFetch]);
+  }, [apiFetch, searchParams]);
 
-  // Fetch once when the admin opens the tab. commercialFetchedRef guards against
-  // refetch loops; Retry calls fetchCommercialReport directly.
+  const fetchCommercialSummary = useCallback(async () => {
+    setCommercialError(null);
+    setCommercialLoading(true);
+    try {
+      const params = new URLSearchParams(searchParams);
+      const res = await apiFetch(`/api/reports/live/summary?${params.toString()}`);
+      const data = await res.json();
+      if (Array.isArray(data)) {
+        setCommercialReport(data);
+      } else {
+        setCommercialError((data && data.error) || 'Failed to load the commercial summary');
+      }
+    } catch (err) {
+      setCommercialError((err && err.message) || 'Failed to load the commercial summary');
+    } finally {
+      setCommercialLoading(false);
+    }
+  }, [apiFetch, searchParams]);
+
+  // Fetch when filters change (searchParams changes)
   useEffect(() => {
-    if (!isAdmin || activeTab !== 'commercial' || commercialFetchedRef.current) return;
-    commercialFetchedRef.current = true;
-    fetchCommercialReport();
-  }, [isAdmin, activeTab, fetchCommercialReport]);
+    if (!isAdmin || activeTab !== 'commercial') return;
+    commercialFetchedRef.current = false; // Allow refetch on filter change
+    const groupBy = searchParams.get('group_by') || 'none';
+    if (groupBy === 'none') {
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      fetchCommercialReport();
+    } else {
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      fetchCommercialSummary();
+    }
+  }, [isAdmin, activeTab, searchParams, fetchCommercialReport, fetchCommercialSummary]);
 
   // Auto-calc quantity derives from the selection. It is recomputed in the
   // event handlers that change the inputs — recipes load exactly once in the
@@ -193,7 +237,8 @@ export default function Reports() {
     if (commercialExporting || commercialLoading || commercialReport.length === 0) return;
     setCommercialExporting(true);
     try {
-      const res = await apiFetch('/api/reports/live/export', {
+      const params = new URLSearchParams(searchParams);
+      const res = await apiFetch(`/api/reports/live/export?${params.toString()}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({})
@@ -226,13 +271,19 @@ export default function Reports() {
   const renderCommercialTab = () => {
     if (!isAdmin) return null;
 
+    const groupBy = searchParams.get('group_by') || 'none';
+    const isGrouped = groupBy !== 'none';
+
     if (commercialLoading) {
       return (
-        <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 shadow-xs">
-          <div className="flex items-center justify-center h-40">
-            <div className="inline-flex items-center gap-2 text-slate-500 dark:text-slate-400">
-              <div className="h-5 w-5 animate-spin rounded-full border-2 border-slate-300 border-t-blue-600" />
-              Loading commercial report...
+        <div className="space-y-4">
+          <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+          <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 shadow-xs">
+            <div className="flex items-center justify-center h-40">
+              <div className="inline-flex items-center gap-2 text-slate-500 dark:text-slate-400">
+                <div className="h-5 w-5 animate-spin rounded-full border-2 border-slate-300 border-t-blue-600" />
+                Loading commercial report...
+              </div>
             </div>
           </div>
         </div>
@@ -241,15 +292,22 @@ export default function Reports() {
 
     if (commercialError) {
       return (
-        <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 shadow-xs text-center">
-          <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-rose-100 dark:bg-rose-950/40">
-            <AlertTriangle className="h-6 w-6 text-rose-500" />
+        <div className="space-y-4">
+          <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+          <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 shadow-xs text-center">
+            <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-rose-100 dark:bg-rose-950/40">
+              <AlertTriangle className="h-6 w-6 text-rose-500" />
+            </div>
+            <p className="text-sm font-semibold text-slate-900 dark:text-white">Could not load the commercial report</p>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">{commercialError}</p>
+            <Button variant="secondary" size="sm" onClick={() => {
+              const groupByNow = searchParams.get('group_by') || 'none';
+              if (groupByNow === 'none') fetchCommercialReport();
+              else fetchCommercialSummary();
+            }} className="mt-4">
+              Retry
+            </Button>
           </div>
-          <p className="text-sm font-semibold text-slate-900 dark:text-white">Could not load the commercial report</p>
-          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">{commercialError}</p>
-          <Button variant="secondary" size="sm" onClick={fetchCommercialReport} className="mt-4">
-            Retry
-          </Button>
         </div>
       );
     }
@@ -258,18 +316,86 @@ export default function Reports() {
 
     if (rows.length === 0) {
       return (
-        <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 shadow-xs text-center">
-          <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-slate-100 dark:bg-slate-800">
-            <ClipboardList className="h-6 w-6 text-slate-400 dark:text-slate-500" />
+        <div className="space-y-4">
+          <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+          <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 shadow-xs text-center">
+            <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-slate-100 dark:bg-slate-800">
+              <ClipboardList className="h-6 w-6 text-slate-400 dark:text-slate-500" />
+            </div>
+            <p className="text-sm font-semibold text-slate-800 dark:text-white">No commercial rows yet</p>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+              Create sales orders, record shipments, and payments to populate this report.
+            </p>
           </div>
-          <p className="text-sm font-semibold text-slate-800 dark:text-white">No commercial rows yet</p>
-          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-            Create sales orders, record shipments, and payments to populate this report.
-          </p>
         </div>
       );
     }
 
+    if (isGrouped) {
+      // Summary/Grouped View
+      return (
+        <div className="space-y-6">
+          <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+
+          {/* Summary Table */}
+          <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs overflow-hidden">
+            <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">
+                  Commercial Summary by {groupBy.charAt(0).toUpperCase() + groupBy.slice(1)}
+                </h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                  {rows.length} period{rows.length !== 1 ? 's' : ''}
+                </p>
+              </div>
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={Download}
+                onClick={handleCommercialExport}
+                loading={commercialExporting}
+                disabled={commercialLoading}
+              >
+                Export CSV
+              </Button>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-slate-100 dark:border-slate-800">
+                    <th className={TH}>Period</th>
+                    <th className={TH}>Lines</th>
+                    <th className={TH}>Gross Sales ($)</th>
+                    <th className={TH}>Received ($)</th>
+                    <th className={TH}>Due ($)</th>
+                    <th className={TH}>Overdue ($)</th>
+                    <th className={TH}>Avg Days to Pay</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-50 dark:divide-slate-800/50">
+                  {rows.map((row, idx) => (
+                    <tr key={row.period || idx} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40">
+                      <td className={clsx(TD, 'font-medium text-slate-900 dark:text-white')}>{row.period || '-'}</td>
+                      <td className={clsx(TD, 'text-right font-mono text-slate-700 dark:text-slate-300')}>{formatNumber(row.line_count || 0)}</td>
+                      <td className={clsx(TD, 'text-right font-mono font-semibold text-slate-900 dark:text-white')}>{formatNumber(row.gross_sales || 0, 2)}</td>
+                      <td className={clsx(TD, 'text-right font-mono text-emerald-600 dark:text-emerald-400')}>{formatNumber(row.received_total || 0, 2)}</td>
+                      <td className={clsx(TD, 'text-right font-mono text-sky-600 dark:text-sky-400')}>{formatNumber(row.due_total || 0, 2)}</td>
+                      <td className={clsx(TD, 'text-right font-mono text-rose-600 dark:text-rose-400')}>{formatNumber(row.overdue_total || 0, 2)}</td>
+                      <td className={clsx(TD, 'text-right font-mono text-slate-700 dark:text-slate-300')}>
+                        {row.avg_days_to_pay != null ? formatNumber(row.avg_days_to_pay, 1) : '-'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Detail View (existing table)
     const sales = dedupeSales(rows);
     const grossSales = rows.reduce((sum, r) => sum + (Number(r.total_price) || 0), 0);
     const receivedTotal = sales.reduce((sum, r) => sum + (Number(r.received_amount) || 0), 0);
@@ -318,6 +444,8 @@ export default function Reports() {
 
     return (
       <div className="space-y-6">
+        <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+
         {/* KPI Cards (USD) */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           {kpis.map(kpi => (
