@@ -12,16 +12,16 @@ import {
   Minus,
   Building2,
   DollarSign,
-  CreditCard,
-  ClipboardList
+  CreditCard
 } from 'lucide-react';
 import clsx from 'clsx';
 import Button from '../components/ui/Button';
 import Badge from '../components/ui/Badge';
-import { formatNumber, formatDate } from '../utils/format';
+import { formatNumber } from '../utils/format';
 import { useAuth } from '../context/AuthContext';
 import { toast } from 'sonner';
 import CommercialFilters from '../components/reports/CommercialFilters';
+import CommercialTable from '../components/reports/CommercialTable';
 
 /**
  * Commercial report rows are per sale-item.
@@ -57,20 +57,6 @@ function dedupeSales(rows) {
   return sales;
 }
 
-/** Paid = green, Partial = amber, Due = blue, Overdue = red, Pending = slate. */
-function paymentBadgeVariant(status) {
-  switch (status) {
-    case 'Paid': return 'success';
-    case 'Partial': return 'warning';
-    case 'Due': return 'info';
-    case 'Overdue': return 'error';
-    default: return 'default';
-  }
-}
-
-const TH = 'px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider whitespace-nowrap';
-const TD = 'px-4 py-3 whitespace-nowrap';
-
 export default function Reports() {
   const { apiFetch, user } = useAuth();
   const isAdmin = user?.role === 'admin';
@@ -89,9 +75,11 @@ export default function Reports() {
 
   // Commercial report (admin tab)
   const [commercialReport, setCommercialReport] = useState([]);
+  const [commercialSummary, setCommercialSummary] = useState([]);
   const [commercialLoading, setCommercialLoading] = useState(false);
   const [commercialError, setCommercialError] = useState(null);
   const [commercialExporting, setCommercialExporting] = useState(false);
+  const [commercialPage, setCommercialPage] = useState(1);
   const [companies, setCompanies] = useState([]);
   const commercialFetchedRef = useRef(false);
 
@@ -150,7 +138,7 @@ export default function Reports() {
       const res = await apiFetch(`/api/reports/live/summary?${params.toString()}`);
       const data = await res.json();
       if (Array.isArray(data)) {
-        setCommercialReport(data);
+        setCommercialSummary(data);
       } else {
         setCommercialError((data && data.error) || 'Failed to load the commercial summary');
       }
@@ -165,6 +153,7 @@ export default function Reports() {
   useEffect(() => {
     if (!isAdmin || activeTab !== 'commercial') return;
     commercialFetchedRef.current = false; // Allow refetch on filter change
+    setCommercialPage(1); // Reset to first page on filter change
     const groupBy = searchParams.get('group_by') || 'none';
     if (groupBy === 'none') {
       // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -233,8 +222,19 @@ export default function Reports() {
     }
   };
 
-  const handleCommercialExport = async () => {
-    if (commercialExporting || commercialLoading || commercialReport.length === 0) return;
+  const totalShortage = report ? report.report.filter(r => r.status === 'SHORTAGE').length : 0;
+  const totalOk = report ? report.report.filter(r => r.status !== 'SHORTAGE').length : 0;
+
+  const PAGE_SIZE = 50;
+
+  const handleCommercialPageChange = useCallback((page) => {
+    setCommercialPage(page);
+  }, []);
+
+  const handleCommercialExport = useCallback(async () => {
+    if (commercialExporting || commercialLoading) return;
+    const hasData = commercialReport.length > 0 || commercialSummary.length > 0;
+    if (!hasData) return;
     setCommercialExporting(true);
     try {
       const params = new URLSearchParams(searchParams);
@@ -263,29 +263,30 @@ export default function Reports() {
     } finally {
       setCommercialExporting(false);
     }
-  };
-
-  const totalShortage = report ? report.report.filter(r => r.status === 'SHORTAGE').length : 0;
-  const totalOk = report ? report.report.filter(r => r.status !== 'SHORTAGE').length : 0;
+  }, [apiFetch, searchParams, commercialExporting, commercialLoading, commercialReport.length, commercialSummary.length]);
 
   const renderCommercialTab = () => {
     if (!isAdmin) return null;
 
     const groupBy = searchParams.get('group_by') || 'none';
     const isGrouped = groupBy !== 'none';
+    const totalRows = isGrouped
+      ? (commercialSummary.length > 0 ? commercialSummary.reduce((sum, p) => sum + (p.kpis?.order_count || 0), 0) : 0)
+      : commercialReport.length;
 
     if (commercialLoading) {
       return (
         <div className="space-y-4">
           <CommercialFilters companies={companies} onFiltersChange={() => {}} />
-          <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 shadow-xs">
-            <div className="flex items-center justify-center h-40">
-              <div className="inline-flex items-center gap-2 text-slate-500 dark:text-slate-400">
-                <div className="h-5 w-5 animate-spin rounded-full border-2 border-slate-300 border-t-blue-600" />
-                Loading commercial report...
-              </div>
-            </div>
-          </div>
+          <CommercialTable
+            data={isGrouped ? { periods: [] } : { rows: [] }}
+            groupBy={groupBy}
+            onPageChange={handleCommercialPageChange}
+            currentPage={commercialPage}
+            pageSize={PAGE_SIZE}
+            totalRows={0}
+            isLoading={true}
+          />
         </div>
       );
     }
@@ -312,240 +313,146 @@ export default function Reports() {
       );
     }
 
-    const rows = commercialReport;
-
-    if (rows.length === 0) {
+    if ((isGrouped && commercialSummary.length === 0) || (!isGrouped && commercialReport.length === 0)) {
       return (
         <div className="space-y-4">
           <CommercialFilters companies={companies} onFiltersChange={() => {}} />
-          <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 shadow-xs text-center">
-            <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-slate-100 dark:bg-slate-800">
-              <ClipboardList className="h-6 w-6 text-slate-400 dark:text-slate-500" />
-            </div>
-            <p className="text-sm font-semibold text-slate-800 dark:text-white">No commercial rows yet</p>
-            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-              Create sales orders, record shipments, and payments to populate this report.
-            </p>
-          </div>
+          <CommercialTable
+            data={isGrouped ? { periods: [] } : { rows: [] }}
+            groupBy={groupBy}
+            onPageChange={handleCommercialPageChange}
+            currentPage={commercialPage}
+            pageSize={PAGE_SIZE}
+            totalRows={0}
+          />
         </div>
       );
     }
 
-    if (isGrouped) {
-      // Summary/Grouped View
+    // For detail mode, compute KPIs for the header
+    if (!isGrouped) {
+      const rows = commercialReport;
+      const sales = dedupeSales(rows);
+      const grossSales = rows.reduce((sum, r) => sum + (Number(r.total_price) || 0), 0);
+      const receivedTotal = sales.reduce((sum, r) => sum + (Number(r.received_amount) || 0), 0);
+      const dueTotal = sales.reduce((sum, r) => sum + (Number(r.due_amount) || 0), 0);
+      const overdueSales = sales.filter(r => r.payment_status === 'Overdue');
+      const overdueTotal = overdueSales.reduce((sum, r) => sum + (Number(r.due_amount) || 0), 0);
+
+      const kpis = [
+        {
+          label: 'Gross Sales',
+          value: grossSales,
+          caption: `${rows.length} sale line${rows.length !== 1 ? 's' : ''} · USD`,
+          icon: DollarSign,
+          box: 'bg-blue-100 dark:bg-blue-950/50',
+          iconCls: 'text-blue-600 dark:text-blue-400',
+          valueCls: 'text-slate-900 dark:text-white'
+        },
+        {
+          label: 'Received',
+          value: receivedTotal,
+          caption: `${sales.length} sale${sales.length !== 1 ? 's' : ''} · USD`,
+          icon: CreditCard,
+          box: 'bg-emerald-100 dark:bg-emerald-950/50',
+          iconCls: 'text-emerald-600 dark:text-emerald-400',
+          valueCls: 'text-emerald-600 dark:text-emerald-400'
+        },
+        {
+          label: 'Due',
+          value: dueTotal,
+          caption: `${sales.length} sale${sales.length !== 1 ? 's' : ''} · USD`,
+          icon: CreditCard,
+          box: 'bg-sky-100 dark:bg-sky-950/50',
+          iconCls: 'text-sky-600 dark:text-sky-400',
+          valueCls: 'text-sky-600 dark:text-sky-400'
+        },
+        {
+          label: 'Overdue',
+          value: overdueTotal,
+          caption: `${overdueSales.length} sale${overdueSales.length !== 1 ? 's' : ''} past maturity`,
+          icon: AlertTriangle,
+          box: 'bg-rose-100 dark:bg-rose-950/50',
+          iconCls: 'text-rose-600 dark:text-rose-400',
+          valueCls: 'text-rose-600 dark:text-rose-400'
+        }
+      ];
+
       return (
         <div className="space-y-6">
           <CommercialFilters companies={companies} onFiltersChange={() => {}} />
 
-          {/* Summary Table */}
-          <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs overflow-hidden">
-            <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between gap-3">
-              <div>
-                <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">
-                  Commercial Summary by {groupBy.charAt(0).toUpperCase() + groupBy.slice(1)}
-                </h3>
-                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                  {rows.length} period{rows.length !== 1 ? 's' : ''}
-                </p>
+          {/* KPI Cards (USD) */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            {kpis.map(kpi => (
+              <div key={kpi.label} className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 shadow-xs">
+                <div className="flex items-center gap-3">
+                  <div className={clsx('flex h-9 w-9 shrink-0 items-center justify-center rounded-lg', kpi.box)}>
+                    <kpi.icon className={clsx('h-4 w-4', kpi.iconCls)} />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-xs text-slate-500 dark:text-slate-400">{kpi.label}</p>
+                    <p className={clsx('text-xl font-bold truncate', kpi.valueCls)}>${formatNumber(kpi.value, 2)}</p>
+                  </div>
+                </div>
+                <p className="text-[11px] text-slate-400 dark:text-slate-500 mt-2">{kpi.caption}</p>
               </div>
-              <Button
-                variant="secondary"
-                size="sm"
-                icon={Download}
-                onClick={handleCommercialExport}
-                loading={commercialExporting}
-                disabled={commercialLoading}
-              >
-                Export CSV
-              </Button>
-            </div>
-
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-slate-100 dark:border-slate-800">
-                    <th className={TH}>Period</th>
-                    <th className={TH}>Lines</th>
-                    <th className={TH}>Gross Sales ($)</th>
-                    <th className={TH}>Received ($)</th>
-                    <th className={TH}>Due ($)</th>
-                    <th className={TH}>Overdue ($)</th>
-                    <th className={TH}>Avg Days to Pay</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-50 dark:divide-slate-800/50">
-                  {rows.map((row, idx) => (
-                    <tr key={row.period || idx} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40">
-                      <td className={clsx(TD, 'font-medium text-slate-900 dark:text-white')}>{row.period || '-'}</td>
-                      <td className={clsx(TD, 'text-right font-mono text-slate-700 dark:text-slate-300')}>{formatNumber(row.line_count || 0)}</td>
-                      <td className={clsx(TD, 'text-right font-mono font-semibold text-slate-900 dark:text-white')}>{formatNumber(row.gross_sales || 0, 2)}</td>
-                      <td className={clsx(TD, 'text-right font-mono text-emerald-600 dark:text-emerald-400')}>{formatNumber(row.received_total || 0, 2)}</td>
-                      <td className={clsx(TD, 'text-right font-mono text-sky-600 dark:text-sky-400')}>{formatNumber(row.due_total || 0, 2)}</td>
-                      <td className={clsx(TD, 'text-right font-mono text-rose-600 dark:text-rose-400')}>{formatNumber(row.overdue_total || 0, 2)}</td>
-                      <td className={clsx(TD, 'text-right font-mono text-slate-700 dark:text-slate-300')}>
-                        {row.avg_days_to_pay != null ? formatNumber(row.avg_days_to_pay, 1) : '-'}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+            ))}
           </div>
-        </div>
-      );
-    }
 
-    // Detail View (existing table)
-    const sales = dedupeSales(rows);
-    const grossSales = rows.reduce((sum, r) => sum + (Number(r.total_price) || 0), 0);
-    const receivedTotal = sales.reduce((sum, r) => sum + (Number(r.received_amount) || 0), 0);
-    const dueTotal = sales.reduce((sum, r) => sum + (Number(r.due_amount) || 0), 0);
-    const overdueSales = sales.filter(r => r.payment_status === 'Overdue');
-    const overdueTotal = overdueSales.reduce((sum, r) => sum + (Number(r.due_amount) || 0), 0);
-
-    const kpis = [
-      {
-        label: 'Gross Sales',
-        value: grossSales,
-        caption: `${rows.length} sale line${rows.length !== 1 ? 's' : ''} · USD`,
-        icon: DollarSign,
-        box: 'bg-blue-100 dark:bg-blue-950/50',
-        iconCls: 'text-blue-600 dark:text-blue-400',
-        valueCls: 'text-slate-900 dark:text-white'
-      },
-      {
-        label: 'Received',
-        value: receivedTotal,
-        caption: `${sales.length} sale${sales.length !== 1 ? 's' : ''} · USD`,
-        icon: CreditCard,
-        box: 'bg-emerald-100 dark:bg-emerald-950/50',
-        iconCls: 'text-emerald-600 dark:text-emerald-400',
-        valueCls: 'text-emerald-600 dark:text-emerald-400'
-      },
-      {
-        label: 'Due',
-        value: dueTotal,
-        caption: `${sales.length} sale${sales.length !== 1 ? 's' : ''} · USD`,
-        icon: CreditCard,
-        box: 'bg-sky-100 dark:bg-sky-950/50',
-        iconCls: 'text-sky-600 dark:text-sky-400',
-        valueCls: 'text-sky-600 dark:text-sky-400'
-      },
-      {
-        label: 'Overdue',
-        value: overdueTotal,
-        caption: `${overdueSales.length} sale${overdueSales.length !== 1 ? 's' : ''} past maturity`,
-        icon: AlertTriangle,
-        box: 'bg-rose-100 dark:bg-rose-950/50',
-        iconCls: 'text-rose-600 dark:text-rose-400',
-        valueCls: 'text-rose-600 dark:text-rose-400'
-      }
-    ];
-
-    return (
-      <div className="space-y-6">
-        <CommercialFilters companies={companies} onFiltersChange={() => {}} />
-
-        {/* KPI Cards (USD) */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          {kpis.map(kpi => (
-            <div key={kpi.label} className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 shadow-xs">
-              <div className="flex items-center gap-3">
-                <div className={clsx('flex h-9 w-9 shrink-0 items-center justify-center rounded-lg', kpi.box)}>
-                  <kpi.icon className={clsx('h-4 w-4', kpi.iconCls)} />
-                </div>
-                <div className="min-w-0">
-                  <p className="text-xs text-slate-500 dark:text-slate-400">{kpi.label}</p>
-                  <p className={clsx('text-xl font-bold truncate', kpi.valueCls)}>${formatNumber(kpi.value, 2)}</p>
-                </div>
-              </div>
-              <p className="text-[11px] text-slate-400 dark:text-slate-500 mt-2">{kpi.caption}</p>
-            </div>
-          ))}
-        </div>
-
-        {/* Commercial Report Table */}
-        <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs overflow-hidden">
-          <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between gap-3">
-            <div>
-              <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Commercial Pipeline</h3>
-              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                {rows.length} line{rows.length !== 1 ? 's' : ''} across {sales.length} sale{sales.length !== 1 ? 's' : ''}
-              </p>
-            </div>
+          {/* Export Button */}
+          <div className="flex justify-end">
             <Button
               variant="secondary"
               size="sm"
               icon={Download}
               onClick={handleCommercialExport}
               loading={commercialExporting}
-              disabled={commercialLoading}
+              disabled={commercialLoading || commercialReport.length === 0}
             >
               Export CSV
             </Button>
           </div>
 
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-slate-100 dark:border-slate-800">
-                  <th className={TH}>Customer</th>
-                  <th className={TH}>PI No</th>
-                  <th className={TH}>PI Date</th>
-                  <th className={TH}>LC No</th>
-                  <th className={TH}>LC Date</th>
-                  <th className={TH}>Product</th>
-                  <th className={TH}>Unit</th>
-                  <th className={TH}>Qty</th>
-                  <th className={TH}>Unit Price</th>
-                  <th className={TH}>Total ($)</th>
-                  <th className={TH}>Invoice Date</th>
-                  <th className={TH}>Latest Ship</th>
-                  <th className={TH}>Actual Ship</th>
-                  <th className={TH}>Maturity</th>
-                  <th className={TH}>Receive Date</th>
-                  <th className={TH}>Received ($)</th>
-                  <th className={TH}>Due ($)</th>
-                  <th className={TH}>Status</th>
-                  <th className={TH}>Comment</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-50 dark:divide-slate-800/50">
-                {rows.map((row, idx) => (
-                  <tr key={row.sale_id != null ? `${row.sale_id}-${idx}` : idx} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40">
-                    <td className={clsx(TD, 'font-medium text-slate-900 dark:text-white')}>{row.customer_name || '-'}</td>
-                    <td className={TD}>{row.pi_number || '-'}</td>
-                    <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.pi_date)}</td>
-                    <td className={TD}>{row.lc_number || '-'}</td>
-                    <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.lc_date)}</td>
-                    <td className={clsx(TD, 'font-medium text-slate-900 dark:text-white')}>{row.product_name || '-'}</td>
-                    <td className={TD}>{row.unit || '-'}</td>
-                    <td className={clsx(TD, 'text-right font-mono text-slate-700 dark:text-slate-300')}>{formatNumber(row.quantity || 0)}</td>
-                    <td className={clsx(TD, 'text-right font-mono text-slate-700 dark:text-slate-300')}>{formatNumber(row.unit_price || 0)}</td>
-                    <td className={clsx(TD, 'text-right font-mono font-semibold text-slate-900 dark:text-white')}>{formatNumber(row.total_price || 0)}</td>
-                    <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.invoice_date)}</td>
-                    <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.latest_ship_date)}</td>
-                    <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.actual_ship_date)}</td>
-                    <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.maturity_date)}</td>
-                    <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.receive_date)}</td>
-                    <td className={clsx(TD, 'text-right font-mono text-emerald-600 dark:text-emerald-400')}>{formatNumber(row.received_amount || 0)}</td>
-                    <td className={clsx(TD, 'text-right font-mono', Number(row.due_amount) > 0 ? 'text-rose-600 dark:text-rose-400' : 'text-slate-400 dark:text-slate-500')}>
-                      {formatNumber(row.due_amount || 0)}
-                    </td>
-                    <td className={TD}>
-                      <Badge variant={paymentBadgeVariant(row.payment_status)} size="xs">
-                        {row.payment_status || 'Pending'}
-                      </Badge>
-                    </td>
-                    <td className="px-4 py-3 text-xs text-slate-500 dark:text-slate-400 max-w-[18rem]">
-                      {row.payment_comment || '-'}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <CommercialTable
+            data={{ rows: commercialReport }}
+            groupBy="none"
+            onPageChange={handleCommercialPageChange}
+            currentPage={commercialPage}
+            pageSize={PAGE_SIZE}
+            totalRows={totalRows}
+          />
         </div>
+      );
+    }
+
+    // Grouped mode
+    return (
+      <div className="space-y-6">
+        <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+
+        {/* Export Button */}
+        <div className="flex justify-end">
+          <Button
+            variant="secondary"
+            size="sm"
+            icon={Download}
+            onClick={handleCommercialExport}
+            loading={commercialExporting}
+            disabled={commercialLoading || commercialSummary.length === 0}
+          >
+            Export CSV
+          </Button>
+        </div>
+
+        <CommercialTable
+          data={{ periods: commercialSummary }}
+          groupBy={groupBy}
+          onPageChange={handleCommercialPageChange}
+          currentPage={commercialPage}
+          pageSize={PAGE_SIZE}
+          totalRows={totalRows}
+        />
       </div>
     );
   };
