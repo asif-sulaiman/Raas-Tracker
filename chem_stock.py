@@ -144,6 +144,7 @@ from raas_tracker.sales import (
     get_sale_total_paid,
     get_sales_summary,
     get_commercial_report,
+    get_commercial_report_summary,
     list_shipments,
     move_sale_to_stage,
     record_sale_payment,

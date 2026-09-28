@@ -695,7 +695,7 @@ def _payment_status(due_amount: float, maturity_date: Any,
     return "Pending"
 
 
-def get_commercial_report(conn: psycopg.Connection) -> List[Dict[str, Any]]:
+def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> List[Dict[str, Any]]:
     """Live commercial report — one output row per sale_item, USD only.
 
     Item-level columns (product, qty, price, total_price, dates on the
@@ -705,45 +705,129 @@ def get_commercial_report(conn: psycopg.Connection) -> List[Dict[str, Any]]:
     every row of that sale. Sale total and sale paid are aggregated in
     scalar subqueries so item x shipment x payment joins can never
     double count.
+
+    filters: {
+        "date_anchor": "pi_date" | "lc_date" | "shipment_date" | "receive_date" | "maturity_date",
+        "date_from": "YYYY-MM-DD",
+        "date_to": "YYYY-MM-DD",
+        "customer_name": str,
+        "product_name": str,
+        "company_id": int,
+        "stage": "pi_issued" | "lc_received" | "shipment_ongoing" | "payment_due" | "completed",
+        "payment_status": "Paid" | "Overdue" | "Partial" | "Due" | "Pending",
+        "page": 1,
+        "page_size": 50,
+    }
     """
-    query = """
-        SELECT
-            s.id AS sale_id,
-            COALESCE(c.name, s.client_name) AS customer_name,
-            s.pi_number, s.pi_date,
-            s.lc_number, s.lc_date,
-            si.product_name, si.unit, si.quantity, si.unit_price,
-            ROUND((si.quantity * si.unit_price)::numeric, 2)::float8 AS total_price,
-            (SELECT MAX(sh.invoice_date)
-               FROM shipments sh WHERE sh.sale_id = s.id) AS invoice_date,
-            (SELECT MAX(sh.ship_date)
-               FROM shipments sh WHERE sh.sale_id = s.id) AS latest_ship_date,
-            s.shipment_date AS actual_ship_date,
-            s.maturity_date,
-            (SELECT MAX(sp.payment_date)
-               FROM sale_payments sp WHERE sp.sale_id = s.id) AS receive_date,
-            (SELECT COALESCE(ROUND(SUM(sp.payment_amount)::numeric, 2), 0)::float8
-               FROM sale_payments sp WHERE sp.sale_id = s.id) AS received_amount,
-            (SELECT COALESCE(ROUND(SUM(si2.quantity * si2.unit_price)::numeric, 2), 0)::float8
-               FROM sale_items si2 WHERE si2.sale_id = s.id) AS sale_total,
-            s.comments
-        FROM sales s
-        LEFT JOIN sale_items si ON si.sale_id = s.id
-        LEFT JOIN companies c ON c.id = s.company_id
-        ORDER BY s.created_at DESC
+    if filters is None:
+        filters = {}
+
+    # Map date_anchor to SQL column expression for CTE
+    date_anchor_map = {
+        "pi_date": "s.pi_date",
+        "lc_date": "s.lc_date",
+        "shipment_date": "s.shipment_date",
+        "receive_date": "COALESCE((SELECT MAX(sp.payment_date) FROM sale_payments sp WHERE sp.sale_id = s.id), s.pi_date)",
+        "maturity_date": "s.maturity_date",
+    }
+    date_anchor_expr = date_anchor_map.get(filters.get("date_anchor"), "s.pi_date")
+
+    # Build WHERE clauses referencing CTE columns
+    where_clauses = []
+    params = {}
+
+    # Date range filters using SUBSTR for TEXT date columns
+    if filters.get("date_from"):
+        where_clauses.append("SUBSTR(date_anchor_col, 1, 10) >= %(date_from)s")
+        params["date_from"] = filters["date_from"]
+    if filters.get("date_to"):
+        where_clauses.append("SUBSTR(date_anchor_col, 1, 10) <= %(date_to)s")
+        params["date_to"] = filters["date_to"]
+
+    if filters.get("customer_name"):
+        where_clauses.append("customer_name ILIKE %(customer_name)s")
+        params["customer_name"] = f"%{filters['customer_name']}%"
+
+    if filters.get("product_name"):
+        where_clauses.append("""EXISTS (
+            SELECT 1 FROM sale_items si3
+            WHERE si3.sale_id = base.sale_id
+            AND si3.product_name ILIKE %(product_name)s
+        )""")
+        params["product_name"] = f"%{filters['product_name']}%"
+
+    if filters.get("company_id") is not None:
+        where_clauses.append("company_id = %(company_id)s")
+        params["company_id"] = filters["company_id"]
+
+    if filters.get("stage"):
+        where_clauses.append("stage = %(stage)s")
+        params["stage"] = filters["stage"]
+
+    if filters.get("payment_status"):
+        where_clauses.append("""
+            CASE
+                WHEN sale_total - received_amount <= 0 THEN 'Paid'
+                WHEN maturity_date::date < CURRENT_DATE AND sale_total - received_amount > 0 THEN 'Overdue'
+                WHEN received_amount > 0 THEN 'Partial'
+                WHEN maturity_date IS NOT NULL THEN 'Due'
+                ELSE 'Pending'
+            END = %(payment_status)s
+        """)
+        params["payment_status"] = filters["payment_status"]
+
+    where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
+    # Pagination
+    page = int(filters.get("page", 1))
+    page_size = int(filters.get("page_size", 50))
+    offset = (page - 1) * page_size
+    params["page_size"] = page_size
+    params["offset"] = offset
+
+    query = f"""
+        WITH base AS (
+            SELECT
+                s.id AS sale_id,
+                COALESCE(c.name, s.client_name) AS customer_name,
+                s.pi_number, s.pi_date,
+                s.lc_number, s.lc_date,
+                s.shipment_date, s.maturity_date, s.stage, s.comments,
+                s.company_id,
+                si.product_name, si.unit, si.quantity, si.unit_price,
+                ROUND((si.quantity * si.unit_price)::numeric, 2)::float8 AS total_price,
+                (SELECT MAX(sh.invoice_date)
+                   FROM shipments sh WHERE sh.sale_id = s.id) AS invoice_date,
+                (SELECT MAX(sh.ship_date)
+                   FROM shipments sh WHERE sh.sale_id = s.id) AS latest_ship_date,
+                (SELECT MAX(sp.payment_date)
+                   FROM sale_payments sp WHERE sp.sale_id = s.id) AS receive_date,
+                (SELECT COALESCE(ROUND(SUM(sp.payment_amount)::numeric, 2), 0)::float8
+                   FROM sale_payments sp WHERE sp.sale_id = s.id) AS received_amount,
+                (SELECT COALESCE(ROUND(SUM(si2.quantity * si2.unit_price)::numeric, 2), 0)::float8
+                   FROM sale_items si2 WHERE si2.sale_id = s.id) AS sale_total,
+                {date_anchor_expr} AS date_anchor_col
+            FROM sales s
+            LEFT JOIN sale_items si ON si.sale_id = s.id
+            LEFT JOIN companies c ON c.id = s.company_id
+        )
+        SELECT * FROM base
+        {where_sql}
+        ORDER BY sale_id DESC
+        LIMIT %(page_size)s OFFSET %(offset)s
     """
-    rows = conn.execute(query).fetchall()
+
+    rows = conn.execute(query, params).fetchall()
 
     report = []
     for r in rows:
         (sale_id, customer_name, pi_number, pi_date, lc_number, lc_date,
+         shipment_date, maturity_date, stage, comments, company_id,
          product_name, unit, quantity, unit_price, total_price,
-         invoice_date, latest_ship_date, actual_ship_date,
-         maturity_date, receive_date, received_amount, sale_total,
-         comments) = r
+         invoice_date, latest_ship_date, receive_date, received_amount,
+         sale_total, date_anchor_col) = r
 
         received = round(float(received_amount or 0), 2)
-        # due = ROUND(sale_total, 2) - sale_paid, clamped at 0.
         due_amount = round(max(round(float(sale_total or 0), 2) - received, 0.0), 2)
         pay_status = _payment_status(due_amount, maturity_date, received)
         pay_comment = (comments or "").strip()
@@ -762,7 +846,7 @@ def get_commercial_report(conn: psycopg.Connection) -> List[Dict[str, Any]]:
             "total_price": total_price,
             "invoice_date": invoice_date,
             "latest_ship_date": latest_ship_date,
-            "actual_ship_date": actual_ship_date,
+            "actual_ship_date": shipment_date,
             "maturity_date": maturity_date,
             "receive_date": receive_date,
             "received_amount": received,
@@ -772,3 +856,154 @@ def get_commercial_report(conn: psycopg.Connection) -> List[Dict[str, Any]]:
         })
 
     return report
+
+
+def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None) -> List[Dict[str, Any]]:
+    """
+    filters: same as get_commercial_report plus "group_by": "month" | "week" | "year" | "none"
+    Returns period-aggregated summary:
+    [{
+        "period_start": "2026-09-01",
+        "period_end": "2026-09-30",
+        "kpis": {"gross_sales": 120000, "received": 90000, "due": 30000, "overdue": 5000, "order_count": 12},
+        "items": [...]  # detail rows for this period (when group_by != "none")
+    }, ...]
+    """
+    if filters is None:
+        filters = {}
+
+    # Map date_anchor to SQL column expression for CTE
+    date_anchor_map = {
+        "pi_date": "s.pi_date",
+        "lc_date": "s.lc_date",
+        "shipment_date": "s.shipment_date",
+        "receive_date": "COALESCE((SELECT MAX(sp.payment_date) FROM sale_payments sp WHERE sp.sale_id = s.id), s.pi_date)",
+        "maturity_date": "s.maturity_date",
+    }
+    date_anchor_expr = date_anchor_map.get(filters.get("date_anchor"), "s.pi_date")
+
+    group_by = filters.get("group_by", "month")
+    if group_by not in ("month", "week", "year", "none"):
+        group_by = "month"
+
+    # Build WHERE clauses referencing CTE columns
+    where_clauses = []
+    params = {}
+
+    if filters.get("date_from"):
+        where_clauses.append("SUBSTR(date_anchor_col, 1, 10) >= %(date_from)s")
+        params["date_from"] = filters["date_from"]
+    if filters.get("date_to"):
+        where_clauses.append("SUBSTR(date_anchor_col, 1, 10) <= %(date_to)s")
+        params["date_to"] = filters["date_to"]
+
+    if filters.get("customer_name"):
+        where_clauses.append("customer_name ILIKE %(customer_name)s")
+        params["customer_name"] = f"%{filters['customer_name']}%"
+
+    if filters.get("product_name"):
+        where_clauses.append("""EXISTS (
+            SELECT 1 FROM sale_items si3
+            WHERE si3.sale_id = base.sale_id
+            AND si3.product_name ILIKE %(product_name)s
+        )""")
+        params["product_name"] = f"%{filters['product_name']}%"
+
+    if filters.get("company_id") is not None:
+        where_clauses.append("company_id = %(company_id)s")
+        params["company_id"] = filters["company_id"]
+
+    if filters.get("stage"):
+        where_clauses.append("stage = %(stage)s")
+        params["stage"] = filters["stage"]
+
+    if filters.get("payment_status"):
+        where_clauses.append("""
+            CASE
+                WHEN sale_total - received_amount <= 0 THEN 'Paid'
+                WHEN maturity_date::date < CURRENT_DATE AND sale_total - received_amount > 0 THEN 'Overdue'
+                WHEN received_amount > 0 THEN 'Partial'
+                WHEN maturity_date IS NOT NULL THEN 'Due'
+                ELSE 'Pending'
+            END = %(payment_status)s
+        """)
+        params["payment_status"] = filters["payment_status"]
+
+    where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
+    # Build the period truncation expression using the CTE column
+    if group_by == "month":
+        period_trunc = "DATE_TRUNC('month', date_anchor_col::timestamp)::DATE"
+        period_end = "(DATE_TRUNC('month', date_anchor_col::timestamp) + INTERVAL '1 month' - INTERVAL '1 day')::DATE"
+    elif group_by == "week":
+        period_trunc = "DATE_TRUNC('week', date_anchor_col::timestamp)::DATE"
+        period_end = "(DATE_TRUNC('week', date_anchor_col::timestamp) + INTERVAL '1 week' - INTERVAL '1 day')::DATE"
+    elif group_by == "year":
+        period_trunc = "DATE_TRUNC('year', date_anchor_col::timestamp)::DATE"
+        period_end = "(DATE_TRUNC('year', date_anchor_col::timestamp) + INTERVAL '1 year' - INTERVAL '1 day')::DATE"
+    else:
+        # "none" - single period covering all
+        period_trunc = "DATE '1900-01-01'"
+        period_end = "DATE '2100-12-31'"
+
+    # Summary query with period grouping
+    summary_query = f"""
+        WITH base AS (
+            SELECT
+                s.id AS sale_id,
+                COALESCE(c.name, s.client_name) AS customer_name,
+                s.pi_number, s.pi_date,
+                s.lc_number, s.lc_date,
+                s.shipment_date, s.maturity_date, s.stage, s.comments,
+                s.company_id,
+                si.product_name, si.unit, si.quantity, si.unit_price,
+                ROUND((si.quantity * si.unit_price)::numeric, 2)::float8 AS total_price,
+                (SELECT MAX(sh.invoice_date)
+                   FROM shipments sh WHERE sh.sale_id = s.id) AS invoice_date,
+                (SELECT MAX(sh.ship_date)
+                   FROM shipments sh WHERE sh.sale_id = s.id) AS latest_ship_date,
+                (SELECT MAX(sp.payment_date)
+                   FROM sale_payments sp WHERE sp.sale_id = s.id) AS receive_date,
+                (SELECT COALESCE(ROUND(SUM(sp.payment_amount)::numeric, 2), 0)::float8
+                   FROM sale_payments sp WHERE sp.sale_id = s.id) AS received_amount,
+                (SELECT COALESCE(ROUND(SUM(si2.quantity * si2.unit_price)::numeric, 2), 0)::float8
+                   FROM sale_items si2 WHERE si2.sale_id = s.id) AS sale_total,
+                {date_anchor_expr} AS date_anchor_col
+            FROM sales s
+            LEFT JOIN sale_items si ON si.sale_id = s.id
+            LEFT JOIN companies c ON c.id = s.company_id
+        )
+        SELECT
+            {period_trunc} AS period_start,
+            {period_end} AS period_end,
+            COUNT(DISTINCT sale_id) AS order_count,
+            SUM(total_price) AS gross_sales,
+            SUM(received_amount) AS total_received,
+            SUM(sale_total - received_amount) AS total_due,
+            SUM(CASE WHEN maturity_date::date < CURRENT_DATE AND sale_total - received_amount > 0
+                     THEN sale_total - received_amount ELSE 0 END) AS total_overdue
+        FROM base
+        {where_sql}
+        GROUP BY period_start, period_end
+        ORDER BY period_start DESC
+    """
+
+    summary_rows = conn.execute(summary_query, params).fetchall()
+
+    periods = []
+    for sr in summary_rows:
+        period_start, period_end, order_count, gross_sales, total_received, total_due, total_overdue = sr
+        periods.append({
+            "period_start": str(period_start),
+            "period_end": str(period_end),
+            "kpis": {
+                "gross_sales": float(gross_sales or 0),
+                "received": float(total_received or 0),
+                "due": float(total_due or 0),
+                "overdue": float(total_overdue or 0),
+                "order_count": int(order_count or 0),
+            },
+            "items": [],  # Detail items not included in summary by default
+        })
+
+    return periods

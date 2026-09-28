@@ -48,7 +48,8 @@ from chem_stock import (
     update_sale_payment_record, delete_sale_payment_record, update_sale_full,
     get_stock_movements, list_companies, create_company, update_company,
     delete_company, get_company, add_shipment, list_shipments, delete_shipment,
-    create_production_run, get_register_products, get_commercial_report
+    create_production_run, get_register_products, get_commercial_report,
+    get_commercial_report_summary
 )
 
 # ---- AuthN/Z: sessions (humans) OR api_keys (scripts) ----
@@ -1474,6 +1475,53 @@ def api_commercial_report():
     rows = get_commercial_report(conn)
     conn.close()
     return jsonify(rows)
+
+
+@app.route("/api/reports/live/filtered")
+@admin_required
+def api_commercial_report_filtered():
+    """Filtered commercial report with pagination."""
+    filters = {
+        "date_anchor": request.args.get("date_anchor"),
+        "date_from": request.args.get("date_from"),
+        "date_to": request.args.get("date_to"),
+        "customer_name": request.args.get("customer_name"),
+        "product_name": request.args.get("product_name"),
+        "company_id": request.args.get("company_id", type=int),
+        "stage": request.args.get("stage"),
+        "payment_status": request.args.get("payment_status"),
+        "page": request.args.get("page", 1, type=int),
+        "page_size": request.args.get("page_size", 50, type=int),
+    }
+    # Remove None values
+    filters = {k: v for k, v in filters.items() if v is not None}
+    conn = get_db()
+    rows = get_commercial_report(conn, filters)
+    conn.close()
+    return jsonify(rows)
+
+
+@app.route("/api/reports/live/summary")
+@admin_required
+def api_commercial_report_summary():
+    """Period-aggregated commercial report summary."""
+    filters = {
+        "date_anchor": request.args.get("date_anchor"),
+        "date_from": request.args.get("date_from"),
+        "date_to": request.args.get("date_to"),
+        "customer_name": request.args.get("customer_name"),
+        "product_name": request.args.get("product_name"),
+        "company_id": request.args.get("company_id", type=int),
+        "stage": request.args.get("stage"),
+        "payment_status": request.args.get("payment_status"),
+        "group_by": request.args.get("group_by", "month"),
+    }
+    # Remove None values
+    filters = {k: v for k, v in filters.items() if v is not None}
+    conn = get_db()
+    periods = get_commercial_report_summary(conn, filters)
+    conn.close()
+    return jsonify({"periods": periods})
 
 
 @app.route("/api/reports/live/export", methods=["POST"])

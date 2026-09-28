@@ -205,6 +205,205 @@ def test_payment_comment_blank_when_no_comments(admin_client, db):
     assert _of(_rows(admin_client), sid)[0]["payment_comment"] == ""
 
 
+# ------------------------- filtered endpoint -------------------------
+def _filtered_rows(client, params=None):
+    """Call /api/reports/live/filtered with query params."""
+    query = "&".join(f"{k}={v}" for k, v in (params or {}).items())
+    url = f"/api/reports/live/filtered?{query}" if query else "/api/reports/live/filtered"
+    r = client.get(url)
+    assert r.status_code == 200
+    return r.get_json()
+
+
+def _summary(client, params=None):
+    """Call /api/reports/live/summary with query params."""
+    query = "&".join(f"{k}={v}" for k, v in (params or {}).items())
+    url = f"/api/reports/live/summary?{query}" if query else "/api/reports/live/summary"
+    r = client.get(url)
+    assert r.status_code == 200
+    return r.get_json()
+
+
+def test_filter_by_date_anchor_and_range(admin_client, db):
+    """date_from/to on pi_date anchor."""
+    _sale(db, "PI-D1", created_at="2026-01-01 00:00:00", pi_date="2026-01-10")
+    _sale(db, "PI-D2", created_at="2026-02-01 00:00:00", pi_date="2026-02-15")
+    _sale(db, "PI-D3", created_at="2026-03-01 00:00:00", pi_date="2026-03-20")
+    # Filter by pi_date from 2026-02-01 to 2026-03-01
+    rows = _filtered_rows(admin_client, {
+        "date_anchor": "pi_date",
+        "date_from": "2026-02-01",
+        "date_to": "2026-03-01",
+    })
+    pi_numbers = {r["pi_number"] for r in rows}
+    assert pi_numbers == {"PI-D2"}  # Only PI-D2 falls in range
+
+
+def test_filter_by_customer_name_ilike(admin_client, db):
+    """Partial case-insensitive match on customer_name."""
+    _sale(db, "PI-C1", client_name="Alpha Corp")
+    _sale(db, "PI-C2", client_name="Beta Industries")
+    _sale(db, "PI-C3", client_name="Gamma LLC")
+    rows = _filtered_rows(admin_client, {"customer_name": "alpha"})
+    assert {r["pi_number"] for r in rows} == {"PI-C1"}
+    rows = _filtered_rows(admin_client, {"customer_name": "ind"})
+    assert {r["pi_number"] for r in rows} == {"PI-C2"}
+    rows = _filtered_rows(admin_client, {"customer_name": "xyz"})
+    assert rows == []
+
+
+def test_filter_by_product_name_exists(admin_client, db):
+    """EXISTS subquery on sale_items.product_name (ILIKE)."""
+    sid1 = _sale(db, "PI-P1", items=[
+        {"product_name": "Sulfuric Acid", "quantity": 1, "unit_price": 10, "unit": "KG"},
+        {"product_name": "Hydrochloric Acid", "quantity": 1, "unit_price": 20, "unit": "KG"},
+    ])
+    sid2 = _sale(db, "PI-P2", items=[
+        {"product_name": "Sodium Hydroxide", "quantity": 1, "unit_price": 15, "unit": "KG"},
+    ])
+    rows = _filtered_rows(admin_client, {"product_name": "sulfur"})
+    pi_numbers = {r["pi_number"] for r in rows}
+    assert pi_numbers == {"PI-P1"}
+    # Should return both rows for PI-P1 (both items match the sale)
+    assert len(rows) == 2
+    # "hydro" matches both "Hydrochloric Acid" (PI-P1) and "Sodium Hydroxide" (PI-P2)
+    rows = _filtered_rows(admin_client, {"product_name": "hydro"})
+    pi_numbers = {r["pi_number"] for r in rows}
+    assert pi_numbers == {"PI-P1", "PI-P2"}
+
+
+def test_filter_by_company_id(admin_client, db):
+    """Exact FK match on company_id."""
+    _sale(db, "PI-CO1", client_name="Company A")
+    _sale(db, "PI-CO2", client_name="Company B")
+    # Need companies to exist for company_id FK
+    conn = db
+    c1 = conn.execute("INSERT INTO companies (name) VALUES ('Company A') RETURNING id").fetchone()[0]
+    c2 = conn.execute("INSERT INTO companies (name) VALUES ('Company B') RETURNING id").fetchone()[0]
+    conn.execute("UPDATE sales SET company_id = %s WHERE pi_number = 'PI-CO1'", (c1,))
+    conn.execute("UPDATE sales SET company_id = %s WHERE pi_number = 'PI-CO2'", (c2,))
+    conn.commit()
+    
+    rows = _filtered_rows(admin_client, {"company_id": c1})
+    assert {r["pi_number"] for r in rows} == {"PI-CO1"}
+    rows = _filtered_rows(admin_client, {"company_id": c2})
+    assert {r["pi_number"] for r in rows} == {"PI-CO2"}
+    rows = _filtered_rows(admin_client, {"company_id": 9999})
+    assert rows == []
+
+
+def test_filter_by_stage_enum(admin_client, db):
+    """Valid stages only: pi_issued, lc_received, shipment_ongoing, payment_due, completed."""
+    _sale(db, "PI-S1", items=[{"product_name": "Item", "quantity": 1, "unit_price": 10}])
+    _sale(db, "PI-S2", items=[{"product_name": "Item", "quantity": 1, "unit_price": 10}])
+    db.execute("UPDATE sales SET stage = 'lc_received' WHERE pi_number = 'PI-S2'")
+    db.commit()
+    
+    rows = _filtered_rows(admin_client, {"stage": "pi_issued"})
+    assert {r["pi_number"] for r in rows} == {"PI-S1"}
+    rows = _filtered_rows(admin_client, {"stage": "lc_received"})
+    assert {r["pi_number"] for r in rows} == {"PI-S2"}
+    rows = _filtered_rows(admin_client, {"stage": "invalid"})
+    # Invalid stage should return empty (no match)
+    assert rows == []
+
+
+def test_filter_by_payment_status(admin_client, db):
+    """Paid/Overdue/Partial/Due/Pending."""
+    # Paid
+    sid_paid = _sale(db, "PI-PAID2", maturity_date="2099-12-31")
+    _pay(db, sid_paid, 10)
+    # Overdue
+    sid_overdue = _sale(db, "PI-OVERDUE2", maturity_date="2020-01-01")
+    # Partial
+    sid_partial = _sale(db, "PI-PARTIAL2", maturity_date="2099-12-31")
+    _pay(db, sid_partial, 4)
+    # Due
+    sid_due = _sale(db, "PI-DUE2", maturity_date="2099-12-31")
+    # Pending
+    sid_pending = _sale(db, "PI-PENDING2")
+    
+    rows = _filtered_rows(admin_client, {"payment_status": "Paid"})
+    assert {r["pi_number"] for r in rows} == {"PI-PAID2"}
+    rows = _filtered_rows(admin_client, {"payment_status": "Overdue"})
+    assert {r["pi_number"] for r in rows} == {"PI-OVERDUE2"}
+    rows = _filtered_rows(admin_client, {"payment_status": "Partial"})
+    assert {r["pi_number"] for r in rows} == {"PI-PARTIAL2"}
+    rows = _filtered_rows(admin_client, {"payment_status": "Due"})
+    assert {r["pi_number"] for r in rows} == {"PI-DUE2"}
+    rows = _filtered_rows(admin_client, {"payment_status": "Pending"})
+    assert {r["pi_number"] for r in rows} == {"PI-PENDING2"}
+
+
+def test_pagination_page_size(admin_client, db):
+    """page=2, page_size=1 returns second item."""
+    _sale(db, "PI-PG1", created_at="2026-01-01 00:00:00")
+    _sale(db, "PI-PG2", created_at="2026-01-02 00:00:00")
+    _sale(db, "PI-PG3", created_at="2026-01-03 00:00:00")
+    # Default page=1, page_size=50 -> all 3
+    rows = _filtered_rows(admin_client, {"page_size": "50"})
+    assert len(rows) == 3
+    # page=1, page_size=1 -> first (newest)
+    rows = _filtered_rows(admin_client, {"page": "1", "page_size": "1"})
+    assert len(rows) == 1
+    assert rows[0]["pi_number"] == "PI-PG3"
+    # page=2, page_size=1 -> second
+    rows = _filtered_rows(admin_client, {"page": "2", "page_size": "1"})
+    assert len(rows) == 1
+    assert rows[0]["pi_number"] == "PI-PG2"
+    # page=3, page_size=1 -> third
+    rows = _filtered_rows(admin_client, {"page": "3", "page_size": "1"})
+    assert len(rows) == 1
+    assert rows[0]["pi_number"] == "PI-PG1"
+
+
+def test_summary_group_by_month(admin_client, db):
+    """group_by=month returns period-aggregated summary."""
+    # Sale in Jan 2026
+    sid1 = _sale(db, "PI-SUM1", created_at="2026-01-10 00:00:00", pi_date="2026-01-10",
+                 items=[{"product_name": "A", "quantity": 10, "unit_price": 100}], maturity_date="2026-02-15")
+    _pay(db, sid1, 500, "2026-01-20")
+    # Sale in Feb 2026
+    sid2 = _sale(db, "PI-SUM2", created_at="2026-02-15 00:00:00", pi_date="2026-02-15",
+                 items=[{"product_name": "B", "quantity": 5, "unit_price": 200}], maturity_date="2026-03-15")
+    _pay(db, sid2, 200, "2026-02-20")
+    # Sale in Mar 2026
+    sid3 = _sale(db, "PI-SUM3", created_at="2026-03-10 00:00:00", pi_date="2026-03-10",
+                 items=[{"product_name": "C", "quantity": 2, "unit_price": 500}], maturity_date="2026-04-15")
+    
+    summary = _summary(admin_client, {"group_by": "month", "date_anchor": "pi_date"})
+    periods = summary["periods"]
+    assert len(periods) == 3
+    # Check period structure
+    for p in periods:
+        assert "period_start" in p
+        assert "period_end" in p
+        assert "kpis" in p
+        assert "items" in p
+        kpis = p["kpis"]
+        assert set(kpis.keys()) == {"gross_sales", "received", "due", "overdue", "order_count"}
+    # Jan period: gross=1000, received=500, due=500, overdue=500 (maturity 2026-02-15 < today 2026-09-28), orders=1
+    jan = next(p for p in periods if p["period_start"] == "2026-01-01")
+    assert jan["period_end"] == "2026-01-31"
+    assert jan["kpis"]["gross_sales"] == 1000
+    assert jan["kpis"]["received"] == 500
+    assert jan["kpis"]["due"] == 500
+    assert jan["kpis"]["overdue"] == 500
+    assert jan["kpis"]["order_count"] == 1
+    # Feb period: gross=1000, received=200, due=800, overdue=800 (maturity 2026-03-15 < today), orders=1
+    feb = next(p for p in periods if p["period_start"] == "2026-02-01")
+    assert feb["kpis"]["gross_sales"] == 1000
+    assert feb["kpis"]["received"] == 200
+    assert feb["kpis"]["due"] == 800
+    assert feb["kpis"]["overdue"] == 800
+    # Mar period: gross=1000, received=0, due=1000, overdue=1000 (maturity 2026-04-15 < today), orders=1
+    mar = next(p for p in periods if p["period_start"] == "2026-03-01")
+    assert mar["kpis"]["gross_sales"] == 1000
+    assert mar["kpis"]["received"] == 0
+    assert mar["kpis"]["due"] == 1000
+    assert mar["kpis"]["overdue"] == 1000
+
+
 # ------------------------- export -------------------------
 def test_export_401_and_403(user_client, db):
     _sale(db, "PI-E0")
