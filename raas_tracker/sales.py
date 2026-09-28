@@ -1003,7 +1003,100 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
                 "overdue": float(total_overdue or 0),
                 "order_count": int(order_count or 0),
             },
-            "items": [],  # Detail items not included in summary by default
+            "items": [],  # Will be populated below if group_by != "none"
         })
 
+    # If group_by != "none", also fetch detail items for each period for expandable rows
+    if group_by != "none":
+        # Query detail items for each period
+        for period in periods:
+            period_start = period["period_start"]
+            period_end = period["period_end"]
+            
+            # Build detail query for this period
+            detail_params = params.copy()
+            detail_params["period_start"] = period_start
+            detail_params["period_end"] = period_end
+            
+            detail_query = f"""
+                WITH base AS (
+                    SELECT
+                        s.id AS sale_id,
+                        COALESCE(c.name, s.client_name) AS customer_name,
+                        s.pi_number, s.pi_date,
+                        s.lc_number, s.lc_date,
+                        s.shipment_date, s.maturity_date, s.stage, s.comments,
+                        s.company_id,
+                        si.product_name, si.unit, si.quantity, si.unit_price,
+                        ROUND((si.quantity * si.unit_price)::numeric, 2)::float8 AS total_price,
+                        (SELECT MAX(sh.invoice_date)
+                           FROM shipments sh WHERE sh.sale_id = s.id) AS invoice_date,
+                        (SELECT MAX(sh.ship_date)
+                           FROM shipments sh WHERE sh.sale_id = s.id) AS latest_ship_date,
+                        (SELECT MAX(sp.payment_date)
+                           FROM sale_payments sp WHERE sp.sale_id = s.id) AS receive_date,
+                        (SELECT COALESCE(ROUND(SUM(sp.payment_amount)::numeric, 2), 0)::float8
+                           FROM sale_payments sp WHERE sp.sale_id = s.id) AS received_amount,
+                        (SELECT COALESCE(ROUND(SUM(si2.quantity * si2.unit_price)::numeric, 2), 0)::float8
+                           FROM sale_items si2 WHERE si2.sale_id = s.id) AS sale_total,
+                        {date_anchor_expr} AS date_anchor_col
+                    FROM sales s
+                    LEFT JOIN sale_items si ON si.sale_id = s.id
+                    LEFT JOIN companies c ON c.id = s.company_id
+                )
+                SELECT
+                    sale_id, customer_name, pi_number, pi_date, lc_number, lc_date,
+                    product_name, unit, quantity, unit_price, total_price,
+                    invoice_date, latest_ship_date, shipment_date AS actual_ship_date, maturity_date,
+                    receive_date, received_amount, 
+                    (sale_total - received_amount) AS due_amount,
+                    CASE 
+                        WHEN sale_total - received_amount <= 0 THEN 'Paid'
+                        WHEN maturity_date::date < CURRENT_DATE AND sale_total - received_amount > 0 THEN 'Overdue'
+                        WHEN received_amount > 0 THEN 'Partial'
+                        WHEN maturity_date IS NOT NULL THEN 'Due'
+                        ELSE 'Pending'
+                    END AS payment_status,
+                    comments AS payment_comment
+                FROM base
+                WHERE {period_trunc} >= %(period_start)s
+                AND {period_trunc} <= %(period_end)s
+                {where_sql}
+                ORDER BY sale_id DESC
+            """
+            
+            detail_rows = conn.execute(detail_query, detail_params).fetchall()
+            
+            items = []
+            for r in detail_rows:
+                (sale_id, customer_name, pi_number, pi_date, lc_number, lc_date,
+                 product_name, unit, quantity, unit_price, total_price,
+                 invoice_date, latest_ship_date, actual_ship_date, maturity_date,
+                 receive_date, received_amount, due_amount, payment_status, payment_comment) = r
+                
+                items.append({
+                    "sale_id": sale_id,
+                    "customer_name": customer_name,
+                    "pi_number": pi_number,
+                    "pi_date": pi_date,
+                    "lc_number": lc_number,
+                    "lc_date": lc_date,
+                    "product_name": product_name,
+                    "unit": unit,
+                    "quantity": float(quantity or 0),
+                    "unit_price": float(unit_price or 0),
+                    "total_price": float(total_price or 0),
+                    "invoice_date": invoice_date,
+                    "latest_ship_date": latest_ship_date,
+                    "actual_ship_date": actual_ship_date,
+                    "maturity_date": maturity_date,
+                    "receive_date": receive_date,
+                    "received_amount": float(received_amount or 0),
+                    "due_amount": float(due_amount or 0),
+                    "payment_status": payment_status,
+                    "payment_comment": payment_comment,
+                })
+            
+            period["items"] = items
+    
     return periods
