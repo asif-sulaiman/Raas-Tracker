@@ -593,7 +593,7 @@ def create_production_run(
             linked_invoice_ids.append(invoice_id)
             # Update invoice status to produced
             conn.execute(
-                "UPDATE invoices SET status = 'produced' WHERE id = %s",
+                "UPDATE invoices SET status = 'produced' WHERE id = %s AND status <> 'paid'",
                 (invoice_id,)
             )
 
