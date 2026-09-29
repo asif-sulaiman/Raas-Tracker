@@ -53,7 +53,7 @@ from chem_stock import (
 )
 from raas_tracker.sales import (
     create_invoice, list_invoices, book_invoice, ship_invoice,
-    mark_invoice_paid, get_sale_completion, _now_str
+    mark_invoice_paid, void_invoice, get_sale_completion, _now_str
 )
 
 # ---- AuthN/Z: sessions (humans) OR api_keys (scripts) ----
@@ -1750,6 +1750,8 @@ def api_produce_recipe(name):
             results.append(result)
     except ValueError as e:
         conn.close()
+        if str(e).startswith("invoice already"):
+            return jsonify({"error": str(e)}), 409
         return jsonify({"error": str(e)}), 400
     except Exception:
         conn.close()
@@ -1871,6 +1873,30 @@ def api_list_invoices(sale_id):
     return jsonify(invoices)
 
 
+def _invoice_url_sale_check(conn, sale_id, invoice_id):
+    """404 response when the invoice is missing or belongs to another sale."""
+    row = conn.execute(
+        "SELECT sale_id FROM invoices WHERE id = %s", (invoice_id,)
+    ).fetchone()
+    if not row or row[0] != sale_id:
+        conn.close()
+        return jsonify({"error": "Invoice not found"}), 404
+    return None
+
+
+def _invoice_transition_error(conn, e):
+    """Map invoice service ValueErrors: terminal-state refusal -> 409."""
+    msg = str(e)
+    if msg.startswith("invoice already"):
+        conn.close()
+        return jsonify({"error": msg}), 409
+    if msg == "Invoice not found":
+        conn.close()
+        return jsonify({"error": msg}), 404
+    conn.close()
+    return jsonify({"error": msg}), 400
+
+
 @app.route("/api/sales/<int:sale_id>/invoices/<int:invoice_id>/book", methods=["POST"])
 @admin_required
 def api_book_invoice(sale_id, invoice_id):
@@ -1879,21 +1905,22 @@ def api_book_invoice(sale_id, invoice_id):
     except ValidationError as e:
         return _validation_error_response(e)
     conn = get_db()
+    denied = _invoice_url_sale_check(conn, sale_id, invoice_id)
+    if denied:
+        return denied
     try:
         success = book_invoice(conn, invoice_id, payload.approx_ship_date)
     except ValueError as e:
-        conn.close()
-        return jsonify({"error": str(e)}), 400
+        return _invoice_transition_error(conn, e)
     except Exception:
         conn.close()
         app.logger.exception("Invoice booking failed")
         return jsonify({"error": "internal server error"}), 500
-    conn.close()
     if not success:
+        conn.close()
         return jsonify({"error": "Invoice not found"}), 404
-    # Update sale's shipment_status — only an upgrade from "not yet booked"
-    # states; already-booked / shipped / delivered values are preserved.
-    conn = get_db()
+    # The booking transitioned: upgrade the sale's shipment_status from
+    # "not yet booked" states; already-booked / shipped / delivered preserved.
     conn.execute(
         "UPDATE sales SET shipment_status = CASE WHEN shipment_status IS NULL "
         "OR shipment_status IN ('production_running','production_done') "
@@ -1913,6 +1940,9 @@ def api_ship_invoice(sale_id, invoice_id):
     except ValidationError as e:
         return _validation_error_response(e)
     conn = get_db()
+    denied = _invoice_url_sale_check(conn, sale_id, invoice_id)
+    if denied:
+        return denied
     try:
         result = ship_invoice(
             conn, invoice_id, payload.actual_ship_date,
@@ -1921,8 +1951,7 @@ def api_ship_invoice(sale_id, invoice_id):
             created_by=getattr(g, "current_identity", {}).get("id")
         )
     except ValueError as e:
-        conn.close()
-        return jsonify({"error": str(e)}), 400
+        return _invoice_transition_error(conn, e)
     except Exception:
         conn.close()
         app.logger.exception("Invoice shipping failed")
@@ -1939,20 +1968,42 @@ def api_pay_invoice(sale_id, invoice_id):
     except ValidationError as e:
         return _validation_error_response(e)
     conn = get_db()
+    denied = _invoice_url_sale_check(conn, sale_id, invoice_id)
+    if denied:
+        return denied
     try:
         result = mark_invoice_paid(
             conn, invoice_id, payload.payment_amount, payload.payment_date,
             notes=payload.notes, created_by=getattr(g, "current_identity", {}).get("id")
         )
     except ValueError as e:
-        conn.close()
-        return jsonify({"error": str(e)}), 400
+        return _invoice_transition_error(conn, e)
     except Exception:
         conn.close()
         app.logger.exception("Invoice payment failed")
         return jsonify({"error": "internal server error"}), 500
     conn.close()
     return jsonify(result), 201
+
+
+@app.route("/api/sales/<int:sale_id>/invoices/<int:invoice_id>", methods=["DELETE"])
+@admin_required
+def api_void_invoice(sale_id, invoice_id):
+    """Void an invoice row (even paid/shipped — the remediation path).
+
+    Payments detach via ON DELETE SET NULL and stay in sale-level totals.
+    """
+    conn = get_db()
+    try:
+        ok = void_invoice(conn, sale_id, invoice_id)
+    except Exception:
+        conn.close()
+        app.logger.exception("Invoice void failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    if not ok:
+        return jsonify({"error": "Invoice not found"}), 404
+    return jsonify({"success": True})
 
 
 @app.route("/api/sales/<int:sale_id>/completion")

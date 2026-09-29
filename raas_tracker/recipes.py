@@ -591,9 +591,19 @@ def create_production_run(
             if sale_id not in linked_sale_ids:
                 linked_sale_ids.append(sale_id)
             linked_invoice_ids.append(invoice_id)
+            # Forward-only: terminal ('shipped'/'paid') invoices refuse the
+            # move (route maps to 409). Non-terminal states (planned, produced,
+            # booked) accept 'produced' — booked->produced is a deliberate
+            # re-run allowance, not a downgrade of shipment progress.
+            inv_status = conn.execute(
+                "SELECT status FROM invoices WHERE id = %s FOR UPDATE",
+                (invoice_id,)
+            ).fetchone()
+            if inv_status and inv_status[0] in ("shipped", "paid"):
+                raise ValueError(f"invoice already {inv_status[0]}")
             # Update invoice status to produced
             conn.execute(
-                "UPDATE invoices SET status = 'produced' WHERE id = %s AND status <> 'paid'",
+                "UPDATE invoices SET status = 'produced' WHERE id = %s AND status NOT IN ('shipped', 'paid')",
                 (invoice_id,)
             )
 

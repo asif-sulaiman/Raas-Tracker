@@ -1132,12 +1132,34 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
     if not invoice_number or not invoice_number.strip():
         raise ValueError("invoice_number is required")
     invoice_number = invoice_number.strip()
+    # Duplicate check first so a repeated number still reports "already exists"
+    # even when the request omits amount on a sale that already has invoices.
+    dup = conn.execute(
+        "SELECT id FROM invoices WHERE sale_id = %s AND invoice_number = %s",
+        (sale_id, invoice_number)
+    ).fetchone()
+    if dup:
+        raise ValueError(f"Invoice number '{invoice_number}' already exists for this sale")
+    existing = conn.execute(
+        "SELECT amount FROM invoices WHERE sale_id = %s", (sale_id,)
+    ).fetchall()
     if amount is None:
+        if existing:
+            raise ValueError("amount is required when the sale already has invoices")
         amount = get_sale_invoice_total(conn, sale_id)
     else:
         amount = float(amount)
         if amount < 0:
             raise ValueError("amount must be >= 0")
+    # No-overstatement cap: invoiced total must not exceed the sale total.
+    # Legacy rows with NULL amount are unverifiable -> skip the sum check.
+    if not any(r[0] is None for r in existing):
+        sale_total = get_sale_invoice_total(conn, sale_id)
+        stated = round(sum(float(r[0]) for r in existing) + float(amount), 2)
+        if stated > round(float(sale_total), 2):
+            raise ValueError(
+                f"total invoice amounts ({stated:g}) would exceed sale total ({float(sale_total):g})"
+            )
     # paid_amount at creation is 0 -> covered when amount <= 0
     status = "paid" if amount <= 0 else "planned"
 
@@ -1165,16 +1187,36 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
             "status": status, "amount": round(float(amount), 2)}
 
 
+# Forward-only invoice lifecycle. Every transition refuses no-op repeats and
+# backward moves (route maps these to 409); pay-on-paid is the only exception
+# and flows through mark_invoice_paid, never here.
+_INVOICE_STATUS_ORDER = ["planned", "produced", "booked", "shipped", "paid"]
+
+
 def update_invoice_status(conn: psycopg.Connection, invoice_id: int, status: str,
                           approx_ship_date: Optional[str] = None,
                           actual_ship_date: Optional[str] = None) -> bool:
-    """Update invoice status and optional dates."""
+    """Update invoice status and optional dates.
+
+    Forward-only: ``status`` must be strictly later in the lifecycle than the
+    current status. Repeats and backward moves from any state (including the
+    terminal 'shipped'/'paid' states) raise ``ValueError("invoice already
+    <current>")``. Returns False only when the invoice does not exist.
+    """
     valid_statuses = ["planned", "produced", "booked", "shipped", "paid"]
     if status not in valid_statuses:
         raise ValueError(f"Invalid status: {status}. Must be one of {valid_statuses}")
-    
-    # Never downgrade a 'paid' invoice (lifecycle is terminal once paid).
-    fields = ["status = CASE WHEN status = 'paid' THEN status ELSE %s END"]
+
+    row = conn.execute(
+        "SELECT status FROM invoices WHERE id = %s FOR UPDATE", (invoice_id,)
+    ).fetchone()
+    if not row:
+        return False
+    current = row[0]
+    if _INVOICE_STATUS_ORDER.index(status) <= _INVOICE_STATUS_ORDER.index(current):
+        raise ValueError(f"invoice already {current}")
+
+    fields = ["status = %s"]
     params = [status]
     if approx_ship_date is not None:
         fields.append("approx_ship_date = %s")
@@ -1204,34 +1246,56 @@ def book_invoice(conn: psycopg.Connection, invoice_id: int, approx_ship_date: st
 def ship_invoice(conn: psycopg.Connection, invoice_id: int, actual_ship_date: str,
                  invoice_number: str, notes: Optional[str] = None,
                  created_by: Optional[int] = None) -> Dict[str, Any]:
-    """Mark an invoice as shipped - creates shipment record and updates invoice."""
+    """Mark an invoice as shipped - creates shipment record and updates invoice.
+
+    Forward-only: the invoice row is locked (``FOR UPDATE``) and its status
+    checked BEFORE any shipment row is written, so a refused transition
+    (terminal 'shipped'/'paid') never leaves a phantom shipment behind.
+    """
     if not actual_ship_date or not actual_ship_date.strip():
         raise ValueError("actual_ship_date is required for shipping")
-    
-    # Get invoice details
+    actual_ship_date = actual_ship_date.strip()
+
+    # Lock first; refuse terminal states before any mutation.
     invoice = conn.execute(
-        "SELECT id, sale_id, invoice_number FROM invoices WHERE id = %s",
+        "SELECT id, sale_id, invoice_number, status FROM invoices WHERE id = %s FOR UPDATE",
         (invoice_id,)
     ).fetchone()
     if not invoice:
         raise ValueError("Invoice not found")
-    
-    _, sale_id, invoice_number = invoice
-    
-    # Create shipment record
-    shipment_id = add_shipment(conn, invoice[1], actual_ship_date.strip(),
-                               invoice_number or invoice[2], None, "Shipped via production run")
-    
-    # Update invoice to shipped
-    conn.execute(
+    _, sale_id, db_number, current = invoice
+    if current in ("shipped", "paid"):
+        conn.rollback()
+        raise ValueError(f"invoice already {current}")
+
+    # Shipment insert is inlined (not via add_shipment, which COMMITs) so the
+    # lock is held until the guarded status flip below commits atomically.
+    ship_row = conn.execute(
+        """INSERT INTO shipments (sale_id, ship_date, invoice_number, invoice_date, notes)
+           VALUES (%s, %s, %s, %s, %s) RETURNING id""",
+        (sale_id, actual_ship_date, (invoice_number or "").strip() or db_number,
+         None, "Shipped via production run")
+    ).fetchone()
+    shipment_id = ship_row[0]
+
+    # Guarded flip: a concurrent transition to a terminal state wins the race.
+    cur = conn.execute(
         "UPDATE invoices SET status = 'shipped', actual_ship_date = %s, "
-        "notes = COALESCE(notes, '') || %s WHERE id = %s AND status <> 'paid'",
-        (actual_ship_date.strip(), f"\nShipped on {actual_ship_date.strip()}: " + (notes or ""), invoice_id)
+        "notes = COALESCE(notes, '') || %s WHERE id = %s AND status NOT IN ('shipped', 'paid')",
+        (actual_ship_date, f"\nShipped on {actual_ship_date}: " + (notes or ""), invoice_id)
     )
-    
+    if cur.rowcount == 0:
+        conn.rollback()
+        lost = conn.execute(
+            "SELECT status FROM invoices WHERE id = %s", (invoice_id,)
+        ).fetchone()
+        raise ValueError(f"invoice already {(lost[0] if lost else 'shipped')}")
+
     conn.commit()
+    log_audit_action(conn, "SHIPMENT_RECORD", "sale", sale_id,
+                     new_value=f"{actual_ship_date}")
     log_audit_action(conn, "INVOICE_SHIP", "invoice", invoice_id,
-                     new_value=f"Shipped on {actual_ship_date.strip()}")
+                     new_value=f"Shipped on {actual_ship_date}")
     return {"invoice_id": invoice_id, "shipment_id": shipment_id, "status": "shipped"}
 
 
@@ -1275,17 +1339,26 @@ def _sync_invoice_paid_status(conn: psycopg.Connection, invoice_id: int) -> bool
 def mark_invoice_paid(conn: psycopg.Connection, invoice_id: int,
                       payment_amount: float, payment_date: str,
                       notes: Optional[str] = None, created_by: Optional[int] = None) -> Dict[str, Any]:
-    """Record a payment for an invoice (partial or full)."""
+    """Record a payment for an invoice (partial or full).
+
+    The invoice row is locked (``FOR UPDATE``) before the payment INSERT so
+    concurrent pays serialize inside one transaction; coverage is computed
+    after the insert and the response ``status`` is the ACTUAL post-sync
+    invoice status (partial payments keep e.g. 'planned', they do NOT report
+    'paid'). Overpayments are accepted without error: the full payment row is
+    recorded and the invoice flips to 'paid' (money received is truth; no
+    amount cap here by design).
+    """
     if payment_amount is None or payment_amount <= 0:
         raise ValueError("payment_amount must be positive")
-    
+
     invoice = conn.execute(
-        "SELECT sale_id FROM invoices WHERE id = %s", (invoice_id,)
+        "SELECT sale_id FROM invoices WHERE id = %s FOR UPDATE", (invoice_id,)
     ).fetchone()
     if not invoice:
         raise ValueError("Invoice not found")
     sale_id = invoice[0]
-    
+
     cursor = conn.execute(
         """INSERT INTO sale_payments (sale_id, payment_date, payment_amount, notes, invoice_id)
            VALUES (%s, %s, %s, %s, %s) RETURNING id""",
@@ -1294,10 +1367,35 @@ def mark_invoice_paid(conn: psycopg.Connection, invoice_id: int,
     payment_id = cursor.fetchone()[0]
     _sync_sale_payment_totals(conn, sale_id)
     _sync_invoice_paid_status(conn, invoice_id)
+    actual_status = conn.execute(
+        "SELECT status FROM invoices WHERE id = %s", (invoice_id,)
+    ).fetchone()[0]
     log_audit_action(conn, "INVOICE_PAYMENT", "invoice", invoice_id,
                      new_value=f"amount={payment_amount:g} date={payment_date}")
     conn.commit()
-    return {"payment_id": payment_id, "status": "paid"}
+    return {"payment_id": payment_id, "status": actual_status}
+
+
+def void_invoice(conn: psycopg.Connection, sale_id: int, invoice_id: int) -> bool:
+    """Void (delete) an invoice belonging to a sale.
+
+    Returns False when the invoice does not exist or belongs to a different
+    sale (route maps to 404). Paid or shipped invoices CAN be voided — this
+    is the remediation path for bad transitions. Payments detach via the
+    existing ``ON DELETE SET NULL`` FK and stay counted in the sale-level
+    totals (payments remain sale-level truth), so sale payment totals are
+    intentionally left unchanged.
+    """
+    row = conn.execute(
+        "SELECT sale_id FROM invoices WHERE id = %s", (invoice_id,)
+    ).fetchone()
+    if not row or row[0] != sale_id:
+        return False
+    conn.execute("DELETE FROM invoices WHERE id = %s", (invoice_id,))
+    conn.commit()
+    log_audit_action(conn, "INVOICE_VOID", "invoice", invoice_id,
+                     new_value=f"voided from sale {sale_id}")
+    return True
 
 
 def list_invoices(conn: psycopg.Connection, sale_id: int) -> List[Dict[str, Any]]:

@@ -26,9 +26,11 @@ def _sale(admin_client, company_id, pi, product="ProdInv", item_no=None):
     return r.get_json()["id"]
 
 
-def _invoice(admin_client, sale_id, number):
-    r = admin_client.post(f"/api/sales/{sale_id}/invoices",
-                          json={"invoice_number": number})
+def _invoice(admin_client, sale_id, number, amount=None):
+    payload = {"invoice_number": number}
+    if amount is not None:
+        payload["amount"] = amount
+    r = admin_client.post(f"/api/sales/{sale_id}/invoices", json=payload)
     assert r.status_code == 201, r.get_json()
     return r.get_json()["invoice_id"]
 
@@ -162,7 +164,9 @@ def test_pay_records_payment_and_syncs_sale_totals(admin_client, db):
     assert r.status_code == 201, r.get_json()
     body = r.get_json()
     assert body["payment_id"]
-    assert body["status"] == "paid"
+    # Partial coverage (25.5 < 50) must report the ACTUAL post-sync status,
+    # not a hardcoded "paid".
+    assert body["status"] == "planned"
 
     rows = db.execute(
         "SELECT invoice_id, payment_amount FROM sale_payments "
@@ -188,8 +192,10 @@ def test_completion_reflects_invoice_counts(admin_client, db):
     assert r.get_json() == {"status": "none", "paid": 0, "total": 0,
                             "invoices": []}
 
-    _invoice(admin_client, sid, "INV-CMP-1")
-    _invoice(admin_client, sid, "INV-CMP-2")
+    # Two invoices with explicit amounts fitting the 50 sale total
+    # (second invoice without amount is 400; amounts capped at sale total).
+    _invoice(admin_client, sid, "INV-CMP-1", amount=30)
+    _invoice(admin_client, sid, "INV-CMP-2", amount=20)
     body = admin_client.get(f"/api/sales/{sid}/completion").get_json()
     assert body["total"] == 2
     assert body["paid"] == 0
