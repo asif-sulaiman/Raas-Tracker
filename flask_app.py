@@ -1524,12 +1524,31 @@ def api_commercial_report_summary():
     return jsonify({"periods": periods})
 
 
-@app.route("/api/reports/live/export", methods=["POST"])
+@app.route("/api/reports/live/export", methods=["GET", "POST"])
 @admin_required
 @limiter.limit("15 per minute")
 def api_commercial_report_export():
+    if request.method == "POST":
+        filters = request.get_json() or {}
+    else:
+        filters = {
+            "date_anchor": request.args.get("date_anchor", "pi_date"),
+            "date_from": request.args.get("date_from"),
+            "date_to": request.args.get("date_to"),
+            "customer_name": request.args.get("customer_name"),
+            "product_name": request.args.get("product_name"),
+            "company_id": request.args.get("company_id", type=int),
+            "stage": request.args.get("stage"),
+            "payment_status": request.args.get("payment_status"),
+        }
+        # Remove None values
+        filters = {k: v for k, v in filters.items() if v is not None}
+    
+    # Remove pagination for export - get all rows
+    filters = {**filters, "page_size": 10000}
+    
     conn = get_db()
-    rows = get_commercial_report(conn)
+    rows = get_commercial_report(conn, filters)
     conn.close()
     if not rows:
         return jsonify({"error": "No data to export"}), 400

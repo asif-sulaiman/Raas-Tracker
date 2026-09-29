@@ -238,11 +238,15 @@ export default function Reports() {
     if (!hasData) return;
     setCommercialExporting(true);
     try {
+      // Build filters from current searchParams, remove pagination for export
       const params = new URLSearchParams(searchParams);
-      const res = await apiFetch(`/api/reports/live/export?${params.toString()}`, {
+      params.delete('page');
+      params.delete('page_size');
+      const filters = Object.fromEntries(params);
+      const res = await apiFetch('/api/reports/live/export', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
+        body: JSON.stringify(filters)
       });
       const data = await res.json();
       if (data.content) {

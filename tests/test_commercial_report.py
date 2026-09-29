@@ -405,6 +405,16 @@ def test_summary_group_by_month(admin_client, db):
 
 
 # ------------------------- export -------------------------
+def _export_rows(client, filters=None, method="POST"):
+    """Call /api/reports/live/export with filters."""
+    if method == "GET":
+        query = "&".join(f"{k}={v}" for k, v in (filters or {}).items())
+        url = f"/api/reports/live/export?{query}" if query else "/api/reports/live/export"
+        return client.get(url)
+    else:
+        return client.post("/api/reports/live/export", json=filters or {})
+
+
 def test_export_401_and_403(user_client, db):
     _sale(db, "PI-E0")
     c = flask_app.app.test_client()
@@ -439,3 +449,141 @@ def test_export_admin_csv(admin_client, db):
     parsed = list(csv.reader(io.StringIO(content)))
     assert len(parsed) == len(expected_rows) + 1
     assert {p[0] for p in parsed[1:]} == {"Alpha Co", "Beta Co"}
+
+
+def test_export_filtered_by_date_range(admin_client, db):
+    """Export with date_from/date_to filters."""
+    _sale(db, "PI-ED1", created_at="2026-01-01 00:00:00", pi_date="2026-01-10")
+    _sale(db, "PI-ED2", created_at="2026-02-01 00:00:00", pi_date="2026-02-15")
+    _sale(db, "PI-ED3", created_at="2026-03-01 00:00:00", pi_date="2026-03-20")
+    # Filter by pi_date from 2026-02-01 to 2026-03-01
+    r = _export_rows(admin_client, {
+        "date_anchor": "pi_date",
+        "date_from": "2026-02-01",
+        "date_to": "2026-03-01",
+    })
+    assert r.status_code == 200
+    body = r.get_json()
+    content = body["content"]
+    parsed = list(csv.reader(io.StringIO(content)))
+    # Header + 1 data row (only PI-ED2)
+    assert len(parsed) == 2
+    assert parsed[1][1] == "PI-ED2"  # PI No column
+
+
+def test_export_filtered_by_customer(admin_client, db):
+    """Export with customer_name filter."""
+    _sale(db, "PI-EC1", client_name="Alpha Corp")
+    _sale(db, "PI-EC2", client_name="Beta Industries")
+    _sale(db, "PI-EC3", client_name="Gamma LLC")
+    r = _export_rows(admin_client, {"customer_name": "alpha"})
+    assert r.status_code == 200
+    body = r.get_json()
+    content = body["content"]
+    parsed = list(csv.reader(io.StringIO(content)))
+    assert len(parsed) == 2  # header + 1 row
+    assert parsed[1][0] == "Alpha Corp"
+
+
+def test_export_filtered_by_stage(admin_client, db):
+    """Export with stage filter."""
+    _sale(db, "PI-ES1", items=[{"product_name": "Item", "quantity": 1, "unit_price": 10}])
+    _sale(db, "PI-ES2", items=[{"product_name": "Item", "quantity": 1, "unit_price": 10}])
+    db.execute("UPDATE sales SET stage = 'lc_received' WHERE pi_number = 'PI-ES2'")
+    db.commit()
+    
+    r = _export_rows(admin_client, {"stage": "pi_issued"})
+    assert r.status_code == 200
+    body = r.get_json()
+    content = body["content"]
+    parsed = list(csv.reader(io.StringIO(content)))
+    assert len(parsed) == 2  # header + 1 row
+    assert parsed[1][1] == "PI-ES1"
+
+
+def test_export_filtered_by_payment_status(admin_client, db):
+    """Export with payment_status filter."""
+    # Paid
+    sid_paid = _sale(db, "PI-EP1", maturity_date="2099-12-31")
+    _pay(db, sid_paid, 10)
+    # Overdue
+    sid_overdue = _sale(db, "PI-EP2", maturity_date="2020-01-01")
+    # Partial
+    sid_partial = _sale(db, "PI-EP3", maturity_date="2099-12-31")
+    _pay(db, sid_partial, 4)
+    
+    r = _export_rows(admin_client, {"payment_status": "Paid"})
+    assert r.status_code == 200
+    body = r.get_json()
+    content = body["content"]
+    parsed = list(csv.reader(io.StringIO(content)))
+    assert len(parsed) == 2  # header + 1 row
+    assert parsed[1][1] == "PI-EP1"
+
+
+def test_export_filtered_by_product_name(admin_client, db):
+    """Export with product_name filter."""
+    sid1 = _sale(db, "PI-EPR1", items=[
+        {"product_name": "Sulfuric Acid", "quantity": 1, "unit_price": 10, "unit": "KG"},
+        {"product_name": "Hydrochloric Acid", "quantity": 1, "unit_price": 20, "unit": "KG"},
+    ])
+    sid2 = _sale(db, "PI-EPR2", items=[
+        {"product_name": "Sodium Hydroxide", "quantity": 1, "unit_price": 15, "unit": "KG"},
+    ])
+    r = _export_rows(admin_client, {"product_name": "sulfur"})
+    assert r.status_code == 200
+    body = r.get_json()
+    content = body["content"]
+    parsed = list(csv.reader(io.StringIO(content)))
+    # Should return both rows for PI-EPR1 (both items match the sale)
+    assert len(parsed) == 3  # header + 2 rows
+    pi_numbers = {p[1] for p in parsed[1:]}
+    assert pi_numbers == {"PI-EPR1"}
+
+
+def test_export_all_filters_combined(admin_client, db):
+    """Export with multiple filters at once."""
+    _sale(db, "PI-EC1", client_name="Alpha Corp", pi_date="2026-01-15",
+          items=[{"product_name": "Sulfuric Acid", "quantity": 1, "unit_price": 10}])
+    _sale(db, "PI-EC2", client_name="Alpha Corp", pi_date="2026-02-15",
+          items=[{"product_name": "Hydrochloric Acid", "quantity": 1, "unit_price": 20}])
+    _sale(db, "PI-EC3", client_name="Beta Corp", pi_date="2026-01-15",
+          items=[{"product_name": "Sulfuric Acid", "quantity": 1, "unit_price": 10}])
+    
+    # Filter: Alpha Corp + sulfur + Jan 2026
+    r = _export_rows(admin_client, {
+        "customer_name": "alpha",
+        "product_name": "sulfur",
+        "date_anchor": "pi_date",
+        "date_from": "2026-01-01",
+        "date_to": "2026-01-31",
+    })
+    assert r.status_code == 200
+    body = r.get_json()
+    content = body["content"]
+    parsed = list(csv.reader(io.StringIO(content)))
+    assert len(parsed) == 2  # header + 1 row (only PI-EC1 matches all)
+
+
+def test_export_empty_result(admin_client, db):
+    """Export with filters that match nothing -> 400 error."""
+    _sale(db, "PI-EE1", client_name="Alpha Corp")
+    r = _export_rows(admin_client, {"customer_name": "nonexistent"})
+    assert r.status_code == 400
+    body = r.get_json()
+    assert body["error"] == "No data to export"
+
+
+def test_export_get_method_with_query_params(admin_client, db):
+    """Export via GET with query parameters works."""
+    _sale(db, "PI-EG1", client_name="Alpha Corp", pi_date="2026-01-15")
+    _sale(db, "PI-EG2", client_name="Beta Corp", pi_date="2026-02-15")
+    r = _export_rows(admin_client, {
+        "customer_name": "alpha",
+    }, method="GET")
+    assert r.status_code == 200
+    body = r.get_json()
+    content = body["content"]
+    parsed = list(csv.reader(io.StringIO(content)))
+    assert len(parsed) == 2  # header + 1 row
+    assert parsed[1][0] == "Alpha Corp"
