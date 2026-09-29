@@ -47,22 +47,26 @@ function jsonResponse(data, ok = true, status = 200) {
   return { ok, status, json: async () => data, headers: { get: () => null } };
 }
 
-function installFetch({ invoices = INVOICES, posts = [], completion, payStatus = 'paid', deleteStatus = 200, deleteBody = null } = {}) {
+function installFetch({ invoices = INVOICES, posts = [], completion, completionStatus = 200, payStatus = 'paid', deleteStatus = 200, deleteBody = null, failInvoicesAfterPost = false, failInvoicesAlways = false } = {}) {
   const deletes = [];
+  let invoiceReadsFail = failInvoicesAfterPost || failInvoicesAlways;
+  // Lets a test flip the invoice read back to healthy to exercise a retry.
+  posts.failInvoices = (on) => { invoiceReadsFail = on; };
   posts.deletes = deletes;
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
     const u = String(url);
+    const method = options?.method || 'GET';
     if (u.includes('/api/auth/me')) {
       return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
     }
-    if (u.includes('/invoices') && options && options.method === 'DELETE') {
+    if (u.includes('/invoices') && method === 'DELETE') {
       deletes.push({ url: u });
       if (deleteStatus >= 400) {
         return jsonResponse(deleteBody || { error: 'Could not void invoice' }, false, deleteStatus);
       }
       return jsonResponse({ success: true });
     }
-    if (u.includes('/invoices') && options && options.method === 'POST') {
+    if (u.includes('/invoices') && method === 'POST') {
       posts.push({ url: u, body: JSON.parse(options.body) });
       if (u.endsWith('/book')) return jsonResponse({ success: true, status: 'booked' });
       if (u.endsWith('/ship')) return jsonResponse({ invoice_id: 7, shipment_id: 3, status: 'shipped' }, true, 201);
@@ -70,11 +74,18 @@ function installFetch({ invoices = INVOICES, posts = [], completion, payStatus =
       return jsonResponse({ invoice_id: 10, invoice_number: 'NEW', status: 'planned' }, true, 201);
     }
     if (u.includes('/completion')) {
+      if (completionStatus >= 400) {
+        return jsonResponse({ error: 'Completion service unavailable' }, false, completionStatus);
+      }
       if (completion) return jsonResponse(completion);
       const paid = invoices.filter((i) => i.status === 'paid').length;
       return jsonResponse({ status: paid > 0 ? 'partial' : 'none', paid, total: invoices.length, invoices });
     }
     if (u.includes('/invoices')) {
+      // A transient failure of the read (start-up or post-mutation reload).
+      if (invoiceReadsFail && (failInvoicesAlways || posts.length > 0)) {
+        return jsonResponse({ error: 'Bad gateway' }, false, 502);
+      }
       return jsonResponse(invoices);
     }
     return jsonResponse({});
@@ -284,5 +295,86 @@ describe('InvoicePanel', () => {
     expect(await screen.findByText('INV-1')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Add invoice' })).toBeNull();
     expect(screen.queryByRole('button', { name: /void invoice/i })).toBeNull();
+  });
+
+  it('still lists invoices when only the completion read fails', async () => {
+    // The invoice rows are the source of truth; completion only adds the
+    // money totals, so a 500 there must not blank the whole panel.
+    renderPanel({ completionStatus: 500 });
+
+    expect(await screen.findByText('INV-1')).toBeTruthy();
+    expect(screen.getByText('INV-2')).toBeTruthy();
+    expect(screen.getByText('INV-3')).toBeTruthy();
+    // Counts fall back to the loaded rows; only the money chip is unavailable.
+    expect(screen.getByText('1/3 invoices paid')).toBeTruthy();
+    expect(screen.getByText(/money totals unavailable/i)).toBeTruthy();
+    expect(screen.queryByText(/could not load invoices/i)).toBeNull();
+  });
+
+  it('still shows the rows and warns when the invoice read itself fails', async () => {
+    renderPanel({ failInvoicesAlways: true });
+
+    expect(await screen.findByText(/bad gateway/i)).toBeTruthy();
+    expect(screen.queryByText('No invoices yet. Add an invoice number to track production and shipment.')).toBeNull();
+  });
+
+  it('warns that the list may be stale when the post-mutation reload fails', async () => {
+    const posts = [];
+    const onChanged = vi.fn();
+    renderPanel({ posts, onChanged, failInvoicesAfterPost: true });
+    expect(await screen.findByText('INV-1')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Book shipment' }));
+    fireEvent.change(await screen.findByLabelText('Approximate ship date'), {
+      target: { value: '2026-09-10' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save booking' }));
+
+    await waitFor(() => expect(posts.filter((p) => p.url.includes('/book'))).toHaveLength(1));
+    // The mutation's own success report survives.
+    expect(toast.success).toHaveBeenCalledWith('Shipment booked');
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+    // ... but the rows below are now known to be out of date.
+    expect(await screen.findByText(/saved, but could not refresh/i)).toBeTruthy();
+    // The row is still on screen, only flagged.
+    expect(screen.getByText('INV-1')).toBeTruthy();
+    screen.getByRole('button', { name: 'Retry' });
+  });
+
+  it('clears the stale warning when the retry succeeds', async () => {
+    const posts = [];
+    renderPanel({ posts, failInvoicesAfterPost: true });
+    expect(await screen.findByText('INV-1')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Book shipment' }));
+    fireEvent.change(await screen.findByLabelText('Approximate ship date'), {
+      target: { value: '2026-09-10' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save booking' }));
+    expect(await screen.findByText(/saved, but could not refresh/i)).toBeTruthy();
+
+    // The API recovers, so the retry repopulates the panel and drops the flag.
+    posts.failInvoices(false);
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(screen.queryByText(/saved, but could not refresh/i)).toBeNull());
+  });
+
+  it('rounds a typed payment amount to the cent before posting', async () => {
+    const posts = [];
+    const invoices = [{
+      invoice_id: 11, invoice_number: 'INV-11', status: 'shipped',
+      approx_ship_date: '2026-09-10', actual_ship_date: '2026-09-12', notes: null,
+      created_at: '2026-09-01 10:00:00',
+      amount: 1200, paid_amount: 800,
+    }];
+    renderPanel({ invoices, posts });
+    fireEvent.click(await screen.findByRole('button', { name: 'Record payment' }));
+    fireEvent.change(await screen.findByLabelText('Payment amount'), { target: { value: '25.555' } });
+    fireEvent.change(screen.getByLabelText('Payment date'), { target: { value: '2026-09-15' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save payment' }));
+
+    await waitFor(() => expect(posts.filter((p) => p.url.includes('/pay'))).toHaveLength(1));
+    // Money is exact — a raw float must never reach the API.
+    expect(posts.find((p) => p.url.includes('/pay')).body.payment_amount).toBe(25.56);
   });
 });

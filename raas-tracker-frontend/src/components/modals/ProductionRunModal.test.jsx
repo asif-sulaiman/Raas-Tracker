@@ -38,10 +38,11 @@ const SALES = [
 const PRODUCTS = [{ product_name: 'Cleaner', quantity: 5000, unit: 'KG', item_no: '1001001' }];
 const INVOICES = [{ invoice_id: 31, invoice_number: 'INV-31', status: 'issued' }];
 
-function installFetch({ companies = COMPANIES, produceStatus = 201, produceBody = { runs: [] }, invoices = INVOICES, sales = SALES, invoiceStatus = 201, invoiceBody = null } = {}) {
+function installFetch({ companies = COMPANIES, companiesFailTimes = 0, companiesError = 'Companies service unavailable', produceStatus = 201, produceBody = { runs: [] }, invoices = INVOICES, sales = SALES, invoiceStatus = 201, invoiceBody = null } = {}) {
   const posts = [];
   const invoicePosts = [];
   const calls = [];
+  let companyFailsLeft = companiesFailTimes;
   posts.invoicePosts = invoicePosts;
   posts.calls = calls;
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
@@ -55,7 +56,13 @@ function installFetch({ companies = COMPANIES, produceStatus = 201, produceBody 
       posts.push({ url: u, body: options?.body ? JSON.parse(options.body) : null });
       return jsonResponse(produceBody, produceStatus < 400, produceStatus);
     }
-    if (u.includes('/api/companies')) return jsonResponse(companies);
+    if (u.includes('/api/companies')) {
+      if (companyFailsLeft > 0) {
+        companyFailsLeft -= 1;
+        return jsonResponse({ error: companiesError }, false, 500);
+      }
+      return jsonResponse(companies);
+    }
     if (u.includes('/api/recipes')) return jsonResponse(RECIPES);
     if (u.includes('/api/production-source')) return jsonResponse({ sale_id: 5, products: PRODUCTS });
     if (u.includes('/invoices') && method === 'POST') {
@@ -293,5 +300,30 @@ describe('ProductionRunModal', () => {
     expect(await screen.findByText('No companies registered yet.')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
     expect(await screen.findByText('Company is required')).toBeTruthy();
+  });
+
+  it('never claims the company master is empty when the reference fetch fails', async () => {
+    installFetch({ companiesFailTimes: 10 });
+    renderModal({ recipe: { name: 'Cleaner X', total_quantity: 1500, company_id: 7 } });
+
+    // A failed fetch is not evidence that no companies exist — say so.
+    expect(await screen.findByText('Could not load companies')).toBeTruthy();
+    expect(screen.getByText('Companies service unavailable')).toBeTruthy();
+    expect(screen.queryByText('No companies registered yet.')).toBeNull();
+    expect(screen.queryByText('No PIs found for this company yet.')).toBeNull();
+    expect(screen.queryByText('No recipes registered for this company yet.')).toBeNull();
+    screen.getByRole('button', { name: 'Retry' });
+  });
+
+  it('recovers the reference lists when the failure is retried', async () => {
+    // The first companies call fails; the retry hits a healthy API.
+    installFetch({ companiesFailTimes: 1 });
+    renderModal();
+
+    expect(await screen.findByText('Could not load companies')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    const company = await screen.findByLabelText('Company');
+    expect(company.value).toBe('7');
+    expect(screen.queryByText('Could not load companies')).toBeNull();
   });
 });

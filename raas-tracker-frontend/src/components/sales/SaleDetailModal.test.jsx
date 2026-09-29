@@ -39,15 +39,26 @@ function jsonResponse(data, ok = true, status = 200) {
   return { ok, status, json: async () => data, headers: { get: () => null } };
 }
 
-function installFetch({ role = 'admin', deletes = [] } = {}) {
+function installFetch({ role = 'admin', deletes = [], failGetsAfterPut = false, notFound = false } = {}) {
+  let putSeen = false;
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
     const u = String(url);
+    const method = options?.method || 'GET';
     if (u.includes('/api/auth/me')) {
       return jsonResponse({ id: 1, username: role, role });
     }
-    if (u.match(/\/api\/sales\/5\/shipments\/\d+/) && options && options.method === 'DELETE') {
+    if (u.match(/\/api\/sales\/5\/shipments\/\d+/) && method === 'DELETE') {
       deletes.push(u);
       return jsonResponse({ message: 'Shipment deleted' });
+    }
+    if (u.match(/\/api\/sales\/5$/) && method === 'PUT') {
+      putSeen = true;
+      return jsonResponse({ comments: 'ok' });
+    }
+    if (u.match(/\/api\/sales\/5$/)) {
+      if (notFound) return jsonResponse({ error: 'Sale not found' }, false, 404);
+      if (failGetsAfterPut && putSeen) return jsonResponse({ error: 'Bad gateway' }, false, 502);
+      return jsonResponse(DETAIL);
     }
     if (u.includes('/api/sales/5')) {
       return jsonResponse(DETAIL);
@@ -91,5 +102,67 @@ describe('SaleDetailModal shipments', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Delete' }));
     await waitFor(() => expect(deletes).toHaveLength(1));
     expect(deletes[0]).toMatch(/\/api\/sales\/5\/shipments\/9/);
+  });
+
+  it('keeps the sale on screen when a post-mutation refresh fails', async () => {
+    // The save succeeds, then the follow-up GET 502s.
+    renderDetail({ role: 'admin', failGetsAfterPut: true });
+    expect(await screen.findByText('INV-9')).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText('Sale comments'), { target: { value: 'check the balance' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    // A failed refresh is not evidence the sale is gone.
+    expect(await screen.findByText(/could not refresh/i)).toBeTruthy();
+    expect(screen.queryByText('Sale not found')).toBeNull();
+    // The already-loaded content stays readable and is flagged as stale.
+    expect(screen.getByText('INV-9')).toBeTruthy();
+    expect(screen.getByText('partial 1/2')).toBeTruthy();
+    expect(screen.getByText('Cotton')).toBeTruthy();
+    screen.getByRole('button', { name: 'Retry' });
+  });
+
+  it('recovers the sale when the refresh retry succeeds', async () => {
+    // The initial load succeeds; every later refresh 502s until the retry.
+    let gets = 0;
+    vi.stubGlobal('fetch', vi.fn(async (url, options) => {
+      const u = String(url);
+      const method = options?.method || 'GET';
+      if (u.includes('/api/auth/me')) return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
+      if (u.match(/\/api\/sales\/5$/) && method === 'PUT') return jsonResponse({ comments: 'ok' });
+      if (u.match(/\/api\/sales\/5$/)) {
+        gets += 1;
+        if (gets === 1) return jsonResponse(DETAIL);
+        if (gets < 3) return jsonResponse({ error: 'Bad gateway' }, false, 502);
+        return jsonResponse(DETAIL);
+      }
+      if (u.includes('/api/sales/5')) return jsonResponse(DETAIL);
+      return jsonResponse({});
+    }));
+    render(
+      <MemoryRouter>
+        <AuthProvider>
+          <ConfirmProvider>
+            <SaleDetailModal saleId={5} onClose={vi.fn()} onSaved={vi.fn()} />
+          </ConfirmProvider>
+        </AuthProvider>
+      </MemoryRouter>
+    );
+    expect(await screen.findByText('INV-9')).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText('Sale comments'), { target: { value: 'note' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(await screen.findByText(/could not refresh/i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(screen.queryByText(/could not refresh/i)).toBeNull());
+    expect(screen.getByText('INV-9')).toBeTruthy();
+  });
+
+  it('reports a missing sale only on an actual not-found response', async () => {
+    renderDetail({ notFound: true });
+    expect(await screen.findByText('Sale not found')).toBeTruthy();
+    // Nothing was loaded, so there is no content to preserve and no retry.
+    expect(screen.queryByText('INV-9')).toBeNull();
   });
 });

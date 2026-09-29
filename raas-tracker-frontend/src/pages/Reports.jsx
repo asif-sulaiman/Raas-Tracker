@@ -82,6 +82,11 @@ export default function Reports() {
   const [commercialExporting, setCommercialExporting] = useState(false);
   const [commercialPage, setCommercialPage] = useState(1);
   const [companies, setCompanies] = useState([]);
+  // The company filter silently falling back to "All Companies" looks identical
+  // to a real filter, so loading/failed/empty are kept distinct here.
+  const [companiesLoading, setCompaniesLoading] = useState(false);
+  const [companiesError, setCompaniesError] = useState(null);
+  const [companiesAttempt, setCompaniesAttempt] = useState(0);
   const commercialFetchedRef = useRef(false);
 
   useEffect(() => {
@@ -100,17 +105,50 @@ export default function Reports() {
 
   // Fetch companies for the filter dropdown
   useEffect(() => {
-    if (!isAdmin) return;
+    if (!isAdmin) return undefined;
+    let cancelled = false;
+    setCompaniesLoading(true);
+    setCompaniesError(null);
     (async () => {
       try {
         const res = await apiFetch('/api/companies');
         const data = await res.json();
+        if (cancelled) return;
         if (Array.isArray(data)) setCompanies(data);
-      } catch {
-        // Companies list stays empty on failure
+      } catch (err) {
+        if (cancelled) return;
+        // An empty list is not evidence that no companies exist — record the
+        // failure so the filter can say it is only a partial fallback.
+        setCompanies([]);
+        setCompaniesError((err && err.message) || 'Unknown error');
+      } finally {
+        if (!cancelled) setCompaniesLoading(false);
       }
     })();
-  }, [apiFetch, isAdmin]);
+    return () => { cancelled = true; };
+  }, [apiFetch, isAdmin, companiesAttempt]);
+
+  const retryCompanies = () => setCompaniesAttempt((n) => n + 1);
+
+  // CommercialFilters owns the dropdown markup, so the company load state is
+  // surfaced beside it instead of inside it. A failed load must never read as
+  // "there are no companies to filter by".
+  const companiesNotice = companiesError ? (
+    <div className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 dark:border-amber-800 dark:bg-amber-950/40">
+      <p className="text-xs font-medium text-amber-700 dark:text-amber-300">
+        Could not load companies
+      </p>
+      <p className="text-xs text-slate-500 dark:text-slate-400">
+        The company filter is limited to All Companies.
+      </p>
+      <p className="text-xs text-slate-500 dark:text-slate-400">{companiesError}</p>
+      <Button variant="secondary" size="sm" onClick={retryCompanies} loading={companiesLoading}>
+        Retry companies
+      </Button>
+    </div>
+  ) : companiesLoading ? (
+    <p className="text-xs text-slate-400 dark:text-slate-500">Loading companies…</p>
+  ) : null;
 
   const fetchCommercialReport = useCallback(async () => {
     setCommercialError(null);
@@ -282,7 +320,10 @@ export default function Reports() {
     if (commercialLoading) {
       return (
         <div className="space-y-4">
-          <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+          <>
+            <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+            {companiesNotice}
+          </>
           <CommercialTable
             data={isGrouped ? { periods: [] } : { rows: [] }}
             groupBy={groupBy}
@@ -299,7 +340,10 @@ export default function Reports() {
     if (commercialError) {
       return (
         <div className="space-y-4">
-          <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+          <>
+            <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+            {companiesNotice}
+          </>
           <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 shadow-xs text-center">
             <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-rose-100 dark:bg-rose-950/40">
               <AlertTriangle className="h-6 w-6 text-rose-500" />
@@ -321,7 +365,10 @@ export default function Reports() {
     if ((isGrouped && commercialSummary.length === 0) || (!isGrouped && commercialReport.length === 0)) {
       return (
         <div className="space-y-4">
-          <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+          <>
+            <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+            {companiesNotice}
+          </>
           <CommercialTable
             data={isGrouped ? { periods: [] } : { rows: [] }}
             groupBy={groupBy}
@@ -385,7 +432,10 @@ export default function Reports() {
 
       return (
         <div className="space-y-6">
-          <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+          <>
+            <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+            {companiesNotice}
+          </>
 
           {/* KPI Cards (USD) */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">

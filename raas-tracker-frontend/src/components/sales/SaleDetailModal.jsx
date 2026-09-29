@@ -40,6 +40,9 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
   const [removedIds, setRemovedIds] = useState([]);
   const [savingSale, setSavingSale] = useState(false);
   const [saleError, setSaleError] = useState(null);
+  // A refresh that failed after a successful mutation. The sale on screen is
+  // then known to be out of date — never evidence that the sale is gone.
+  const [refreshError, setRefreshError] = useState(null);
   const [showShipmentModal, setShowShipmentModal] = useState(false);
   const [comments, setComments] = useState('');
   const [savingComments, setSavingComments] = useState(false);
@@ -50,8 +53,16 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
       const data = await res.json();
       setSale(data.error ? null : data);
       setComments(data && !data.error ? (data.comments || '') : '');
-    } catch {
-      setSale(null);
+      setRefreshError(null);
+    } catch (err) {
+      // Only a real 404 means the sale is gone. A network/5xx failure must keep
+      // what is already on screen rather than claiming the sale does not exist.
+      if (err?.status === 404) {
+        setSale(null);
+        setRefreshError(null);
+      } else {
+        setRefreshError(err?.message || 'Could not refresh the sale');
+      }
     } finally {
       setLoading(false);
     }
@@ -66,6 +77,7 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
       setEditingPaymentId(null);
       setEditing(false);
       setSaleError(null);
+      setRefreshError(null);
       refresh(saleId);
     } else {
       setSale(null);
@@ -263,10 +275,29 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
     >
       {loading ? (
         <p className="text-sm text-slate-500 py-6 text-center">Loading…</p>
+      ) : refreshError && !sale ? (
+        <div className="py-6 text-center">
+          <p className="text-sm font-semibold text-rose-600 dark:text-rose-400">Could not load this sale</p>
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">{refreshError}</p>
+          <Button variant="secondary" size="sm" className="mt-4" onClick={() => refresh(saleId)}>
+            Retry
+          </Button>
+        </div>
       ) : !sale ? (
         <p className="text-sm text-rose-500 py-6 text-center">Sale not found</p>
       ) : (
         <div className="space-y-5">
+          {refreshError && (
+            <div className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 dark:border-amber-800 dark:bg-amber-950/40">
+              <p className="text-xs font-medium text-amber-700 dark:text-amber-300">
+                Could not refresh — showing the last loaded data, which may be out of date.
+              </p>
+              <Button variant="secondary" size="sm" onClick={() => refresh(saleId)}>
+                Retry
+              </Button>
+            </div>
+          )}
+
           <div className="flex items-center gap-2">
             <Badge variant={STAGE_BADGE[sale.stage] || 'default'}>
               {STAGE_LABELS[sale.stage] || sale.stage}

@@ -34,10 +34,16 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
   const [packing, setPacking] = useState('');
   const [batchNumber, setBatchNumber] = useState('');
   const [productionDate, setProductionDate] = useState(today());
+  const [sourceError, setSourceError] = useState(null);
 
   const [recipeRows, setRecipeRows] = useState([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
+  // The dropdown sources (companies / recipes / PIs) load as one unit. A failure
+  // leaves every list empty, which is indistinguishable from a genuinely empty
+  // master — so the failure gets its own state and never renders as "no data".
+  const [refsError, setRefsError] = useState(null);
+  const [refsAttempt, setRefsAttempt] = useState(0);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -63,6 +69,7 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
     setProductionDate(today());
     setRecipeRows([{ key: 'row-0', recipe_name: recipe?.name || '', qty: initialQty }]);
     setError(null);
+    setRefsError(null);
     setSaving(false);
     setLoadingRefs(true);
     (async () => {
@@ -76,8 +83,14 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
         setCompanies(Array.isArray(cos) ? cos : []);
         setRecipes(Array.isArray(recs) ? recs : []);
         setAllSales(Array.isArray(sales) ? sales : []);
-      } catch {
-        // Lists stay empty — the empty-state messages below cover it.
+      } catch (err) {
+        // Empty lists are indistinguishable from an empty master, so record the
+        // failure — the empty-state messages below stay reserved for a real
+        // successful-but-empty response.
+        setCompanies([]);
+        setRecipes([]);
+        setAllSales([]);
+        setRefsError(err?.message || 'Could not load companies, recipes, and PIs');
       } finally {
         setLoadingRefs(false);
       }
@@ -85,7 +98,9 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
     // apiFetch is not referentially stable (its useCallback chain bottoms out in
     // react-router's navigate) — adding it would refetch on every parent render.
     // oxlint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOpen, recipe]);
+  }, [isOpen, recipe, refsAttempt]);
+
+  const retryRefs = () => setRefsAttempt((n) => n + 1);
 
   const defaultQty = () => (recipe?.total_quantity != null ? String(recipe.total_quantity) : '');
 
@@ -98,6 +113,7 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
     setProducts([]);
     setInvoices([]);
     setLoadingSource(false);
+    setSourceError(null);
     setInvoiceChoice('');
     setNewInvoiceNumber('');
     setNewInvoiceAmount('');
@@ -116,6 +132,7 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
     setInvoiceChoice('');
     setNewInvoiceNumber('');
     setNewInvoiceAmount('');
+    setSourceError(null);
     if (!value) {
       setRowField(0, 'qty', defaultQty());
       setLoadingSource(false);
@@ -138,6 +155,7 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
         if (itemNo) setMaterialNumber(String(itemNo));
       }
     } catch (err) {
+      setSourceError(err.message || 'Could not load PI details');
       setError(err.message || 'Could not load PI details');
     } finally {
       setLoadingSource(false);
@@ -341,6 +359,16 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
           <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Company *</label>
           {loadingRefs ? (
             <p className="text-xs text-slate-400 dark:text-slate-500">Loading…</p>
+          ) : refsError ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="text-xs font-medium text-rose-600 dark:text-rose-400">
+                Could not load companies
+              </p>
+              <p className="text-xs text-slate-500 dark:text-slate-400">{refsError}</p>
+              <Button variant="secondary" size="sm" onClick={retryRefs}>
+                Retry
+              </Button>
+            </div>
           ) : companies.length === 0 ? (
             <p className="text-xs text-slate-500 dark:text-slate-400 italic">
               No companies registered yet.
@@ -368,6 +396,10 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
             </select>
           ) : loadingRefs ? (
             <p className="text-xs text-slate-400 dark:text-slate-500">Loading…</p>
+          ) : refsError ? (
+            <p className="text-xs font-medium text-rose-600 dark:text-rose-400">
+              Could not load PIs for this company
+            </p>
           ) : companySales.length === 0 ? (
             <p className="text-xs text-slate-500 dark:text-slate-400 italic">
               No PIs found for this company yet.
@@ -391,9 +423,11 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
             <p className="mt-1 text-xs text-slate-400 dark:text-slate-500">
               {loadingSource
                 ? 'Loading PI details…'
-                : products.length === 0
-                  ? 'No items found on this PI.'
-                  : `${products.length} item${products.length === 1 ? '' : 's'} · total quantity ${formatNumber(totalProductQty)}`}
+                : sourceError
+                  ? <span className="font-medium text-rose-600 dark:text-rose-400">{sourceError}</span>
+                  : products.length === 0
+                    ? 'No items found on this PI.'
+                    : `${products.length} item${products.length === 1 ? '' : 's'} · total quantity ${formatNumber(totalProductQty)}`}
             </p>
           )}
         </div>
@@ -561,7 +595,7 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
               </div>
             ))}
           </div>
-          {companyId && !loadingRefs && companyRecipes.length === 0 && (
+          {companyId && !loadingRefs && !refsError && companyRecipes.length === 0 && (
             <p className="mt-1.5 text-xs text-slate-400 dark:text-slate-500 italic">
               No recipes registered for this company yet.
             </p>

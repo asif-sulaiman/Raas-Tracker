@@ -80,6 +80,12 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged, total
   const [completion, setCompletion] = useState(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(null);
+  // Set when a mutation succeeded but the follow-up read failed: the rows on
+  // screen are then known to be out of date and must be flagged as such.
+  const [staleError, setStaleError] = useState(null);
+  // The two reads are independent — completion only adds the money totals, so
+  // its failure downgrades the totals chip instead of hiding the invoice rows.
+  const [totalsUnavailable, setTotalsUnavailable] = useState(false);
   const [adding, setAdding] = useState(false);
   const [invoiceNumber, setInvoiceNumber] = useState('');
   const [invoiceAmount, setInvoiceAmount] = useState('');
@@ -89,15 +95,31 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged, total
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState(null);
 
+  /**
+   * Independent reads, settled separately. `invoices` is `null` when that read
+   * failed (as opposed to a genuinely empty list) so callers can tell the two
+   * apart; `completion` is `null` when it failed or carried no usable totals.
+   */
   const fetchData = async () => {
-    const [invRes, compRes] = await Promise.all([
+    const [invResult, compResult] = await Promise.allSettled([
       apiFetch(`/api/sales/${saleId}/invoices`),
       apiFetch(`/api/sales/${saleId}/completion`),
     ]);
-    const [inv, comp] = await Promise.all([invRes.json(), compRes.json()]);
+    let invoices = null;
+    if (invResult.status === 'fulfilled') {
+      const inv = await invResult.value.json();
+      invoices = Array.isArray(inv) ? inv : [];
+    }
+    let completion = null;
+    if (compResult.status === 'fulfilled') {
+      const comp = await compResult.value.json();
+      completion = comp && typeof comp.total === 'number' ? comp : null;
+    }
     return {
-      invoices: Array.isArray(inv) ? inv : [],
-      completion: comp && typeof comp.total === 'number' ? comp : null,
+      invoices,
+      completion,
+      invoicesError: invResult.status === 'rejected' ? invResult.reason : null,
+      completionError: compResult.status === 'rejected' ? compResult.reason : null,
     };
   };
 
@@ -107,9 +129,14 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged, total
       try {
         const data = await fetchData();
         if (cancelled) return;
-        setInvoices(data.invoices);
-        setCompletion(data.completion);
-        setLoadError(null);
+        if (data.invoices) setInvoices(data.invoices);
+        if (data.completion) setCompletion(data.completion);
+        setTotalsUnavailable(!!data.completionError && !data.completion);
+        if (data.invoicesError) {
+          setLoadError(data.invoicesError?.message || 'Could not load invoices');
+        } else {
+          setLoadError(null);
+        }
       } catch (err) {
         if (cancelled) return;
         setLoadError(err?.message || 'Could not load invoices');
@@ -129,11 +156,18 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged, total
   const reload = async () => {
     try {
       const data = await fetchData();
-      setInvoices(data.invoices);
-      setCompletion(data.completion);
-      setLoadError(null);
-    } catch {
-      // Rows stay as they are — the mutation itself already reported success.
+      if (data.invoices) setInvoices(data.invoices);
+      if (data.completion) setCompletion(data.completion);
+      setTotalsUnavailable(!!data.completionError && !data.completion);
+      if (data.invoicesError) {
+        // The mutation landed but the rows on screen are now out of date —
+        // saying so beats presenting stale statuses as current.
+        setStaleError(data.invoicesError?.message || 'Could not refresh invoices');
+        return;
+      }
+      setStaleError(null);
+    } catch (err) {
+      setStaleError(err?.message || 'Could not refresh invoices');
     }
   };
 
@@ -213,7 +247,9 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged, total
     }
     let amount = 0;
     if (kind === 'pay') {
-      amount = parseFloat(payAmount);
+      // Money is exact: round to the cent the same way invoice creation does,
+      // so a typed 25.555 never posts an unrounded float.
+      amount = fromCents(toCents(parseFloat(payAmount)));
       if (!amount || amount <= 0) {
         setFormError('Enter a payment amount greater than 0');
         return;
@@ -307,6 +343,11 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged, total
               {totalsReady && ` · ${usd(completion.paid_amount)} of ${usd(completion.total_amount)}`}
             </span>
           )}
+          {totalsUnavailable && !totalsReady && (
+            <span className="ml-2 text-xs font-normal text-amber-600 dark:text-amber-400">
+              Money totals unavailable
+            </span>
+          )}
         </h4>
         {isAdmin && !adding && !step && (
           <Button variant="secondary" size="sm" icon={Plus} onClick={openAdd}>
@@ -314,6 +355,17 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged, total
           </Button>
         )}
       </div>
+
+      {staleError && (
+        <div className="mb-2 flex flex-wrap items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-1.5 dark:border-amber-800 dark:bg-amber-950/40">
+          <p className="text-xs font-medium text-amber-700 dark:text-amber-300">
+            Saved, but could not refresh — the rows below may be out of date.
+          </p>
+          <Button variant="secondary" size="sm" onClick={reload} disabled={saving}>
+            Retry
+          </Button>
+        </div>
+      )}
 
       {loading ? (
         <p className="text-xs text-slate-400 dark:text-slate-500 py-2">Loading invoices…</p>
