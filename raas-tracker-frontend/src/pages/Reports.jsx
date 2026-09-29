@@ -22,6 +22,7 @@ import { useAuth } from '../context/AuthContext';
 import { toast } from 'sonner';
 import CommercialFilters from '../components/reports/CommercialFilters';
 import CommercialTable from '../components/reports/CommercialTable';
+import CommercialCalendarNavigator from '../components/reports/CommercialCalendarNavigator';
 
 /**
  * Commercial report rows are per sale-item.
@@ -427,9 +428,29 @@ export default function Reports() {
     }
 
     // Grouped mode
+    // Determine current period from summary data (first period)
+    const currentPeriod = commercialSummary[0];
+    const periodStart = currentPeriod?.period_start;
+    const periodEnd = currentPeriod?.period_end;
+    const dateAnchor = searchParams.get('date_anchor') || 'pi_date';
+    const dateFrom = searchParams.get('date_from') || '';
+    const dateTo = searchParams.get('date_to') || '';
+
     return (
       <div className="space-y-6">
         <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+        
+        {/* Period Navigator for grouped views */}
+        <CommercialCalendarNavigator
+          groupBy={groupBy}
+          dateAnchor={dateAnchor}
+          dateFrom={dateFrom}
+          dateTo={dateTo}
+          onFiltersChange={() => {}}
+          periodStart={periodStart}
+          periodEnd={periodEnd}
+          isLoading={commercialLoading}
+        />
 
         {/* Export Button */}
         <div className="flex justify-end">
