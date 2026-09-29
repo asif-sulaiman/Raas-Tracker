@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react';
-import { Plus, Check } from 'lucide-react';
+import { Plus, Check, Trash2 } from 'lucide-react';
 import Button from '../ui/Button';
 import { formatDate, formatNumber, toCents, fromCents } from '../../utils/format';
 import { useAuth } from '../../context/AuthContext';
+import { useConfirm } from '../../context/ConfirmContext';
 import { toast } from 'sonner';
 
 const inputCls =
@@ -74,6 +75,7 @@ function StatusChip({ status }) {
  */
 export default function InvoicePanel({ saleId, isAdmin = false, onChanged, totalValue = null }) {
   const { apiFetch } = useAuth();
+  const { confirm } = useConfirm();
   const [invoices, setInvoices] = useState([]);
   const [completion, setCompletion] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -238,18 +240,42 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged, total
         });
         toast.success('Invoice shipped');
       } else {
-        await apiFetch(`/api/sales/${saleId}/invoices/${invoiceId}/pay`, {
+        const payRes = await apiFetch(`/api/sales/${saleId}/invoices/${invoiceId}/pay`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ payment_amount: amount, payment_date: stepDate }),
         });
-        toast.success('Payment recorded');
+        // A partial payment leaves the invoice short of paid — only the
+        // returned status says whether it is actually paid now.
+        const payData = await payRes.json().catch(() => ({}));
+        toast.success(payData?.status === 'paid' ? 'Invoice paid' : 'Payment recorded');
       }
       closeStep();
       await reload();
       onChanged?.();
     } catch (err) {
       setFormError(err?.message || 'Could not save invoice');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleVoid = async (inv) => {
+    const ok = await confirm({
+      title: `Void invoice ${inv.invoice_number}?`,
+      message: 'The invoice row will be removed. Payments already recorded stay in the sale totals.',
+      confirmLabel: 'Void',
+      danger: true,
+    });
+    if (!ok) return;
+    setSaving(true);
+    try {
+      await apiFetch(`/api/sales/${saleId}/invoices/${inv.invoice_id}`, { method: 'DELETE' });
+      toast.success('Invoice voided');
+      await reload();
+      onChanged?.();
+    } catch (err) {
+      toast.error(err.message || 'Could not void invoice');
     } finally {
       setSaving(false);
     }
@@ -339,6 +365,18 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged, total
                     <Button variant="secondary" size="sm" onClick={() => openStep(inv.invoice_id, kind)}>
                       {STEP_LABEL[kind]}
                     </Button>
+                  )}
+                  {isAdmin && !active && !adding && (
+                    <button
+                      type="button"
+                      onClick={() => handleVoid(inv)}
+                      disabled={saving}
+                      className="p-1 text-slate-400 hover:text-rose-600 disabled:opacity-50 cursor-pointer"
+                      title="Void invoice"
+                      aria-label={`Void invoice ${inv.invoice_number}`}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
                   )}
                 </div>
 

@@ -4,6 +4,8 @@ import React from 'react';
 import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { AuthProvider } from '../../context/AuthContext';
+import { ConfirmProvider } from '../../context/ConfirmContext';
+import { toast } from 'sonner';
 import InvoicePanel from './InvoicePanel';
 
 vi.mock('sonner', () => {
@@ -17,6 +19,7 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  vi.clearAllMocks();
 });
 
 const INVOICES = [
@@ -44,17 +47,26 @@ function jsonResponse(data, ok = true, status = 200) {
   return { ok, status, json: async () => data, headers: { get: () => null } };
 }
 
-function installFetch({ invoices = INVOICES, posts = [], completion } = {}) {
+function installFetch({ invoices = INVOICES, posts = [], completion, payStatus = 'paid', deleteStatus = 200, deleteBody = null } = {}) {
+  const deletes = [];
+  posts.deletes = deletes;
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
     const u = String(url);
     if (u.includes('/api/auth/me')) {
       return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
     }
+    if (u.includes('/invoices') && options && options.method === 'DELETE') {
+      deletes.push({ url: u });
+      if (deleteStatus >= 400) {
+        return jsonResponse(deleteBody || { error: 'Could not void invoice' }, false, deleteStatus);
+      }
+      return jsonResponse({ success: true });
+    }
     if (u.includes('/invoices') && options && options.method === 'POST') {
       posts.push({ url: u, body: JSON.parse(options.body) });
       if (u.endsWith('/book')) return jsonResponse({ success: true, status: 'booked' });
       if (u.endsWith('/ship')) return jsonResponse({ invoice_id: 7, shipment_id: 3, status: 'shipped' }, true, 201);
-      if (u.endsWith('/pay')) return jsonResponse({ payment_id: 4, status: 'paid' }, true, 201);
+      if (u.endsWith('/pay')) return jsonResponse({ payment_id: 4, status: payStatus }, true, 201);
       return jsonResponse({ invoice_id: 10, invoice_number: 'NEW', status: 'planned' }, true, 201);
     }
     if (u.includes('/completion')) {
@@ -74,15 +86,23 @@ function renderPanel(opts = {}) {
   return render(
     <MemoryRouter>
       <AuthProvider>
-        <InvoicePanel
-          saleId={5}
-          isAdmin
-          totalValue={opts.totalValue ?? null}
-          onChanged={opts.onChanged || vi.fn()}
-        />
+        <ConfirmProvider>
+          <InvoicePanel
+            saleId={5}
+            isAdmin={opts.isAdmin ?? true}
+            totalValue={opts.totalValue ?? null}
+            onChanged={opts.onChanged || vi.fn()}
+          />
+        </ConfirmProvider>
       </AuthProvider>
     </MemoryRouter>
   );
+}
+
+function invoiceGetCount() {
+  return globalThis.fetch.mock.calls.filter(
+    ([u, o]) => String(u).includes('/invoices') && !(o && o.method && o.method !== 'GET')
+  ).length;
 }
 
 describe('InvoicePanel', () => {
@@ -191,5 +211,78 @@ describe('InvoicePanel', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save payment' }));
     expect(await screen.findByText(/payment amount greater than 0/i)).toBeTruthy();
     expect(posts.filter((p) => p.url.includes('/pay'))).toHaveLength(0);
+  });
+
+  it('records a partial payment without claiming the invoice is paid', async () => {
+    const posts = [];
+    const invoices = [{
+      invoice_id: 11, invoice_number: 'INV-11', status: 'shipped',
+      approx_ship_date: '2026-09-10', actual_ship_date: '2026-09-12', notes: null,
+      created_at: '2026-09-01 10:00:00',
+      amount: 1200, paid_amount: 800,
+    }];
+    // A partial payment leaves the invoice short of paid.
+    renderPanel({ invoices, posts, payStatus: 'shipped' });
+    fireEvent.click(await screen.findByRole('button', { name: 'Record payment' }));
+    fireEvent.change(await screen.findByLabelText('Payment amount'), { target: { value: '100' } });
+    fireEvent.change(screen.getByLabelText('Payment date'), { target: { value: '2026-09-15' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save payment' }));
+    await waitFor(() => expect(posts.filter((p) => p.url.includes('/pay'))).toHaveLength(1));
+    await waitFor(() => expect(toast.success).toHaveBeenCalled());
+    expect(toast.success).toHaveBeenCalledWith('Payment recorded');
+    expect(toast.success).not.toHaveBeenCalledWith('Invoice paid');
+  });
+
+  it('announces paid only when the pay response says paid', async () => {
+    const posts = [];
+    const invoices = [{
+      invoice_id: 11, invoice_number: 'INV-11', status: 'shipped',
+      approx_ship_date: '2026-09-10', actual_ship_date: '2026-09-12', notes: null,
+      created_at: '2026-09-01 10:00:00',
+      amount: 1200, paid_amount: 800,
+    }];
+    renderPanel({ invoices, posts, payStatus: 'paid' });
+    fireEvent.click(await screen.findByRole('button', { name: 'Record payment' }));
+    fireEvent.change(await screen.findByLabelText('Payment amount'), { target: { value: '400' } });
+    fireEvent.change(screen.getByLabelText('Payment date'), { target: { value: '2026-09-15' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save payment' }));
+    await waitFor(() => expect(posts.filter((p) => p.url.includes('/pay'))).toHaveLength(1));
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Invoice paid'));
+  });
+
+  it('voids an invoice after confirmation and refetches', async () => {
+    const posts = [];
+    const onChanged = vi.fn();
+    renderPanel({ posts, onChanged });
+    expect(await screen.findByText('INV-1')).toBeTruthy();
+    expect(invoiceGetCount()).toBe(1);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Void invoice INV-1' }));
+    // The app confirm pattern names the destructive action.
+    fireEvent.click(await screen.findByRole('button', { name: 'Void' }));
+
+    await waitFor(() => expect(posts.deletes).toHaveLength(1));
+    expect(posts.deletes[0].url).toContain('/api/sales/5/invoices/7');
+    expect(toast.success).toHaveBeenCalledWith('Invoice voided');
+    await waitFor(() => expect(invoiceGetCount()).toBeGreaterThan(1));
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+  });
+
+  it('toasts the server error when voiding fails', async () => {
+    const posts = [];
+    renderPanel({ posts, deleteStatus: 404, deleteBody: { error: 'Invoice not found for this sale' } });
+    fireEvent.click(await screen.findByRole('button', { name: 'Void invoice INV-1' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Void' }));
+
+    await waitFor(() => expect(posts.deletes).toHaveLength(1));
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Invoice not found for this sale'));
+    expect(toast.success).not.toHaveBeenCalledWith('Invoice voided');
+  });
+
+  it('hides invoice actions (including void) for non-admins', async () => {
+    renderPanel({ isAdmin: false });
+    expect(await screen.findByText('INV-1')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Add invoice' })).toBeNull();
+    expect(screen.queryByRole('button', { name: /void invoice/i })).toBeNull();
   });
 });

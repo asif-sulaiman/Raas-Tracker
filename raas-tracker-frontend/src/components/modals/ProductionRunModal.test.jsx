@@ -38,10 +38,16 @@ const SALES = [
 const PRODUCTS = [{ product_name: 'Cleaner', quantity: 5000, unit: 'KG', item_no: '1001001' }];
 const INVOICES = [{ invoice_id: 31, invoice_number: 'INV-31', status: 'issued' }];
 
-function installFetch({ companies = COMPANIES, produceStatus = 201, produceBody = { runs: [] } } = {}) {
+function installFetch({ companies = COMPANIES, produceStatus = 201, produceBody = { runs: [] }, invoices = INVOICES, sales = SALES, invoiceStatus = 201, invoiceBody = null } = {}) {
   const posts = [];
+  const invoicePosts = [];
+  const calls = [];
+  posts.invoicePosts = invoicePosts;
+  posts.calls = calls;
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
     const u = String(url);
+    const method = options?.method || 'GET';
+    calls.push({ url: u, method });
     if (u.includes('/api/auth/me')) {
       return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
     }
@@ -52,8 +58,14 @@ function installFetch({ companies = COMPANIES, produceStatus = 201, produceBody 
     if (u.includes('/api/companies')) return jsonResponse(companies);
     if (u.includes('/api/recipes')) return jsonResponse(RECIPES);
     if (u.includes('/api/production-source')) return jsonResponse({ sale_id: 5, products: PRODUCTS });
-    if (u.includes('/invoices')) return jsonResponse(INVOICES);
-    if (u.includes('/api/sales')) return jsonResponse(SALES);
+    if (u.includes('/invoices') && method === 'POST') {
+      const body = options?.body ? JSON.parse(options.body) : null;
+      invoicePosts.push({ url: u, body });
+      const created = invoiceBody || { invoice_id: 42, invoice_number: body?.invoice_number, status: 'planned' };
+      return jsonResponse(created, invoiceStatus < 400, invoiceStatus);
+    }
+    if (u.includes('/invoices')) return jsonResponse(invoices);
+    if (u.includes('/api/sales')) return jsonResponse(sales);
     return jsonResponse({});
   }));
   return posts;
@@ -147,20 +159,101 @@ describe('ProductionRunModal', () => {
     expect(posts[0].body.production_date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
     await waitFor(() => expect(onSaved).toHaveBeenCalled());
     expect(toast.success).toHaveBeenCalled();
+    // Picking an existing invoice never creates a row.
+    expect(posts.invoicePosts).toHaveLength(0);
   });
 
-  it('accepts a new invoice number typed inline', async () => {
+  it('creates the invoice row before producing when a new number is typed', async () => {
     const posts = installFetch();
     renderModal();
 
     await pickCompanyAndPi();
     fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
     fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-NEW-7' } });
+    // The fixture sale already has an invoice row, so an amount is required.
+    fireEvent.change(screen.getByLabelText('Amount'), { target: { value: '500' } });
     fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
 
     await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts.invoicePosts).toHaveLength(1);
+    expect(posts.invoicePosts[0].url).toContain('/api/sales/5/invoices');
+    expect(posts.invoicePosts[0].body).toEqual({ invoice_number: 'INV-NEW-7', amount: 500 });
+    // The invoice POST ran before the produce POST.
+    const invIdx = posts.calls.findIndex((c) => c.url.endsWith('/api/sales/5/invoices') && c.method === 'POST');
+    const prodIdx = posts.calls.findIndex((c) => c.url.includes('/produce'));
+    expect(invIdx).toBeGreaterThanOrEqual(0);
+    expect(prodIdx).toBeGreaterThan(invIdx);
     expect(posts[0].body.invoice_number).toBe('INV-NEW-7');
-    expect(posts[0].body.invoice_ids).toBeUndefined();
+    expect(posts[0].body.invoice_ids).toEqual([42]);
+  });
+
+  it('prefills the sale remaining as the new-invoice amount', async () => {
+    installFetch({
+      sales: [{ id: 5, pi_number: 'PI-9', client_name: 'Acme LLC', company_id: 7, total_value: 5000 }],
+      invoices: [
+        { invoice_id: 31, invoice_number: 'INV-31', status: 'booked', amount: 1200, paid_amount: 200 },
+        { invoice_id: 32, invoice_number: 'INV-32', status: 'planned', amount: 800, paid_amount: 0 },
+      ],
+    });
+    renderModal();
+
+    await pickCompanyAndPi();
+    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
+    // 5000 − 1200 − 800, computed in cents.
+    expect((await screen.findByLabelText('Amount')).value).toBe('3000');
+  });
+
+  it('leaves the amount blank and omits it for a sale with no invoices', async () => {
+    const posts = installFetch({ invoices: [] });
+    renderModal();
+
+    await pickCompanyAndPi();
+    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
+    fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-FIRST' } });
+    expect(screen.getByLabelText('Amount').value).toBe('');
+    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
+
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts.invoicePosts).toHaveLength(1);
+    // Blank stays omitted so the server defaults it to the sale total.
+    expect(posts.invoicePosts[0].body).toEqual({ invoice_number: 'INV-FIRST' });
+    expect(posts[0].body.invoice_ids).toEqual([42]);
+  });
+
+  it('requires an amount for a new invoice when the sale already has invoices', async () => {
+    const posts = installFetch();
+    renderModal();
+
+    await pickCompanyAndPi();
+    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
+    fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-NEW-8' } });
+    // No sale total in this fixture, so nothing is prefilled — blank is blocked.
+    expect(screen.getByLabelText('Amount').value).toBe('');
+    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
+
+    expect(await screen.findByText('Amount is required when the sale already has invoices')).toBeTruthy();
+    expect(posts.invoicePosts).toHaveLength(0);
+    expect(posts).toHaveLength(0);
+  });
+
+  it('shows the invoice-create error inline and does not produce', async () => {
+    const posts = installFetch({
+      invoiceStatus: 400,
+      invoiceBody: { error: 'Invoice amounts would exceed the sale total' },
+    });
+    const { onSaved } = renderModal();
+
+    await pickCompanyAndPi();
+    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
+    fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-BIG' } });
+    fireEvent.change(screen.getByLabelText('Amount'), { target: { value: '999999' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
+
+    expect(await screen.findByText('Invoice amounts would exceed the sale total')).toBeTruthy();
+    expect(posts.invoicePosts).toHaveLength(1);
+    expect(posts).toHaveLength(0);
+    expect(onSaved).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
   });
 
   it('sends every recipe row and uses the first row for production_qty', async () => {

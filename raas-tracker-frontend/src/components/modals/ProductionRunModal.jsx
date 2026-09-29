@@ -4,7 +4,7 @@ import Modal from './Modal';
 import Button from '../ui/Button';
 import { useAuth } from '../../context/AuthContext';
 import { toast } from 'sonner';
-import { formatNumber } from '../../utils/format';
+import { formatNumber, toCents, fromCents } from '../../utils/format';
 
 const inputCls =
   'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
@@ -29,6 +29,7 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
 
   const [invoiceChoice, setInvoiceChoice] = useState('');
   const [newInvoiceNumber, setNewInvoiceNumber] = useState('');
+  const [newInvoiceAmount, setNewInvoiceAmount] = useState('');
   const [materialNumber, setMaterialNumber] = useState('');
   const [packing, setPacking] = useState('');
   const [batchNumber, setBatchNumber] = useState('');
@@ -55,6 +56,7 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
     setLoadingSource(false);
     setInvoiceChoice('');
     setNewInvoiceNumber('');
+    setNewInvoiceAmount('');
     setMaterialNumber('');
     setPacking('');
     setBatchNumber('');
@@ -98,6 +100,7 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
     setLoadingSource(false);
     setInvoiceChoice('');
     setNewInvoiceNumber('');
+    setNewInvoiceAmount('');
     setRowField(0, 'qty', defaultQty());
   };
 
@@ -112,6 +115,7 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
     setInvoices([]);
     setInvoiceChoice('');
     setNewInvoiceNumber('');
+    setNewInvoiceAmount('');
     if (!value) {
       setRowField(0, 'qty', defaultQty());
       setLoadingSource(false);
@@ -137,6 +141,33 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
       setError(err.message || 'Could not load PI details');
     } finally {
       setLoadingSource(false);
+    }
+  };
+
+  // Sale remaining in integer cents: sale total minus the amounts already
+  // invoiced, clamped at zero (never float subtraction). Null when the sale
+  // total is unknown, in which case no prefill is possible.
+  const selectedSale = allSales.find((s) => String(s.id) === String(saleId));
+  const invoicedCents = invoices.reduce((sum, inv) => sum + toCents(inv.amount), 0);
+  const saleTotalCents =
+    selectedSale?.total_value === null || selectedSale?.total_value === undefined
+      ? null
+      : toCents(selectedSale.total_value);
+  const remainingCents = saleTotalCents === null ? null : Math.max(0, saleTotalCents - invoicedCents);
+  const saleHasInvoices = invoices.length > 0;
+
+  const handleInvoiceChoiceChange = (value) => {
+    setInvoiceChoice(value);
+    if (value === 'new') {
+      // Prefill the unbilled remainder so a follow-up invoice defaults to
+      // exactly what's left. Blank-optional for a sale's first invoice.
+      if (saleHasInvoices && remainingCents !== null) {
+        setNewInvoiceAmount(String(fromCents(remainingCents)));
+      } else {
+        setNewInvoiceAmount('');
+      }
+    } else {
+      setNewInvoiceAmount('');
     }
   };
 
@@ -178,9 +209,59 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
       return;
     }
 
-    const chosen = invoices.find((inv) => String(inv.invoice_id) === invoiceChoice);
-    const invoiceNumber =
-      invoiceChoice === 'new' ? newInvoiceNumber.trim() : chosen?.invoice_number || '';
+    const isNewInvoice = invoiceChoice === 'new';
+    const trimmedNewNumber = newInvoiceNumber.trim();
+    if (isNewInvoice && !trimmedNewNumber) {
+      setError('New invoice number is required');
+      return;
+    }
+    // The server requires an amount for every invoice after the first, so
+    // validate before any POST. Blank stays omitted for a first invoice and
+    // the server defaults it to the sale total.
+    let newInvoiceBodyAmount;
+    if (isNewInvoice) {
+      const rawAmount = newInvoiceAmount.trim();
+      if (saleHasInvoices && !rawAmount) {
+        setError('Amount is required when the sale already has invoices');
+        return;
+      }
+      if (rawAmount) {
+        const value = parseFloat(rawAmount.replace(/,/g, ''));
+        if (Number.isNaN(value) || value < 0) {
+          setError('Enter an amount of 0 or more');
+          return;
+        }
+        newInvoiceBodyAmount = fromCents(toCents(value));
+      }
+    }
+
+    setSaving(true);
+    // A typed invoice number is free text until it exists as a row: create it
+    // first so produce can link the run via invoice_ids. A failed create (400
+    // over total, 409 duplicate) blocks the run — the error shows inline.
+    let createdInvoiceId = null;
+    let invoiceNumber;
+    if (isNewInvoice) {
+      const invBody = { invoice_number: trimmedNewNumber };
+      if (newInvoiceBodyAmount !== undefined) invBody.amount = newInvoiceBodyAmount;
+      try {
+        const invRes = await apiFetch(`/api/sales/${encodeURIComponent(saleId)}/invoices`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(invBody),
+        });
+        const created = await invRes.json();
+        createdInvoiceId = created?.invoice_id ?? created?.id ?? null;
+        invoiceNumber = created?.invoice_number || trimmedNewNumber;
+      } catch (err) {
+        setError(err.message || 'Could not create invoice');
+        setSaving(false);
+        return;
+      }
+    } else {
+      const chosen = invoices.find((inv) => String(inv.invoice_id) === invoiceChoice);
+      invoiceNumber = chosen?.invoice_number || '';
+    }
 
     const body = {
       company_id: Number(companyId),
@@ -193,11 +274,12 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
       sale_ids: [Number(saleId)],
       recipes: rows,
     };
-    if (invoiceChoice && invoiceChoice !== 'new') {
+    if (createdInvoiceId !== null) {
+      body.invoice_ids = [createdInvoiceId];
+    } else if (invoiceChoice && invoiceChoice !== 'new') {
       body.invoice_ids = [Number(invoiceChoice)];
     }
 
-    setSaving(true);
     try {
       await apiFetch(`/api/recipes/${encodeURIComponent(rows[0].recipe_name)}/produce`, {
         method: 'POST',
@@ -322,7 +404,7 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
             <select
               aria-label="Invoice number"
               value={invoiceChoice}
-              onChange={(e) => setInvoiceChoice(e.target.value)}
+              onChange={(e) => handleInvoiceChoiceChange(e.target.value)}
               disabled={!saleId || loadingSource}
               className={inputCls}
             >
@@ -349,16 +431,42 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
             />
           </div>
           {invoiceChoice === 'new' && (
-            <div className="col-span-2">
-              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">New invoice number</label>
-              <input
-                aria-label="New invoice number"
-                type="text"
-                value={newInvoiceNumber}
-                onChange={(e) => setNewInvoiceNumber(e.target.value)}
-                placeholder="INV-2026-001"
-                className={inputCls}
-              />
+            <div className="col-span-2 grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">New invoice number</label>
+                <input
+                  aria-label="New invoice number"
+                  type="text"
+                  value={newInvoiceNumber}
+                  onChange={(e) => setNewInvoiceNumber(e.target.value)}
+                  placeholder="INV-2026-001"
+                  className={inputCls}
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="new-invoice-amount"
+                  className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5"
+                >
+                  Amount
+                </label>
+                <input
+                  id="new-invoice-amount"
+                  type="number"
+                  min="0"
+                  step="any"
+                  value={newInvoiceAmount}
+                  onChange={(e) => setNewInvoiceAmount(e.target.value)}
+                  placeholder="0.00"
+                  aria-required={saleHasInvoices}
+                  className={inputCls}
+                />
+              </div>
+              <p className="col-span-2 text-[11px] text-slate-400 dark:text-slate-500">
+                {saleHasInvoices
+                  ? `Required — this sale already has invoices${remainingCents !== null ? ` (remaining $${formatNumber(fromCents(remainingCents))})` : ''}.`
+                  : 'Optional — blank uses the sale total.'}
+              </p>
             </div>
           )}
         </div>
