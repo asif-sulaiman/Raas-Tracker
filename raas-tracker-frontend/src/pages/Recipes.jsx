@@ -11,7 +11,8 @@ import {
   AlertTriangle,
   Droplets,
   Hash,
-  Weight
+  Weight,
+  Factory
 } from 'lucide-react';
 import clsx from 'clsx';
 import Button from '../components/ui/Button';
@@ -21,6 +22,7 @@ import { formatNumber } from '../utils/format';
 import { useAuth } from '../context/AuthContext';
 import { useConfirm } from '../context/ConfirmContext';
 import { toast } from 'sonner';
+import ProductionRunModal from '../components/modals/ProductionRunModal';
 
 export default function Recipes() {
   const { apiFetch, user } = useAuth();
@@ -33,9 +35,10 @@ export default function Recipes() {
   const [selectedRecipe, setSelectedRecipe] = useState(null);
   const [recipeItems, setRecipeItems] = useState([]);
 
-  const [showCreateModal, setShowCreateModal] = useState(false);
+const [showCreateModal, setShowCreateModal] = useState(false);
   const [showDetail, setShowDetail] = useState(false);
   const [showEditMeta, setShowEditMeta] = useState(false);
+  const [showProductionRun, setShowProductionRun] = useState(false);
 
   const [newName, setNewName] = useState('');
   const [newYield, setNewYield] = useState('');
@@ -73,9 +76,11 @@ export default function Recipes() {
     })();
   }, [fetchData]);
 
-  const fetchRecipeDetail = async (name) => {
+  const fetchRecipeDetail = async (name, companyId) => {
     try {
-      const res = await apiFetch('/api/recipes/' + encodeURIComponent(name));
+      const res = await apiFetch(
+        '/api/recipes/' + encodeURIComponent(name) + '?company_id=' + encodeURIComponent(companyId)
+      );
       const data = await res.json();
       if (data.recipe) {
         setSelectedRecipe(data.recipe);
@@ -116,7 +121,7 @@ export default function Recipes() {
     }
   };
 
-  const handleDelete = async (name) => {
+  const handleDelete = async (name, companyId) => {
     const ok = await confirm({
       title: `Delete recipe "${name}"?`,
       message: 'The recipe and all its ingredients will be removed.',
@@ -125,7 +130,10 @@ export default function Recipes() {
     });
     if (!ok) return;
     try {
-      const res = await apiFetch('/api/recipes/' + encodeURIComponent(name), { method: 'DELETE' });
+      const res = await apiFetch(
+        '/api/recipes/' + encodeURIComponent(name) + '?company_id=' + encodeURIComponent(companyId),
+        { method: 'DELETE' }
+      );
       const data = await res.json();
       if (data.success) {
         if (showDetail && selectedRecipe?.name === name) setShowDetail(false);
@@ -145,6 +153,7 @@ export default function Recipes() {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          company_id: selectedRecipe.company_id,
           total_quantity: parseFloat(editYield) || selectedRecipe.total_quantity,
           water_percentage: parseFloat(editWater) || selectedRecipe.water_percentage
         })
@@ -153,7 +162,7 @@ export default function Recipes() {
       if (data.success) {
         setShowEditMeta(false);
         toast.success('Recipe updated');
-        fetchRecipeDetail(selectedRecipe.name);
+        fetchRecipeDetail(selectedRecipe.name, selectedRecipe.company_id);
         setLoading(true);
         fetchData();
       }
@@ -168,14 +177,14 @@ export default function Recipes() {
       const res = await apiFetch('/api/recipes/' + encodeURIComponent(selectedRecipe.name) + '/items', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chemical: addChemical, percentage: parseFloat(addPct) })
+        body: JSON.stringify({ chemical: addChemical, percentage: parseFloat(addPct), company_id: selectedRecipe.company_id })
       });
       const data = await res.json();
       if (data.success) {
         setAddChemical('');
         setAddPct('');
         toast.success('Ingredient added');
-        fetchRecipeDetail(selectedRecipe.name);
+        fetchRecipeDetail(selectedRecipe.name, selectedRecipe.company_id);
       } else {
         toast.error('Failed to add ingredient');
       }
@@ -191,7 +200,7 @@ export default function Recipes() {
         {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ percentage: parseFloat(editItemPct) })
+          body: JSON.stringify({ percentage: parseFloat(editItemPct), company_id: selectedRecipe.company_id })
         }
       );
       const data = await res.json();
@@ -199,7 +208,7 @@ export default function Recipes() {
         setEditItemId(null);
         setEditItemPct('');
         toast.success('Ingredient updated');
-        fetchRecipeDetail(selectedRecipe.name);
+        fetchRecipeDetail(selectedRecipe.name, selectedRecipe.company_id);
       }
     } catch (err) {
       toast.error(err.message || 'Could not update ingredient');
@@ -215,13 +224,14 @@ export default function Recipes() {
     if (!ok) return;
     try {
       const res = await apiFetch(
-        '/api/recipes/' + encodeURIComponent(selectedRecipe.name) + '/items/' + encodeURIComponent(chem),
+        '/api/recipes/' + encodeURIComponent(selectedRecipe.name) + '/items/' + encodeURIComponent(chem) +
+          '?company_id=' + encodeURIComponent(selectedRecipe.company_id),
         { method: 'DELETE' }
       );
       const data = await res.json();
       if (data.success) {
         toast.success('Ingredient removed');
-        fetchRecipeDetail(selectedRecipe.name);
+        fetchRecipeDetail(selectedRecipe.name, selectedRecipe.company_id);
       }
     } catch (err) {
       toast.error(err.message || 'Could not remove ingredient');
@@ -266,14 +276,19 @@ export default function Recipes() {
               {recipeItems.length} ingredient{recipeItems.length !== 1 ? 's' : ''}
             </p>
           </div>
-          <div className="flex gap-2">
+<div className="flex gap-2">
             <Button variant="secondary" size="sm" icon={Edit3} onClick={() => {
               setEditYield(String(selectedRecipe.total_quantity));
               setEditWater(String(selectedRecipe.water_percentage));
               setShowEditMeta(true);
             }}>Edit</Button>
             {isAdmin && (
-              <Button variant="danger" size="sm" icon={Trash2} onClick={() => handleDelete(selectedRecipe.name)}>Delete</Button>
+              <Button variant="danger" size="sm" icon={Trash2} onClick={() => handleDelete(selectedRecipe.name, selectedRecipe.company_id)}>Delete</Button>
+            )}
+            {isAdmin && recipeItems.length > 0 && (
+              <Button variant="primary" size="sm" icon={Factory} onClick={() => setShowProductionRun(true)}>
+                Go for Production
+              </Button>
             )}
           </div>
         </div>
@@ -455,6 +470,14 @@ export default function Recipes() {
             </div>
           </div>
         </Modal>
+
+        <ProductionRunModal
+          isOpen={showProductionRun}
+          onClose={() => setShowProductionRun(false)}
+          recipe={selectedRecipe}
+          recipeItems={recipeItems}
+          onSaved={() => setShowProductionRun(false)}
+        />
       </div>
     );
   }
@@ -512,12 +535,12 @@ export default function Recipes() {
                 <td className="px-4 py-3 text-slate-500 dark:text-slate-400 text-xs">{recipe.created || '—'}</td>
                 <td className="px-4 py-3">
                   <div className="flex items-center justify-end gap-1.5">
-                    <Button variant="ghost" size="sm" icon={Eye} onClick={() => fetchRecipeDetail(recipe.name)}>
+                    <Button variant="ghost" size="sm" icon={Eye} onClick={() => fetchRecipeDetail(recipe.name, recipe.company_id)}>
                       View
                     </Button>
                     {isAdmin && (
                       <button
-                        onClick={() => handleDelete(recipe.name)}
+                        onClick={() => handleDelete(recipe.name, recipe.company_id)}
                         className="p-1.5 rounded-md text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors cursor-pointer"
                         title="Delete recipe"
                       >
