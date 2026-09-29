@@ -152,10 +152,11 @@ def get_sale_by_id(conn: psycopg.Connection, sale_id: int) -> Optional[Dict[str,
         ).fetchall()
     ]
     sale["invoices"] = list_invoices(conn, sale_id)
-    sale["invoice_total"] = sum(
-        (i["quantity"] or 0) * (i["unit_price"] or 0) for i in sale["items"]
-    )
-    sale["total_paid"] = sum(p["payment_amount"] or 0 for p in sale["payments"])
+    # Same SQL-rounded helpers the payment paths use, so the displayed balance
+    # can never drift from what record_sale_payment / update_sale_payment_record
+    # report (Python float multiplication used to be unrounded here).
+    sale["invoice_total"] = get_sale_invoice_total(conn, sale_id)
+    sale["total_paid"] = get_sale_total_paid(conn, sale_id)
     sale["balance"] = sale["invoice_total"] - sale["total_paid"]
     sale["shipments"] = list_shipments(conn, sale_id)
     return sale
@@ -344,11 +345,12 @@ def record_sale_payment(conn: psycopg.Connection, sale_id: int, payment_date: st
     
     cursor = conn.execute(
         """INSERT INTO sale_payments (sale_id, payment_date, payment_amount, notes)
-           VALUES (%s, %s, %s, %s) RETURNING id""",
+           VALUES (%s, %s, %s, %s) RETURNING id, invoice_id""",
         (sale_id, payment_date, payment_amount, notes)
     )
-    payment_id = cursor.fetchone()[0]
+    payment_id, payment_invoice_id = cursor.fetchone()
     _sync_sale_payment_totals(conn, sale_id)
+    _resync_invoice_payment_status(conn, payment_invoice_id)
     total_paid = get_sale_total_paid(conn, sale_id)
     invoice_total = get_sale_invoice_total(conn, sale_id)
     old_balance = invoice_total - (total_paid - payment_amount)
@@ -395,12 +397,13 @@ def update_sale_payment_record(conn: psycopg.Connection, payment_id: int,
                                payment_amount: Optional[float] = None,
                                notes: Optional[str] = None) -> bool:
     """Edit a payment record. Reverts a completed sale to payment_due
-    if the new total no longer covers the invoice."""
-    row = conn.execute("SELECT sale_id, payment_amount FROM sale_payments WHERE id = %s",
+    if the new total no longer covers the invoice, and re-derives the linked
+    invoice's paid status."""
+    row = conn.execute("SELECT sale_id, payment_amount, invoice_id FROM sale_payments WHERE id = %s",
                        (payment_id,)).fetchone()
     if not row:
         return False
-    sale_id, old_amount = row[0], row[1]
+    sale_id, old_amount, invoice_id = row[0], row[1], row[2]
     fields, vals = [], []
     if payment_date is not None:
         fields.append("payment_date = %s")
@@ -417,6 +420,7 @@ def update_sale_payment_record(conn: psycopg.Connection, payment_id: int,
         vals.append(payment_id)
         conn.execute(f"UPDATE sale_payments SET {', '.join(fields)} WHERE id = %s", vals)
     _sync_sale_payment_totals(conn, sale_id)
+    _resync_invoice_payment_status(conn, invoice_id)
     total_paid = get_sale_total_paid(conn, sale_id)
     invoice_total = get_sale_invoice_total(conn, sale_id)
     new_amount = payment_amount if payment_amount is not None else old_amount
@@ -435,14 +439,17 @@ def update_sale_payment_record(conn: psycopg.Connection, payment_id: int,
 
 
 def delete_sale_payment_record(conn: psycopg.Connection, payment_id: int) -> bool:
-    """Delete a payment record and re-sync totals."""
-    row = conn.execute("SELECT sale_id, payment_amount FROM sale_payments WHERE id = %s",
+    """Delete a payment record, re-sync totals, and re-derive the linked
+    invoice's paid status (the invoice may no longer be covered)."""
+    row = conn.execute("SELECT sale_id, payment_amount, invoice_id FROM sale_payments WHERE id = %s",
                        (payment_id,)).fetchone()
     if not row:
         return False
     sale_id = row[0]
+    invoice_id = row[2]
     conn.execute("DELETE FROM sale_payments WHERE id = %s", (payment_id,))
     _sync_sale_payment_totals(conn, sale_id)
+    _resync_invoice_payment_status(conn, invoice_id)
     total_paid = get_sale_total_paid(conn, sale_id)
     invoice_total = get_sale_invoice_total(conn, sale_id)
     old_balance = invoice_total - (total_paid + row[1])
@@ -922,7 +929,7 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
     if filters.get("product_name"):
         where_clauses.append("""EXISTS (
             SELECT 1 FROM sale_items si3
-            WHERE si3.sale_id = base.sale_id
+            WHERE si3.sale_id = {alias}.sale_id
             AND si3.product_name ILIKE %(product_name)s
         )""")
         params["product_name"] = f"%{filters['product_name']}%"
@@ -947,7 +954,17 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
         """)
         params["payment_status"] = filters["payment_status"]
 
-    where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+    # The product filter is the only clause that names the base relation, so it
+    # is rendered once per query: the summary collapses `base` to one row per
+    # sale inside a CTE aliased `b`, while the detail query selects FROM base.
+    # Only the static alias is substituted — every user value stays a %(name)s
+    # placeholder.
+    def _where_sql(alias):
+        rendered = (c.replace("{alias}", alias) for c in where_clauses)
+        return "WHERE " + " AND ".join(rendered) if where_clauses else ""
+
+    where_sql = _where_sql("base")
+    sale_where_sql = _where_sql("b")
 
     # Build the period truncation expression using the CTE column
     if group_by == "month":
@@ -964,7 +981,19 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
         period_trunc = "DATE '1900-01-01'"
         period_end = "DATE '2100-12-31'"
 
-    # Summary query with period grouping
+    # Summary query with period grouping.
+    #
+    # `base` carries ONE ROW PER LINE ITEM, so the sale-level scalars
+    # (received_amount / sale_total / maturity_date) repeat on every row of the
+    # same sale: a bare SUM(received_amount) multiplies the money by the item
+    # count (a 3-item sale of 3000 paid 1000 reported 3000 received).
+    # sale_rows collapses `base` to ONE ROW PER SALE (MAX keeps the single
+    # copy of each sale-level scalar, SUM(total_price) keeps the per-item gross
+    # ), so the outer per-period aggregates count the money exactly once per
+    # sale while gross_sales stays a per-item sum. Money follows the file
+    # convention COALESCE(ROUND(SUM(...)::numeric, 2)::float8, 0) — no float
+    # drift — and due is clamped with GREATEST(..., 0) so an overpaid sale
+    # reports 0 due, matching get_commercial_report's Python clamp.
     summary_query = f"""
         WITH base AS (
             SELECT
@@ -990,18 +1019,33 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
             FROM sales s
             LEFT JOIN sale_items si ON si.sale_id = s.id
             LEFT JOIN companies c ON c.id = s.company_id
+        ),
+        sale_rows AS (
+            SELECT
+                b.sale_id,
+                MAX(b.date_anchor_col) AS date_anchor_col,
+                MAX(b.customer_name) AS customer_name,
+                MAX(b.company_id) AS company_id,
+                MAX(b.stage) AS stage,
+                MAX(b.maturity_date) AS maturity_date,
+                MAX(b.received_amount) AS received_amount,
+                MAX(b.sale_total) AS sale_total,
+                SUM(b.total_price) AS gross_sales
+            FROM base b
+            {sale_where_sql}
+            GROUP BY b.sale_id
         )
         SELECT
             {period_trunc} AS period_start,
             {period_end} AS period_end,
             COUNT(DISTINCT sale_id) AS order_count,
-            SUM(total_price) AS gross_sales,
-            SUM(received_amount) AS total_received,
-            SUM(sale_total - received_amount) AS total_due,
-            SUM(CASE WHEN maturity_date::date < CURRENT_DATE AND sale_total - received_amount > 0
-                     THEN sale_total - received_amount ELSE 0 END) AS total_overdue
-        FROM base
-        {where_sql}
+            COALESCE(ROUND(SUM(gross_sales)::numeric, 2)::float8, 0) AS gross_sales,
+            COALESCE(ROUND(SUM(received_amount)::numeric, 2)::float8, 0) AS total_received,
+            COALESCE(ROUND(SUM(GREATEST(sale_total - received_amount, 0))::numeric, 2)::float8, 0) AS total_due,
+            COALESCE(ROUND(SUM(CASE WHEN maturity_date::date < CURRENT_DATE
+                                     AND sale_total - received_amount > 0
+                                  THEN sale_total - received_amount ELSE 0 END)::numeric, 2)::float8, 0) AS total_overdue
+        FROM sale_rows
         GROUP BY period_start, period_end
         ORDER BY period_start DESC
     """
@@ -1336,6 +1380,69 @@ def _sync_invoice_paid_status(conn: psycopg.Connection, invoice_id: int) -> bool
     return cur.rowcount > 0
 
 
+def _invoice_unpaid_status(conn: psycopg.Connection, invoice_id: int) -> str:
+    """Furthest non-paid lifecycle state provable from the invoice row.
+
+    ``paid`` does not record the state it replaced, so an invoice whose
+    coverage disappeared is returned to the deepest state still evidenced by
+    its own dates: shipped (actual_ship_date) -> booked (approx_ship_date)
+    -> planned. 'produced' is not derivable from the invoice row alone.
+    """
+    row = conn.execute(
+        "SELECT actual_ship_date, approx_ship_date FROM invoices WHERE id = %s",
+        (invoice_id,)
+    ).fetchone()
+    if row:
+        if row[0]:
+            return "shipped"
+        if row[1]:
+            return "booked"
+    return "planned"
+
+
+def _resync_invoice_payment_status(conn: psycopg.Connection,
+                                   invoice_id: Optional[int]) -> bool:
+    """Re-derive an invoice's paid status from its payments, BOTH directions.
+
+    Single entry point for every payment write path (insert / edit / delete):
+    a payment that no longer covers the invoice must not leave it stuck at
+    'paid' with paid_amount 0 — a permanent silent financial misstatement.
+
+    * covered  -> ``_sync_invoice_paid_status`` (forward-only flip to 'paid').
+    * not covered and status == 'paid' -> demote to ``_invoice_unpaid_status``
+      (never lower than what the invoice's own dates prove).
+    * otherwise -> no write (a partial payment leaves the status untouched).
+    """
+    if invoice_id is None:
+        return False
+    row = conn.execute(
+        "SELECT amount, status FROM invoices WHERE id = %s", (invoice_id,)
+    ).fetchone()
+    if not row:
+        return False
+    amount, status = row[0], row[1]
+    paid = _invoice_paid_amount(conn, invoice_id)
+    # Same coverage rule as _sync_invoice_paid_status: legacy NULL amounts
+    # (unknown) are paid by ANY payment; amount 0 is paid at creation.
+    covered = (paid > 0) if amount is None else (paid >= float(amount))
+    if covered:
+        return _sync_invoice_paid_status(conn, invoice_id)
+    if status != "paid":
+        return False
+    restored = _invoice_unpaid_status(conn, invoice_id)
+    cur = conn.execute(
+        "UPDATE invoices SET status = %s WHERE id = %s AND status = 'paid'",
+        (restored, invoice_id)
+    )
+    if cur.rowcount > 0:
+        stated = "NULL" if amount is None else f"{float(amount):g}"
+        log_audit_action(conn, "INVOICE_PAYMENT_REVERSED", "invoice", invoice_id,
+                         old_value="paid",
+                         new_value=f"status={restored} paid_to_date={paid:g} "
+                                   f"amount={stated}")
+    return cur.rowcount > 0
+
+
 def mark_invoice_paid(conn: psycopg.Connection, invoice_id: int,
                       payment_amount: float, payment_date: str,
                       notes: Optional[str] = None, created_by: Optional[int] = None) -> Dict[str, Any]:
@@ -1366,7 +1473,7 @@ def mark_invoice_paid(conn: psycopg.Connection, invoice_id: int,
     )
     payment_id = cursor.fetchone()[0]
     _sync_sale_payment_totals(conn, sale_id)
-    _sync_invoice_paid_status(conn, invoice_id)
+    _resync_invoice_payment_status(conn, invoice_id)
     actual_status = conn.execute(
         "SELECT status FROM invoices WHERE id = %s", (invoice_id,)
     ).fetchone()[0]
