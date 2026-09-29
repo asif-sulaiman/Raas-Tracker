@@ -4,8 +4,15 @@ import Button from '../ui/Button';
 import { formatNumber, formatDate } from '../../utils/format';
 import { STAGE_BADGE, isOverdue } from '../../utils/sales';
 
+const SHIPMENT_SUB_STEPS = {
+  production_running: { label: 'Production running', variant: 'pending' },
+  production_done: { label: 'Production done', variant: 'info' },
+  ship_booked: { label: 'Ship booked', variant: 'new' },
+};
+
 export default function SaleCard({ sale, actionLabel, actionVariant = 'primary', onAction, onView, onDelete }) {
   const total = sale.total_value ?? 0;
+  const subStep = sale.stage === 'shipment_ongoing' ? SHIPMENT_SUB_STEPS[sale.shipment_status] : null;
 
   return (
     <div className="rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-3.5 shadow-xs hover:shadow-md transition-shadow">
@@ -29,6 +36,14 @@ export default function SaleCard({ sale, actionLabel, actionVariant = 'primary',
           )}
         </div>
       </div>
+
+      {subStep && (
+        <div className="mt-2">
+          <Badge variant={subStep.variant} size="xs">
+            {subStep.label}
+          </Badge>
+        </div>
+      )}
 
       <div className="flex items-center gap-1.5 mt-2.5 text-xs text-slate-500 dark:text-slate-400">
         <Package className="h-3.5 w-3.5 shrink-0" />

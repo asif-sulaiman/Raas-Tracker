@@ -82,11 +82,15 @@ export default function Sales() {
     } else if (stageDef.action === 'payment') {
       setPaymentSale(sale);
     } else if (stageDef.action === 'move') {
-      handleMove(sale.id);
+      handleMove(sale);
     }
   };
 
-  const handleMove = async (saleId, notes) => {
+  const handleMove = async (sale, notes) => {
+    const saleId = sale?.id ?? sale;
+    // Reminder target: the lc_received → shipment_ongoing hop is where an
+    // invoice number first becomes meaningful.
+    const enteringShipment = sale?.stage === 'lc_received';
     setMovingId(saleId);
     try {
       await apiFetch(`/api/sales/${saleId}/move`, {
@@ -95,6 +99,18 @@ export default function Sales() {
         body: JSON.stringify({ notes: notes || '' }),
       });
       toast.success('Sale moved to next stage');
+      if (enteringShipment) {
+        // Non-blocking reminder only — the move has already succeeded above.
+        try {
+          const res = await apiFetch(`/api/sales/${saleId}/invoices`);
+          const invoices = await res.json();
+          if (Array.isArray(invoices) && invoices.length === 0) {
+            toast.warning('No invoice yet — add an invoice number so production and shipping can be tracked.');
+          }
+        } catch {
+          // Best effort: never surface an error after a successful move.
+        }
+      }
     } catch (err) {
       toast.error(err.message || 'Could not move sale');
     } finally {

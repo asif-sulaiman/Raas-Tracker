@@ -4,6 +4,7 @@ import Modal from '../modals/Modal';
 import Badge from '../ui/Badge';
 import Button from '../ui/Button';
 import ShipmentModal from './ShipmentModal';
+import InvoicePanel from './InvoicePanel';
 import { formatNumber, formatDate, formatDateTime, sumLineTotals, lineTotal } from '../../utils/format';
 import { STAGE_LABELS, STAGE_BADGE } from '../../utils/sales';
 import { useAuth } from '../../context/AuthContext';
@@ -476,6 +477,18 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
               </div>
             )}
           </div>
+
+          {sale.stage === 'shipment_ongoing' && (
+            <InvoicePanel
+              key={sale.id}
+              saleId={sale.id}
+              isAdmin={isAdmin}
+              onChanged={() => {
+                refresh(saleId);
+                onSaved?.();
+              }}
+            />
+          )}
 
           <div>
             <h4 className="text-sm font-semibold text-slate-800 dark:text-white mb-2">Comments</h4>
