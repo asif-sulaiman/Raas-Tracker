@@ -87,6 +87,22 @@ Backend only (frontend is a separate design lane).
 
 ---
 
+## 📊 Phase CR: Commercial Report Enhancement (Completed)
+
+Vertical slices for filtering, grouping, calendar navigation, and export on the live commercial report.
+
+| Task | Description | Files Touched | Acceptance |
+|---|---|---|---|
+| CR-1 ✅ | **Backend Filter Engine** — CTE-based query with date_anchor, date_from/to, customer_name (ILIKE), product_name (EXISTS), company_id, stage, payment_status, pagination | `sales.py`, `flask_app.py`, `tests/test_commercial_report.py` | `/api/reports/live/filtered` returns filtered detail rows |
+| CR-2 ✅ | **Frontend URL-Synced Filter Bar** — Quick Search, Date Anchor, Preset Range, Custom From/To, Stage, Payment Status, Company, Group By, Clear; state in URL | `CommercialFilters.jsx`, `datePresets.js`, `Reports.jsx` | Filters persist on refresh, shareable links, group_by toggles view |
+| CR-3 ✅ | **Expandable Period Table + Pagination** — Detail mode (19 cols) + Grouped mode (period headers with KPIs, expandable detail rows), skeleton loading | `CommercialTable.jsx`, `Reports.jsx` | Expand/collapse works, pagination, both modes render correctly |
+| CR-4 ✅ | **Backend Group-By Summary + Detail Items** — Period aggregation (month/week/year) with KPIs; detail items for expandable rows | `sales.py`, `flask_app.py` | `/api/reports/live/summary` returns periods with items for CR-3 |
+| CR-5 ✅ | **Frontend Calendar Navigator** — Prev/Next period, Date Anchor, Quick Presets (Month/Quarter/Year), Custom Dates, Clear; URL-synced | `CommercialCalendarNavigator.jsx`, `Reports.jsx` | Navigates periods, presets update dates, anchor changes refetch |
+| CR-6 ✅ | **Filtered Export** — Export button sends current filters; GET/POST endpoint returns CSV of filtered data | `flask_app.py`, `Reports.jsx`, `test_commercial_report.py` | Exported CSV matches UI filters |
+| CR-7 ✅ | **Full Gate + Docs** — pytest + vitest + oxlint + build pass; SPEC.md updated with new endpoints | `docs/SPEC.md`, `docs/plan.md` | All gates green, docs current |
+
+---
+
 ## 🔮 Phase M8: Future Features (Backlog)
 
 Not yet sliced — awaiting prioritization.

@@ -469,7 +469,10 @@ CREATE TABLE app_settings (
 | POST | `/api/reports/generate` | Session/Key (15/min) | Multi-recipe report JSON |
 | POST | `/api/reports/export` | Session/Key (15/min) | CSV export |
 | GET | `/api/reports/live` | Admin | Live commercial report — one row per sale item, sale-level payment fields repeated (P4) |
-| POST | `/api/reports/live/export` | Admin (15/min) | Commercial report CSV `{success, filename, content}` (P4) |
+| GET | `/api/reports/live/filtered` | Admin | Filtered commercial report — detail rows with date_anchor, date_from/to, customer_name, product_name, company_id, stage, payment_status, pagination |
+| GET | `/api/reports/live/summary` | Admin | Period-aggregated commercial report — month/week/year grouping with KPIs and optional detail items |
+| GET | `/api/reports/live/export` | Admin (15/min) | Commercial report CSV export with same filter params as `/live/filtered` |
+| POST | `/api/reports/live/export` | Admin (15/min) | Commercial report CSV `{success, filename, content}` with filter params in body |
 
 ### Audit & Notifications
 | Method | Path | Auth | Description |
