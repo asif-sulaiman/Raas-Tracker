@@ -1,12 +1,12 @@
 import { useSearchParams } from 'react-router-dom';
-import { Calendar, Filter, X, ChevronDown } from 'lucide-react';
+import { Filter, X } from 'lucide-react';
 import Button from '../ui/Button';
 import { DATE_PRESETS, dateAnchorOptions } from '../../utils/datePresets';
 
 export default function CommercialFilters({
   onFiltersChange,
   companies = [],
-  initialFilters = {},
+  _initialFilters = {},
 }) {
   const [searchParams, setSearchParams] = useSearchParams();
 

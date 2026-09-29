@@ -1,7 +1,6 @@
-import { ChevronLeft, ChevronRight, Calendar, Minus, Plus } from 'lucide-react';
+import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { useSearchParams } from 'react-router-dom';
 import Button from '../ui/Button';
-import clsx from 'clsx';
 import { DATE_PRESETS, dateAnchorOptions } from '../../utils/datePresets';
 
 // Parse YYYY-MM-DD as UTC date to avoid timezone issues

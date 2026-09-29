@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import React from 'react';
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
@@ -16,7 +16,7 @@ vi.mock('lucide-react', () => ({
 
 // Mock Button component
 vi.mock('../ui/Button', () => ({
-  default: ({ children, onClick, disabled, variant, size, className, 'aria-label': ariaLabel, ...props }) => (
+  default: ({ children, onClick, disabled, _variant, _size, className, 'aria-label': ariaLabel, ...props }) => (
     <button
       onClick={onClick}
       disabled={disabled}
