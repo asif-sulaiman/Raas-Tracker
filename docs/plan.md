@@ -103,6 +103,21 @@ Vertical slices for filtering, grouping, calendar navigation, and export on the 
 
 ---
 
+## 🏭 Phase GP: Go for Production & Invoicing (Completed)
+
+Vertical slices linking production runs to sale invoices: schema, lifecycle backend, Recipes
+"Go for Production" modal, pipeline invoice panel, amount/auto-paid rules.
+
+| Task | Description | Files Touched | Acceptance |
+|---|---|---|---|
+| S1 ✅ | **Production/invoice schema** — `invoices` (+ unique `(sale_id, invoice_number)`), `production_run_links`, `sales.shipment_status`, `sale_items.item_no`, `sale_payments.invoice_id`; `production_runs` gains `material_number/packing/invoice_number`, `sale_item_id` nullable; `_REQUIRED_SIG_TOKENS` entry so additive DDL isn't skipped by the schema-sig fast path | `raas_tracker/db.py` | Migrates existing DBs; gate green |
+| S2–S3 ✅ | **Invoice lifecycle + run links backend** — invoice create/list, book/ship/pay, sale completion, `production-source`, produce links run→sales/invoices with advance-only statuses (`paid` terminal); sale payloads gain `shipment_status`/`invoices[]`/`item_no` | `flask_app.py`, `raas_tracker/sales.py`, `raas_tracker/recipes.py`, `tests/test_invoices_production.py` | 12 new tests green; gate green |
+| S4 ✅ | **Go for Production modal** — company → PI/sale → invoice dropdown/new number → material number (auto from `item_no`) → packing → batch → date → qty → multi-recipe rows; Recipes detail calls now pass `company_id` (scoping fix) | `ProductionRunModal.jsx`, `Recipes.jsx` | Run created + linked; gate green |
+| S5 ✅ | **Pipeline invoice panel + sub-step badges** — InvoicePanel in SaleDetailModal (`shipment_ongoing`) with per-invoice book/ship/pay, amount + balance, completion money header; SaleCard badges (Production running / Production done / Ship booked); non-blocking no-invoice toast on `lc_received → shipment_ongoing` | `InvoicePanel.jsx`, `SaleCard.jsx`, `SaleDetailModal.jsx`, `Sales.jsx` | Actions + badges render; gate green |
+| S6 ✅ | **Invoice amount + auto-paid** — `invoices.amount` (NUMERIC(14,2), NULL = legacy), POST default = sale total, paid flip when `paid_amount >= amount` (0 → paid at creation, NULL → any payment), no-downgrade rules | `raas_tracker/db.py`, `flask_app.py`, `raas_tracker/sales.py`, `InvoicePanel.jsx`, `tests/test_invoice_amount.py` | 10 new tests green; backend 304 passed/8 skipped, frontend 234, oxlint 0, build OK |
+
+---
+
 ## 🔮 Phase M8: Future Features (Backlog)
 
 Not yet sliced — awaiting prioritization.

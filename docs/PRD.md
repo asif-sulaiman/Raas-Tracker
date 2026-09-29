@@ -2,7 +2,7 @@
 
 ## 1. Summary
 
-RAAS Tracker is a web-based application for chemical warehouse/factory inventory management, monthly reconciliation, recipe/production reports, file-upload-based stock comparison (PDF/Excel), and a sales pipeline (PI → LC → shipment → payment → completed) with PDF/`.docx` proforma invoice (PI) parsing. Flask backend serves a React 19 + Vite frontend. PostgreSQL (Supabase) is the database in every environment.
+RAAS Tracker is a web-based application for chemical warehouse/factory inventory management, monthly reconciliation, recipe/production reports, file-upload-based stock comparison (PDF/Excel), and a sales pipeline (PI → LC → shipment → payment → completed) with per-invoice production/shipment tracking and PDF/`.docx` proforma invoice (PI) parsing. Flask backend serves a React 19 + Vite frontend. PostgreSQL (Supabase) is the database in every environment.
 
 ## 2. Problem & Goals
 
@@ -47,13 +47,14 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 8. **Notification System:** Real-time bell icon, admin-scoped critical alerts (login failures)
 9. **Reason Codes:** Categorized reasons for mismatches/approvals (MEASUREMENT_ERROR, UNIT_CONVERSION…)
 10. **Setup Token:** First-admin creation (single-use, 60-min TTL, console-printed)
+11. **Go for Production & Invoicing:** one-click production run from a recipe, linked to the sale's invoices; per-invoice lifecycle (planned → produced → booked → shipped → paid), shipment sub-step badges on the pipeline, invoice panel + paid/total completion on the sale detail
 
 ### Future
-11. Multi-warehouse support
-12. Batch/lot tracking
-13. Role-based field-level permissions
-14. Advanced reporting (dashboard charts, trends)
-15. Email/webhook notifications
+12. Multi-warehouse support
+13. Batch/lot tracking
+14. Role-based field-level permissions
+15. Advanced reporting (dashboard charts, trends)
+16. Email/webhook notifications
 
 ## 5. User Flows
 
@@ -84,6 +85,13 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 2. Admin goes to **Users & Keys** → create/revoke users and API keys
 3. Audit logs (`/api/audit-logs`) trace all actions
 
+### Flow 6: Go for Production & Invoice Tracking
+1. Sale reaches `lc_received` → **Move** → `shipment_ongoing`; if the sale has no invoice yet, a warning toast reminds the user (non-blocking — the move still succeeds)
+2. Sale detail → **Invoice** panel → create invoice (invoice number + amount, defaults to the sale total)
+3. Recipes → detail → **Go for Production** → company → sale/PI → invoice (existing or new number) → material number (auto-filled from item no.), packing, batch, date, quantity, optional multi-recipe rows → production run created and linked
+4. Linked invoices advance `planned → produced`; pipeline card shows the shipment sub-step badge (Production running → Production done → Ship booked)
+5. Per invoice: **Book** (approx. ship date) → `booked`; **Ship** (actual date) → `shipped` + shipment record; **Pay** → `paid` once payments cover the amount — `paid` never reverts
+
 ## 6. Data Model
 
 ### Core Tables
@@ -98,12 +106,14 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 | `reason_codes` | id, code (unique), description, category | Mismatch/approval reasons |
 | `approval_workflow` | id, upload_id, upload_row_id, status, reason_code, comments, reviewed_by, reviewed_at | Approval workflow |
 | `audit_logs` | id, action, entity_type, entity_id, user_id, old_value, new_value, timestamp, ip_address | Full audit trail |
-| `sales` | id, stage, pi_number, pi_date, client_name, pi_file_path, lc_number, lc_date, shipment_date, payment_date, payment_amount, company_id (FK), maturity_date, comments, created_at, updated_at | Sales header |
-| `sale_items` | id, sale_id (FK), product_name, quantity, unit_price, unit | Sales line items |
+| `sales` | id, stage, pi_number, pi_date, client_name, pi_file_path, lc_number, lc_date, shipment_date, payment_date, payment_amount, company_id (FK), maturity_date, comments, shipment_status, created_at, updated_at | Sales header |
+| `sale_items` | id, sale_id (FK), item_no, product_name, quantity, unit_price, unit | Sales line items |
 | `companies` | id, name (unique), code, country, address, contact_person, swift, lc_bank | Customer master (P0) |
 | `shipments` | id, sale_id (FK), ship_date, invoice_number, invoice_date, notes | Actual shipments, partials as rows (P1) |
-| `production_runs` + `production_run_items` | run: recipe/order/batch/dates/notes; items: frozen formula + deducted qtys | Immutable batch log (P1 DDL, P3 executes) |
-| `sale_payments` | id, sale_id, payment_date, payment_amount, notes, created_at | Payment records |
+| `invoices` | id, sale_id (FK), invoice_number, status (planned → produced → booked → shipped → paid), amount, approx/actual ship dates, notes | Per-invoice shipment lifecycle; a sale may hold several |
+| `production_runs` + `production_run_items` | run: recipe/order/batch/dates/material_number/packing/invoice_number/notes; items: frozen formula + deducted qtys | Immutable batch log (P1 DDL, P3 executes) |
+| `production_run_links` | id, run_id (FK), sale_id (FK), invoice_id (FK) | Ties a production run to the sale(s)/invoice(s) it fulfils |
+| `sale_payments` | id, sale_id, invoice_id (FK), payment_date, payment_amount, notes, created_at | Payment records |
 | `users` | id, username (unique), password_hash, role (admin/user), created_at | Users |
 | `sessions` | id, token_hash (unique), user_id, created_at, expires_at, revoked | Sessions |
 | `api_keys` | id, key_hash, name, created_by, expires_at, allowed_ips, revoked, last_used_at | API keys |
