@@ -34,8 +34,11 @@ react_frontend/
 !/public/.gitkeep
 
 # === Uploads & Generated Files ===
-uploads/
-reports/
+# Anchored to repo root: an unanchored `reports/` also matched
+# raas-tracker-frontend/src/components/reports/ and silently dropped
+# CommercialTable.jsx from every commit (build broke on clean clone).
+/uploads/
+/reports/
 *.xlsx
 *.csv
 !requirements.txt
