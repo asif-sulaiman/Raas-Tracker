@@ -55,6 +55,7 @@ from raas_tracker.sales import (
     create_invoice, list_invoices, book_invoice, ship_invoice,
     mark_invoice_paid, void_invoice, get_sale_completion, _now_str
 )
+from raas_tracker.stock import sync_reorder_notifications
 
 # ---- AuthN/Z: sessions (humans) OR api_keys (scripts) ----
 # The legacy RAAS_TOKEN env gate is retired: per-key api_keys provide
@@ -1476,8 +1477,10 @@ def api_report_export():
 @admin_required
 def api_commercial_report():
     conn = get_db()
-    rows = get_commercial_report(conn)
-    conn.close()
+    try:
+        rows = get_commercial_report(conn)
+    finally:
+        conn.close()
     return jsonify(rows)
 
 
@@ -1500,8 +1503,10 @@ def api_commercial_report_filtered():
     # Remove None values
     filters = {k: v for k, v in filters.items() if v is not None}
     conn = get_db()
-    rows = get_commercial_report(conn, filters)
-    conn.close()
+    try:
+        rows = get_commercial_report(conn, filters)
+    finally:
+        conn.close()
     return jsonify(rows)
 
 
@@ -1523,8 +1528,10 @@ def api_commercial_report_summary():
     # Remove None values
     filters = {k: v for k, v in filters.items() if v is not None}
     conn = get_db()
-    periods = get_commercial_report_summary(conn, filters)
-    conn.close()
+    try:
+        periods = get_commercial_report_summary(conn, filters)
+    finally:
+        conn.close()
     return jsonify({"periods": periods})
 
 
@@ -1552,8 +1559,10 @@ def api_commercial_report_export():
     filters = {**filters, "page_size": 10000}
     
     conn = get_db()
-    rows = get_commercial_report(conn, filters)
-    conn.close()
+    try:
+        rows = get_commercial_report(conn, filters)
+    finally:
+        conn.close()
     if not rows:
         return jsonify({"error": "No data to export"}), 400
     import csv
@@ -1703,6 +1712,40 @@ class ProductionRunCreateIn(_StrippedModel):
     recipes: list[dict] | None = None  # [{"recipe_name": str, "qty": float}]
 
 
+def _rollback(conn):
+    """Discard uncommitted work on a request-scoped connection.
+
+    ``conn.close()`` alone is NOT safe on an error path: the pooled wrapper
+    commits any pending transaction before returning the connection, so a
+    half-applied request would be made durable. Every error/early-return path
+    that can follow a partial write rolls back explicitly first.
+    """
+    try:
+        conn.rollback()
+    except Exception:
+        app.logger.exception("rollback failed")
+
+
+def _rollback_close(conn):
+    """Roll back (best effort) then release the connection."""
+    _rollback(conn)
+    conn.close()
+
+
+# Service ValueError message -> HTTP status for the invoice/production routes.
+# 409 = the request conflicts with the resource's current state (terminal
+# lifecycle state), 404 = the referenced resource is missing or invisible to
+# this tenant, everything else stays a 400 validation-style rejection.
+def _state_error_status(message):
+    msg = (message or "").strip()
+    if msg.startswith("invoice already"):
+        return 409
+    if msg == "Invoice not found" or msg.startswith("linked sale ") \
+            or msg.startswith("linked invoice "):
+        return 404
+    return 400
+
+
 @app.route("/api/recipes/<path:name>/produce", methods=["POST"])
 @admin_required
 def api_produce_recipe(name):
@@ -1718,19 +1761,22 @@ def api_produce_recipe(name):
         company_id = int(company_id)
     except (TypeError, ValueError):
         return jsonify({"error": "company_id must be an integer"}), 400
-    
-    # Handle multi-recipe production
+
+    # Handle multi-recipe production. ALL recipes in one request share ONE
+    # transaction: a failure on recipe 2 must not leave recipe 1 produced
+    # (which a retry would then produce a second time).
     recipes_data = data.get("recipes") or [{"recipe_name": name, "qty": payload.production_qty}]
     results = []
+    pending_reorder: list[str] = []
     conn = get_db()
     try:
         for recipe_data in recipes_data:
             recipe_name = recipe_data.get("recipe_name", name)
             qty = float(recipe_data.get("qty", payload.production_qty))
             if qty <= 0:
-                conn.close()
+                _rollback_close(conn)
                 return jsonify({"error": "production_qty must be positive for each recipe"}), 400
-            
+
             result = create_production_run(
                 conn, company_id, recipe_name, qty,
                 order_number=payload.order_number,
@@ -1743,20 +1789,24 @@ def api_produce_recipe(name):
                 invoice_ids=payload.invoice_ids,
                 notes=payload.notes,
                 created_by=getattr(g, "current_identity", {}).get("id"),
+                atomic=False,
+                deferred_reorder=pending_reorder,
             )
             if not result:
-                conn.close()
+                _rollback_close(conn)
                 return jsonify({"error": f"Recipe '{recipe_name}' not found"}), 404
             results.append(result)
+        conn.commit()
     except ValueError as e:
-        conn.close()
-        if str(e).startswith("invoice already"):
-            return jsonify({"error": str(e)}), 409
-        return jsonify({"error": str(e)}), 400
+        _rollback_close(conn)
+        return jsonify({"error": str(e)}), _state_error_status(str(e))
     except Exception:
-        conn.close()
+        _rollback_close(conn)
         app.logger.exception("Production run failed")
         return jsonify({"error": "internal server error"}), 500
+    # Committed: only now may the reorder alerts for the deducted ingredients go
+    # out (notify_reorder_status commits, so it must never run mid-transaction).
+    sync_reorder_notifications(conn, pending_reorder)
     conn.close()
     return jsonify({"runs": results}), 201
 
@@ -1851,14 +1901,21 @@ def api_create_invoice(sale_id):
     except ValidationError as e:
         return _validation_error_response(e)
     conn = get_db()
+    # Explicit existence check: create_invoice() lets the FK violation surface
+    # as a generic "invoice number already exists", so an unknown sale_id would
+    # be reported as a bogus duplicate (400) instead of 404. Checked here, in
+    # the route, so no service module has to change.
+    if not conn.execute("SELECT 1 FROM sales WHERE id = %s", (sale_id,)).fetchone():
+        conn.close()
+        return jsonify({"error": "Sale not found"}), 404
     try:
         result = create_invoice(conn, sale_id, payload.invoice_number,
                                 payload.amount)
     except ValueError as e:
-        conn.close()
+        _rollback_close(conn)
         return jsonify({"error": str(e)}), 400
     except Exception:
-        conn.close()
+        _rollback_close(conn)
         app.logger.exception("Invoice creation failed")
         return jsonify({"error": "internal server error"}), 500
     conn.close()
@@ -1879,22 +1936,20 @@ def _invoice_url_sale_check(conn, sale_id, invoice_id):
         "SELECT sale_id FROM invoices WHERE id = %s", (invoice_id,)
     ).fetchone()
     if not row or row[0] != sale_id:
-        conn.close()
+        _rollback_close(conn)
         return jsonify({"error": "Invoice not found"}), 404
     return None
 
 
 def _invoice_transition_error(conn, e):
-    """Map invoice service ValueErrors: terminal-state refusal -> 409."""
+    """Map invoice service ValueErrors to a status and release the connection.
+
+    The rollback is mandatory here: the caller may already hold uncommitted
+    writes in this transaction, and close() would otherwise commit them.
+    """
     msg = str(e)
-    if msg.startswith("invoice already"):
-        conn.close()
-        return jsonify({"error": msg}), 409
-    if msg == "Invoice not found":
-        conn.close()
-        return jsonify({"error": msg}), 404
-    conn.close()
-    return jsonify({"error": msg}), 400
+    _rollback_close(conn)
+    return jsonify({"error": msg}), _state_error_status(msg)
 
 
 @app.route("/api/sales/<int:sale_id>/invoices/<int:invoice_id>/book", methods=["POST"])
@@ -1908,26 +1963,30 @@ def api_book_invoice(sale_id, invoice_id):
     denied = _invoice_url_sale_check(conn, sale_id, invoice_id)
     if denied:
         return denied
+    # ONE transaction, ONE commit. The sale's shipment_status is written FIRST
+    # and stays uncommitted; book_invoice() then performs its own commit, which
+    # makes both writes durable together. Any failure before that commit (the
+    # sale UPDATE itself, a refused invoice transition, or an exception inside
+    # the booking) rolls the sale UPDATE back instead of leaving the badge
+    # stranded on 'ship_booked' for an unbooked invoice.
     try:
+        conn.execute(
+            "UPDATE sales SET shipment_status = CASE WHEN shipment_status IS NULL "
+            "OR shipment_status IN ('production_running','production_done') "
+            "THEN 'ship_booked' ELSE shipment_status END, updated_at = %s WHERE id = %s",
+            (_now_str(), sale_id)
+        )
         success = book_invoice(conn, invoice_id, payload.approx_ship_date)
+        if not success:
+            _rollback_close(conn)
+            return jsonify({"error": "Invoice not found"}), 404
+        conn.commit()
     except ValueError as e:
         return _invoice_transition_error(conn, e)
     except Exception:
-        conn.close()
+        _rollback_close(conn)
         app.logger.exception("Invoice booking failed")
         return jsonify({"error": "internal server error"}), 500
-    if not success:
-        conn.close()
-        return jsonify({"error": "Invoice not found"}), 404
-    # The booking transitioned: upgrade the sale's shipment_status from
-    # "not yet booked" states; already-booked / shipped / delivered preserved.
-    conn.execute(
-        "UPDATE sales SET shipment_status = CASE WHEN shipment_status IS NULL "
-        "OR shipment_status IN ('production_running','production_done') "
-        "THEN 'ship_booked' ELSE shipment_status END, updated_at = %s WHERE id = %s",
-        (_now_str(), sale_id)
-    )
-    conn.commit()
     conn.close()
     return jsonify({"success": True, "status": "booked"})
 
@@ -1953,7 +2012,7 @@ def api_ship_invoice(sale_id, invoice_id):
     except ValueError as e:
         return _invoice_transition_error(conn, e)
     except Exception:
-        conn.close()
+        _rollback_close(conn)
         app.logger.exception("Invoice shipping failed")
         return jsonify({"error": "internal server error"}), 500
     conn.close()
@@ -1979,7 +2038,7 @@ def api_pay_invoice(sale_id, invoice_id):
     except ValueError as e:
         return _invoice_transition_error(conn, e)
     except Exception:
-        conn.close()
+        _rollback_close(conn)
         app.logger.exception("Invoice payment failed")
         return jsonify({"error": "internal server error"}), 500
     conn.close()
@@ -1997,7 +2056,7 @@ def api_void_invoice(sale_id, invoice_id):
     try:
         ok = void_invoice(conn, sale_id, invoice_id)
     except Exception:
-        conn.close()
+        _rollback_close(conn)
         app.logger.exception("Invoice void failed")
         return jsonify({"error": "internal server error"}), 500
     conn.close()

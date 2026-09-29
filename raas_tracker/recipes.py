@@ -482,6 +482,44 @@ def generate_multi_recipe_report(conn: psycopg.Connection, recipe_selections: Li
     return report
 
 
+def _owned_sale_ids(conn: psycopg.Connection, company_id: int,
+                    sale_ids: List[int]) -> List[int]:
+    """Fail closed unless every referenced sale belongs to ``company_id``.
+
+    ``production_run_links`` writes drive a customer-visible status flip
+    (``sales.shipment_status``), so an unscoped id from the request body would
+    let a run for customer A advance customer B's pipeline. Mirrors the recipe
+    lookup discipline (``get_recipe_by_name`` is scoped by company_id).
+    """
+    owned: List[int] = []
+    for sale_id in dict.fromkeys(sale_ids):
+        row = conn.execute(
+            "SELECT id FROM sales WHERE id = %s AND company_id = %s",
+            (sale_id, company_id)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"linked sale {sale_id} not found for this company")
+        owned.append(row[0])
+    return owned
+
+
+def _owned_invoice_ids(conn: psycopg.Connection, company_id: int,
+                       invoice_ids: List[int]) -> List[int]:
+    """Fail closed unless every referenced invoice belongs to ``company_id``."""
+    owned: List[int] = []
+    for invoice_id in dict.fromkeys(invoice_ids):
+        row = conn.execute(
+            """SELECT i.id, i.sale_id FROM invoices i
+               JOIN sales s ON s.id = i.sale_id
+               WHERE i.id = %s AND s.company_id = %s""",
+            (invoice_id, company_id)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"linked invoice {invoice_id} not found for this company")
+        owned.append(row[0])
+    return owned
+
+
 def create_production_run(
     conn: psycopg.Connection,
     company_id: int,
@@ -497,9 +535,17 @@ def create_production_run(
     invoice_ids: list[int] | None = None,
     notes: str = None,
     created_by: int = None,
+    atomic: bool = True,
+    deferred_reorder: list[str] | None = None,
 ) -> dict:
     """
     Create a production run by snapshotting the recipe formula and deducting stock.
+
+    The whole run — the ``production_runs`` row, every ``production_run_links``
+    row, the linked invoice/sale status flips and EVERY ingredient deduction —
+    is ONE transaction. Nothing is committed until the last ingredient is
+    written, so a shortage on the Nth ingredient leaves no partially deducted
+    batch and no orphan run behind (the caller retries cleanly).
 
     Args:
         conn: Database connection
@@ -511,13 +557,27 @@ def create_production_run(
         production_date: Production date (ISO format, defaults to today)
         notes: Optional notes
         created_by: User ID who initiated the run
+        sale_ids: Sales to link — must belong to ``company_id`` or the call fails
+        invoice_ids: Invoices to link — must belong to ``company_id`` or the call fails.
+            Producing advances an invoice ONLY forward (``planned`` ->
+            ``produced``); an invoice already at or past ``produced``
+            (``produced``/``booked``) keeps its status and ``shipped``/``paid``
+            refuse the run outright (``ValueError`` -> 409).
+        atomic: True (default) commits the run itself and flushes its reorder
+            notifications. False leaves the transaction to the caller (the
+            multi-recipe produce route commits once for the whole request);
+            with False the caller MUST supply ``deferred_reorder`` (a list) and
+            flush it with sync_reorder_notifications() after its own commit.
 
     Returns:
         Dict with run_id, shortage_report, and any warnings
     """
     from datetime import date as _date
-    from raas_tracker.stock import update_stock
-    from raas_tracker.sales import _now_str
+    from raas_tracker.stock import update_stock, sync_reorder_notifications
+    from raas_tracker.sales import _now_str, _INVOICE_STATUS_ORDER
+
+    if not atomic and deferred_reorder is None:
+        raise ValueError("atomic=False requires a deferred_reorder list")
 
     # Validate inputs
     if production_qty <= 0:
@@ -549,22 +609,27 @@ def create_production_run(
             "unit": item["unit"],
         })
 
-    # Create production run record
-    prod_date = production_date or _date.today().isoformat()
-    cursor = conn.execute(
-        """INSERT INTO production_runs
-           (recipe_id, order_number, batch_number, production_date, qty_produced, notes, created_by,
-            material_number, packing, invoice_number)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
-        (recipe["id"], order_number, batch_number, prod_date, production_qty, notes, created_by,
-         material_number, packing, invoice_number)
-    )
-    run_id = cursor.fetchone()[0]
+    # Fail closed on cross-company links BEFORE any write happens, so a
+    # rejected request never touches stock, runs or links.
+    verified_sale_ids = _owned_sale_ids(conn, company_id, sale_ids or [])
+    verified_invoice_ids = _owned_invoice_ids(conn, company_id, invoice_ids or [])
 
-    # Link production run to sales and invoices
-    linked_sale_ids: List[int] = []
-    if sale_ids:
-        for sale_id in sale_ids:
+    try:
+        # Create production run record
+        prod_date = production_date or _date.today().isoformat()
+        cursor = conn.execute(
+            """INSERT INTO production_runs
+               (recipe_id, order_number, batch_number, production_date, qty_produced, notes, created_by,
+                material_number, packing, invoice_number)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+            (recipe["id"], order_number, batch_number, prod_date, production_qty, notes, created_by,
+             material_number, packing, invoice_number)
+        )
+        run_id = cursor.fetchone()[0]
+
+        # Link production run to sales and invoices (company-scoped ids only)
+        linked_sale_ids: List[int] = []
+        for sale_id in verified_sale_ids:
             conn.execute(
                 """INSERT INTO production_run_links (run_id, sale_id)
                    VALUES (%s, %s)""",
@@ -572,9 +637,8 @@ def create_production_run(
             )
             if sale_id not in linked_sale_ids:
                 linked_sale_ids.append(sale_id)
-    linked_invoice_ids: List[int] = []
-    if invoice_ids:
-        for invoice_id in invoice_ids:
+        linked_invoice_ids: List[int] = []
+        for invoice_id in verified_invoice_ids:
             # sale_id is derived from the invoice row itself — never guessed.
             invoice_row = conn.execute(
                 "SELECT sale_id FROM invoices WHERE id = %s", (invoice_id,)
@@ -591,70 +655,95 @@ def create_production_run(
             if sale_id not in linked_sale_ids:
                 linked_sale_ids.append(sale_id)
             linked_invoice_ids.append(invoice_id)
-            # Forward-only: terminal ('shipped'/'paid') invoices refuse the
-            # move (route maps to 409). Non-terminal states (planned, produced,
-            # booked) accept 'produced' — booked->produced is a deliberate
-            # re-run allowance, not a downgrade of shipment progress.
-            inv_status = conn.execute(
+            # Forward-only, same ordering the rest of the lifecycle uses
+            # (raas_tracker.sales._INVOICE_STATUS_ORDER). Producing marks the
+            # batch built; it must never drag an invoice BACKWARDS:
+            #   planned  -> produced  (the one move produce owns)
+            #   produced -> no-op     (re-run, already at that step)
+            #   booked   -> no-op     (booking is later than producing; the
+            #                             production fact lives on the sale's
+            #                             shipment_status, see below)
+            #   shipped/paid -> refused 409 (terminal, unchanged behaviour)
+            inv_row = conn.execute(
                 "SELECT status FROM invoices WHERE id = %s FOR UPDATE",
                 (invoice_id,)
             ).fetchone()
-            if inv_status and inv_status[0] in ("shipped", "paid"):
-                raise ValueError(f"invoice already {inv_status[0]}")
-            # Update invoice status to produced
+            current = inv_row[0] if inv_row else None
+            if current in ("shipped", "paid"):
+                raise ValueError(f"invoice already {current}")
+            if current in _INVOICE_STATUS_ORDER and \
+                    _INVOICE_STATUS_ORDER.index(current) < _INVOICE_STATUS_ORDER.index("produced"):
+                conn.execute(
+                    "UPDATE invoices SET status = %s WHERE id = %s",
+                    ("produced", invoice_id)
+                )
+            else:
+                logger.info(
+                    "Invoice %s is already at '%s'; production recorded without "
+                    "moving its lifecycle status (forward-only).", invoice_id, current)
+
+        # Production finished: advance shipment_status to production_done.
+        # CASE keeps later states (production_done, ship_booked, ...) intact.
+        if linked_sale_ids:
             conn.execute(
-                "UPDATE invoices SET status = 'produced' WHERE id = %s AND status NOT IN ('shipped', 'paid')",
-                (invoice_id,)
+                """UPDATE sales
+                      SET shipment_status = CASE
+                            WHEN shipment_status IS NULL
+                              OR shipment_status = 'production_running'
+                            THEN 'production_done'
+                            ELSE shipment_status END,
+                        updated_at = %s
+                    WHERE id = ANY(%s)""",
+                (_now_str(), linked_sale_ids)
             )
 
-    # Production finished: advance shipment_status to production_done.
-    # CASE keeps later states (production_done, ship_booked, ...) intact.
-    if linked_sale_ids:
-        conn.execute(
-            """UPDATE sales
-                  SET shipment_status = CASE
-                        WHEN shipment_status IS NULL
-                          OR shipment_status = 'production_running'
-                        THEN 'production_done'
-                        ELSE shipment_status END,
-                      updated_at = %s
-                WHERE id = ANY(%s)""",
-            (_now_str(), linked_sale_ids)
-        )
+        # Snapshot formula and deduct stock — every deduction in this
+        # transaction (atomic=False), never one commit per ingredient.
+        for item in run_items:
+            required = item["required_qty"]
+            chem_name = item["chemical_name"]
 
-    # Snapshot formula and deduct stock
-    for item in run_items:
-        required = item["required_qty"]
-        chem_name = item["chemical_name"]
+            # Deduce stock (warn-and-allow: clamps at zero)
+            success = update_stock(conn, chem_name, -item["required_qty"],
+                                   reason=f"Production {batch_number or run_id} for {recipe_name}",
+                                   atomic=False)
+            if not success:
+                logger.warning("Chemical '%s' not found for deduction", chem_name)
+                # Still record with deducted=0
+                deducted = 0
+            else:
+                deducted = item["required_qty"]
 
-        # Deduce stock (warn-and-allow: clamps at zero)
-        success = update_stock(conn, chem_name, -item["required_qty"],
-                               reason=f"Production {batch_number or run_id} for {recipe_name}")
-        if not success:
-            logger.warning("Chemical '%s' not found for deduction", chem_name)
-            # Still record with deducted=0
-            deducted = 0
-        else:
-            deducted = item["required_qty"]
+            # Snapshot the formula (required and actual deducted)
+            conn.execute(
+                """INSERT INTO production_run_items
+                   (run_id, chemical_id, chemical_name, required_qty, deducted_qty, unit)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (run_id, item.get("chemical_id"), item["chemical_name"],
+                 item["required_qty"], deducted, item["unit"])
+            )
 
-        # Snapshot the formula (required and actual deducted)
-        conn.execute(
-            """INSERT INTO production_run_items
-               (run_id, chemical_id, chemical_name, required_qty, deducted_qty, unit)
-               VALUES (%s, %s, %s, %s, %s, %s)""",
-            (run_id, item.get("chemical_id"), item["chemical_name"],
-             item["required_qty"], deducted, item["unit"])
-        )
+        log_audit_action(conn, "PRODUCTION_RUN_CREATE", "production_run", run_id,
+                         new_value=f"{recipe_name} x{production_qty}", atomic=False)
+    except Exception:
+        # Nothing above was committed: drop the whole run.
+        conn.rollback()
+        raise
 
-    conn.commit()
+    if atomic:
+        conn.commit()
+        # Committed: the reorder alerts for the touched ingredients can go out.
+        sync_reorder_notifications(conn, [i["chemical_name"] for i in run_items])
+    else:
+        # Caller-owned transaction: hand the names over so the caller can flush
+        # them once, after it commits (or drop them with a rollback).
+        deferred_reorder.extend(i["chemical_name"] for i in run_items)
 
     # Re-generate shortage report after deduction for accuracy
     final_shortage_report = generate_report(conn, company_id, recipe_name, production_qty)
 
     logger.info("Created production run %s for recipe '%s' (qty: %s)",
                 run_id, recipe_name, production_qty)
-    log_audit_action(conn, "PRODUCTION_RUN_CREATE", "production_run", run_id,
-                     new_value=f"{recipe_name} x{production_qty}")
 
     return {
         "run_id": run_id,

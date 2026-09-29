@@ -21,9 +21,9 @@ def set_audit_actor(name: Optional[str]) -> None:
 def log_audit_action(conn: psycopg.Connection, action: str, entity_type: str = None,
                      entity_id: int = None, user_id: str = "system",
                      old_value: str = None, new_value: str = None,
-                     ip_address: str = None) -> int:
+                     ip_address: str = None, atomic: bool = True) -> int:
     """Log an audit action.
-    
+
     Args:
         conn: Database connection
         action: Action performed (e.g., 'APPROVE_ROW', 'REJECT_ROW', 'ADJUST_STOCK')
@@ -33,7 +33,12 @@ def log_audit_action(conn: psycopg.Connection, action: str, entity_type: str = N
         old_value: Previous value
         new_value: New value
         ip_address: IP address of user
-    
+        atomic: When True (default) the audit row is committed immediately, as
+            every caller has always expected. When False the INSERT is left in
+            the caller's transaction: no commit AND no rollback is issued here,
+            so an enclosing operation that aborts leaves no audit trail for work
+            that never happened (and a committed one keeps its trail).
+
     Returns:
         Log ID
     """
@@ -44,7 +49,8 @@ def log_audit_action(conn: psycopg.Connection, action: str, entity_type: str = N
            VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
         (action, entity_type, entity_id, user_id, old_value, new_value, ip_address)
     )
-    conn.commit()
+    if atomic:
+        conn.commit()
     return cursor.fetchone()[0]
 
 

@@ -180,10 +180,29 @@ def delete_unit_conversion(conn: psycopg.Connection, from_unit: str, to_unit: st
         return False
 
 
+def sync_reorder_notifications(conn: psycopg.Connection,
+                               chemical_names: List[str]) -> None:
+    """Re-sync reorder notifications for chemicals changed with atomic=False.
+
+    ``notify_reorder_status()`` commits, so it can never run inside a
+    caller-owned transaction without silently committing that transaction.
+    ``update_stock(atomic=False)`` therefore skips the inline call and the
+    caller flushes the affected names here, AFTER it commits: a buy alert for
+    a run that was rolled back would be a lie.
+    """
+    for name in dict.fromkeys(n for n in (chemical_names or []) if n):
+        row = conn.execute(
+            "SELECT id, name, current_qty, reorder_level FROM chemicals WHERE name = %s",
+            (name,)
+        ).fetchone()
+        if row:
+            notify_reorder_status(conn, row[0], row[1], row[2], row[3] or 0)
+
+
 def update_stock(conn: psycopg.Connection, name: str, delta: float, unit: str = "KG",
-                 reason: str = None) -> bool:
+                 reason: str = None, atomic: bool = True) -> bool:
     """Update chemical stock by delta (positive or negative).
-    
+
     Args:
         conn: Database connection
         name: Chemical name
@@ -191,10 +210,17 @@ def update_stock(conn: psycopg.Connection, name: str, delta: float, unit: str = 
         unit: Unit of delta (must match chemical's unit or be 'KG')
         reason: Free-text purpose (e.g. 'Supplier delivery'), stored on the
             audit row's note channel (same convention as upload adjustments).
-    
+        atomic: When True (default) the UPDATE is committed immediately, as
+            every caller has always expected. When False the write (and its
+            audit row) is left in the caller's transaction: no commit AND no
+            rollback is issued here. Multi-row callers (production runs) MUST
+            pass False so a mid-loop failure cannot leave earlier ingredients
+            durably deducted; they then flush reorder notifications after
+            committing via sync_reorder_notifications().
+
     Returns:
         True if updated successfully, False if chemical not found
-    
+
     Raises:
         ValueError: If the delta would result in negative stock ("insufficient stock")
     """
@@ -226,11 +252,14 @@ def update_stock(conn: psycopg.Connection, name: str, delta: float, unit: str = 
         "UPDATE chemicals SET current_qty = %s, last_updated = %s WHERE id = %s",
         (new_qty, date.isoformat(date.today()), chem_id)
     )
-    conn.commit()
+    if atomic:
+        conn.commit()
     log_audit_action(conn, "ADJUST_STOCK", "chemical", chem_id,
                      old_value=str(current_qty), new_value=str(new_qty),
-                     ip_address=(reason or "").strip()[:120] or None)
-    notify_reorder_status(conn, chem_id, chem_name, new_qty, reorder_level)
+                     ip_address=(reason or "").strip()[:120] or None,
+                     atomic=atomic)
+    if atomic:
+        notify_reorder_status(conn, chem_id, chem_name, new_qty, reorder_level)
 
     logger.info("Updated '%s': %s %s -> %s %s (change: %s %s)",
                 chem_name, current_qty, chem_unit, new_qty, chem_unit, delta, chem_unit)

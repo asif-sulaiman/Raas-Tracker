@@ -46,6 +46,13 @@ def _invoice_status(db, invoice_id):
         "SELECT status FROM invoices WHERE id = %s", (invoice_id,)).fetchone()[0]
 
 
+def _stock(db, names):
+    rows = db.execute(
+        "SELECT name, current_qty FROM chemicals WHERE name = ANY(%s) ORDER BY name",
+        (list(names),)).fetchall()
+    return [(r[0], r[1]) for r in rows]
+
+
 # ---------- 1. invoice create + duplicate rules ----------
 
 def test_invoice_create_list_duplicate_and_cross_sale_reuse(admin_client, db):
@@ -266,21 +273,43 @@ def test_produce_links_run_invoices_sales_and_new_columns(admin_client, db):
     assert (row[0], row[1], row[2]) == ("MAT-77", "25KG drum", "INV-NUM-A")
 
 
-def test_produce_never_downgrades_ship_booked(admin_client, db):
+def test_produce_never_downgrades_ship_booked_sale_or_booked_invoice(
+        admin_client, db):
+    """Produce is forward-only on BOTH tracks.
+
+    A booked invoice has already moved PAST 'produced' in the lifecycle
+    [planned, produced, booked, shipped, paid], so a successful production run
+    must not set it back to 'produced'. Likewise the sale's shipment sub-step
+    stays at 'ship_booked' rather than reverting to 'production_done'. The
+    production itself is still recorded (201, stock deducted, run + links
+    written) — only the lifecycle positions are left alone.
+    """
     cid, sid, inv = _production_setup(admin_client, db, "B")
 
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
                           json={"approx_ship_date": "2026-11-01"})
     assert r.status_code == 200
     assert _detail(admin_client, sid)["shipment_status"] == "ship_booked"
+    assert _invoice_status(db, inv) == "booked"
 
     r = admin_client.post("/api/recipes/Recipe-B/produce", json={
         "production_qty": 5, "company_id": cid,
         "sale_ids": [sid], "invoice_ids": [inv]})
     assert r.status_code == 201, r.get_json()
 
+    # The sale's shipment sub-step is not pushed back to production_done...
     assert _detail(admin_client, sid)["shipment_status"] == "ship_booked"
-    assert _invoice_status(db, inv) == "produced"
+    # ...and the invoice is not dragged back from 'booked' to 'produced'.
+    assert _invoice_status(db, inv) == "booked"
+
+    # The production still happened and is linked.
+    run_id = r.get_json()["runs"][0]["run_id"]
+    pairs = {(l[0], l[1]) for l in db.execute(
+        "SELECT sale_id, invoice_id FROM production_run_links "
+        "WHERE run_id = %s", (run_id,)).fetchall()}
+    assert (sid, inv) in pairs
+    # 40% of 5 = 2.0 KG deducted from the seeded 500 KG.
+    assert _stock(db, ["Chem-B"]) == [("Chem-B", 498.0)]
 
 
 def test_produce_cross_sale_invoice_uses_invoices_own_sale(admin_client, db):
