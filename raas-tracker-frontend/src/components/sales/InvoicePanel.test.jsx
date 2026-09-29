@@ -24,16 +24,19 @@ const INVOICES = [
     invoice_id: 7, invoice_number: 'INV-1', status: 'planned',
     approx_ship_date: null, actual_ship_date: null, notes: null,
     created_at: '2026-09-01 10:00:00',
+    amount: null, paid_amount: 0, // legacy row — no amount to show
   },
   {
     invoice_id: 8, invoice_number: 'INV-2', status: 'booked',
     approx_ship_date: '2026-09-20', actual_ship_date: null, notes: null,
     created_at: '2026-09-02 10:00:00',
+    amount: 1200, paid_amount: 800,
   },
   {
     invoice_id: 9, invoice_number: 'INV-3', status: 'paid',
     approx_ship_date: '2026-09-10', actual_ship_date: '2026-09-12', notes: null,
     created_at: '2026-09-03 10:00:00',
+    amount: 2400, paid_amount: 2400,
   },
 ];
 
@@ -41,7 +44,7 @@ function jsonResponse(data, ok = true, status = 200) {
   return { ok, status, json: async () => data, headers: { get: () => null } };
 }
 
-function installFetch({ invoices = INVOICES, posts = [] } = {}) {
+function installFetch({ invoices = INVOICES, posts = [], completion } = {}) {
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
     const u = String(url);
     if (u.includes('/api/auth/me')) {
@@ -55,6 +58,7 @@ function installFetch({ invoices = INVOICES, posts = [] } = {}) {
       return jsonResponse({ invoice_id: 10, invoice_number: 'NEW', status: 'planned' }, true, 201);
     }
     if (u.includes('/completion')) {
+      if (completion) return jsonResponse(completion);
       const paid = invoices.filter((i) => i.status === 'paid').length;
       return jsonResponse({ status: paid > 0 ? 'partial' : 'none', paid, total: invoices.length, invoices });
     }
@@ -70,7 +74,12 @@ function renderPanel(opts = {}) {
   return render(
     <MemoryRouter>
       <AuthProvider>
-        <InvoicePanel saleId={5} isAdmin onChanged={opts.onChanged || vi.fn()} />
+        <InvoicePanel
+          saleId={5}
+          isAdmin
+          totalValue={opts.totalValue ?? null}
+          onChanged={opts.onChanged || vi.fn()}
+        />
       </AuthProvider>
     </MemoryRouter>
   );
@@ -125,7 +134,62 @@ describe('InvoicePanel', () => {
     });
     fireEvent.click(screen.getByRole('button', { name: 'Save invoice' }));
     await waitFor(() => expect(posts.filter((p) => p.body && p.body.invoice_number === 'INV-3')).toHaveLength(1));
-    expect(posts.find((p) => p.body && p.body.invoice_number === 'INV-3').url)
-      .toContain('/api/sales/5/invoices');
+    const post = posts.find((p) => p.body && p.body.invoice_number === 'INV-3');
+    expect(post.url).toContain('/api/sales/5/invoices');
+    // Amount is optional — blank means the server defaults it to the sale total.
+    expect(post.body.amount).toBeUndefined();
+  });
+
+  it('shows amount and paid progress on each invoice row', async () => {
+    renderPanel();
+    expect(await screen.findByText('INV-2')).toBeTruthy();
+    expect(screen.getByText('$1,200.00 · paid $800.00')).toBeTruthy();
+    expect(screen.getByText('$2,400.00 · paid $2,400.00')).toBeTruthy();
+    // Legacy row (amount null) shows no money line at all.
+    const legacyRow = screen.getByText('INV-1').closest('div');
+    expect(legacyRow.textContent).not.toContain('· paid');
+    // Paid row carries a checkmark, unpaid row does not.
+    expect(screen.getByText('$2,400.00 · paid $2,400.00').querySelector('svg')).toBeTruthy();
+    expect(screen.getByText('$1,200.00 · paid $800.00').querySelector('svg')).toBeFalsy();
+  });
+
+  it('renders money totals in the completion header when the API provides them', async () => {
+    renderPanel({
+      completion: {
+        status: 'partial', paid: 1, total: 3, invoices: INVOICES,
+        total_amount: 2400, paid_amount: 800,
+      },
+    });
+    expect(await screen.findByText('1/3 invoices paid · $800.00 of $2,400.00')).toBeTruthy();
+  });
+
+  it('offers the sale total as the Amount placeholder and sends a typed amount', async () => {
+    const posts = [];
+    renderPanel({ posts, totalValue: 2400 });
+    fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
+    const amountInput = await screen.findByLabelText('Amount');
+    expect(amountInput.placeholder).toBe('$2,400.00');
+    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'INV-9' } });
+    fireEvent.change(amountInput, { target: { value: '1234.50' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save invoice' }));
+    await waitFor(() => expect(posts.filter((p) => p.body && p.body.invoice_number === 'INV-9')).toHaveLength(1));
+    expect(posts.find((p) => p.body.invoice_number === 'INV-9').body.amount).toBe(1234.5);
+  });
+
+  it('shows the remaining balance while recording a payment', async () => {
+    const posts = [];
+    const invoices = [{
+      invoice_id: 11, invoice_number: 'INV-11', status: 'shipped',
+      approx_ship_date: '2026-09-10', actual_ship_date: '2026-09-12', notes: null,
+      created_at: '2026-09-01 10:00:00',
+      amount: 1200, paid_amount: 800,
+    }];
+    renderPanel({ invoices, posts });
+    fireEvent.click(await screen.findByRole('button', { name: 'Record payment' }));
+    expect(await screen.findByText('Balance $400.00')).toBeTruthy();
+    // Validation is unchanged: an empty payment amount is still rejected.
+    fireEvent.click(screen.getByRole('button', { name: 'Save payment' }));
+    expect(await screen.findByText(/payment amount greater than 0/i)).toBeTruthy();
+    expect(posts.filter((p) => p.url.includes('/pay'))).toHaveLength(0);
   });
 });

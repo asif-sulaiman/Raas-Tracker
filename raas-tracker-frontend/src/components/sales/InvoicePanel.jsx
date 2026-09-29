@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
-import { Plus } from 'lucide-react';
+import { Plus, Check } from 'lucide-react';
 import Button from '../ui/Button';
-import { formatDate } from '../../utils/format';
+import { formatDate, formatNumber, toCents, fromCents } from '../../utils/format';
 import { useAuth } from '../../context/AuthContext';
 import { toast } from 'sonner';
 
@@ -44,6 +44,17 @@ function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
+/** Money label — same `$1,200.00` shape the rest of the app uses. */
+function usd(value) {
+  return `$${formatNumber(value)}`;
+}
+
+/** Exact remaining balance in integer cents (no float subtraction on display). */
+function balanceCents(amount, paidAmount) {
+  if (amount === null || amount === undefined) return null;
+  return Math.max(0, toCents(amount) - toCents(paidAmount));
+}
+
 function StatusChip({ status }) {
   return (
     <span
@@ -61,7 +72,7 @@ function StatusChip({ status }) {
  * Rendered inside SaleDetailModal while the sale sits in Shipment Ongoing.
  * Mutations are admin-only (the API enforces that), so actions hide for users.
  */
-export default function InvoicePanel({ saleId, isAdmin = false, onChanged }) {
+export default function InvoicePanel({ saleId, isAdmin = false, onChanged, totalValue = null }) {
   const { apiFetch } = useAuth();
   const [invoices, setInvoices] = useState([]);
   const [completion, setCompletion] = useState(null);
@@ -69,6 +80,7 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged }) {
   const [loadError, setLoadError] = useState(null);
   const [adding, setAdding] = useState(false);
   const [invoiceNumber, setInvoiceNumber] = useState('');
+  const [invoiceAmount, setInvoiceAmount] = useState('');
   const [step, setStep] = useState(null); // { invoiceId, kind: 'book' | 'ship' | 'pay' }
   const [stepDate, setStepDate] = useState('');
   const [payAmount, setPayAmount] = useState('');
@@ -140,12 +152,14 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged }) {
   const openAdd = () => {
     setAdding(true);
     setInvoiceNumber('');
+    setInvoiceAmount('');
     setFormError(null);
   };
 
   const closeAdd = () => {
     setAdding(false);
     setInvoiceNumber('');
+    setInvoiceAmount('');
     setFormError(null);
   };
 
@@ -155,12 +169,23 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged }) {
       setFormError('Invoice number is required');
       return;
     }
+    const body = { invoice_number: number };
+    const rawAmount = invoiceAmount.trim();
+    if (rawAmount) {
+      // Allow pasted "$2,400.00" hints; strip separators before parsing.
+      const value = parseFloat(rawAmount.replace(/,/g, ''));
+      if (Number.isNaN(value) || value < 0) {
+        setFormError('Enter an amount of 0 or more');
+        return;
+      }
+      body.amount = fromCents(toCents(value));
+    }
     setSaving(true);
     try {
       await apiFetch(`/api/sales/${saleId}/invoices`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ invoice_number: number }),
+        body: JSON.stringify(body),
       });
       toast.success('Invoice added');
       closeAdd();
@@ -236,6 +261,14 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged }) {
   const totalCount = completion && typeof completion.total === 'number'
     ? completion.total
     : invoices.length;
+  // Money totals ride along on the completion payload when the backend has them.
+  const totalsReady = !!completion
+    && typeof completion.total_amount === 'number'
+    && typeof completion.paid_amount === 'number';
+  // Balance hint for the open "Record payment" form (exact, in cents).
+  const stepInvoice = step ? invoices.find((i) => i.invoice_id === step.invoiceId) : null;
+  const stepBalance = stepInvoice ? balanceCents(stepInvoice.amount, stepInvoice.paid_amount) : null;
+  const amountPlaceholder = totalValue === null || totalValue === undefined ? '0.00' : usd(totalValue);
 
   return (
     <div>
@@ -245,6 +278,7 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged }) {
           {totalCount > 0 && (
             <span className="ml-2 text-xs font-normal text-slate-500 dark:text-slate-400">
               {paidCount}/{totalCount} invoices paid
+              {totalsReady && ` · ${usd(completion.paid_amount)} of ${usd(completion.total_amount)}`}
             </span>
           )}
         </h4>
@@ -277,6 +311,14 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged }) {
                     {inv.invoice_number}
                   </span>
                   <StatusChip status={inv.status} />
+                  {inv.amount !== null && inv.amount !== undefined && (
+                    <span className="text-[11px] font-medium text-slate-600 dark:text-slate-300">
+                      {usd(inv.amount)} · paid {usd(inv.paid_amount || 0)}
+                      {inv.status === 'paid' && (
+                        <Check className="ml-1 inline h-3 w-3 text-emerald-600" aria-hidden="true" />
+                      )}
+                    </span>
+                  )}
                   {inv.approx_ship_date && (
                     <span className="text-[11px] text-slate-400">
                       approx ship {formatDate(inv.approx_ship_date)}
@@ -318,6 +360,11 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged }) {
                             placeholder="0.00"
                             className={`${inputCls} w-24`}
                           />
+                          {stepBalance !== null && (
+                            <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                              Balance {usd(fromCents(stepBalance))}
+                            </p>
+                          )}
                         </div>
                         <div>
                           <label className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1">
@@ -379,6 +426,24 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged }) {
                 placeholder="INV-2026-001"
                 className={`${inputCls} flex-1 min-w-40`}
               />
+              <div>
+                <label
+                  htmlFor="invoice-amount"
+                  className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1"
+                >
+                  Amount
+                </label>
+                <input
+                  id="invoice-amount"
+                  type="number"
+                  min="0"
+                  step="any"
+                  value={invoiceAmount}
+                  onChange={(e) => setInvoiceAmount(e.target.value)}
+                  placeholder={amountPlaceholder}
+                  className={`${inputCls} w-28`}
+                />
+              </div>
               <Button variant="primary" size="sm" onClick={handleAdd} loading={saving} disabled={saving}>
                 Save invoice
               </Button>

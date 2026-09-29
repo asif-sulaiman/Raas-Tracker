@@ -65,6 +65,17 @@ DEFAULT_TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/raas_
 # app_settings key holding the schema signature (see _schema_signature).
 _SCHEMA_SIG_KEY = "raas_schema_sig"
 
+# Signature tokens the fast path must see before it may skip DDL.
+#
+# The stored signature is only ever a copy of the *live* schema, so merely
+# adding a new column to _create_tables() does NOT invalidate an existing
+# database: stored == live (both still lack the column) and the fast path
+# would skip the migration forever. Listing the new column's signature token
+# here forces exactly one full DDL run; _create_tables then re-records the
+# signature (now containing the column) and the fast path resumes.
+# Keep one "table.column:data_type" token per additive migration.
+_REQUIRED_SIG_TOKENS: tuple = ("invoices.amount:numeric",)
+
 # Connection pool (initialized lazily on first get_connection call)
 _pool: Optional[ConnectionPool] = None
 _pool_dsn: Optional[str] = None
@@ -182,7 +193,8 @@ def _schema_current(conn: psycopg.Connection) -> bool:
             (_SCHEMA_SIG_KEY,),
         )
         stored, live = cur.fetchone()
-        ready = bool(stored) and stored == live
+        ready = (bool(stored) and stored == live
+                 and all(tok in live for tok in _REQUIRED_SIG_TOKENS))
     except Exception:
         ready = False
     try:
@@ -591,6 +603,10 @@ def _create_tables(conn: psycopg.Connection) -> None:
     if "invoice_id" not in _table_columns(conn, "sale_payments"):
         conn.execute("ALTER TABLE sale_payments ADD COLUMN invoice_id INTEGER "
                      "REFERENCES invoices(id) ON DELETE SET NULL")
+
+    # invoices.amount (NULL = legacy/unknown; drives invoice auto-paid rule)
+    if "amount" not in _table_columns(conn, "invoices"):
+        conn.execute("ALTER TABLE invoices ADD COLUMN amount NUMERIC(14,2)")
 
     # Global name uniqueness gives way to one master per company x product.
     conn.execute("ALTER TABLE recipes DROP CONSTRAINT IF EXISTS recipes_name_key")

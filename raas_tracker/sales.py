@@ -1120,17 +1120,32 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
     return periods
 
 
-def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str) -> Dict[str, Any]:
-    """Create a new invoice for a sale."""
+def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
+                   amount: Optional[float] = None) -> Dict[str, Any]:
+    """Create a new invoice for a sale.
+
+    ``amount`` defaults to the sale's invoice total (sum of line items).
+    An amount of 0 means nothing is owed, so the invoice is 'paid' at
+    creation. Legacy rows keep amount NULL (= unknown) and are handled by
+    _sync_invoice_paid_status.
+    """
     if not invoice_number or not invoice_number.strip():
         raise ValueError("invoice_number is required")
     invoice_number = invoice_number.strip()
-    
+    if amount is None:
+        amount = get_sale_invoice_total(conn, sale_id)
+    else:
+        amount = float(amount)
+        if amount < 0:
+            raise ValueError("amount must be >= 0")
+    # paid_amount at creation is 0 -> covered when amount <= 0
+    status = "paid" if amount <= 0 else "planned"
+
     try:
         cursor = conn.execute(
-            """INSERT INTO invoices (sale_id, invoice_number, status, created_at)
-               VALUES (%s, %s, 'planned', %s) RETURNING id""",
-            (sale_id, invoice_number.strip(), _now_str())
+            """INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at)
+               VALUES (%s, %s, %s, ROUND(%s::numeric, 2), %s) RETURNING id""",
+            (sale_id, invoice_number, status, amount, _now_str())
         )
         invoice_id = cursor.fetchone()[0]
     except psycopg.IntegrityError:
@@ -1145,8 +1160,9 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str) 
     
     conn.commit()
     log_audit_action(conn, "INVOICE_CREATE", "invoice", invoice_id,
-                     new_value=invoice_number)
-    return {"invoice_id": invoice_id, "invoice_number": invoice_number, "status": "planned"}
+                     new_value=f"{invoice_number} amount={amount:g} status={status}")
+    return {"invoice_id": invoice_id, "invoice_number": invoice_number,
+            "status": status, "amount": round(float(amount), 2)}
 
 
 def update_invoice_status(conn: psycopg.Connection, invoice_id: int, status: str,
@@ -1157,7 +1173,8 @@ def update_invoice_status(conn: psycopg.Connection, invoice_id: int, status: str
     if status not in valid_statuses:
         raise ValueError(f"Invalid status: {status}. Must be one of {valid_statuses}")
     
-    fields = ["status = %s"]
+    # Never downgrade a 'paid' invoice (lifecycle is terminal once paid).
+    fields = ["status = CASE WHEN status = 'paid' THEN status ELSE %s END"]
     params = [status]
     if approx_ship_date is not None:
         fields.append("approx_ship_date = %s")
@@ -1207,7 +1224,8 @@ def ship_invoice(conn: psycopg.Connection, invoice_id: int, actual_ship_date: st
     
     # Update invoice to shipped
     conn.execute(
-        "UPDATE invoices SET status = 'shipped', actual_ship_date = %s, notes = COALESCE(notes, '') || %s WHERE id = %s",
+        "UPDATE invoices SET status = 'shipped', actual_ship_date = %s, "
+        "notes = COALESCE(notes, '') || %s WHERE id = %s AND status <> 'paid'",
         (actual_ship_date.strip(), f"\nShipped on {actual_ship_date.strip()}: " + (notes or ""), invoice_id)
     )
     
@@ -1215,6 +1233,43 @@ def ship_invoice(conn: psycopg.Connection, invoice_id: int, actual_ship_date: st
     log_audit_action(conn, "INVOICE_SHIP", "invoice", invoice_id,
                      new_value=f"Shipped on {actual_ship_date.strip()}")
     return {"invoice_id": invoice_id, "shipment_id": shipment_id, "status": "shipped"}
+
+
+def _invoice_paid_amount(conn: psycopg.Connection, invoice_id: int) -> float:
+    """Sum of payments recorded against one invoice."""
+    row = conn.execute(
+        """SELECT COALESCE(ROUND(SUM(payment_amount)::numeric, 2)::float8, 0)
+           FROM sale_payments WHERE invoice_id = %s""",
+        (invoice_id,)
+    ).fetchone()
+    return float(row[0]) if row else 0.0
+
+
+def _sync_invoice_paid_status(conn: psycopg.Connection, invoice_id: int) -> bool:
+    """Flip an invoice to 'paid' once payments cover its amount.
+
+    Rules (never un-pays — the UPDATE only ever writes 'paid'):
+      * amount IS NOT NULL -> paid when paid_amount >= amount
+        (amount 0 is already 'paid' at creation);
+      * amount IS NULL (legacy row, amount unknown) -> old behaviour:
+        any payment carrying this invoice_id marks it 'paid'.
+    Returns True when the status changed to 'paid'.
+    """
+    row = conn.execute(
+        "SELECT amount, status FROM invoices WHERE id = %s", (invoice_id,)
+    ).fetchone()
+    if not row or row[1] == "paid":
+        return False
+    amount = row[0]
+    paid = _invoice_paid_amount(conn, invoice_id)
+    covered = (paid > 0) if amount is None else (paid >= float(amount))
+    if not covered:
+        return False
+    cur = conn.execute(
+        "UPDATE invoices SET status = 'paid' WHERE id = %s AND status <> 'paid'",
+        (invoice_id,)
+    )
+    return cur.rowcount > 0
 
 
 def mark_invoice_paid(conn: psycopg.Connection, invoice_id: int,
@@ -1238,6 +1293,7 @@ def mark_invoice_paid(conn: psycopg.Connection, invoice_id: int,
     )
     payment_id = cursor.fetchone()[0]
     _sync_sale_payment_totals(conn, sale_id)
+    _sync_invoice_paid_status(conn, invoice_id)
     log_audit_action(conn, "INVOICE_PAYMENT", "invoice", invoice_id,
                      new_value=f"amount={payment_amount:g} date={payment_date}")
     conn.commit()
@@ -1245,13 +1301,18 @@ def mark_invoice_paid(conn: psycopg.Connection, invoice_id: int,
 
 
 def list_invoices(conn: psycopg.Connection, sale_id: int) -> List[Dict[str, Any]]:
-    """List all invoices for a sale."""
+    """List all invoices for a sale, with amount + paid-to-date per invoice."""
     return [
         {"invoice_id": r[0], "invoice_number": r[1], "status": r[2],
          "approx_ship_date": r[3], "actual_ship_date": r[4], "notes": r[5],
-         "created_at": r[6]}
+         "created_at": r[6],
+         "amount": (float(r[7]) if r[7] is not None else None),
+         "paid_amount": float(r[8])}
         for r in conn.execute(
-            """SELECT id, invoice_number, status, approx_ship_date, actual_ship_date, notes, created_at
+            """SELECT id, invoice_number, status, approx_ship_date, actual_ship_date,
+                      notes, created_at, amount,
+                      (SELECT COALESCE(ROUND(SUM(sp.payment_amount)::numeric, 2)::float8, 0)
+                       FROM sale_payments sp WHERE sp.invoice_id = invoices.id) AS paid_amount
                FROM invoices WHERE sale_id = %s ORDER BY id""",
             (sale_id,)
         ).fetchall()
@@ -1259,13 +1320,21 @@ def list_invoices(conn: psycopg.Connection, sale_id: int) -> List[Dict[str, Any]
 
 
 def get_sale_completion(conn: psycopg.Connection, sale_id: int) -> Dict[str, Any]:
-    """Get sale completion status based on invoices."""
+    """Get sale completion status based on invoices.
+
+    Adds ``total_amount`` (sum of non-NULL invoice amounts) and
+    ``paid_amount`` (sum of per-invoice paid amounts) alongside the legacy
+    status/paid/total/invoices keys.
+    """
     invoices = list_invoices(conn, sale_id)
     if not invoices:
         return {"status": "none", "paid": 0, "total": 0, "invoices": []}
     
     paid = sum(1 for inv in invoices if inv["status"] == "paid")
     total = len(invoices)
+    total_amount = round(sum(float(inv["amount"]) for inv in invoices
+                             if inv["amount"] is not None), 2)
+    paid_amount = round(sum(inv["paid_amount"] for inv in invoices), 2)
     
     if paid == total:
         status = "full"
@@ -1274,4 +1343,6 @@ def get_sale_completion(conn: psycopg.Connection, sale_id: int) -> Dict[str, Any
     else:
         status = "none"
     
-    return {"status": status, "paid": paid, "total": total, "invoices": invoices}
+    return {"status": status, "paid": paid, "total": total,
+            "invoices": invoices, "total_amount": total_amount,
+            "paid_amount": paid_amount}

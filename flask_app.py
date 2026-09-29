@@ -1821,6 +1821,7 @@ def api_get_production_run(name, run_id):
 
 class InvoiceCreateIn(_StrippedModel):
     invoice_number: str = Field(min_length=1)
+    amount: float | None = Field(default=None, ge=0)
 
 
 class InvoiceBookIn(_StrippedModel):
@@ -1849,7 +1850,8 @@ def api_create_invoice(sale_id):
         return _validation_error_response(e)
     conn = get_db()
     try:
-        result = create_invoice(conn, sale_id, payload.invoice_number)
+        result = create_invoice(conn, sale_id, payload.invoice_number,
+                                payload.amount)
     except ValueError as e:
         conn.close()
         return jsonify({"error": str(e)}), 400
@@ -1889,10 +1891,13 @@ def api_book_invoice(sale_id, invoice_id):
     conn.close()
     if not success:
         return jsonify({"error": "Invoice not found"}), 404
-    # Update sale's shipment_status
+    # Update sale's shipment_status — only an upgrade from "not yet booked"
+    # states; already-booked / shipped / delivered values are preserved.
     conn = get_db()
     conn.execute(
-        "UPDATE sales SET shipment_status = 'ship_booked', updated_at = %s WHERE id = %s",
+        "UPDATE sales SET shipment_status = CASE WHEN shipment_status IS NULL "
+        "OR shipment_status IN ('production_running','production_done') "
+        "THEN 'ship_booked' ELSE shipment_status END, updated_at = %s WHERE id = %s",
         (_now_str(), sale_id)
     )
     conn.commit()

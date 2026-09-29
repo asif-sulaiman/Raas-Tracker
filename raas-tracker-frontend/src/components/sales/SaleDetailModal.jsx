@@ -483,6 +483,7 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
               key={sale.id}
               saleId={sale.id}
               isAdmin={isAdmin}
+              totalValue={sale.total_value ?? total}
               onChanged={() => {
                 refresh(saleId);
                 onSaved?.();
