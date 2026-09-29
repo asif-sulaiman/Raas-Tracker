@@ -12,6 +12,7 @@ so all Python-side comparisons and sorting work unchanged.
 import atexit
 import logging as _logging
 import os
+import threading
 from typing import Optional, Set
 
 import psycopg
@@ -31,7 +32,12 @@ class _PooledConnection:
         return getattr(self._conn, name)
 
     def close(self):
-        """Return connection to pool instead of closing it. Commit any pending transaction first."""
+        """Return connection to pool instead of closing it. Commit any pending transaction first.
+
+        Explicit close() is the *success* path: callers across the app rely on it
+        to make their writes durable (transactional mode, no autocommit). An
+        exceptional exit must go through rollback() instead - see __exit__.
+        """
         if self._conn is not None:
             try:
                 # Commit any pending transaction to avoid "INTRANS" rollback warnings
@@ -48,7 +54,22 @@ class _PooledConnection:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+        # Never commit a block that raised. Before connection pooling,
+        # psycopg.Connection.close() on an open transaction performed a
+        # server-side ROLLBACK; the pooled wrapper's close() commits instead,
+        # so `with get_connection() as conn:` used to make half-written work
+        # durable on every error path. Roll back on exception, commit on
+        # success, and return the connection to the pool either way.
+        if exc_type is None:
+            self.close()
+        else:
+            conn, self._conn = self._conn, None
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                self._pool.putconn(conn)
         return False
 
 logger = _logging.getLogger("raas")
@@ -65,16 +86,40 @@ DEFAULT_TEST_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/raas_
 # app_settings key holding the schema signature (see _schema_signature).
 _SCHEMA_SIG_KEY = "raas_schema_sig"
 
-# Signature tokens the fast path must see before it may skip DDL.
+# app_settings key holding the code-owned schema version.
+_SCHEMA_VERSION_KEY = "raas_schema_version"
+
+# Code-owned, monotonically increasing schema version.
 #
-# The stored signature is only ever a copy of the *live* schema, so merely
-# adding a new column to _create_tables() does NOT invalidate an existing
-# database: stored == live (both still lack the column) and the fast path
-# would skip the migration forever. Listing the new column's signature token
-# here forces exactly one full DDL run; _create_tables then re-records the
-# signature (now containing the column) and the fast path resumes.
+# The stored signature is only ever a copy of the *live* schema, so it can
+# never detect a *code-side* schema change: adding a column to
+# _create_tables() leaves stored == live (both still lack the column) and the
+# fast path would skip the migration forever. The old defence was a hand-typed
+# _REQUIRED_SIG_TOKENS tuple that nothing enforced, so additive migrations
+# that forgot their token silently never applied and no later deploy recovered.
+#
+# This integer is the primary, self-maintaining gate: _schema_current() returns
+# False whenever stored != _SCHEMA_VERSION, and _create_tables() re-stamps the
+# current value in the same transaction as the signature.
+#
+# BUMP RULE: increment this whenever _create_tables() gains DDL (new table,
+# new column, new index) or a data migration that must run once. A database
+# that predates this key has no row at all, which counts as "not current" and
+# runs the full path exactly once.
+_SCHEMA_VERSION = 1
+
+# Legacy belt-and-braces signature tokens, kept for databases upgraded from a
+# build that shipped them. _SCHEMA_VERSION is the real gate; these only add a
+# reason to run the full path when a token is still absent from a live schema.
 # Keep one "table.column:data_type" token per additive migration.
 _REQUIRED_SIG_TOKENS: tuple = ("invoices.amount:numeric",)
+
+# Advisory lock key serialising the migration across pool connections, so a
+# cold start with --threads=N runs the DDL once instead of N times racing.
+_MIGRATION_LOCK_KEY = 0x52414153  # "RAAS"
+
+# Guards lazy pool construction (double-checked locking around _pool/_pool_dsn).
+_pool_lock = threading.Lock()
 
 # Connection pool (initialized lazily on first get_connection call)
 _pool: Optional[ConnectionPool] = None
@@ -102,21 +147,31 @@ def resolve_dsn(dsn: Optional[str] = None) -> str:
 
 
 def _get_pool(dsn: Optional[str] = None) -> ConnectionPool:
-    """Get or create the global connection pool."""
+    """Get or create the global connection pool.
+
+    Double-checked locking: on a cold start several threads (waitress
+    --threads=4) reach this at once. Without the lock each builds its own
+    ConnectionPool, and only the winner is reachable from close_pool/atexit,
+    so every loser's pool (plus its min_size=1 background connection) leaked.
+    """
     global _pool, _pool_dsn
     effective_dsn = resolve_dsn(dsn)
-    if _pool is None or _pool_dsn != effective_dsn:
-        if _pool is not None:
-            _pool.close()
-        _pool = ConnectionPool(
-            conninfo=effective_dsn,
-            min_size=1,
-            max_size=10,
-            kwargs={"prepare_threshold": None},
-            open=True,
-        )
-        _pool_dsn = effective_dsn
-    return _pool
+    pool = _pool
+    if pool is not None and _pool_dsn == effective_dsn:
+        return pool
+    with _pool_lock:
+        if _pool is None or _pool_dsn != effective_dsn:
+            if _pool is not None:
+                _pool.close()
+            _pool = ConnectionPool(
+                conninfo=effective_dsn,
+                min_size=1,
+                max_size=10,
+                kwargs={"prepare_threshold": None},
+                open=True,
+            )
+            _pool_dsn = effective_dsn
+        return _pool
 
 
 def get_connection(dsn: Optional[str] = None) -> psycopg.Connection:
@@ -127,7 +182,8 @@ def get_connection(dsn: Optional[str] = None) -> psycopg.Connection:
     Server-side statement preparation is disabled (prepare_threshold=None)
     so the app also works through transaction-mode poolers (e.g. Supabase).
 
-    Schema setup runs only when the live schema drifts from the recorded
+    Schema setup runs only when the recorded schema version differs from the
+    code's _SCHEMA_VERSION, or the live schema drifts from the recorded
     signature (missing tables/columns after an upgrade or a manual DROP):
     the common case is a single probe query, which keeps per-request (and
     per-test) overhead to one round trip instead of the full DDL.
@@ -144,7 +200,13 @@ def get_connection(dsn: Optional[str] = None) -> psycopg.Connection:
             _create_tables(conn)
         _ensure_seeds(conn)
     except Exception:
-        # If schema check fails, return connection to pool and re-raise
+        # If schema check/migration fails, discard the transaction (a failed
+        # migration leaves the connection aborted) and return it to the pool,
+        # then re-raise. The caller sees the same exception as before.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         pool.putconn(conn)
         raise
     return _PooledConnection(conn, pool)
@@ -153,10 +215,11 @@ def get_connection(dsn: Optional[str] = None) -> psycopg.Connection:
 def close_pool() -> None:
     """Close the global connection pool. Called at shutdown."""
     global _pool, _pool_dsn
-    if _pool is not None:
-        _pool.close()
-        _pool = None
-        _pool_dsn = None
+    with _pool_lock:
+        if _pool is not None:
+            _pool.close()
+            _pool = None
+            _pool_dsn = None
 
 
 atexit.register(close_pool)
@@ -175,25 +238,44 @@ def _schema_signature_live(conn: psycopg.Connection) -> str:
     return cur.fetchone()[0]
 
 
-def _schema_current(conn: psycopg.Connection) -> bool:
-    """True when the live schema matches the recorded signature.
+def _version_is_current(stored_version: Optional[str]) -> bool:
+    """True only when the stored schema version parses to the code version.
 
-    Single round trip. Any error (fresh database without app_settings,
-    missing tables) means "not current" and triggers the full path.
+    A missing key (database predating _SCHEMA_VERSION) or any unparseable
+    value is "not current": the full DDL path must run once, which is exactly
+    the migration behaviour we want.
+    """
+    if stored_version is None:
+        return False
+    try:
+        return int(str(stored_version).strip()) == _SCHEMA_VERSION
+    except (TypeError, ValueError):
+        return False
+
+
+def _schema_current(conn: psycopg.Connection) -> bool:
+    """True when the live schema matches the code version + recorded signature.
+
+    Single round trip. The version is the primary gate: it is the only signal
+    that can see a code-side change to _create_tables(), since the signature is
+    just a copy of the live schema. Any error (fresh database without
+    app_settings, missing tables) means "not current" and triggers the full path.
     """
     try:
         cur = conn.execute(
             "SELECT (SELECT value FROM app_settings WHERE key = %s), "
+            "(SELECT value FROM app_settings WHERE key = %s), "
             "(SELECT (SELECT coalesce(string_agg(table_name || '.' || column_name || ':'"
             " || data_type, ',' ORDER BY table_name, column_name, data_type), '') "
             "FROM information_schema.columns WHERE table_schema = 'public') "
             "|| '|idx:' || "
             "(SELECT coalesce(string_agg(indexname, ',' ORDER BY indexname), '') "
             "FROM pg_indexes WHERE schemaname = 'public'))",
-            (_SCHEMA_SIG_KEY,),
+            (_SCHEMA_SIG_KEY, _SCHEMA_VERSION_KEY),
         )
-        stored, live = cur.fetchone()
-        ready = (bool(stored) and stored == live
+        stored, stored_version, live = cur.fetchone()
+        ready = (_version_is_current(stored_version)
+                 and bool(stored) and stored == live
                  and all(tok in live for tok in _REQUIRED_SIG_TOKENS))
     except Exception:
         ready = False
@@ -215,7 +297,53 @@ def _table_columns(conn: psycopg.Connection, table: str) -> Set[str]:
 
 
 def _create_tables(conn: psycopg.Connection) -> None:
-    """Create all required tables if they don't exist, then migrate + seed."""
+    """Migrate the schema, atomically.
+
+    The whole migration is ONE transaction that commits exactly once, at the
+    end, together with the signature + version upsert. Any failure rolls the
+    lot back, so a database is never left half-migrated: the recorded version
+    stays behind, the next get_connection() retries cleanly, and no partial DDL
+    is ever durable. Nothing below this function may commit or rollback.
+
+    Concurrency: a transaction-scoped advisory lock serialises the body, so on a
+    cold start with --threads=N only one connection migrates. xact-scoped means
+    PostgreSQL releases it at COMMIT *or* ROLLBACK, so it cannot leak onto a
+    pooled connection even if this function raises.
+    """
+    try:
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (_MIGRATION_LOCK_KEY,))
+        _run_migration(conn)
+        _record_schema_state(conn)
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+
+
+def _record_schema_state(conn: psycopg.Connection) -> None:
+    """Stamp the live signature and the code schema version (same transaction)."""
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES (%s, %s) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        (_SCHEMA_SIG_KEY, _schema_signature_live(conn)),
+    )
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES (%s, %s) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        (_SCHEMA_VERSION_KEY, str(_SCHEMA_VERSION)),
+    )
+
+
+def _run_migration(conn: psycopg.Connection) -> None:
+    """Every DDL statement of the schema. NO commit/rollback in here.
+
+    Runs inside _create_tables' transaction, under its advisory lock. Every
+    statement must be idempotent so it is safe on a fresh *and* an existing
+    production database.
+    """
     conn.execute("""
         CREATE TABLE IF NOT EXISTS chemicals (
             id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -545,12 +673,17 @@ def _create_tables(conn: psycopg.Connection) -> None:
     backfill_company_links(conn)
 
     # S1: Production & Invoice schema
-    # Fix production_runs.sale_item_id (broken NOT NULL)
-    if "sale_item_id" in _table_columns(conn, "production_runs"):
-        try:
-            conn.execute("ALTER TABLE production_runs ALTER COLUMN sale_item_id DROP NOT NULL")
-        except Exception:
-            pass  # already nullable
+    # Fix production_runs.sale_item_id (broken NOT NULL).
+    # Probe is_nullable instead of catching the ALTER's error: a failed
+    # statement aborts the whole transaction, and the migration is now one
+    # transaction, so a swallowed error here would poison everything after it.
+    cur = conn.execute(
+        "SELECT is_nullable FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = 'production_runs' "
+        "AND column_name = 'sale_item_id'")
+    nullable = cur.fetchone()
+    if nullable and nullable[0] == "NO":
+        conn.execute("ALTER TABLE production_runs ALTER COLUMN sale_item_id DROP NOT NULL")
     # production_runs new columns
     for col, ddl in [
         ("material_number", "ADD COLUMN material_number TEXT"),
@@ -560,36 +693,32 @@ def _create_tables(conn: psycopg.Connection) -> None:
         if col not in _table_columns(conn, "production_runs"):
             conn.execute(f"ALTER TABLE production_runs {ddl}")
 
-    # invoices table
-    if "invoices" not in [r[0] for r in conn.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema='public'").fetchall()]:
-        conn.execute("""
-            CREATE TABLE invoices (
-                id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-                sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
-                invoice_number TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'planned',
-                approx_ship_date TEXT,
-                actual_ship_date TEXT,
-                notes TEXT,
-                created_by INTEGER,
-                created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS'))
-            )
-        """)
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_sale_number "
-                     "ON invoices (sale_id, invoice_number)")
+    # invoices table (idempotent: no existence SELECT, so no check-then-act race)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS invoices (
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+            invoice_number TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'planned',
+            approx_ship_date TEXT,
+            actual_ship_date TEXT,
+            notes TEXT,
+            created_by INTEGER,
+            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS'))
+        )
+    """)
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_sale_number "
+                 "ON invoices (sale_id, invoice_number)")
 
     # production_run_links table
-    if "production_run_links" not in [r[0] for r in conn.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema='public'").fetchall()]:
-        conn.execute("""
-            CREATE TABLE production_run_links (
-                id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-                run_id INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
-                sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
-                invoice_id INTEGER REFERENCES invoices(id) ON DELETE SET NULL
-            )
-        """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS production_run_links (
+            id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+            run_id INTEGER NOT NULL REFERENCES production_runs(id) ON DELETE CASCADE,
+            sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+            invoice_id INTEGER REFERENCES invoices(id) ON DELETE SET NULL
+        )
+    """)
 
     # sales.shipment_status
     if "shipment_status" not in _table_columns(conn, "sales"):
@@ -612,14 +741,12 @@ def _create_tables(conn: psycopg.Connection) -> None:
     conn.execute("ALTER TABLE recipes DROP CONSTRAINT IF EXISTS recipes_name_key")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_recipes_company_name "
                  "ON recipes (company_id, name)")
+    # Second pass so companies created for legacy free-text clients also get
+    # the unique index / constraint cleanup applied to the same rows.
     from .companies import backfill_company_links  # local: avoids circular import
     backfill_company_links(conn)
-    conn.execute(
-        "INSERT INTO app_settings (key, value) VALUES (%s, %s) "
-        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        (_SCHEMA_SIG_KEY, _schema_signature_live(conn)),
-    )
-    conn.commit()
+    # Signature + schema version are stamped by _create_tables, in this same
+    # transaction: nothing below commits.
 
 
 def _ensure_seeds(conn: psycopg.Connection) -> None:

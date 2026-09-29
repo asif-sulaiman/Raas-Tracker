@@ -46,8 +46,11 @@ Flask 3 + psycopg3 backend, React 19/Vite/Tailwind 4 frontend, PostgreSQL (Supab
 - **API errors:** real HTTP statuses; validation → 400 `{error, details:[{field, message}]}`;
   auth → 401/403; rate limit → 429 + `Retry-After`.
 - **Schema/migrations:** idempotent `CREATE TABLE IF NOT EXISTS` + `ALTER TABLE` in
-  `raas_tracker/db.py:_create_tables()`. Schema-signature fast path skips DDL
-  (`raas_schema_sig` in `app_settings`).
+  `raas_tracker/db.py:_create_tables()`, run as ONE transaction under
+  `pg_advisory_xact_lock`. Fast path skips DDL only when the stored
+  `raas_schema_version` equals the code's `_SCHEMA_VERSION` **and** the
+  signature matches — **bump `_SCHEMA_VERSION` whenever `_create_tables()`
+  gains DDL** (a missing bump is what silently skipped past migrations).
 - **Seeds** run per-connection when tables are empty, so tests can truncate safely.
 
 ## Security — non-negotiable

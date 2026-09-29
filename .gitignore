@@ -61,6 +61,12 @@ desktop.ini
 *.swo
 *~
 
+# === Throwaway local diagnostics (run DDL at import; never commit) ===
+/check_schema.py
+/verify_schema.py
+/test_summary.py
+/test_summary2.py
+
 # === Installer build artifacts ===
 build/
 dist/

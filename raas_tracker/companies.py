@@ -108,6 +108,12 @@ def backfill_company_links(conn: psycopg.Connection) -> int:
 
     Idempotent: case variants share one company (first-seen spelling wins;
     rename later via the Companies page). Returns sales rows newly linked.
+
+    Transaction control belongs to the caller. This used to commit, which
+    split _create_tables' migration in two durable halves: anything issued
+    before the call was committed even if the rest of the migration then
+    failed, leaving a half-applied schema that was retried forever. Standalone
+    callers must commit themselves.
     """
     names = conn.execute(
         "SELECT DISTINCT trim(client_name) FROM sales "
@@ -125,7 +131,6 @@ def backfill_company_links(conn: psycopg.Connection) -> int:
            WHERE company_id IS NULL
              AND client_name IS NOT NULL AND trim(client_name) <> ''""")
     linked = cursor.rowcount or 0
-    conn.commit()
     if linked:
         logger.info("Backfilled %s sales rows to companies.", linked)
     return linked

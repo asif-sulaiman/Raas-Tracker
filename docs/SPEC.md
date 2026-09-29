@@ -414,10 +414,13 @@ CREATE TABLE app_settings (
 - FK indexes auto-created by PG
 
 ### Migration Strategy (`db.py:_create_tables`)
-- Schema-signature fast path: `_schema_signature_live()` compares columns+indexes vs stored `raas_schema_sig` in `app_settings`
-- If drift detected → full `_create_tables()` runs (idempotent `CREATE TABLE IF NOT EXISTS` + `ALTER TABLE` migrations)
+- **Code-owned version gate (`_SCHEMA_VERSION`, primary):** `_schema_current()` reads `raas_schema_version` from `app_settings` in the same round trip as the signature. A missing, unparseable, or stale value means *not current* → the full DDL runs exactly once and re-stamps the version. **Bump `_SCHEMA_VERSION` whenever `_create_tables()` gains DDL.**
+- Schema-signature fast path (secondary): `_schema_signature_live()` compares columns+indexes vs stored `raas_schema_sig` in `app_settings`, so an out-of-band `DROP` is still detected.
+- Idempotent DDL only: `CREATE TABLE IF NOT EXISTS` for tables, `ALTER TABLE ... ADD COLUMN` guarded by `_table_columns()` for columns — safe on a fresh DB *and* an existing production one.
+- **One transaction:** `_create_tables` is a transactional wrapper (`pg_advisory_xact_lock` → migration body → re-stamp signature+version → single `commit()`), so a mid-migration failure leaves nothing durable and the version un-advanced. Helpers it calls (e.g. `backfill_company_links`) must NOT commit — the caller owns transaction control. The advisory lock is transaction-scoped, so PG releases it on COMMIT *or* ROLLBACK and it cannot leak onto a pooled connection.
 - Seeds (`reason_codes`, `unit_conversions`) run on every connection if tables empty (test isolation friendly)
-- **Additive-migration gotcha (`_REQUIRED_SIG_TOKENS`):** the stored signature is a copy of the *live* schema, so adding only an `ALTER TABLE ADD COLUMN` does not invalidate it — stored == live (both lack the new column) and the fast path would skip the DDL forever. Every additive migration must add a `"table.column:data_type"` token to `_REQUIRED_SIG_TOKENS` (e.g. `"invoices.amount:numeric"`); `_schema_current()` requires those tokens in the live signature, forcing exactly one full DDL run, after which `_create_tables` re-records the signature and the fast path resumes.
+- Legacy `_REQUIRED_SIG_TOKENS` (`"table.column:data_type"` substrings) is retained only as a secondary check; it is no longer the migration gate and nothing requires new entries.
+- **Pooled connections:** `_PooledConnection.close()` commits (explicit close is the success path); `__exit__` rolls back when the block raised. Pre-pool, `psycopg.Connection.close()` rolled back, so any `except: conn.close()` path must `rollback()` explicitly first.
 
 ## 4. API Endpoints
 
