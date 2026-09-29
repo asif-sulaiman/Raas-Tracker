@@ -51,6 +51,10 @@ from chem_stock import (
     create_production_run, get_register_products, get_commercial_report,
     get_commercial_report_summary
 )
+from raas_tracker.sales import (
+    create_invoice, list_invoices, book_invoice, ship_invoice,
+    mark_invoice_paid, get_sale_completion, _now_str
+)
 
 # ---- AuthN/Z: sessions (humans) OR api_keys (scripts) ----
 # The legacy RAAS_TOKEN env gate is retired: per-key api_keys provide
@@ -1690,6 +1694,13 @@ class ProductionRunCreateIn(_StrippedModel):
     batch_number: str | None = None
     production_date: str | None = None
     notes: str | None = None
+    material_number: str | None = None
+    packing: str | None = None
+    invoice_number: str | None = None
+    sale_ids: list[int] | None = None
+    invoice_ids: list[int] | None = None
+    # Multiple recipe rows for multi-recipe production
+    recipes: list[dict] | None = None  # [{"recipe_name": str, "qty": float}]
 
 
 @app.route("/api/recipes/<path:name>/produce", methods=["POST"])
@@ -1707,16 +1718,36 @@ def api_produce_recipe(name):
         company_id = int(company_id)
     except (TypeError, ValueError):
         return jsonify({"error": "company_id must be an integer"}), 400
+    
+    # Handle multi-recipe production
+    recipes_data = data.get("recipes") or [{"recipe_name": name, "qty": payload.production_qty}]
+    results = []
     conn = get_db()
     try:
-        result = create_production_run(
-            conn, company_id, name, payload.production_qty,
-            order_number=payload.order_number,
-            batch_number=payload.batch_number,
-            production_date=payload.production_date,
-            notes=payload.notes,
-            created_by=getattr(g, "current_identity", {}).get("id"),
-        )
+        for recipe_data in recipes_data:
+            recipe_name = recipe_data.get("recipe_name", name)
+            qty = float(recipe_data.get("qty", payload.production_qty))
+            if qty <= 0:
+                conn.close()
+                return jsonify({"error": "production_qty must be positive for each recipe"}), 400
+            
+            result = create_production_run(
+                conn, company_id, recipe_name, qty,
+                order_number=payload.order_number,
+                batch_number=payload.batch_number,
+                production_date=payload.production_date,
+                material_number=payload.material_number,
+                packing=payload.packing,
+                invoice_number=payload.invoice_number,
+                sale_ids=payload.sale_ids,
+                invoice_ids=payload.invoice_ids,
+                notes=payload.notes,
+                created_by=getattr(g, "current_identity", {}).get("id"),
+            )
+            if not result:
+                conn.close()
+                return jsonify({"error": f"Recipe '{recipe_name}' not found"}), 404
+            results.append(result)
     except ValueError as e:
         conn.close()
         return jsonify({"error": str(e)}), 400
@@ -1725,9 +1756,7 @@ def api_produce_recipe(name):
         app.logger.exception("Production run failed")
         return jsonify({"error": "internal server error"}), 500
     conn.close()
-    if not result:
-        return jsonify({"error": "Recipe not found"}), 404
-    return jsonify(result), 201
+    return jsonify({"runs": results}), 201
 
 
 @app.route("/api/recipes/<path:name>/runs")
@@ -1779,12 +1808,201 @@ def api_get_production_run(name, run_id):
     ).fetchall()
     conn.close()
     return jsonify({
-        "id": run[0], "order_number": run[1], "batch_number": run[1],
-        "production_date": run[2], "qty_produced": run[2], "notes": run[4], "created_at": run[5],
-        "items": [
-            {"chemical_name": i[0], "required_qty": i[1], "deducted_qty": i[2], "unit": i[3]}
-            for i in items
-        ]
+            "id": run[0], "order_number": run[1], "batch_number": run[1],
+            "production_date": run[2], "qty_produced": run[2], "notes": run[4], "created_at": run[5],
+            "items": [
+                {"chemical_name": i[0], "required_qty": i[1], "deducted_qty": i[2], "unit": i[3]}
+                for i in items
+            ]
+        })
+
+
+# ==================== API: INVOICES ====================
+
+class InvoiceCreateIn(_StrippedModel):
+    invoice_number: str = Field(min_length=1)
+
+
+class InvoiceBookIn(_StrippedModel):
+    approx_ship_date: str = Field(min_length=1)
+
+
+class InvoiceShipIn(_StrippedModel):
+    actual_ship_date: str = Field(min_length=1)
+    invoice_number: str | None = None
+    notes: str | None = None
+
+
+class InvoicePayIn(_StrippedModel):
+    payment_amount: float = Field(gt=0)
+    payment_date: str = Field(min_length=1)
+    notes: str | None = None
+
+
+@app.route("/api/sales/<int:sale_id>/invoices", methods=["POST"])
+@admin_required
+def api_create_invoice(sale_id):
+    """Create a new invoice for a sale."""
+    try:
+        payload = InvoiceCreateIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        result = create_invoice(conn, sale_id, payload.invoice_number)
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
+    except Exception:
+        conn.close()
+        app.logger.exception("Invoice creation failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    return jsonify(result), 201
+
+
+@app.route("/api/sales/<int:sale_id>/invoices")
+def api_list_invoices(sale_id):
+    conn = get_db()
+    invoices = list_invoices(conn, sale_id)
+    conn.close()
+    return jsonify(invoices)
+
+
+@app.route("/api/sales/<int:sale_id>/invoices/<int:invoice_id>/book", methods=["POST"])
+@admin_required
+def api_book_invoice(sale_id, invoice_id):
+    try:
+        payload = InvoiceBookIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        success = book_invoice(conn, invoice_id, payload.approx_ship_date)
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
+    except Exception:
+        conn.close()
+        app.logger.exception("Invoice booking failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    if not success:
+        return jsonify({"error": "Invoice not found"}), 404
+    # Update sale's shipment_status
+    conn = get_db()
+    conn.execute(
+        "UPDATE sales SET shipment_status = 'ship_booked', updated_at = %s WHERE id = %s",
+        (_now_str(), sale_id)
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "status": "booked"})
+
+
+@app.route("/api/sales/<int:sale_id>/invoices/<int:invoice_id>/ship", methods=["POST"])
+@admin_required
+def api_ship_invoice(sale_id, invoice_id):
+    try:
+        payload = InvoiceShipIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        result = ship_invoice(
+            conn, invoice_id, payload.actual_ship_date,
+            invoice_number=payload.invoice_number,
+            notes=payload.notes,
+            created_by=getattr(g, "current_identity", {}).get("id")
+        )
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
+    except Exception:
+        conn.close()
+        app.logger.exception("Invoice shipping failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    return jsonify(result), 201
+
+
+@app.route("/api/sales/<int:sale_id>/invoices/<int:invoice_id>/pay", methods=["POST"])
+@admin_required
+def api_pay_invoice(sale_id, invoice_id):
+    try:
+        payload = InvoicePayIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        result = mark_invoice_paid(
+            conn, invoice_id, payload.payment_amount, payload.payment_date,
+            notes=payload.notes, created_by=getattr(g, "current_identity", {}).get("id")
+        )
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
+    except Exception:
+        conn.close()
+        app.logger.exception("Invoice payment failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    return jsonify(result), 201
+
+
+@app.route("/api/sales/<int:sale_id>/completion")
+def api_sale_completion(sale_id):
+    conn = get_db()
+    completion = get_sale_completion(conn, sale_id)
+    conn.close()
+    return jsonify(completion)
+
+
+@app.route("/api/production-source")
+def api_production_source():
+    """Get production source data for a sale (company, items, recipes)."""
+    sale_id = request.args.get("sale_id", type=int)
+    if sale_id is None:
+        return jsonify({"error": "sale_id is required"}), 400
+    conn = get_db()
+    try:
+        # Get sale with items
+        sale = get_sale_by_id(conn, sale_id)
+        if not sale:
+            return jsonify({"error": "Sale not found"}), 404
+        # Real recipe list for the sale's company (single connection).
+        company_id = sale.get("company_id")
+        recipes = list_recipes(conn, company_id) if company_id is not None else []
+    finally:
+        conn.close()
+
+    # Recipes whose product matches the line item (case-insensitive).
+    named = [r for r in recipes if (r.get("product_name") or "").strip()]
+    # Legacy datasets have no product-linked recipes: show all of them.
+    unassigned_only = not named
+    products = []
+    for item in sale.get("items", []):
+        product_name = item["product_name"]
+        if unassigned_only:
+            product_recipes = recipes
+        else:
+            product_recipes = [r for r in named
+                               if (r.get("product_name") or "").lower() == product_name.lower()]
+        products.append({
+            "product_name": product_name,
+            "quantity": item["quantity"],
+            "unit": item["unit"],
+            "item_no": item.get("item_no"),
+            "recipes": product_recipes
+        })
+    
+    return jsonify({
+        "sale_id": sale["id"],
+        "company_id": sale.get("company_id"),
+        "company_name": sale.get("company_name"),
+        "pi_number": sale.get("pi_number"),
+        "pi_date": sale.get("pi_date"),
+        "products": products
     })
 
 
@@ -1796,6 +2014,7 @@ class SaleItemIn(_StrippedModel):
     quantity: float = Field(ge=0)
     unit_price: float = Field(ge=0)
     unit: str = Field(default="KG", min_length=1)
+    item_no: str | None = None
 
 
 class SaleHeaderIn(_StrippedModel):

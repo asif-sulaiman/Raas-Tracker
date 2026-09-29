@@ -42,9 +42,10 @@ def add_sale(conn: psycopg.Connection, sale_data: Dict[str, Any],
     for item in items:
         unit = (item.get("unit") or "KG").strip().upper() or "KG"
         conn.execute(
-            """INSERT INTO sale_items (sale_id, product_name, quantity, unit_price, unit)
-               VALUES (%s, %s, %s, %s, %s)""",
-            (sale_id, item["product_name"], item.get("quantity", 0), item.get("unit_price", 0), unit)
+            """INSERT INTO sale_items (sale_id, product_name, quantity, unit_price, unit, item_no)
+               VALUES (%s, %s, %s, %s, %s, %s)""",
+            (sale_id, item["product_name"], item.get("quantity", 0), item.get("unit_price", 0),
+             unit, item.get("item_no"))
         )
     conn.execute(
         """INSERT INTO sales_stage_history (sale_id, from_stage, to_stage, notes)
@@ -71,7 +72,8 @@ def get_all_sales(conn: psycopg.Connection, stage: Optional[str] = None,
                 COALESCE(ROUND(SUM(si.quantity * si.unit_price)::numeric, 2)::float8, 0) AS total_value,
                 COUNT(si.id) AS item_count,
                 COALESCE((SELECT ROUND(SUM(sp.payment_amount)::numeric, 2)::float8 FROM sale_payments sp
-                          WHERE sp.sale_id = s.id), 0) AS total_paid
+                          WHERE sp.sale_id = s.id), 0) AS total_paid,
+               s.shipment_status
         FROM sales s
         LEFT JOIN sale_items si ON si.sale_id = s.id
         LEFT JOIN companies c ON c.id = s.company_id
@@ -98,6 +100,7 @@ def get_all_sales(conn: psycopg.Connection, stage: Optional[str] = None,
          "company_id": r[13], "maturity_date": r[14], "comments": r[15],
          "company_name": r[16],
          "total_value": r[17], "item_count": r[18], "total_paid": r[19],
+         "shipment_status": r[20],
          "balance": r[17] - r[19]}
         for r in conn.execute(query, params).fetchall()
     ]
@@ -109,7 +112,7 @@ def get_sale_by_id(conn: psycopg.Connection, sale_id: int) -> Optional[Dict[str,
         "SELECT s.id, s.stage, s.pi_number, s.pi_date, s.client_name, "
         "s.pi_file_path, s.lc_number, s.lc_date, s.shipment_date, "
         "s.payment_date, s.payment_amount, s.created_at, s.updated_at, "
-        "s.company_id, s.maturity_date, s.comments, c.name "
+        "s.company_id, s.maturity_date, s.comments, c.name, s.shipment_status "
         "FROM sales s LEFT JOIN companies c ON c.id = s.company_id "
         "WHERE s.id = %s", (sale_id,)).fetchone()
     if not row:
@@ -121,12 +124,14 @@ def get_sale_by_id(conn: psycopg.Connection, sale_id: int) -> Optional[Dict[str,
         "payment_amount": row[10], "created_at": row[11], "updated_at": row[12],
         "company_id": row[13], "maturity_date": row[14], "comments": row[15],
         "company_name": row[16] or row[4],
+        "shipment_status": row[17],
     }
     sale["items"] = [
         {"id": r[0], "sale_id": r[1], "product_name": r[2],
-         "quantity": r[3], "unit_price": r[4], "unit": r[5] or "KG"}
+         "quantity": r[3], "unit_price": r[4], "unit": r[5] or "KG",
+         "item_no": r[6]}
         for r in conn.execute(
-            "SELECT id, sale_id, product_name, quantity, unit_price, unit "
+            "SELECT id, sale_id, product_name, quantity, unit_price, unit, item_no "
             "FROM sale_items WHERE sale_id = %s ORDER BY id", (sale_id,)
         ).fetchall()
     ]
@@ -146,6 +151,7 @@ def get_sale_by_id(conn: psycopg.Connection, sale_id: int) -> Optional[Dict[str,
             (sale_id,)
         ).fetchall()
     ]
+    sale["invoices"] = list_invoices(conn, sale_id)
     sale["invoice_total"] = sum(
         (i["quantity"] or 0) * (i["unit_price"] or 0) for i in sale["items"]
     )
@@ -164,10 +170,22 @@ def move_sale_to_stage(conn: psycopg.Connection, sale_id: int, new_stage: str,
     current, client_name = row[0], row[1] or f"#{sale_id}"
     if new_stage not in SALE_STAGE_ORDER:
         return False
-    conn.execute(
-        "UPDATE sales SET stage = %s, updated_at = %s WHERE id = %s",
-        (new_stage, _now_str(), sale_id)
-    )
+    if new_stage == "shipment_ongoing":
+        # Entering production/shipment: mark the sale as running unless it
+        # already reached a later shipment_status (never downgrade).
+        conn.execute(
+            """UPDATE sales
+               SET stage = %s,
+                   shipment_status = COALESCE(shipment_status, 'production_running'),
+                   updated_at = %s
+               WHERE id = %s""",
+            (new_stage, _now_str(), sale_id)
+        )
+    else:
+        conn.execute(
+            "UPDATE sales SET stage = %s, updated_at = %s WHERE id = %s",
+            (new_stage, _now_str(), sale_id)
+        )
     conn.execute(
         """INSERT INTO sales_stage_history (sale_id, from_stage, to_stage, notes)
            VALUES (%s, %s, %s, %s)""",
@@ -1100,3 +1118,160 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
             period["items"] = items
     
     return periods
+
+
+def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str) -> Dict[str, Any]:
+    """Create a new invoice for a sale."""
+    if not invoice_number or not invoice_number.strip():
+        raise ValueError("invoice_number is required")
+    invoice_number = invoice_number.strip()
+    
+    try:
+        cursor = conn.execute(
+            """INSERT INTO invoices (sale_id, invoice_number, status, created_at)
+               VALUES (%s, %s, 'planned', %s) RETURNING id""",
+            (sale_id, invoice_number.strip(), _now_str())
+        )
+        invoice_id = cursor.fetchone()[0]
+    except psycopg.IntegrityError:
+        raise ValueError(f"Invoice number '{invoice_number}' already exists for this sale")
+    
+    # Entering production: only set production_running when no status yet
+    # (COALESCE so a sale already at production_done/ship_booked never downgrades)
+    conn.execute(
+        "UPDATE sales SET shipment_status = COALESCE(shipment_status, 'production_running'), updated_at = %s WHERE id = %s",
+        (_now_str(), sale_id)
+    )
+    
+    conn.commit()
+    log_audit_action(conn, "INVOICE_CREATE", "invoice", invoice_id,
+                     new_value=invoice_number)
+    return {"invoice_id": invoice_id, "invoice_number": invoice_number, "status": "planned"}
+
+
+def update_invoice_status(conn: psycopg.Connection, invoice_id: int, status: str,
+                          approx_ship_date: Optional[str] = None,
+                          actual_ship_date: Optional[str] = None) -> bool:
+    """Update invoice status and optional dates."""
+    valid_statuses = ["planned", "produced", "booked", "shipped", "paid"]
+    if status not in valid_statuses:
+        raise ValueError(f"Invalid status: {status}. Must be one of {valid_statuses}")
+    
+    fields = ["status = %s"]
+    params = [status]
+    if approx_ship_date is not None:
+        fields.append("approx_ship_date = %s")
+        params.append(approx_ship_date)
+    if actual_ship_date is not None:
+        fields.append("actual_ship_date = %s")
+        params.append(actual_ship_date)
+    
+    params.append(invoice_id)
+    cursor = conn.execute(
+        f"UPDATE invoices SET {', '.join(fields)} WHERE id = %s",
+        params
+    )
+    if cursor.rowcount == 0:
+        return False
+    conn.commit()
+    return True
+
+
+def book_invoice(conn: psycopg.Connection, invoice_id: int, approx_ship_date: str) -> bool:
+    """Book an invoice with approximate ship date."""
+    if not approx_ship_date or not approx_ship_date.strip():
+        raise ValueError("approx_ship_date is required for booking")
+    return update_invoice_status(conn, invoice_id, "booked", approx_ship_date=approx_ship_date.strip())
+
+
+def ship_invoice(conn: psycopg.Connection, invoice_id: int, actual_ship_date: str,
+                 invoice_number: str, notes: Optional[str] = None,
+                 created_by: Optional[int] = None) -> Dict[str, Any]:
+    """Mark an invoice as shipped - creates shipment record and updates invoice."""
+    if not actual_ship_date or not actual_ship_date.strip():
+        raise ValueError("actual_ship_date is required for shipping")
+    
+    # Get invoice details
+    invoice = conn.execute(
+        "SELECT id, sale_id, invoice_number FROM invoices WHERE id = %s",
+        (invoice_id,)
+    ).fetchone()
+    if not invoice:
+        raise ValueError("Invoice not found")
+    
+    _, sale_id, invoice_number = invoice
+    
+    # Create shipment record
+    shipment_id = add_shipment(conn, invoice[1], actual_ship_date.strip(),
+                               invoice_number or invoice[2], None, "Shipped via production run")
+    
+    # Update invoice to shipped
+    conn.execute(
+        "UPDATE invoices SET status = 'shipped', actual_ship_date = %s, notes = COALESCE(notes, '') || %s WHERE id = %s",
+        (actual_ship_date.strip(), f"\nShipped on {actual_ship_date.strip()}: " + (notes or ""), invoice_id)
+    )
+    
+    conn.commit()
+    log_audit_action(conn, "INVOICE_SHIP", "invoice", invoice_id,
+                     new_value=f"Shipped on {actual_ship_date.strip()}")
+    return {"invoice_id": invoice_id, "shipment_id": shipment_id, "status": "shipped"}
+
+
+def mark_invoice_paid(conn: psycopg.Connection, invoice_id: int,
+                      payment_amount: float, payment_date: str,
+                      notes: Optional[str] = None, created_by: Optional[int] = None) -> Dict[str, Any]:
+    """Record a payment for an invoice (partial or full)."""
+    if payment_amount is None or payment_amount <= 0:
+        raise ValueError("payment_amount must be positive")
+    
+    invoice = conn.execute(
+        "SELECT sale_id FROM invoices WHERE id = %s", (invoice_id,)
+    ).fetchone()
+    if not invoice:
+        raise ValueError("Invoice not found")
+    sale_id = invoice[0]
+    
+    cursor = conn.execute(
+        """INSERT INTO sale_payments (sale_id, payment_date, payment_amount, notes, invoice_id)
+           VALUES (%s, %s, %s, %s, %s) RETURNING id""",
+        (sale_id, payment_date, payment_amount, notes, invoice_id)
+    )
+    payment_id = cursor.fetchone()[0]
+    _sync_sale_payment_totals(conn, sale_id)
+    log_audit_action(conn, "INVOICE_PAYMENT", "invoice", invoice_id,
+                     new_value=f"amount={payment_amount:g} date={payment_date}")
+    conn.commit()
+    return {"payment_id": payment_id, "status": "paid"}
+
+
+def list_invoices(conn: psycopg.Connection, sale_id: int) -> List[Dict[str, Any]]:
+    """List all invoices for a sale."""
+    return [
+        {"invoice_id": r[0], "invoice_number": r[1], "status": r[2],
+         "approx_ship_date": r[3], "actual_ship_date": r[4], "notes": r[5],
+         "created_at": r[6]}
+        for r in conn.execute(
+            """SELECT id, invoice_number, status, approx_ship_date, actual_ship_date, notes, created_at
+               FROM invoices WHERE sale_id = %s ORDER BY id""",
+            (sale_id,)
+        ).fetchall()
+    ]
+
+
+def get_sale_completion(conn: psycopg.Connection, sale_id: int) -> Dict[str, Any]:
+    """Get sale completion status based on invoices."""
+    invoices = list_invoices(conn, sale_id)
+    if not invoices:
+        return {"status": "none", "paid": 0, "total": 0, "invoices": []}
+    
+    paid = sum(1 for inv in invoices if inv["status"] == "paid")
+    total = len(invoices)
+    
+    if paid == total:
+        status = "full"
+    elif paid > 0:
+        status = "partial"
+    else:
+        status = "none"
+    
+    return {"status": status, "paid": paid, "total": total, "invoices": invoices}

@@ -167,14 +167,20 @@ def add_recipe_item(conn: psycopg.Connection, company_id: int, recipe_name: str,
     return True
 
 
-def list_recipes(conn: psycopg.Connection) -> List[Dict[str, Any]]:
-    """List all recipes with owning company."""
-    cursor = conn.execute(
+def list_recipes(conn: psycopg.Connection,
+                 company_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    """List all recipes with owning company (optionally one company's only)."""
+    query = (
         "SELECT r.id, r.name, r.total_quantity, r.water_percentage, "
         "r.created_date, r.company_id, r.product_name, c.name "
         "FROM recipes r LEFT JOIN companies c ON c.id = r.company_id "
-        "ORDER BY r.name"
     )
+    params: list = []
+    if company_id is not None:
+        query += "WHERE r.company_id = %s "
+        params.append(company_id)
+    query += "ORDER BY r.name"
+    cursor = conn.execute(query, params)
     return [
         {"id": row[0], "name": row[1], "total_quantity": row[2], "water_percentage": row[3], "created": row[4],
          "company_id": row[5], "product_name": row[6], "company_name": row[7]}
@@ -484,6 +490,11 @@ def create_production_run(
     order_number: str = None,
     batch_number: str = None,
     production_date: str = None,
+    material_number: str = None,
+    packing: str = None,
+    invoice_number: str = None,
+    sale_ids: list[int] | None = None,
+    invoice_ids: list[int] | None = None,
     notes: str = None,
     created_by: int = None,
 ) -> dict:
@@ -506,6 +517,7 @@ def create_production_run(
     """
     from datetime import date as _date
     from raas_tracker.stock import update_stock
+    from raas_tracker.sales import _now_str
 
     # Validate inputs
     if production_qty <= 0:
@@ -541,11 +553,64 @@ def create_production_run(
     prod_date = production_date or _date.today().isoformat()
     cursor = conn.execute(
         """INSERT INTO production_runs
-           (recipe_id, order_number, batch_number, production_date, qty_produced, notes, created_by)
-           VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
-        (recipe["id"], order_number, batch_number, prod_date, production_qty, notes, created_by)
+           (recipe_id, order_number, batch_number, production_date, qty_produced, notes, created_by,
+            material_number, packing, invoice_number)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+        (recipe["id"], order_number, batch_number, prod_date, production_qty, notes, created_by,
+         material_number, packing, invoice_number)
     )
     run_id = cursor.fetchone()[0]
+
+    # Link production run to sales and invoices
+    linked_sale_ids: List[int] = []
+    if sale_ids:
+        for sale_id in sale_ids:
+            conn.execute(
+                """INSERT INTO production_run_links (run_id, sale_id)
+                   VALUES (%s, %s)""",
+                (run_id, sale_id)
+            )
+            if sale_id not in linked_sale_ids:
+                linked_sale_ids.append(sale_id)
+    linked_invoice_ids: List[int] = []
+    if invoice_ids:
+        for invoice_id in invoice_ids:
+            # sale_id is derived from the invoice row itself — never guessed.
+            invoice_row = conn.execute(
+                "SELECT sale_id FROM invoices WHERE id = %s", (invoice_id,)
+            ).fetchone()
+            if not invoice_row:
+                logger.warning("Invoice %s not found; skipping production run link", invoice_id)
+                continue
+            sale_id = invoice_row[0]
+            conn.execute(
+                """INSERT INTO production_run_links (run_id, sale_id, invoice_id)
+                   VALUES (%s, %s, %s)""",
+                (run_id, sale_id, invoice_id)
+            )
+            if sale_id not in linked_sale_ids:
+                linked_sale_ids.append(sale_id)
+            linked_invoice_ids.append(invoice_id)
+            # Update invoice status to produced
+            conn.execute(
+                "UPDATE invoices SET status = 'produced' WHERE id = %s",
+                (invoice_id,)
+            )
+
+    # Production finished: advance shipment_status to production_done.
+    # CASE keeps later states (production_done, ship_booked, ...) intact.
+    if linked_sale_ids:
+        conn.execute(
+            """UPDATE sales
+                  SET shipment_status = CASE
+                        WHEN shipment_status IS NULL
+                          OR shipment_status = 'production_running'
+                        THEN 'production_done'
+                        ELSE shipment_status END,
+                      updated_at = %s
+                WHERE id = ANY(%s)""",
+            (_now_str(), linked_sale_ids)
+        )
 
     # Snapshot formula and deduct stock
     for item in run_items:
@@ -585,6 +650,11 @@ def create_production_run(
         "run_id": run_id,
         "recipe_name": recipe_name,
         "production_qty": production_qty,
+        "material_number": material_number,
+        "packing": packing,
+        "invoice_number": invoice_number,
+        "sale_ids": linked_sale_ids,
+        "invoice_ids": linked_invoice_ids,
         "shortage_report": final_shortage_report,
         "warnings": [item for item in final_shortage_report if item["status"] == "SHORTAGE"],
     }
