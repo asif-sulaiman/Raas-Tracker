@@ -106,6 +106,7 @@ _SCHEMA_VERSION_KEY = "raas_schema_version"
 # new column, new index) or a data migration that must run once. A database
 # that predates this key has no row at all, which counts as "not current" and
 # runs the full path exactly once.
+#
 _SCHEMA_VERSION = 1
 
 # Legacy belt-and-braces signature tokens, kept for databases upgraded from a
@@ -628,6 +629,12 @@ def _run_migration(conn: psycopg.Connection) -> None:
             ON chemicals (lower(name));
         CREATE INDEX IF NOT EXISTS idx_audit_chemical_time
             ON audit_logs (entity_type, entity_id, timestamp);
+        -- Performance indexes for dashboard / sales pipeline queries
+        CREATE INDEX IF NOT EXISTS idx_sales_stage ON sales(stage);
+        CREATE INDEX IF NOT EXISTS idx_sales_created_at ON sales(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_sale_items_sale_id ON sale_items(sale_id);
+        CREATE INDEX IF NOT EXISTS idx_sale_items_product_name ON sale_items(product_name);
+        CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp DESC);
         CREATE TABLE IF NOT EXISTS notification_reads (
             user_id INTEGER NOT NULL,
             notification_id INTEGER NOT NULL,
@@ -646,6 +653,7 @@ def _run_migration(conn: psycopg.Connection) -> None:
     if "company_id" not in _table_columns(conn, "sales"):
         conn.execute("ALTER TABLE sales ADD COLUMN company_id INTEGER "
                      "REFERENCES companies(id) ON DELETE RESTRICT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_company_id ON sales(company_id)")
     if "comments" not in _table_columns(conn, "sales"):
         conn.execute("ALTER TABLE sales ADD COLUMN comments TEXT")
     if "maturity_date" not in _table_columns(conn, "sales"):
