@@ -186,7 +186,7 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 
 1. Should `warehouse_id` column be added for multi-warehouse? (In non-goals, but may be needed later)
 2. Recipe item `required_qty_per_unit` is currently auto-calculated (percentage × total_quantity) — should it be persisted?
-3. Vercel preview has 4.5MB upload limit — strategy for large PI files in production? (Production host uses waitress, Vercel preview only)
+3. Vercel 4.5MB upload limit — strategy for large PI files? The app is currently served from Vercel, where the platform caps bodies at 4.5MB at the edge before Flask sees them; `MAX_CONTENT_LENGTH_MB` (M7.1) aligns the app's own cap and 413 JSON with it. Still open: stand up a non-Vercel host (waitress, 50MB) for large PI files, or require PI files under 4.5MB?
 4. `stock.py` missing from `raas_tracker` package — `chem_stock.py` shim used; should package be renamed?
 
 ---

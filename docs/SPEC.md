@@ -633,10 +633,10 @@ CREATE TABLE app_settings (
 | **DB Errors** | `psycopg.IntegrityError` → `ValueError` → 400/409; `OperationalError` → 500 |
 | **Auth** | Missing/invalid → 401/403 JSON; login throttle → 429 + `Retry-After` |
 | **Rate Limit** | 429 + `Retry-After` header; JSON `{error: "rate limit exceeded, slow down"}` |
-| **File Upload** | Max 50MB (`MAX_CONTENT_LENGTH`); allowed ext {.pdf,.xlsx,.xls}; secure filename; parse failure → 400 + file cleanup |
+| **File Upload** | Max 50MB by default (`MAX_CONTENT_LENGTH`, override with `MAX_CONTENT_LENGTH_MB`); allowed ext {.pdf,.xlsx,.xls}; secure filename; parse failure → 400 + file cleanup |
 | **PI Parse** | Only `.pdf`/`.docx` accepted; legacy `.doc` rejected with guidance |
 | **Global** | `@app.errorhandler(500)` + `@app.errorhandler(Exception)` → 500 `{"error":"internal server error"}` (log full trace) |
-| **413** | File too large → 413 `{"error":"file too large (max 50MB)"}` |
+| **413** | File too large → 413 `{"error":"file too large (max N MB)"}` where N = `MAX_CONTENT_LENGTH_MB` (default 50). On Vercel the platform 4.5MB body limit fires at the edge first, so >4.5MB gets Vercel's own 413 page, not this JSON — set `MAX_CONTENT_LENGTH_MB=4.5` to align the app cap with the platform |
 
 ## 7. Testing Strategy
 
@@ -674,13 +674,14 @@ CREATE TABLE app_settings (
 | `CORS_ALLOWED_ORIGINS` | No | `""` | Comma-separated origins (empty = same-origin only) |
 | `RAAS_RATE_LIMITS` | No | `on` | `off` disables Flask-Limiter (tests) |
 | `REDIS_URL` | **Prod (multi-process)** | unset → in-memory | Shared rate-limit storage (Flask-Limiter). **Required on serverless/multi-process** so limits are global, not per-process; optional for single-process dev |
+| `MAX_CONTENT_LENGTH_MB` | No | `50` | Upload body cap in MB (float allowed, e.g. `4.5` on Vercel) |
 | `RAAS_DATA_DIR` | No | repo root | Writable data dir (uploads, reports) |
 
 ## 9. Risks & Unknowns
 
 | Risk | Mitigation |
 |---|---|
-| **Vercel 4.5MB body limit** | Preview-only; production host uses waitress (50MB). Show size warning on upload page. |
+| **Vercel 4.5MB body limit** | Platform limit is enforced at the edge before Flask; set `MAX_CONTENT_LENGTH_MB=4.5` on Vercel so the app cap matches. Off-Vercel (waitress) the cap is 50MB. Show size warning on upload page. |
 | **Password leakage in chat** | Rotation guide (README); never put passwords in git/chat. |
 | **Supabase project pause (free tier)** | Monitoring + alerts; recommend paid plan for production. |
 | **Schema drift manual DROP** | Schema-sig fast path auto-detects; `_create_tables` idempotent. |

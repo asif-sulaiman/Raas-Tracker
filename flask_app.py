@@ -24,10 +24,27 @@ if not _secret:
           file=sys.stderr)
     print("  Set RAAS_SECRET env var for production.", file=sys.stderr)
 
+def _max_content_length_bytes(raw, default_mb=50.0):
+    """Resolve MAX_CONTENT_LENGTH_MB (env, MB) to bytes for Flask's MAX_CONTENT_LENGTH."""
+    if raw is None or not str(raw).strip():
+        return int(default_mb * 1024 * 1024)
+    try:
+        mb = float(raw)
+        if mb <= 0:
+            raise ValueError("must be > 0")
+    except (TypeError, ValueError):
+        print(f"WARNING: invalid MAX_CONTENT_LENGTH_MB={raw!r}; using {default_mb}MB",
+              file=sys.stderr)
+        return int(default_mb * 1024 * 1024)
+    return int(mb * 1024 * 1024)
+
+
 app = Flask(__name__)
 app.secret_key = _secret
 # Hard cap on request bodies (client-side 50MB check is bypassable)
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = _max_content_length_bytes(
+    os.getenv("MAX_CONTENT_LENGTH_MB")
+)
 REACT_BUILD_DIR = os.path.join(os.path.dirname(__file__), "react_frontend")
 
 # ProxyFix for correct remote_addr behind proxy (e.g., nginx, Cloudflare)
@@ -718,7 +735,8 @@ def api_revoke_key(key_id):
 
 @app.errorhandler(413)
 def _too_large(_e):
-    return jsonify({"error": "file too large (max 50MB)"}), 413
+    max_mb = app.config["MAX_CONTENT_LENGTH"] / (1024 * 1024)
+    return jsonify({"error": f"file too large (max {max_mb:g}MB)"}), 413
 
 
 def _req_float(data, field, default=0):
