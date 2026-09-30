@@ -654,8 +654,10 @@ CREATE TABLE app_settings (
 - **Lint**: oxlint (0 errors, 39 baseline warnings)
 
 ### CI (`.github/workflows/ci.yml`)
+- **Runtime**: Python **3.12** pinned to the Vercel deploy runtime (Vercel defaults to 3.12; no `.python-version`/`pyproject.toml` overrides it) · Node 22 · postgres:16
 - **Backend**: Ubuntu + postgres:16 service → `pip install -r requirements.txt requirements-dev.txt` → `pytest tests/ -q`
 - **Frontend**: Node 22 + npm ci → oxlint → vitest run → vite build
+- **Triggers**: push + PR to `main`
 
 ## 8. Environment Variables
 
