@@ -176,8 +176,9 @@ export default function Reports() {
       const params = new URLSearchParams(searchParams);
       const res = await apiFetch(`/api/reports/live/summary?${params.toString()}`);
       const data = await res.json();
-      if (Array.isArray(data)) {
-        setCommercialSummary(data);
+      const periods = Array.isArray(data) ? data : (Array.isArray(data?.periods) ? data.periods : null);
+      if (periods) {
+        setCommercialSummary(periods);
       } else {
         setCommercialError((data && data.error) || 'Failed to load the commercial summary');
       }
