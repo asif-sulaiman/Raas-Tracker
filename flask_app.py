@@ -1585,6 +1585,7 @@ def api_commercial_report_export():
         return jsonify({"error": "No data to export"}), 400
     import csv
     import io
+    from chem_stock import csv_safe
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
@@ -1595,7 +1596,7 @@ def api_commercial_report_export():
         "Due Amount ($)", "Payment Status", "Payment Comment"
     ])
     for r in rows:
-        writer.writerow([
+        writer.writerow([csv_safe(v) for v in (
             r.get("customer_name", ""),
             r.get("pi_number", ""), r.get("pi_date", ""),
             r.get("lc_number", ""), r.get("lc_date", ""),
@@ -1609,7 +1610,7 @@ def api_commercial_report_export():
             r.get("received_amount", 0),
             r.get("due_amount", 0),
             r.get("payment_status", ""), r.get("payment_comment", "")
-        ])
+        )])
     from datetime import date as _date
     filename = f"commercial_report_{_date.today().isoformat()}.csv"
     output.seek(0)

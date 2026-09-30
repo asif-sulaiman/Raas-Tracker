@@ -451,6 +451,19 @@ def test_export_admin_csv(admin_client, db):
     assert {p[0] for p in parsed[1:]} == {"Alpha Co", "Beta Co"}
 
 
+def test_export_neutralizes_formula_injection(admin_client, db):
+    """User-supplied cells starting with =/+/-/@ must not reach Excel as live formulas."""
+    _sale(db, "PI-FX1", client_name='=HYPERLINK("http://evil","x")',
+          created_at="2026-01-01 00:00:00",
+          items=[{"product_name": "=1+1", "quantity": 1, "unit_price": 10, "unit": "KG"}])
+    r = admin_client.post("/api/reports/live/export", json={})
+    assert r.status_code == 200
+    parsed = list(csv.reader(io.StringIO(r.get_json()["content"])))
+    assert len(parsed) == 2
+    assert parsed[1][0] == '\'=HYPERLINK("http://evil","x")'
+    assert parsed[1][5] == "'=1+1"
+
+
 def test_export_filtered_by_date_range(admin_client, db):
     """Export with date_from/date_to filters."""
     _sale(db, "PI-ED1", created_at="2026-01-01 00:00:00", pi_date="2026-01-10")
