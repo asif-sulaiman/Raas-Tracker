@@ -62,7 +62,7 @@ Vertical slices, each independently testable.
 ## 🚀 Phase M9: Sales–Production–Live Epic (Current)
 
 Locked: USD only · admin-only financials/history/mutations · partial shipments real ·
-warn-and-allow shortages · manual master recipes (no auto-create) · frozen batch
+fail-closed shortage handling (a short ingredient rejects the whole run) · manual master recipes (no auto-create) · frozen batch
 snapshots · companies master · single shipment header per record.
 
 | Task | Description | Files Touched | Acceptance |

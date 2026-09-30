@@ -703,7 +703,7 @@ def create_production_run(
             required = item["required_qty"]
             chem_name = item["chemical_name"]
 
-            # Deduce stock (warn-and-allow: clamps at zero)
+            # Deduce stock (fail-closed: any shortage rejects the whole run)
             success = update_stock(conn, chem_name, -item["required_qty"],
                                    reason=f"Production {batch_number or run_id} for {recipe_name}",
                                    atomic=False)

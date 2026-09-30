@@ -482,7 +482,7 @@ CREATE TABLE app_settings (
 | PUT | `/api/recipes/<name>` | Session/Key | Update yield/water% |
 | PUT | `/api/recipes/<name>/items/<chem>` | Session/Key | Update item % |
 | GET | `/api/register/products` | Session/Key | Registered products for a company (master-recipe source, P2) |
-| POST | `/api/recipes/<name>/produce` | Admin | Create production run(s): formula snapshot + atomic stock deduction (warn-and-allow) (P3). `company_id` required; optional `material_number`, `packing`, `invoice_number`, `sale_ids`, `invoice_ids`, multi-recipe `recipes:[{recipe_name, qty}]`. Linked invoices → `produced`, sale → `production_done` (advance-only) |
+| POST | `/api/recipes/<name>/produce` | Admin | Create production run(s): formula snapshot + atomic stock deduction (fail-closed on shortage) (P3). `company_id` required; optional `material_number`, `packing`, `invoice_number`, `sale_ids`, `invoice_ids`, multi-recipe `recipes:[{recipe_name, qty}]`. Linked invoices → `produced`, sale → `production_done` (advance-only) |
 | GET | `/api/recipes/<name>/runs` | Session/Key | List production runs for a recipe (P3) |
 | GET | `/api/recipes/<name>/runs/<id>` | Session/Key | Production run detail with snapshot (P3) |
 | GET | `/api/production-source` | Session/Key | Sale + line items (with `item_no`) + company recipes for the Go for Production modal (`sale_id` required) |
