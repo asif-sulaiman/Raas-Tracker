@@ -603,6 +603,11 @@ CREATE TABLE app_settings (
 - Default: 300/min per identity (user/key/IP)
 - Tier 2: `/api/upload`, `/api/uploads/*/approve|apply|export`, `/api/reports/*`, `/api/sales/parse`, `/api/sales/export` → 15/min
 - Tier 1: Login throttle (5 fails/10 min per username+IP, DB-backed)
+- Storage: `memory://` unless `REDIS_URL` is set — counters are **per process**. On a
+  multi-process/serverless host (Vercel, waitress with >1 worker) each process counts
+  independently, so a client can exceed the tabled limits by a factor of N processes.
+  Tier 1 (login) is DB-backed and unaffected. Set `REDIS_URL` in production to share
+  counters across processes.
 - Test bypass: `RAAS_RATE_LIMITS=off`
 
 ### Cron Jobs (Vercel)
@@ -668,6 +673,7 @@ CREATE TABLE app_settings (
 | `RAAS_LOG_LEVEL` | No | `INFO` | Python log level |
 | `CORS_ALLOWED_ORIGINS` | No | `""` | Comma-separated origins (empty = same-origin only) |
 | `RAAS_RATE_LIMITS` | No | `on` | `off` disables Flask-Limiter (tests) |
+| `REDIS_URL` | **Prod (multi-process)** | unset → in-memory | Shared rate-limit storage (Flask-Limiter). **Required on serverless/multi-process** so limits are global, not per-process; optional for single-process dev |
 | `RAAS_DATA_DIR` | No | repo root | Writable data dir (uploads, reports) |
 
 ## 9. Risks & Unknowns
