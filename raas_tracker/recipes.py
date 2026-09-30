@@ -1,5 +1,6 @@
 """Recipes plus production reports."""
 
+import math
 import psycopg
 from .audit import log_audit_action
 import json
@@ -579,8 +580,9 @@ def create_production_run(
     if not atomic and deferred_reorder is None:
         raise ValueError("atomic=False requires a deferred_reorder list")
 
-    # Validate inputs
-    if production_qty <= 0:
+    # Validate inputs (isfinite first: NaN passes every "<= 0" comparison,
+    # and +inf would deduct infinite stock downstream).
+    if not math.isfinite(production_qty) or production_qty <= 0:
         raise ValueError("production_qty must be positive")
 
     # Get recipe

@@ -3,6 +3,7 @@
 import os
 import sys
 import io
+import math
 import hashlib
 from flask import Flask, request, jsonify, send_from_directory, g, redirect
 from datetime import date, timedelta
@@ -742,9 +743,14 @@ def _too_large(_e):
 def _req_float(data, field, default=0):
     """V5: coerce numeric input or raise a 400-friendly ValueError."""
     try:
-        return float(data.get(field, default))
+        value = float(data.get(field, default))
     except (TypeError, ValueError):
         raise ValueError(f"{field} must be a number")
+    # NaN/Infinity parse fine as floats but poison every comparison and sum
+    # downstream (nan <= 0 is False, so "> 0" guards never trip).
+    if not math.isfinite(value):
+        raise ValueError(f"{field} must be a finite number")
+    return value
 
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -1730,8 +1736,15 @@ def api_create_conversion():
 
 
 # ==================== API: PRODUCTION RUNS ====================
+class ProductionRecipeIn(_StrippedModel):
+    recipe_name: str | None = None
+    # gt alone does not exclude +inf, and NaN slips past naive "> 0" checks,
+    # so both are rejected here — before any SQL sees the number.
+    qty: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+
+
 class ProductionRunCreateIn(_StrippedModel):
-    production_qty: float = Field(gt=0)
+    production_qty: float = Field(gt=0, allow_inf_nan=False)
     order_number: str | None = None
     batch_number: str | None = None
     production_date: str | None = None
@@ -1742,7 +1755,7 @@ class ProductionRunCreateIn(_StrippedModel):
     sale_ids: list[int] | None = None
     invoice_ids: list[int] | None = None
     # Multiple recipe rows for multi-recipe production
-    recipes: list[dict] | None = None  # [{"recipe_name": str, "qty": float}]
+    recipes: list[ProductionRecipeIn] | None = None
 
 
 def _rollback(conn):
@@ -1797,18 +1810,16 @@ def api_produce_recipe(name):
 
     # Handle multi-recipe production. ALL recipes in one request share ONE
     # transaction: a failure on recipe 2 must not leave recipe 1 produced
-    # (which a retry would then produce a second time).
-    recipes_data = data.get("recipes") or [{"recipe_name": name, "qty": payload.production_qty}]
+    # (which a retry would then produce a second time). Rows come from the
+    # validated schema — qty is guaranteed finite and > 0 here.
+    recipes_data = payload.recipes or [ProductionRecipeIn(recipe_name=name, qty=payload.production_qty)]
     results = []
     pending_reorder: list[str] = []
     conn = get_db()
     try:
         for recipe_data in recipes_data:
-            recipe_name = recipe_data.get("recipe_name", name)
-            qty = float(recipe_data.get("qty", payload.production_qty))
-            if qty <= 0:
-                _rollback_close(conn)
-                return jsonify({"error": "production_qty must be positive for each recipe"}), 400
+            recipe_name = recipe_data.recipe_name or name
+            qty = recipe_data.qty if recipe_data.qty is not None else payload.production_qty
 
             result = create_production_run(
                 conn, company_id, recipe_name, qty,
