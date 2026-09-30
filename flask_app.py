@@ -1499,6 +1499,7 @@ def api_report_export():
 
 # ==================== API: LIVE COMMERCIAL REPORT ====================
 @app.route("/api/reports/live")
+@limiter.limit("15 per minute")
 @admin_required
 def api_commercial_report():
     conn = get_db()
@@ -1510,6 +1511,7 @@ def api_commercial_report():
 
 
 @app.route("/api/reports/live/filtered")
+@limiter.limit("15 per minute")
 @admin_required
 def api_commercial_report_filtered():
     """Filtered commercial report with pagination."""
@@ -1541,6 +1543,7 @@ def api_commercial_report_filtered():
 
 
 @app.route("/api/reports/live/summary")
+@limiter.limit("15 per minute")
 @admin_required
 def api_commercial_report_summary():
     """Period-aggregated commercial report summary."""
