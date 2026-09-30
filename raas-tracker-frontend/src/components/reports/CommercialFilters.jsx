@@ -18,6 +18,7 @@ export default function CommercialFilters({
     date_preset: searchParams.get('date_preset') || '',
     customer_name: searchParams.get('customer_name') || '',
     product_name: searchParams.get('product_name') || '',
+    q: searchParams.get('q') || '',
     company_id: searchParams.get('company_id') || '',
     stage: searchParams.get('stage') || '',
     payment_status: searchParams.get('payment_status') || '',
@@ -55,6 +56,7 @@ export default function CommercialFilters({
       date_from: '',
       date_to: '',
       date_preset: '',
+      q: '',
       customer_name: '',
       product_name: '',
       company_id: '',
@@ -77,13 +79,8 @@ export default function CommercialFilters({
             id="quick-search"
             type="text"
             placeholder="Quick Search: PI No / Customer"
-            value={filters.customer_name}
-            onChange={(e) =>
-              updateFilters({
-                customer_name: e.target.value,
-                product_name: e.target.value,
-              })
-            }
+            value={filters.q}
+            onChange={(e) => updateFilters({ q: e.target.value })}
             className="w-full pl-9 pr-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500"
           />
           <Filter className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />

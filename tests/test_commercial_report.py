@@ -600,3 +600,73 @@ def test_export_get_method_with_query_params(admin_client, db):
     parsed = list(csv.reader(io.StringIO(content)))
     assert len(parsed) == 2  # header + 1 row
     assert parsed[1][0] == "Alpha Corp"
+
+
+# ------------------------- quick search (q) + server total -------------------------
+def _q_seed(db):
+    a = _sale(db, "PI-QQ1", client_name="Acme Ltd",
+              items=[{"product_name": "Widget Alpha", "quantity": 1, "unit_price": 10, "unit": "KG"}])
+    b = _sale(db, "PI-77", client_name="QQ Traders",
+              items=[{"product_name": "Bolt M6", "quantity": 2, "unit_price": 5, "unit": "EA"}])
+    c = _sale(db, "PI-88", client_name="Globex",
+              items=[{"product_name": "QQ Liquid", "quantity": 3, "unit_price": 7, "unit": "L"}])
+    d = _sale(db, "PI-99", client_name="Other Co",
+              items=[{"product_name": "Plain Salt", "quantity": 1, "unit_price": 3, "unit": "KG"}])
+    return a, b, c, d
+
+
+def test_quick_search_matches_pi_or_customer_or_product(admin_client, db):
+    a, b, c, d = _q_seed(db)
+    rows = _filtered_rows(admin_client, {"q": "QQ"})
+    assert {r["sale_id"] for r in rows} == {a, b, c}
+    rows = _filtered_rows(admin_client, {"q": "widget"})
+    assert {r["sale_id"] for r in rows} == {a}
+    rows = _filtered_rows(admin_client, {"q": "bolt"})
+    assert {r["sale_id"] for r in rows} == {b}
+    rows = _filtered_rows(admin_client, {"q": "PI-99"})
+    assert {r["sale_id"] for r in rows} == {d}
+
+
+def test_quick_search_combines_with_other_filters(admin_client, db):
+    a, b, c, _d = _q_seed(db)
+    rows = _filtered_rows(admin_client, {"q": "QQ", "stage": "pi_issued"})
+    assert {r["sale_id"] for r in rows} == {a, b, c}
+    rows = _filtered_rows(admin_client, {"q": "QQ", "stage": "completed"})
+    assert rows == []
+
+
+def test_filtered_total_header(admin_client, db):
+    _q_seed(db)
+    r = admin_client.get("/api/reports/live/filtered?page_size=2&q=QQ")
+    assert r.status_code == 200
+    assert len(r.get_json()) == 2
+    assert r.headers.get("X-Total-Count") == "3"
+    r = admin_client.get("/api/reports/live/filtered?page_size=2&page=2&q=QQ")
+    assert len(r.get_json()) == 1
+    assert r.headers.get("X-Total-Count") == "3"
+    r = admin_client.get("/api/reports/live/filtered?q=nomatch")
+    assert r.get_json() == []
+    assert r.headers.get("X-Total-Count") == "0"
+
+
+def test_summary_quick_search(admin_client, db):
+    _q_seed(db)
+    body = _summary(admin_client, {"group_by": "month", "q": "QQ"})
+    assert sum(p["kpis"]["order_count"] for p in body["periods"]) == 3
+    body = _summary(admin_client, {"group_by": "month"})
+    assert sum(p["kpis"]["order_count"] for p in body["periods"]) == 4
+
+
+def test_export_q_filter_and_row_count(admin_client, db):
+    _q_seed(db)
+    r = _export_rows(admin_client, {"q": "QQ"})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["row_count"] == 3
+    assert body["truncated"] is False
+    parsed = list(csv.reader(io.StringIO(body["content"])))
+    assert len(parsed) == 4  # header + 3 matching rows
+    r = _export_rows(admin_client, {"q": "widget"}, method="GET")
+    assert r.status_code == 200
+    parsed = list(csv.reader(io.StringIO(r.get_json()["content"])))
+    assert len(parsed) == 2  # header + 1 matching row

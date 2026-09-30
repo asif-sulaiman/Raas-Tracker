@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { Fragment, useState } from 'react';
 import { ChevronDown, ChevronRight, ChevronLeft } from 'lucide-react';
 import { formatNumber, formatDate } from '../../utils/format';
 import Badge from '../ui/Badge';
@@ -247,7 +247,7 @@ function GroupedTable({ periods, currentPage, pageSize, totalRows, onPageChange 
           </thead>
           <tbody className="divide-y divide-slate-50 dark:divide-slate-800/50">
             {periods.map((period) => (
-              <> 
+              <Fragment key={period.period_start || period.period_end}>
                 {/* Period Header Row */}
                 <tr className="bg-slate-50 dark:bg-slate-800/50 cursor-pointer hover:bg-slate-100/80 dark:hover:bg-slate-700/50"
                     onClick={() => togglePeriod(period.period_start)}>
@@ -313,7 +313,7 @@ function GroupedTable({ periods, currentPage, pageSize, totalRows, onPageChange 
                     ))}
                   </>
                 )}
-              </>
+              </Fragment>
             ))}
           </tbody>
         </table>

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
   Download,
@@ -62,7 +62,7 @@ export default function Reports() {
   const { apiFetch, user } = useAuth();
   const isAdmin = user?.role === 'admin';
   const [activeTab, setActiveTab] = useState('production');
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   const [recipes, setRecipes] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -80,14 +80,14 @@ export default function Reports() {
   const [commercialLoading, setCommercialLoading] = useState(false);
   const [commercialError, setCommercialError] = useState(null);
   const [commercialExporting, setCommercialExporting] = useState(false);
-  const [commercialPage, setCommercialPage] = useState(1);
+  const [commercialTotal, setCommercialTotal] = useState(0);
+  const [commercialKpis, setCommercialKpis] = useState(null);
   const [companies, setCompanies] = useState([]);
   // The company filter silently falling back to "All Companies" looks identical
   // to a real filter, so loading/failed/empty are kept distinct here.
   const [companiesLoading, setCompaniesLoading] = useState(false);
   const [companiesError, setCompaniesError] = useState(null);
   const [companiesAttempt, setCompaniesAttempt] = useState(0);
-  const commercialFetchedRef = useRef(false);
 
   useEffect(() => {
     (async () => {
@@ -155,13 +155,26 @@ export default function Reports() {
     setCommercialLoading(true);
     try {
       const params = new URLSearchParams(searchParams);
-      const res = await apiFetch(`/api/reports/live/filtered?${params.toString()}`);
-      const data = await res.json();
-      if (Array.isArray(data)) {
-        setCommercialReport(data);
-      } else {
+      // KPI totals come from the unpaginated summary (group_by=none) so the
+      // cards describe the WHOLE filtered set, never just the loaded page.
+      const kpiParams = new URLSearchParams(params);
+      kpiParams.set('group_by', 'none');
+      const [res, kpiRes] = await Promise.all([
+        apiFetch(`/api/reports/live/filtered?${params.toString()}`),
+        apiFetch(`/api/reports/live/summary?${kpiParams.toString()}`),
+      ]);
+      const [data, kpiData] = await Promise.all([res.json(), kpiRes.json()]);
+      if (!Array.isArray(data)) {
         setCommercialError((data && data.error) || 'Failed to load the commercial report');
+        return;
       }
+      const totalHeader = res.headers && res.headers.get('X-Total-Count');
+      setCommercialReport(data);
+      setCommercialTotal(totalHeader !== null && totalHeader !== undefined
+        ? (parseInt(totalHeader, 10) || 0)
+        : data.length);
+      const periods = Array.isArray(kpiData) ? kpiData : (Array.isArray(kpiData?.periods) ? kpiData.periods : null);
+      setCommercialKpis(periods && periods.length > 0 ? (periods[0].kpis || null) : null);
     } catch (err) {
       setCommercialError((err && err.message) || 'Failed to load the commercial report');
     } finally {
@@ -189,11 +202,11 @@ export default function Reports() {
     }
   }, [apiFetch, searchParams]);
 
-  // Fetch when filters change (searchParams changes)
+  // Fetch when filters change (searchParams changes). Filter writers
+  // (CommercialFilters, CommercialCalendarNavigator) always reset page=1 in
+  // the URL, so only a deliberate page change re-requests another slice.
   useEffect(() => {
     if (!isAdmin || activeTab !== 'commercial') return;
-    commercialFetchedRef.current = false; // Allow refetch on filter change
-    setCommercialPage(1); // Reset to first page on filter change
     const groupBy = searchParams.get('group_by') || 'none';
     if (groupBy === 'none') {
       // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -266,10 +279,16 @@ export default function Reports() {
   const totalOk = report ? report.report.filter(r => r.status !== 'SHORTAGE').length : 0;
 
   const PAGE_SIZE = 50;
+  const commercialPage = Math.max(1, parseInt(searchParams.get('page') || '1', 10) || 1);
 
   const handleCommercialPageChange = useCallback((page) => {
-    setCommercialPage(page);
-  }, []);
+    // The page lives in the URL: the fetch effect keys off searchParams, so
+    // this both moves the pager and triggers the refetch for that slice.
+    const params = new URLSearchParams(searchParams);
+    if (page <= 1) params.delete('page');
+    else params.set('page', String(page));
+    setSearchParams(params, { replace: true });
+  }, [searchParams, setSearchParams]);
 
   const handleCommercialExport = useCallback(async () => {
     if (commercialExporting || commercialLoading) return;
@@ -314,9 +333,9 @@ export default function Reports() {
 
     const groupBy = searchParams.get('group_by') || 'none';
     const isGrouped = groupBy !== 'none';
-    const totalRows = isGrouped
-      ? (commercialSummary.length > 0 ? commercialSummary.reduce((sum, p) => sum + (p.kpis?.order_count || 0), 0) : 0)
-      : commercialReport.length;
+    // Detail paging is server-driven (X-Total-Count); grouped summaries are
+    // already returned in full, so a pager there would be a dead control.
+    const totalRows = isGrouped ? 0 : commercialTotal;
 
     if (commercialLoading) {
       return (
@@ -363,7 +382,10 @@ export default function Reports() {
       );
     }
 
-    if ((isGrouped && commercialSummary.length === 0) || (!isGrouped && commercialReport.length === 0)) {
+    // total (not rows.length) decides emptiness: a stale/out-of-range page
+    // still has rows behind it, so it keeps the pager for recovery instead
+    // of claiming the report is empty.
+    if ((isGrouped && commercialSummary.length === 0) || (!isGrouped && commercialTotal === 0)) {
       return (
         <div className="space-y-4">
           <>
@@ -376,27 +398,41 @@ export default function Reports() {
             onPageChange={handleCommercialPageChange}
             currentPage={commercialPage}
             pageSize={PAGE_SIZE}
-            totalRows={0}
+            totalRows={totalRows}
           />
         </div>
       );
     }
 
-    // For detail mode, compute KPIs for the header
+    // For detail mode, KPIs prefer the whole-filter summary totals so the
+    // cards can never disagree with the export; page sums are a last-resort
+    // fallback whose captions say "this page" instead of passing silently.
     if (!isGrouped) {
       const rows = commercialReport;
       const sales = dedupeSales(rows);
-      const grossSales = rows.reduce((sum, r) => sum + (Number(r.total_price) || 0), 0);
-      const receivedTotal = sales.reduce((sum, r) => sum + (Number(r.received_amount) || 0), 0);
-      const dueTotal = sales.reduce((sum, r) => sum + (Number(r.due_amount) || 0), 0);
+      const pageGross = rows.reduce((sum, r) => sum + (Number(r.total_price) || 0), 0);
+      const pageReceived = sales.reduce((sum, r) => sum + (Number(r.received_amount) || 0), 0);
+      const pageDue = sales.reduce((sum, r) => sum + (Number(r.due_amount) || 0), 0);
       const overdueSales = sales.filter(r => r.payment_status === 'Overdue');
-      const overdueTotal = overdueSales.reduce((sum, r) => sum + (Number(r.due_amount) || 0), 0);
+      const pageOverdue = overdueSales.reduce((sum, r) => sum + (Number(r.due_amount) || 0), 0);
+
+      const whole = commercialKpis;
+      const grossSales = whole ? Number(whole.gross_sales) || 0 : pageGross;
+      const receivedTotal = whole ? Number(whole.received) || 0 : pageReceived;
+      const dueTotal = whole ? Number(whole.due) || 0 : pageDue;
+      const overdueTotal = whole ? Number(whole.overdue) || 0 : pageOverdue;
+      const lineCaption = whole
+        ? `${commercialTotal} sale line${commercialTotal !== 1 ? 's' : ''} · USD`
+        : `${rows.length} sale line${rows.length !== 1 ? 's' : ''} (this page) · USD`;
+      const salesCaption = whole
+        ? `${whole.order_count} sale${whole.order_count !== 1 ? 's' : ''} · USD`
+        : `${sales.length} sale${sales.length !== 1 ? 's' : ''} (this page) · USD`;
 
       const kpis = [
         {
           label: 'Gross Sales',
           value: grossSales,
-          caption: `${rows.length} sale line${rows.length !== 1 ? 's' : ''} · USD`,
+          caption: lineCaption,
           icon: DollarSign,
           box: 'bg-blue-100 dark:bg-blue-950/50',
           iconCls: 'text-blue-600 dark:text-blue-400',
@@ -405,7 +441,7 @@ export default function Reports() {
         {
           label: 'Received',
           value: receivedTotal,
-          caption: `${sales.length} sale${sales.length !== 1 ? 's' : ''} · USD`,
+          caption: salesCaption,
           icon: CreditCard,
           box: 'bg-emerald-100 dark:bg-emerald-950/50',
           iconCls: 'text-emerald-600 dark:text-emerald-400',
@@ -414,7 +450,7 @@ export default function Reports() {
         {
           label: 'Due',
           value: dueTotal,
-          caption: `${sales.length} sale${sales.length !== 1 ? 's' : ''} · USD`,
+          caption: salesCaption,
           icon: CreditCard,
           box: 'bg-sky-100 dark:bg-sky-950/50',
           iconCls: 'text-sky-600 dark:text-sky-400',
@@ -423,7 +459,9 @@ export default function Reports() {
         {
           label: 'Overdue',
           value: overdueTotal,
-          caption: `${overdueSales.length} sale${overdueSales.length !== 1 ? 's' : ''} past maturity`,
+          caption: whole
+            ? 'past maturity · USD'
+            : `${overdueSales.length} past maturity`,
           icon: AlertTriangle,
           box: 'bg-rose-100 dark:bg-rose-950/50',
           iconCls: 'text-rose-600 dark:text-rose-400',

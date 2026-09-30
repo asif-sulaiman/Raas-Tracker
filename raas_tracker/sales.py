@@ -723,8 +723,11 @@ def _payment_status(due_amount: float, maturity_date: Any,
     return "Pending"
 
 
-def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> List[Dict[str, Any]]:
+def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> "tuple[List[Dict[str, Any]], int]":
     """Live commercial report — one output row per sale_item, USD only.
+
+    Returns (rows, total): `rows` is the requested page (page/page_size),
+    `total` is how many rows match the filters across ALL pages.
 
     Item-level columns (product, qty, price, total_price, dates on the
     shipment) vary per row. Sale-level payment columns — received_amount,
@@ -740,6 +743,7 @@ def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> Lis
         "date_to": "YYYY-MM-DD",
         "customer_name": str,
         "product_name": str,
+        "q": str,  # quick search: matches PI number OR customer OR product
         "company_id": int,
         "stage": "pi_issued" | "lc_received" | "shipment_ongoing" | "payment_due" | "completed",
         "payment_status": "Paid" | "Overdue" | "Partial" | "Due" | "Pending",
@@ -783,6 +787,20 @@ def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> Lis
             AND si3.product_name ILIKE %(product_name)s
         )""")
         params["product_name"] = f"%{filters['product_name']}%"
+
+    # Quick search: ONE term matches PI number OR customer OR product
+    # (OR semantics — never AND-ed across the three).
+    if filters.get("q"):
+        where_clauses.append("""(
+            pi_number ILIKE %(q)s
+            OR customer_name ILIKE %(q)s
+            OR EXISTS (
+                SELECT 1 FROM sale_items si4
+                WHERE si4.sale_id = base.sale_id
+                AND si4.product_name ILIKE %(q)s
+            )
+        )""")
+        params["q"] = f"%{filters['q']}%"
 
     if filters.get("company_id") is not None:
         where_clauses.append("company_id = %(company_id)s")
@@ -839,7 +857,8 @@ def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> Lis
             LEFT JOIN sale_items si ON si.sale_id = s.id
             LEFT JOIN companies c ON c.id = s.company_id
         )
-        SELECT * FROM base
+        SELECT *, COUNT(*) OVER() AS _total_rows
+        FROM base
         {where_sql}
         ORDER BY sale_id DESC
         LIMIT %(page_size)s OFFSET %(offset)s
@@ -847,13 +866,17 @@ def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> Lis
 
     rows = conn.execute(query, params).fetchall()
 
+    # Total counts every row matching the filters, BEFORE LIMIT/OFFSET, so the
+    # caller can page honestly instead of mistaking a full page for the report.
+    total = rows[0][-1] if rows else 0
+
     report = []
     for r in rows:
         (sale_id, customer_name, pi_number, pi_date, lc_number, lc_date,
          shipment_date, maturity_date, stage, comments, company_id,
          product_name, unit, quantity, unit_price, total_price,
          invoice_date, latest_ship_date, receive_date, received_amount,
-         sale_total, date_anchor_col) = r
+         sale_total, date_anchor_col, _total_rows) = r
 
         received = round(float(received_amount or 0), 2)
         due_amount = round(max(round(float(sale_total or 0), 2) - received, 0.0), 2)
@@ -883,7 +906,7 @@ def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> Lis
             "payment_comment": pay_comment,
         })
 
-    return report
+    return report, total
 
 
 def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None) -> List[Dict[str, Any]]:
@@ -937,6 +960,20 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
         )""")
         params["product_name"] = f"%{filters['product_name']}%"
 
+    # Quick search: ONE term matches PI number OR customer OR product
+    # (OR semantics — never AND-ed across the three).
+    if filters.get("q"):
+        where_clauses.append("""(
+            pi_number ILIKE %(q)s
+            OR customer_name ILIKE %(q)s
+            OR EXISTS (
+                SELECT 1 FROM sale_items si4
+                WHERE si4.sale_id = {alias}.sale_id
+                AND si4.product_name ILIKE %(q)s
+            )
+        )""")
+        params["q"] = f"%{filters['q']}%"
+
     if filters.get("company_id") is not None:
         where_clauses.append("company_id = %(company_id)s")
         params["company_id"] = filters["company_id"]
@@ -961,13 +998,14 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
     # is rendered once per query: the summary collapses `base` to one row per
     # sale inside a CTE aliased `b`, while the detail query selects FROM base.
     # Only the static alias is substituted — every user value stays a %(name)s
-    # placeholder.
-    def _where_sql(alias):
+    # placeholder. `prefix` lets the per-period items query chain the clauses
+    # with AND after its own WHERE instead of emitting a second WHERE.
+    def _where_sql(alias, prefix="WHERE "):
         rendered = (c.replace("{alias}", alias) for c in where_clauses)
-        return "WHERE " + " AND ".join(rendered) if where_clauses else ""
+        return prefix + " AND ".join(rendered) if where_clauses else ""
 
-    where_sql = _where_sql("base")
     sale_where_sql = _where_sql("b")
+    period_where_sql = _where_sql("base", prefix="AND ")
 
     # Build the period truncation expression using the CTE column
     if group_by == "month":
@@ -1126,7 +1164,7 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
                 FROM base
                 WHERE {period_trunc} >= %(period_start)s
                 AND {period_trunc} <= %(period_end)s
-                {where_sql}
+                {period_where_sql}
                 ORDER BY sale_id DESC
             """
             

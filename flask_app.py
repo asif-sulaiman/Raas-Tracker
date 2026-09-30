@@ -1496,7 +1496,7 @@ def api_report_export():
 def api_commercial_report():
     conn = get_db()
     try:
-        rows = get_commercial_report(conn)
+        rows, _total = get_commercial_report(conn)
     finally:
         conn.close()
     return jsonify(rows)
@@ -1512,6 +1512,7 @@ def api_commercial_report_filtered():
         "date_to": request.args.get("date_to"),
         "customer_name": request.args.get("customer_name"),
         "product_name": request.args.get("product_name"),
+        "q": request.args.get("q"),
         "company_id": request.args.get("company_id", type=int),
         "stage": request.args.get("stage"),
         "payment_status": request.args.get("payment_status"),
@@ -1522,10 +1523,14 @@ def api_commercial_report_filtered():
     filters = {k: v for k, v in filters.items() if v is not None}
     conn = get_db()
     try:
-        rows = get_commercial_report(conn, filters)
+        rows, total = get_commercial_report(conn, filters)
     finally:
         conn.close()
-    return jsonify(rows)
+    resp = jsonify(rows)
+    # Total matching rows across ALL pages: without it a full page looks like
+    # the whole report and the pager can never appear.
+    resp.headers["X-Total-Count"] = str(total)
+    return resp
 
 
 @app.route("/api/reports/live/summary")
@@ -1538,6 +1543,7 @@ def api_commercial_report_summary():
         "date_to": request.args.get("date_to"),
         "customer_name": request.args.get("customer_name"),
         "product_name": request.args.get("product_name"),
+        "q": request.args.get("q"),
         "company_id": request.args.get("company_id", type=int),
         "stage": request.args.get("stage"),
         "payment_status": request.args.get("payment_status"),
@@ -1566,6 +1572,7 @@ def api_commercial_report_export():
             "date_to": request.args.get("date_to"),
             "customer_name": request.args.get("customer_name"),
             "product_name": request.args.get("product_name"),
+            "q": request.args.get("q"),
             "company_id": request.args.get("company_id", type=int),
             "stage": request.args.get("stage"),
             "payment_status": request.args.get("payment_status"),
@@ -1573,12 +1580,13 @@ def api_commercial_report_export():
         # Remove None values
         filters = {k: v for k, v in filters.items() if v is not None}
     
-    # Remove pagination for export - get all rows
-    filters = {**filters, "page_size": 10000}
+    # Export always covers every matching row: pagination from the client is
+    # ignored (page forced to 1) so the file can never silently skip a slice.
+    filters = {**filters, "page_size": 10000, "page": 1}
     
     conn = get_db()
     try:
-        rows = get_commercial_report(conn, filters)
+        rows, total = get_commercial_report(conn, filters)
     finally:
         conn.close()
     if not rows:
@@ -1614,7 +1622,13 @@ def api_commercial_report_export():
     from datetime import date as _date
     filename = f"commercial_report_{_date.today().isoformat()}.csv"
     output.seek(0)
-    return jsonify({"success": True, "filename": filename, "content": output.getvalue()})
+    return jsonify({
+        "success": True,
+        "filename": filename,
+        "content": output.getvalue(),
+        "row_count": total,
+        "truncated": total > len(rows),
+    })
 
 
 # ==================== API: AUDIT LOGS ====================

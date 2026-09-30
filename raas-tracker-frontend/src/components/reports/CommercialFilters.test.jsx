@@ -74,12 +74,17 @@ describe('CommercialFilters', () => {
     const searchInput = screen.getByPlaceholderText('Quick Search: PI No / Customer');
     fireEvent.change(searchInput, { target: { value: 'PI-123' } });
 
+    // One term is sent as `q` (server ORs it across PI / customer / product) —
+    // never duplicated into customer_name AND product_name, which the server
+    // would AND together and almost always match nothing.
     expect(mockOnFiltersChange).toHaveBeenCalledWith(
       expect.objectContaining({
-        customer_name: 'PI-123',
-        product_name: 'PI-123',
+        q: 'PI-123',
         page: 1,
       })
+    );
+    expect(mockOnFiltersChange).not.toHaveBeenCalledWith(
+      expect.objectContaining({ customer_name: 'PI-123' })
     );
   });
 
@@ -247,7 +252,7 @@ describe('CommercialFilters', () => {
       <CommercialFilters companies={mockCompanies} onFiltersChange={mockOnFiltersChange} />,
       {
         initialPath:
-          '/reports?date_anchor=lc_date&date_from=2025-01-01&date_to=2025-12-31&date_preset=This Year&customer_name=test&product_name=test&company_id=1&stage=pi_issued&payment_status=Paid&group_by=month&page=3',
+          '/reports?date_anchor=lc_date&date_from=2025-01-01&date_to=2025-12-31&date_preset=This Year&q=test&customer_name=test&product_name=test&company_id=1&stage=pi_issued&payment_status=Paid&group_by=month&page=3',
       }
     );
 
@@ -260,6 +265,7 @@ describe('CommercialFilters', () => {
         date_from: '',
         date_to: '',
         date_preset: '',
+        q: '',
         customer_name: '',
         product_name: '',
         company_id: '',
