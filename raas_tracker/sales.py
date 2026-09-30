@@ -552,7 +552,7 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
     removed_ids = [int(r) for r in (removed_ids or [])]
     try:
         row = conn.execute(
-            "SELECT id, company_id, client_name FROM sales WHERE id = %s",
+            "SELECT id, company_id, client_name, pi_date, comments FROM sales WHERE id = %s",
             (sale_id,)).fetchone()
         if not row:
             conn.rollback()
@@ -580,6 +580,9 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
         pi_number = (header.get("pi_number") or "").strip()
         if not pi_number:
             raise ValueError("pi_number is required")
+        # Absent optional fields keep their stored values (never NULL-wipe).
+        pi_date = header["pi_date"] if "pi_date" in header else row[3]
+        comments = header["comments"] if "comments" in header else row[4]
         if not items:
             raise ValueError("A sale must keep at least one product item")
         company_id = header.get("company_id")
@@ -626,8 +629,8 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
         conn.execute(
             """UPDATE sales SET pi_number = %s, pi_date = %s, client_name = %s,
                company_id = %s, comments = %s, updated_at = %s WHERE id = %s""",
-            (pi_number, header.get("pi_date"), client_name, company_id,
-             header.get("comments"), _now_str(), sale_id)
+            (pi_number, pi_date, client_name, company_id,
+             comments, _now_str(), sale_id)
         )
         for it in seen:
             if it["id"] is None:

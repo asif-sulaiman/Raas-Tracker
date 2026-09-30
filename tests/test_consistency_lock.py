@@ -250,6 +250,57 @@ def test_update_sale_full_audit_logged(admin_client, db):
     assert new_val["items"][0]["quantity"] == 150
 
 
+def test_full_update_without_comments_key_preserves_comments(admin_client, db):
+    """Edit Sale sends only pi fields — it must never NULL-wipe comments."""
+    sale_id, item_ids = _create_sale_and_items(admin_client, pi_number="PI-COMM-1")
+    r = admin_client.put(f"/api/sales/{sale_id}", json={"comments": "ship via Dubai"})
+    assert r.status_code == 200
+    assert admin_client.get(f"/api/sales/{sale_id}").get_json()["comments"] == "ship via Dubai"
+
+    r = admin_client.put(f"/api/sales/{sale_id}", json={
+        "header": {"pi_number": "PI-COMM-1", "pi_date": "2026-09-01",
+                   "client_name": "Test Client"},
+        "items": [
+            {"id": item_ids[0], "product_name": "ProdA", "quantity": 100,
+             "unit_price": 3.25, "unit": "KG"},
+            {"id": item_ids[1], "product_name": "ProdB", "quantity": 50,
+             "unit_price": 5.00, "unit": "DRUM"},
+        ],
+        "removedIds": [],
+    })
+    assert r.status_code == 200, r.get_json()
+    assert admin_client.get(f"/api/sales/{sale_id}").get_json()["comments"] == "ship via Dubai"
+
+
+def test_clearing_comments_really_clears(admin_client, db):
+    """An explicit null/empty comments patch must write, not silently no-op."""
+    sale_id, _ = _create_sale_and_items(admin_client, pi_number="PI-COMM-2")
+    r = admin_client.put(f"/api/sales/{sale_id}", json={"comments": "temporary"})
+    assert r.status_code == 200
+
+    r = admin_client.put(f"/api/sales/{sale_id}", json={"comments": None})
+    assert r.status_code == 200
+    detail = admin_client.get(f"/api/sales/{sale_id}").get_json()
+    assert detail["comments"] in (None, "")
+
+
+def test_full_update_without_pi_date_preserves_pi_date(admin_client, db):
+    """Absent header fields keep their stored values (the rule comments now follow)."""
+    sale_id, item_ids = _create_sale_and_items(admin_client, pi_number="PI-COMM-3")
+    r = admin_client.put(f"/api/sales/{sale_id}", json={
+        "header": {"pi_number": "PI-COMM-3", "client_name": "Test Client"},
+        "items": [
+            {"id": item_ids[0], "product_name": "ProdA", "quantity": 100,
+             "unit_price": 3.25, "unit": "KG"},
+            {"id": item_ids[1], "product_name": "ProdB", "quantity": 50,
+             "unit_price": 5.00, "unit": "DRUM"},
+        ],
+        "removedIds": [],
+    })
+    assert r.status_code == 200, r.get_json()
+    assert admin_client.get(f"/api/sales/{sale_id}").get_json()["pi_date"] == "2026-09-01"
+
+
 def test_add_sale_item_audit_logged(admin_client, db):
     """Admin add_sale_item creates audit row with action='SALE_ITEM_ADD'."""
     sale_id, _ = _create_sale_and_items(admin_client, pi_number="PI-AUDIT-2")

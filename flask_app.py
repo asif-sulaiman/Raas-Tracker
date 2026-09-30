@@ -2317,7 +2317,7 @@ def api_update_sale(sale_id):
             return _validation_error_response(e)
         conn = get_db()
         try:
-            sale = update_sale_full(conn, sale_id, full.header.model_dump(),
+            sale = update_sale_full(conn, sale_id, full.header.model_dump(exclude_unset=True),
                                     [i.model_dump() for i in full.items],
                                     full.removedIds)
         except ValueError as e:
@@ -2336,6 +2336,9 @@ def api_update_sale(sale_id):
     except ValidationError as e:
         return _validation_error_response(e)
     data = patch.model_dump(exclude_none=True)
+    # An explicit null comments means "clear it" — exclude_none would drop it.
+    if "comments" in raw:
+        data["comments"] = patch.comments
     conn = get_db()
     fields, vals = [], []
     for key in ("pi_number", "pi_date", "client_name", "pi_file_path",
