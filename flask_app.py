@@ -2365,29 +2365,37 @@ def api_update_sale(sale_id):
     if "comments" in raw:
         data["comments"] = patch.comments
     conn = get_db()
-    fields, vals = [], []
-    for key in ("pi_number", "pi_date", "client_name", "pi_file_path",
-                "comments"):
-        if key in data:
-            fields.append(f"{key} = %s")
-            vals.append(data[key])
-    if fields:
-        from datetime import datetime as _dt, timezone
-        vals.append(_dt.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
-        vals.append(sale_id)
-        conn.execute(f"UPDATE sales SET {', '.join(fields)}, updated_at = %s WHERE id = %s", vals)
-        conn.commit()
-    conn.close()
-    return jsonify({"message": "Sale updated"})
+    try:
+        if not conn.execute("SELECT 1 FROM sales WHERE id = %s",
+                            (sale_id,)).fetchone():
+            return jsonify({"error": "Sale not found"}), 404
+        fields, vals = [], []
+        for key in ("pi_number", "pi_date", "client_name", "pi_file_path",
+                    "comments"):
+            if key in data:
+                fields.append(f"{key} = %s")
+                vals.append(data[key])
+        if fields:
+            from datetime import datetime as _dt, timezone
+            vals.append(_dt.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+            vals.append(sale_id)
+            conn.execute(f"UPDATE sales SET {', '.join(fields)}, updated_at = %s WHERE id = %s", vals)
+            conn.commit()
+        return jsonify({"message": "Sale updated"})
+    finally:
+        _rollback_close(conn)
 
 
 @app.route("/api/sales/<int:sale_id>", methods=["DELETE"])
 @admin_required
 def api_delete_sale(sale_id):
     conn = get_db()
-    delete_sale(conn, sale_id)
-    conn.close()
-    return jsonify({"message": "Sale deleted"})
+    try:
+        if not delete_sale(conn, sale_id):
+            return jsonify({"error": "Sale not found"}), 404
+        return jsonify({"message": "Sale deleted"})
+    finally:
+        _rollback_close(conn)
 
 
 @app.route("/api/sales/<int:sale_id>/move", methods=["POST"])
@@ -2396,11 +2404,16 @@ def api_move_sale(sale_id):
     data = request.get_json() or {}
     notes = data.get("notes")
     conn = get_db()
-    new_stage = advance_sale(conn, sale_id, notes)
-    conn.close()
-    if not new_stage:
-        return jsonify({"error": "Cannot advance sale"}), 400
-    return jsonify({"new_stage": new_stage, "message": f"Moved to {new_stage}"})
+    try:
+        if not conn.execute("SELECT 1 FROM sales WHERE id = %s",
+                            (sale_id,)).fetchone():
+            return jsonify({"error": "Sale not found"}), 404
+        new_stage = advance_sale(conn, sale_id, notes)
+        if not new_stage:
+            return jsonify({"error": "Cannot advance sale"}), 400
+        return jsonify({"new_stage": new_stage, "message": f"Moved to {new_stage}"})
+    finally:
+        _rollback_close(conn)
 
 
 @app.route("/api/sales/<int:sale_id>/lc", methods=["PUT"])
@@ -2412,10 +2425,14 @@ def api_update_lc(sale_id):
     if not lc_number:
         return jsonify({"error": "lc_number is required"}), 400
     conn = get_db()
-    update_sale_lc(conn, sale_id, lc_number, data.get("lc_date"), data.get("shipment_date"))
-    move_sale_to_stage(conn, sale_id, "lc_received", "LC details entered")
-    conn.close()
-    return jsonify({"message": "LC details saved"})
+    try:
+        if not update_sale_lc(conn, sale_id, lc_number, data.get("lc_date"),
+                              data.get("shipment_date")):
+            return jsonify({"error": "Sale not found"}), 404
+        move_sale_to_stage(conn, sale_id, "lc_received", "LC details entered")
+        return jsonify({"message": "LC details saved"})
+    finally:
+        _rollback_close(conn)
 
 
 class PaymentIn(_StrippedModel):
@@ -2440,15 +2457,19 @@ def api_update_payment(sale_id):
         return _validation_error_response(e)
     conn = get_db()
     try:
-        result = record_sale_payment(conn, sale_id, payment.payment_date,
-                                     payment.payment_amount, payment.notes,
-                                     payment.maturity_date)
-    except ValueError as e:
-        conn.close()
-        return jsonify({"error": str(e)}), 400
-    conn.close()
-    result["message"] = "Payment recorded"
-    return jsonify(result)
+        if not conn.execute("SELECT 1 FROM sales WHERE id = %s",
+                            (sale_id,)).fetchone():
+            return jsonify({"error": "Sale not found"}), 404
+        try:
+            result = record_sale_payment(conn, sale_id, payment.payment_date,
+                                         payment.payment_amount, payment.notes,
+                                         payment.maturity_date)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        result["message"] = "Payment recorded"
+        return jsonify(result)
+    finally:
+        _rollback_close(conn)
 
 
 @app.route("/api/sales/<int:sale_id>/payments/<int:payment_id>", methods=["PUT"])

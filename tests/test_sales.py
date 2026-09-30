@@ -194,3 +194,48 @@ def test_api_full_update_roundtrip(admin_client):
     # Legacy header-only patch still works.
     assert admin_client.put(f"/api/sales/{sid}", json={"client_name": "API3"}).status_code == 200
     assert admin_client.get(f"/api/sales/{sid}").get_json()["client_name"] == "API3"
+
+
+# ---------------- missing sale must 404 (not 200/400/500) ----------------
+_MISSING = 999999
+
+
+def test_patch_header_missing_sale_404(admin_client):
+    r = admin_client.put(f"/api/sales/{_MISSING}", json={"client_name": "X"})
+    assert r.status_code == 404
+    assert r.get_json()["error"] == "Sale not found"
+
+
+def test_lc_missing_sale_404(admin_client):
+    r = admin_client.put(f"/api/sales/{_MISSING}/lc",
+                         json={"lc_number": "LC-1", "lc_date": "2026-01-01"})
+    assert r.status_code == 404
+
+
+def test_payment_missing_sale_404(admin_client):
+    r = admin_client.put(f"/api/sales/{_MISSING}/payment",
+                         json={"payment_amount": 5, "payment_date": "2026-01-01"})
+    assert r.status_code == 404
+    assert r.get_json()["error"] == "Sale not found"
+
+
+def test_move_missing_sale_404(admin_client):
+    r = admin_client.post(f"/api/sales/{_MISSING}/move", json={})
+    assert r.status_code == 404
+
+
+def test_delete_missing_sale_404(admin_client):
+    r = admin_client.delete(f"/api/sales/{_MISSING}")
+    assert r.status_code == 404
+
+
+def test_delete_missing_sale_writes_no_audit(db, admin_client):
+    before = db.execute(
+        "SELECT COUNT(*) FROM audit_logs WHERE action = 'SALE_DELETE'"
+    ).fetchone()[0]
+    r = admin_client.delete(f"/api/sales/{_MISSING}")
+    assert r.status_code == 404
+    after = db.execute(
+        "SELECT COUNT(*) FROM audit_logs WHERE action = 'SALE_DELETE'"
+    ).fetchone()[0]
+    assert after == before

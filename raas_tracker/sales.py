@@ -213,13 +213,15 @@ def advance_sale(conn: psycopg.Connection, sale_id: int,
 
 def update_sale_lc(conn: psycopg.Connection, sale_id: int, lc_number: str,
                    lc_date: str, shipment_date: str) -> bool:
-    """Enter LC details for a sale."""
-    conn.execute(
+    """Enter LC details for a sale. Returns False when the sale doesn't exist."""
+    cur = conn.execute(
         """UPDATE sales
            SET lc_number = %s, lc_date = %s, shipment_date = %s, updated_at = %s
            WHERE id = %s""",
         (lc_number, lc_date, shipment_date, _now_str(), sale_id)
     )
+    if cur.rowcount == 0:
+        return False
     log_audit_action(conn, "SALE_LC", "sale", sale_id, new_value=lc_number)
     conn.commit()
     return True
@@ -669,9 +671,10 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
 def delete_sale(conn: psycopg.Connection, sale_id: int) -> bool:
     """Delete a sale and cascade-delete its items and history."""
     row = conn.execute("SELECT pi_number FROM sales WHERE id = %s", (sale_id,)).fetchone()
+    if not row:
+        return False
     conn.execute("DELETE FROM sales WHERE id = %s", (sale_id,))
-    log_audit_action(conn, "SALE_DELETE", "sale", sale_id,
-                     old_value=row[0] if row else None)
+    log_audit_action(conn, "SALE_DELETE", "sale", sale_id, old_value=row[0])
     conn.commit()
     return True
 
