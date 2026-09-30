@@ -59,12 +59,20 @@ def add_sale(conn: psycopg.Connection, sale_data: Dict[str, Any],
 
 
 def get_all_sales(conn: psycopg.Connection, stage: Optional[str] = None,
-                  search: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Return all sales (optionally filtered by stage and/or search text).
+                  search: Optional[str] = None, page: int = 1,
+                  page_size: int = 50) -> Dict[str, Any]:
+    """Return paginated sales (optionally filtered by stage and/or search text).
 
     Search matches PI number, client name, LC number, and product names.
+    Returns dict with 'sales' list and 'total' count.
     """
-    query = """
+    if page < 1:
+        page = 1
+    if page_size < 1 or page_size > 200:
+        page_size = 50
+    offset = (page - 1) * page_size
+
+    base_query = """
         WITH sale_payments_agg AS (
             SELECT sale_id,
                    COALESCE(ROUND(SUM(payment_amount)::numeric, 2)::float8, 0) AS total_paid
@@ -78,7 +86,8 @@ def get_all_sales(conn: psycopg.Connection, stage: Optional[str] = None,
                 COALESCE(ROUND(SUM(si.quantity * si.unit_price)::numeric, 2)::float8, 0) AS total_value,
                 COUNT(si.id) AS item_count,
                COALESCE(spa.total_paid, 0) AS total_paid,
-               s.shipment_status
+               s.shipment_status,
+               COUNT(*) OVER() AS total_count
         FROM sales s
         LEFT JOIN sale_items si ON si.sale_id = s.id
         LEFT JOIN companies c ON c.id = s.company_id
@@ -96,9 +105,14 @@ def get_all_sales(conn: psycopg.Connection, stage: Optional[str] = None,
                        AND si2.product_name ILIKE %s))""")
         params.extend([like, like, like, like])
     if clauses:
-        query += " WHERE " + " AND ".join(clauses)
-    query += " GROUP BY s.id, c.id, spa.total_paid ORDER BY s.created_at DESC, s.id DESC"
-    return [
+        base_query += " WHERE " + " AND ".join(clauses)
+    base_query += " GROUP BY s.id, c.id, spa.total_paid ORDER BY s.created_at DESC, s.id DESC"
+    base_query += " LIMIT %s OFFSET %s"
+    params.extend([page_size, offset])
+
+    rows = conn.execute(base_query, params).fetchall()
+    total = rows[0][21] if rows else 0  # total_count is the last column
+    sales = [
         {"id": r[0], "stage": r[1], "pi_number": r[2], "pi_date": r[3],
          "client_name": r[4], "pi_file_path": r[5], "lc_number": r[6],
          "lc_date": r[7], "shipment_date": r[8], "payment_date": r[9],
@@ -108,8 +122,9 @@ def get_all_sales(conn: psycopg.Connection, stage: Optional[str] = None,
          "total_value": r[17], "item_count": r[18], "total_paid": r[19],
          "shipment_status": r[20],
          "balance": r[17] - r[19]}
-        for r in conn.execute(query, params).fetchall()
+        for r in rows
     ]
+    return {"sales": sales, "total": total}
 
 
 def get_sale_by_id(conn: psycopg.Connection, sale_id: int) -> Optional[Dict[str, Any]]:

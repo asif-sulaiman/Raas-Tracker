@@ -2241,10 +2241,12 @@ def api_parse_pi():
 def api_list_sales():
     stage = request.args.get("stage")
     search = request.args.get("q")
+    page = request.args.get("page", 1, type=int)
+    page_size = request.args.get("page_size", 50, type=int)
     conn = get_db()
-    sales = get_all_sales(conn, stage=stage, search=search)
+    result = get_all_sales(conn, stage=stage, search=search, page=page, page_size=page_size)
     conn.close()
-    return jsonify(sales)
+    return jsonify(result)
 
 
 @app.route("/api/sales/export")
@@ -2255,7 +2257,7 @@ def api_sales_export():
     from flask import Response
     from datetime import date as _date
     conn = get_db()
-    sales = get_all_sales(conn)
+    sales = get_all_sales(conn, page=1, page_size=10000)["sales"]
     conn.close()
     buf = io.StringIO()
     writer = csv.writer(buf)

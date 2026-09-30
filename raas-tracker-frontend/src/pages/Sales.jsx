@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { UploadCloud, Plus, DollarSign, RefreshCw, Search, Download } from 'lucide-react';
+import { UploadCloud, Plus, DollarSign, RefreshCw, Search, Download, ChevronLeft, ChevronRight } from 'lucide-react';
 import Button from '../components/ui/Button';
 import KpiCard from '../components/cards/KpiCard';
 import PipelineColumn from '../components/sales/PipelineColumn';
@@ -28,21 +28,31 @@ export default function Sales() {
   const [paymentSale, setPaymentSale] = useState(null);
   const [detailSaleId, setDetailSaleId] = useState(null);
   const [query, setQuery] = useState('');
+  const [page, setPage] = useState(1);
+  const [totalSales, setTotalSales] = useState(0);
+  const pageSize = 50;
 
   const abortRef = useRef(null);
-  const fetchData = useCallback(async (q) => {
+  const fetchData = useCallback(async (q, pageNum = 1) => {
     // Abort the in-flight search so out-of-order responses can't win.
     abortRef.current?.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
-    const url = q ? `/api/sales?q=${encodeURIComponent(q)}` : '/api/sales';
+    const url = q
+      ? `/api/sales?q=${encodeURIComponent(q)}&page=${pageNum}&page_size=${pageSize}`
+      : `/api/sales?page=${pageNum}&page_size=${pageSize}`;
     try {
       const [salesRes, summaryRes] = await Promise.all([
         apiFetch(url, { signal: ctrl.signal }),
         apiFetch('/api/sales/summary', { signal: ctrl.signal }),
       ]);
       const [salesData, summaryData] = await Promise.all([salesRes.json(), summaryRes.json()]);
-      if (Array.isArray(salesData)) setSales(salesData);
+      if (salesData && Array.isArray(salesData.sales)) {
+        setSales(salesData.sales);
+        setTotalSales(salesData.total || 0);
+      } else if (Array.isArray(salesData)) {
+        setSales(salesData);
+      }
       if (summaryData) setSummary(summaryData);
     } catch (err) {
       if (err && err.name === 'AbortError') return;
@@ -66,7 +76,10 @@ export default function Sales() {
       firstRender.current = false;
       return;
     }
-    const t = setTimeout(() => fetchData(query.trim()), 300);
+    const t = setTimeout(() => {
+      setPage(1);
+      fetchData(query.trim(), 1);
+    }, 300);
     return () => clearTimeout(t);
   }, [query, fetchData]);
 
@@ -228,21 +241,52 @@ export default function Sales() {
           Loading sales pipeline…
         </div>
       ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-5 gap-4 items-start">
-          {STAGES.map((st) => (
-            <PipelineColumn
-              key={st.key}
-              stage={st.key}
-              title={st.title}
-              sales={salesByStage(st.key)}
-              actionLabel={movingId ? null : st.actionLabel}
-              actionVariant={st.actionVariant}
-              onAction={(sale) => handleCardAction(sale, st)}
-              onView={(sale) => setDetailSaleId(sale.id)}
-              onDelete={isAdmin ? handleDelete : undefined}
-            />
-          ))}
-        </div>
+        <>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-5 gap-4 items-start">
+            {STAGES.map((st) => (
+              <PipelineColumn
+                key={st.key}
+                stage={st.key}
+                title={st.title}
+                sales={salesByStage(st.key)}
+                actionLabel={movingId ? null : st.actionLabel}
+                actionVariant={st.actionVariant}
+                onAction={(sale) => handleCardAction(sale, st)}
+                onView={(sale) => setDetailSaleId(sale.id)}
+                onDelete={isAdmin ? handleDelete : undefined}
+              />
+            ))}
+          </div>
+          {totalSales > pageSize && (
+            <div className="flex items-center justify-between mt-4 px-2">
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Showing {Math.min((page - 1) * pageSize + 1, totalSales)}–{Math.min(page * pageSize, totalSales)} of {totalSales} sales
+              </p>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  icon={ChevronLeft}
+                  onClick={() => { setPage(p => Math.max(1, p - 1)); fetchData(query.trim(), page - 1); }}
+                  disabled={page === 1}
+                  aria-label="Previous page"
+                >
+                  Previous
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  icon={ChevronRight}
+                  onClick={() => { setPage(p => p + 1); fetchData(query.trim(), page + 1); }}
+                  disabled={page * pageSize >= totalSales}
+                  aria-label="Next page"
+                >
+                  Next
+                </Button>
+              </div>
+            </div>
+          )}
+        </>
       )}
 
       <UploadPI

@@ -361,7 +361,7 @@ def test_sales_list_has_shipment_status_detail_has_item_no(admin_client, db):
     sid = _sale(admin_client, cid, "PI-SHAPE-1", item_no="ITM-7")
 
     def _row():
-        rows = admin_client.get("/api/sales").get_json()
+        rows = admin_client.get("/api/sales").get_json()["sales"]
         return [x for x in rows if x["id"] == sid][0]
 
     row = _row()
