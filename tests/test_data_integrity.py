@@ -223,3 +223,49 @@ def test_proxyfix_remote_addr(client):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+def test_production_run_get_serializers_map_columns(admin_client, db, pg_dsn):
+    """List and detail serializers must map every SELECT column to its own key."""
+    conn = db
+    c_id = create_company(conn, name="Run Co", code="RUNCO", country="US",
+                          address="Addr", contact_person="P")
+    add_sale(conn, {"pi_number": "PI-RUN-1", "client_name": "Run Co",
+                    "company_id": c_id},
+             [{"product_name": "Product R", "quantity": 10, "unit_price": 10,
+               "unit": "KG"}])
+    add_chemical(conn, "ChemRun", 100, "KG")
+    add_recipe(conn, "Run Recipe", 100, 0, c_id, "Product R")
+    add_recipe_item(conn, c_id, "Run Recipe", "ChemRun", 10.0)
+    create_production_run(conn, c_id, "Run Recipe", 42.5,
+                          order_number="ORD-1", batch_number="BATCH-1",
+                          production_date="2026-05-04", notes="hello")
+    conn.commit()
+    recipe = get_recipe_by_name(conn, c_id, "Run Recipe")
+    run_id = conn.execute(
+        "SELECT id FROM production_runs WHERE recipe_id = %s ORDER BY id DESC LIMIT 1",
+        (recipe["id"],)).fetchone()[0]
+
+    import urllib.parse
+    enc = urllib.parse.quote("Run Recipe", safe='')
+
+    r = admin_client.get(f"/api/recipes/{enc}/runs?company_id={c_id}")
+    assert r.status_code == 200
+    rows = r.get_json()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["order_number"] == "ORD-1"
+    assert row["batch_number"] == "BATCH-1"
+    assert row["production_date"] == "2026-05-04"
+    assert row["qty_produced"] == 42.5
+    assert row["notes"] == "hello"
+    assert row["created_at"]
+
+    r = admin_client.get(f"/api/recipes/{enc}/runs/{run_id}?company_id={c_id}")
+    assert r.status_code == 200
+    d = r.get_json()
+    assert d["order_number"] == "ORD-1"
+    assert d["batch_number"] == "BATCH-1"
+    assert d["production_date"] == "2026-05-04"
+    assert d["qty_produced"] == 42.5
+    assert d["notes"] == "hello"
+    assert d["created_at"]

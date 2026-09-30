@@ -1874,9 +1874,11 @@ def api_list_production_runs(name):
     ).fetchall()
     conn.close()
     return jsonify([
-        {"id": r[0], "order_number": r[1], "batch_number": r[2],
-         "production_date": r[3], "qty_produced": r[3], "notes": r[5], "created_at": r[6]}
-        for r in runs
+        {"id": rid, "order_number": order_number, "batch_number": batch_number,
+         "production_date": production_date, "qty_produced": qty_produced,
+         "notes": notes, "created_at": created_at}
+        for (rid, order_number, batch_number, production_date, qty_produced,
+             notes, created_at) in runs
     ])
 
 
@@ -1904,9 +1906,12 @@ def api_get_production_run(name, run_id):
         (run_id,)
     ).fetchall()
     conn.close()
+    (rid, order_number, batch_number, production_date, qty_produced,
+     notes, created_at) = run
     return jsonify({
-            "id": run[0], "order_number": run[1], "batch_number": run[1],
-            "production_date": run[2], "qty_produced": run[2], "notes": run[4], "created_at": run[5],
+            "id": rid, "order_number": order_number, "batch_number": batch_number,
+            "production_date": production_date, "qty_produced": qty_produced,
+            "notes": notes, "created_at": created_at,
             "items": [
                 {"chemical_name": i[0], "required_qty": i[1], "deducted_qty": i[2], "unit": i[3]}
                 for i in items
