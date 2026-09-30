@@ -34,6 +34,8 @@ export default function Home() {
   const [recipes, setRecipes] = useState([]);
   const [sales, setSales] = useState([]);
   const [salesSummary, setSalesSummary] = useState(null);
+  const [salesLoading, setSalesLoading] = useState(true);
+  const [salesError, setSalesError] = useState(null);
   const [salesExpanded, setSalesExpanded] = useState(false);
   const [uploads, setUploads] = useState([]);
   const [uploadsError, setUploadsError] = useState(null);
@@ -84,26 +86,36 @@ export default function Home() {
     })();
   }, [loadUploads]);
 
+  // Load recipes, sales, and summary lazily after initial render
+  // so the dashboard shows chemicals/uploads immediately
   useEffect(() => {
+    let mounted = true;
     (async () => {
       try {
         const [recsRes, salesRes, summaryRes] = await Promise.all([
           apiFetch('/api/recipes'),
-          apiFetch('/api/sales').catch(() => null),
+          apiFetch('/api/sales?page=1&page_size=20').catch(() => null),
           apiFetch('/api/sales/summary').catch(() => null)
         ]);
+        if (!mounted) return;
         const recs = await recsRes.json();
         if (Array.isArray(recs)) setRecipes(recs);
         if (salesRes) {
           const salesData = await salesRes.json();
-          if (Array.isArray(salesData)) setSales(salesData);
+          if (salesData && Array.isArray(salesData.sales)) {
+            setSales(salesData.sales);
+          } else if (Array.isArray(salesData)) {
+            setSales(salesData);
+          }
         }
         if (summaryRes) {
           const summaryData = await summaryRes.json();
           if (summaryData) setSalesSummary(summaryData);
         }
-      } catch {
-        // Sections stay empty on failure; chemicals errors have their own panel.
+      } catch (err) {
+        if (mounted) setSalesError(err.message || 'Could not load sales data');
+      } finally {
+        if (mounted) setSalesLoading(false);
       }
     })();
     // Recent activity is best-effort (audit log is admin-only): hide on failure.
@@ -111,11 +123,12 @@ export default function Home() {
       try {
         const res = await apiFetch('/api/audit-logs?limit=5');
         const data = await res.json();
-        if (Array.isArray(data)) setActivity(data.slice(0, 3));
+        if (mounted && Array.isArray(data)) setActivity(data.slice(0, 3));
       } catch {
-        setActivityHidden(true);
+        if (mounted) setActivityHidden(true);
       }
     })();
+    return () => { mounted = false; };
   }, [apiFetch]);
 
   const overdueCount = countOverdue(sales);
@@ -172,6 +185,8 @@ export default function Home() {
         overdueCount={overdueCount}
         recentDefault={RECENT_DEFAULT}
         recentMax={RECENT_MAX}
+        loading={salesLoading}
+        error={salesError}
       />
 
       {/* KPI Cards Grid */}

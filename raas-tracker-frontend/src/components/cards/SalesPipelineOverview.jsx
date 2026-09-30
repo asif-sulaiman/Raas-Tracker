@@ -76,6 +76,8 @@ export default function SalesPipelineOverview({
   overdueCount = 0,
   recentDefault = 5,
   recentMax = 20,
+  loading = false,
+  error = null,
 }) {
   const stageCount = (key) =>
     salesSummary?.[key]?.count ?? sales.filter((s) => s.stage === key).length;
@@ -85,6 +87,114 @@ export default function SalesPipelineOverview({
   const completedCount =
     salesSummary?.completed?.count ?? sales.filter((s) => s.stage === 'completed').length;
   const completedValue = money(salesSummary?.completed?.value);
+
+  if (loading) {
+    return (
+      <section
+        aria-labelledby="sales-pipeline-heading"
+        className="overflow-hidden rounded-2xl border border-slate-200/80 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900"
+      >
+        <div className="h-1 bg-gradient-to-r from-sky-500 via-indigo-500 to-emerald-500" />
+        <div className="p-5 sm:p-6">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-start gap-3">
+              <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-sm animate-pulse">
+                <DollarSign className="h-5 w-5" />
+              </span>
+              <div className="space-y-1">
+                <div className="h-5 w-48 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" />
+                <div className="h-4 w-64 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" />
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="h-5 w-24 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" />
+              <div className="h-6 w-20 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" />
+            </div>
+          </div>
+
+          <ol className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-5 xl:gap-4">
+            {STAGES.map((_, i) => (
+              <li key={i} className="relative">
+                <div className="group flex h-full flex-col overflow-hidden rounded-xl border border-slate-200 bg-white transition-all duration-200 dark:border-slate-700 dark:bg-slate-900 animate-pulse">
+                  <span className="h-1 w-full bg-gradient-to-r from-sky-500 via-indigo-500 to-emerald-500" />
+                  <span className="flex flex-1 flex-col p-3.5">
+                    <div className="flex items-center justify-between">
+                      <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-slate-200 dark:bg-slate-700" />
+                      <div className="h-3 w-16 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" />
+                    </div>
+                    <div className="mt-3 h-4 w-24 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" />
+                    <div className="mt-1 h-8 w-20 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" />
+                    <div className="mt-0.5 h-4 w-16 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" />
+                  </span>
+                </div>
+                {i < STAGES.length - 1 && (
+                  <span aria-hidden="true" className="absolute top-1/2 -right-5 z-10 hidden h-6 w-6 -translate-y-1/2 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-400 shadow-xs xl:flex dark:border-slate-700 dark:bg-slate-800 dark:text-slate-500" />
+                )}
+              </li>
+            ))}
+          </ol>
+
+          <div className="mt-3 grid grid-cols-1 gap-3 rounded-xl border border-slate-200/80 bg-slate-50/70 p-3 sm:grid-cols-2 dark:border-slate-800 dark:bg-slate-800/40 animate-pulse">
+            <div className="flex items-center justify-between gap-3 overflow-hidden rounded-lg bg-gradient-to-br from-emerald-600 to-teal-600 p-4 text-white shadow-sm">
+              <div className="space-y-1">
+                <div className="h-3 w-32 bg-white/30 rounded animate-pulse" />
+                <div className="h-6 w-24 bg-white/50 rounded animate-pulse" />
+                <div className="h-3 w-20 bg-white/30 rounded animate-pulse" />
+              </div>
+              <div className="h-10 w-10 shrink-0 bg-white/25 rounded animate-pulse" />
+            </div>
+            <div className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-900 animate-pulse">
+              <div className="space-y-1">
+                <div className="h-3 w-24 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" />
+                <div className="h-6 w-24 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" />
+                <div className="h-3 w-28 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" />
+              </div>
+              <div className="h-10 w-10 shrink-0 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" />
+            </div>
+          </div>
+
+          <div className="mt-5 border-t border-slate-100 pt-4 dark:border-slate-800 animate-pulse">
+            <div className="mb-3 flex items-center justify-between">
+              <div className="h-4 w-32 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" />
+              <div className="h-3 w-16 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" />
+            </div>
+            <div className="overflow-x-auto rounded-xl border border-slate-200 dark:border-slate-700 animate-pulse">
+              <div className="w-full">
+                <div className="h-8 bg-slate-100 dark:bg-slate-800/60" />
+                <div className="divide-y divide-slate-100 dark:divide-slate-800/60">
+                  {Array.from({ length: 5 }).map((_, i) => (
+                    <div key={i} className="h-10" />
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div className="mt-3 h-8 w-40 bg-slate-200 dark:bg-slate-700 rounded animate-pulse" />
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  if (error) {
+    return (
+      <section
+        aria-labelledby="sales-pipeline-heading"
+        className="overflow-hidden rounded-2xl border border-rose-200 bg-rose-50 p-5 shadow-sm dark:border-rose-800 dark:bg-rose-950/30"
+      >
+        <div className="flex items-center gap-3">
+          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-rose-100 text-rose-700 dark:bg-rose-950/60 dark:text-rose-300">
+            <DollarSign className="h-5 w-5" />
+          </span>
+          <div>
+            <h2 id="sales-pipeline-heading" className="text-lg font-bold text-slate-900 dark:text-white">
+              Sales Pipeline Overview
+            </h2>
+            <p className="text-sm text-rose-700 dark:text-rose-300">{error}</p>
+          </div>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section
