@@ -65,18 +65,24 @@ def get_all_sales(conn: psycopg.Connection, stage: Optional[str] = None,
     Search matches PI number, client name, LC number, and product names.
     """
     query = """
+        WITH sale_payments_agg AS (
+            SELECT sale_id,
+                   COALESCE(ROUND(SUM(payment_amount)::numeric, 2)::float8, 0) AS total_paid
+            FROM sale_payments
+            GROUP BY sale_id
+        )
         SELECT s.id, s.stage, s.pi_number, s.pi_date, s.client_name, s.pi_file_path,
                s.lc_number, s.lc_date, s.shipment_date, s.payment_date, s.payment_amount,
                s.created_at, s.updated_at, s.company_id, s.maturity_date, s.comments,
                COALESCE(c.name, s.client_name),
                 COALESCE(ROUND(SUM(si.quantity * si.unit_price)::numeric, 2)::float8, 0) AS total_value,
                 COUNT(si.id) AS item_count,
-                COALESCE((SELECT ROUND(SUM(sp.payment_amount)::numeric, 2)::float8 FROM sale_payments sp
-                          WHERE sp.sale_id = s.id), 0) AS total_paid,
+               COALESCE(spa.total_paid, 0) AS total_paid,
                s.shipment_status
         FROM sales s
         LEFT JOIN sale_items si ON si.sale_id = s.id
         LEFT JOIN companies c ON c.id = s.company_id
+        LEFT JOIN sale_payments_agg spa ON spa.sale_id = s.id
     """
     params: list = []
     clauses = []
@@ -91,7 +97,7 @@ def get_all_sales(conn: psycopg.Connection, stage: Optional[str] = None,
         params.extend([like, like, like, like])
     if clauses:
         query += " WHERE " + " AND ".join(clauses)
-    query += " GROUP BY s.id, c.id ORDER BY s.created_at DESC, s.id DESC"
+    query += " GROUP BY s.id, c.id, spa.total_paid ORDER BY s.created_at DESC, s.id DESC"
     return [
         {"id": r[0], "stage": r[1], "pi_number": r[2], "pi_date": r[3],
          "client_name": r[4], "pi_file_path": r[5], "lc_number": r[6],
