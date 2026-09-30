@@ -41,9 +41,11 @@ const INVOICES = [{ invoice_id: 31, invoice_number: 'INV-31', status: 'issued' }
 function installFetch({ companies = COMPANIES, companiesFailTimes = 0, companiesError = 'Companies service unavailable', produceStatus = 201, produceBody = { runs: [] }, invoices = INVOICES, sales = SALES, invoiceStatus = 201, invoiceBody = null } = {}) {
   const posts = [];
   const invoicePosts = [];
+  const invoiceDeletes = [];
   const calls = [];
   let companyFailsLeft = companiesFailTimes;
   posts.invoicePosts = invoicePosts;
+  posts.invoiceDeletes = invoiceDeletes;
   posts.calls = calls;
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
     const u = String(url);
@@ -70,6 +72,10 @@ function installFetch({ companies = COMPANIES, companiesFailTimes = 0, companies
       invoicePosts.push({ url: u, body });
       const created = invoiceBody || { invoice_id: 42, invoice_number: body?.invoice_number, status: 'planned' };
       return jsonResponse(created, invoiceStatus < 400, invoiceStatus);
+    }
+    if (u.includes('/invoices') && method === 'DELETE') {
+      invoiceDeletes.push({ url: u, method });
+      return jsonResponse({ success: true });
     }
     if (u.includes('/invoices')) return jsonResponse(invoices);
     if (u.includes('/api/sales')) return jsonResponse(sales);
@@ -291,6 +297,42 @@ describe('ProductionRunModal', () => {
     expect(await screen.findByText('Recipe has no ingredients')).toBeTruthy();
     expect(onSaved).not.toHaveBeenCalled();
     expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it('voids the just-created invoice when produce fails, so a retry starts clean', async () => {
+    const posts = installFetch({
+      produceStatus: 400,
+      produceBody: { error: 'Recipe has no ingredients' },
+    });
+    const { onSaved } = renderModal();
+
+    await pickCompanyAndPi();
+    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
+    fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-NEW-7' } });
+    fireEvent.change(screen.getByLabelText('Amount'), { target: { value: '500' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
+
+    expect(await screen.findByText('Recipe has no ingredients')).toBeTruthy();
+    expect(onSaved).not.toHaveBeenCalled();
+    expect(posts.invoicePosts).toHaveLength(1);
+    // The invoice row exists only to link the run — without the run it would
+    // be orphaned, and a retry with the same number would hit a duplicate.
+    await waitFor(() => expect(posts.invoiceDeletes).toHaveLength(1));
+    expect(posts.invoiceDeletes[0].url).toContain('/api/sales/5/invoices/42');
+    expect(posts.invoiceDeletes[0].method).toBe('DELETE');
+  });
+
+  it('does not void anything when the invoice already existed (no create)', async () => {
+    const posts = installFetch({ produceStatus: 400, produceBody: { error: 'Recipe has no ingredients' } });
+    renderModal();
+
+    await pickCompanyAndPi();
+    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: '31' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
+
+    expect(await screen.findByText('Recipe has no ingredients')).toBeTruthy();
+    expect(posts.invoicePosts).toHaveLength(0);
+    expect(posts.invoiceDeletes).toHaveLength(0);
   });
 
   it('shows an empty state when no companies exist', async () => {

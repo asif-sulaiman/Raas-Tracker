@@ -308,6 +308,19 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
       onSaved?.();
       onClose?.();
     } catch (err) {
+      // The typed invoice was created only to link this run. Without the run
+      // it would be orphaned and a retry with the same number would collide,
+      // so void it best-effort — the produce error stays the one shown.
+      if (createdInvoiceId !== null) {
+        try {
+          await apiFetch(
+            `/api/sales/${encodeURIComponent(saleId)}/invoices/${encodeURIComponent(createdInvoiceId)}`,
+            { method: 'DELETE' },
+          );
+        } catch {
+          // Cleanup is secondary — never mask the produce error.
+        }
+      }
       setError(err.message || 'Could not start the production run');
       setSaving(false);
     }

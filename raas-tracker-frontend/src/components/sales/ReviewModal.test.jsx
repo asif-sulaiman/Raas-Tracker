@@ -162,4 +162,34 @@ describe('Company auto-match tiered fuzzy', () => {
     renderReviewWithCustomFetch(vi.fn(), INITIAL);
     await waitFor(() => expect(toast.error).toHaveBeenCalledWith(expect.stringContaining('Could not load companies')));
   });
+
+  it('fetch failure shows a persistent inline error with retry, not an empty master', async () => {
+    let companyCalls = 0;
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes('/api/auth/me')) {
+        return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
+      }
+      if (u.includes('/api/companies')) {
+        companyCalls += 1;
+        if (companyCalls === 1) {
+          return jsonResponse({ error: 'Companies service unavailable' }, false, 500);
+        }
+        return jsonResponse([{ id: 7, name: 'Acme' }]);
+      }
+      return jsonResponse({});
+    }));
+    renderReviewWithCustomFetch(vi.fn(), INITIAL);
+
+    expect(await screen.findByText('Could not load companies')).toBeTruthy();
+    expect(screen.getByText('Companies service unavailable')).toBeTruthy();
+    // A failed fetch is not evidence that the company master is empty.
+    expect(screen.queryByText(/No companies registered/i)).toBeNull();
+    expect(screen.getByRole('button', { name: 'Save to PI Issued' }).disabled).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    const select = await screen.findByLabelText('Company');
+    await waitFor(() => expect(select.value).toBe('7'));
+    expect(screen.queryByText('Could not load companies')).toBeNull();
+  });
 });

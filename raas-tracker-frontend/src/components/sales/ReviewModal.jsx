@@ -20,6 +20,12 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
   const [warnings, setWarnings] = useState([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
+  // The companies list drives both the dropdown and the Save button, so a
+  // fetch failure must not masquerade as an empty master — it gets its own
+  // state with an inline message and a retry (mirrors ProductionRunModal).
+  const [refsLoading, setRefsLoading] = useState(true);
+  const [refsError, setRefsError] = useState(null);
+  const [refsAttempt, setRefsAttempt] = useState(0);
 
   const { apiFetch } = useAuth();
 
@@ -78,6 +84,8 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
       setSaving(false);
       const preset = initialData.company_id != null ? String(initialData.company_id) : '';
       setCompanyId(preset);
+      setRefsLoading(true);
+      setRefsError(null);
       const loadCompanies = async () => {
         try {
           const res = await apiFetch('/api/companies');
@@ -88,14 +96,22 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
             const match = findBestMatch(initialData.client_name, rows);
             if (match) setCompanyId(String(match.id));
           }
-        } catch {
+        } catch (err) {
           toast.error('Could not load companies');
           setCompanies([]);
+          setRefsError(err?.message || 'Could not load companies');
+        } finally {
+          setRefsLoading(false);
         }
       };
       loadCompanies();
     }
-  }, [isOpen, initialData, apiFetch]);
+    // refsAttempt: each retry re-runs the load; apiFetch is not referentially
+    // stable (its useCallback chain bottoms out in react-router's navigate).
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, initialData, apiFetch, refsAttempt]);
+
+  const retryRefs = () => setRefsAttempt((n) => n + 1);
 
   const updateItem = (key, field, value) => {
     setItems((prev) => prev.map((i) => (i.key === key ? { ...i, [field]: value } : i)));
@@ -198,7 +214,19 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
           </div>
           <div>
             <label className="text-xs font-medium text-slate-600 dark:text-slate-300">Company *</label>
-            {companies.length > 0 ? (
+            {refsLoading ? (
+              <p className="text-xs text-slate-400 dark:text-slate-500">Loading…</p>
+            ) : refsError ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="text-xs font-medium text-rose-600 dark:text-rose-400">
+                  Could not load companies
+                </p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">{refsError}</p>
+                <Button variant="secondary" size="sm" onClick={retryRefs}>
+                  Retry
+                </Button>
+              </div>
+            ) : companies.length > 0 ? (
               <select
                 aria-label="Company"
                 value={companyId}
