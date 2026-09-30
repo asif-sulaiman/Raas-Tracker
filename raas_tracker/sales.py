@@ -1328,7 +1328,12 @@ def book_invoice(conn: psycopg.Connection, invoice_id: int, approx_ship_date: st
     """Book an invoice with approximate ship date."""
     if not approx_ship_date or not approx_ship_date.strip():
         raise ValueError("approx_ship_date is required for booking")
-    return update_invoice_status(conn, invoice_id, "booked", approx_ship_date=approx_ship_date.strip())
+    approx = approx_ship_date.strip()
+    if not update_invoice_status(conn, invoice_id, "booked", approx_ship_date=approx):
+        return False
+    log_audit_action(conn, "INVOICE_BOOK", "invoice", invoice_id,
+                     new_value=f"Booked on {approx}")
+    return True
 
 
 def ship_invoice(conn: psycopg.Connection, invoice_id: int, actual_ship_date: str,

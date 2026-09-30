@@ -239,3 +239,63 @@ def test_delete_missing_sale_writes_no_audit(db, admin_client):
         "SELECT COUNT(*) FROM audit_logs WHERE action = 'SALE_DELETE'"
     ).fetchone()[0]
     assert after == before
+
+
+# ---------------- #11: mutating actions must be audited ----------------
+def test_header_patch_updates_are_audited(admin_client, db):
+    r = admin_client.post("/api/sales", json={
+        "sale": {"pi_number": "PI-PATCH-A", "client_name": "Old Co"},
+        "items": [{"product_name": "W", "quantity": 1, "unit_price": 10}]})
+    assert r.status_code in (200, 201)
+    sid = r.get_json().get("id") or r.get_json()["sale"]["id"]
+    r = admin_client.put(f"/api/sales/{sid}", json={"client_name": "New Co"})
+    assert r.status_code == 200
+    row = db.execute(
+        "SELECT old_value, new_value FROM audit_logs "
+        "WHERE action = 'SALE_UPDATE' AND entity_type = 'sale' AND entity_id = %s",
+        (sid,)).fetchone()
+    assert row is not None, "header-only patch must write a SALE_UPDATE audit"
+    assert "Old Co" in (row[0] or "")
+    assert "New Co" in (row[1] or "")
+
+
+def test_book_invoice_writes_audit(admin_client, db):
+    r = admin_client.post("/api/sales", json={
+        "sale": {"pi_number": "PI-BOOK-A", "client_name": "B Co"},
+        "items": [{"product_name": "W", "quantity": 1, "unit_price": 10}]})
+    sid = r.get_json().get("id") or r.get_json()["sale"]["id"]
+    inv = admin_client.post(
+        f"/api/sales/{sid}/invoices",
+        json={"invoice_number": "INV-AUD-BOOK"}).get_json()["invoice_id"]
+    r = admin_client.post(
+        f"/api/sales/{sid}/invoices/{inv}/book",
+        json={"approx_ship_date": "2026-11-01"})
+    assert r.status_code == 200, r.get_json()
+    row = db.execute(
+        "SELECT new_value FROM audit_logs "
+        "WHERE action = 'INVOICE_BOOK' AND entity_type = 'invoice' AND entity_id = %s",
+        (inv,)).fetchone()
+    assert row is not None, "booking an invoice must write an INVOICE_BOOK audit"
+    assert "2026-11-01" in (row[0] or "")
+
+
+def test_refused_book_writes_no_audit(admin_client, db):
+    r = admin_client.post("/api/sales", json={
+        "sale": {"pi_number": "PI-BOOK-B", "client_name": "B Co"},
+        "items": [{"product_name": "W", "quantity": 1, "unit_price": 10}]})
+    sid = r.get_json().get("id") or r.get_json()["sale"]["id"]
+    inv = admin_client.post(
+        f"/api/sales/{sid}/invoices",
+        json={"invoice_number": "INV-AUD-BOOK2"}).get_json()["invoice_id"]
+    ok = admin_client.post(
+        f"/api/sales/{sid}/invoices/{inv}/book",
+        json={"approx_ship_date": "2026-11-01"})
+    assert ok.status_code == 200
+    refused = admin_client.post(
+        f"/api/sales/{sid}/invoices/{inv}/book",
+        json={"approx_ship_date": "2026-11-02"})
+    assert refused.status_code == 409
+    count = db.execute(
+        "SELECT COUNT(*) FROM audit_logs "
+        "WHERE action = 'INVOICE_BOOK' AND entity_id = %s", (inv,)).fetchone()[0]
+    assert count == 1, "a refused transition must not add an audit row"

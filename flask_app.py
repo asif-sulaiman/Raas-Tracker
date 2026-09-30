@@ -3,6 +3,7 @@
 import os
 import sys
 import io
+import json
 import math
 import hashlib
 from flask import Flask, request, jsonify, send_from_directory, g, redirect
@@ -2366,12 +2367,15 @@ def api_update_sale(sale_id):
         data["comments"] = patch.comments
     conn = get_db()
     try:
-        if not conn.execute("SELECT 1 FROM sales WHERE id = %s",
-                            (sale_id,)).fetchone():
+        keys = ("pi_number", "pi_date", "client_name", "pi_file_path", "comments")
+        row = conn.execute(
+            "SELECT pi_number, pi_date, client_name, pi_file_path, comments "
+            "FROM sales WHERE id = %s", (sale_id,)).fetchone()
+        if not row:
             return jsonify({"error": "Sale not found"}), 404
+        old = dict(zip(keys, row))
         fields, vals = [], []
-        for key in ("pi_number", "pi_date", "client_name", "pi_file_path",
-                    "comments"):
+        for key in keys:
             if key in data:
                 fields.append(f"{key} = %s")
                 vals.append(data[key])
@@ -2380,6 +2384,11 @@ def api_update_sale(sale_id):
             vals.append(_dt.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
             vals.append(sale_id)
             conn.execute(f"UPDATE sales SET {', '.join(fields)}, updated_at = %s WHERE id = %s", vals)
+            changed = [k for k in data if k in old]
+            log_audit_action(conn, "SALE_UPDATE", "sale", sale_id,
+                             old_value=json.dumps({k: old[k] for k in changed}, default=str),
+                             new_value=json.dumps({k: data[k] for k in changed}, default=str),
+                             atomic=False)
             conn.commit()
         return jsonify({"message": "Sale updated"})
     finally:
