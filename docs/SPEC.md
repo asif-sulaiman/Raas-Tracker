@@ -646,12 +646,12 @@ CREATE TABLE app_settings (
 - **Fixtures**: `db` (clean conn), `client` (Flask test client), `admin_client`, `user_client`
 - **Bcrypt**: Rounds=4 in tests (vs 13 prod) for speed
 - **Rate Limits**: `RAAS_RATE_LIMITS=off` globally; targeted tests re-enable
-- **Coverage**: 304 passing / 8 skipped (auth, stock, upload, sales, invoices, production, rate limits, PI parse, notifications) — includes `tests/test_invoices_production.py` (12) + `tests/test_invoice_amount.py` (10)
+- **Coverage**: 367 passing / 8 skipped (auth, stock, upload, sales, invoices, production, rate limits, PI parse, notifications, schema migration, upload-limit config) — includes `tests/test_invoices_production.py` (12) + `tests/test_invoice_amount.py` (10)
 
 ### Frontend (Vitest)
 - **Environment**: jsdom
-- **Coverage**: 23 test files, 234 tests (utils, components, contexts, pages) — includes `ProductionRunModal.test.jsx` (7) + `InvoicePanel.test.jsx` (8)
-- **Lint**: oxlint (0 errors, 39 baseline warnings)
+- **Coverage**: 33 test files, 256 tests (utils, components, contexts, pages) — includes `ProductionRunModal.test.jsx` (7) + `InvoicePanel.test.jsx` (8)
+- **Lint**: oxlint (0 errors, 0 warnings)
 
 ### CI (`.github/workflows/ci.yml`)
 - **Runtime**: Python **3.12** pinned to the Vercel deploy runtime (Vercel defaults to 3.12; no `.python-version`/`pyproject.toml` overrides it) · Node 22 · postgres:16
