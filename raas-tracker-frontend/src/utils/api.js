@@ -7,5 +7,6 @@ export class ApiError extends Error {
     this.status = status;
     this.fields = fields;
     this.retryAfter = retryAfter;
+    this.missing = null;
   }
 }

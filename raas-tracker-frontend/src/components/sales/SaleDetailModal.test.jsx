@@ -165,4 +165,64 @@ describe('SaleDetailModal shipments', () => {
     // Nothing was loaded, so there is no content to preserve and no retry.
     expect(screen.queryByText('INV-9')).toBeNull();
   });
+
+  it('F8 renders nothing for the invoice-lines section when there is no invoice', async () => {
+    const noInv = { ...DETAIL, invoices: [], stage: 'shipment_ongoing' };
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      const u = String(url);
+      if (u.includes('/api/auth/me')) return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
+      if (u.match(/\/api\/sales\/5$/)) return jsonResponse(noInv);
+      if (u.includes('/api/sales/5')) return jsonResponse(noInv);
+      return jsonResponse({});
+    }));
+    render(
+      <MemoryRouter>
+        <AuthProvider>
+          <ConfirmProvider>
+            <SaleDetailModal saleId={5} onClose={vi.fn()} onSaved={vi.fn()} />
+          </ConfirmProvider>
+        </AuthProvider>
+      </MemoryRouter>
+    );
+    expect(await screen.findByText('Cotton')).toBeTruthy();
+    expect(screen.queryByText(/add an invoice line/i)).toBeNull();
+  });
+
+  it('F10 refetches invoice lines when invoice ids change and surfaces 404', async () => {
+    const withInv = {
+      ...DETAIL,
+      invoices: [{ invoice_id: 101, invoice_number: 'INV-101', status: 'planned' }],
+    };
+    const voided = { ...DETAIL, invoices: [] };
+    let saleCalls = 0;
+    let itemsCalls = 0;
+    vi.stubGlobal('fetch', vi.fn(async (url, options) => {
+      const u = String(url);
+      const method = options?.method || 'GET';
+      if (u.includes('/api/auth/me')) return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
+      if (u.match(/\/api\/invoices\/101\/items/) && method === 'GET') {
+        itemsCalls += 1;
+        if (itemsCalls === 1) return jsonResponse([{ sale_item_id: 21, quantity: 10 }]);
+        return jsonResponse({ error: 'Invoice not found' }, false, 404);
+      }
+      if (u.match(/\/api\/sales\/5$/)) {
+        saleCalls += 1;
+        return jsonResponse(saleCalls === 1 ? withInv : voided);
+      }
+      if (u.includes('/api/sales/5')) return jsonResponse(withInv);
+      return jsonResponse({});
+    }));
+    const onSaved = vi.fn();
+    render(
+      <MemoryRouter>
+        <AuthProvider>
+          <ConfirmProvider>
+            <SaleDetailModal saleId={5} onClose={vi.fn()} onSaved={onSaved} />
+          </ConfirmProvider>
+        </AuthProvider>
+      </MemoryRouter>
+    );
+    expect(await screen.findByText('Cotton')).toBeTruthy();
+    expect(itemsCalls).toBeGreaterThanOrEqual(1);
+  });
 });

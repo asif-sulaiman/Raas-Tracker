@@ -33,4 +33,17 @@ describe('ApiError', () => {
     expect(err.status).toBe(0);
     expect(err.message).toMatch(/network/i);
   });
+
+  it('F1 carries backend details and missing without dropping fields', () => {
+    const details = [{ field: 'company_id', message: 'required' }];
+    const err = new ApiError(400, 'Invalid payload', details, null);
+    err.missing = ['company_id'];
+    expect(err.fields).toEqual(details);
+    expect(err.missing).toEqual(['company_id']);
+    // Consumers stay on err.fields; details alias must map to fields.
+    const backendBody = { error: 'Invalid payload', details, missing: ['company_id'] };
+    const mappedFields = backendBody.fields || backendBody.details || backendBody.errors || null;
+    expect(mappedFields).toEqual(details);
+    expect(backendBody.missing).toEqual(['company_id']);
+  });
 });

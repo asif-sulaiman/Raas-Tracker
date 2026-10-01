@@ -33,6 +33,7 @@ export default function Home() {
   const [chemError, setChemError] = useState(null);
   const [recipes, setRecipes] = useState([]);
   const [sales, setSales] = useState([]);
+  const [lcs, setLcs] = useState([]);
   const [salesSummary, setSalesSummary] = useState(null);
   const [salesLoading, setSalesLoading] = useState(true);
   const [salesError, setSalesError] = useState(null);
@@ -92,10 +93,11 @@ export default function Home() {
     let mounted = true;
     (async () => {
       try {
-        const [recsRes, salesRes, summaryRes] = await Promise.all([
+        const [recsRes, salesRes, summaryRes, lcsRes] = await Promise.all([
           apiFetch('/api/recipes'),
           apiFetch('/api/sales?page=1&page_size=20').catch(() => null),
-          apiFetch('/api/sales/summary').catch(() => null)
+          apiFetch('/api/sales/summary').catch(() => null),
+          apiFetch('/api/lcs').catch(() => null)
         ]);
         if (!mounted) return;
         const recs = await recsRes.json();
@@ -111,6 +113,11 @@ export default function Home() {
         if (summaryRes) {
           const summaryData = await summaryRes.json();
           if (summaryData) setSalesSummary(summaryData);
+        }
+        // Best-effort LC enrichment for nested recent-sales rows.
+        if (lcsRes) {
+          const lcsData = await lcsRes.json().catch(() => null);
+          if (Array.isArray(lcsData)) setLcs(lcsData);
         }
       } catch (err) {
         if (mounted) setSalesError(err.message || 'Could not load sales data');
@@ -178,6 +185,7 @@ export default function Home() {
       {/* Sales Pipeline Overview — hero section, first under the banner */}
       <SalesPipelineOverview
         sales={sales}
+        lcs={lcs}
         salesSummary={salesSummary}
         visibleSales={visibleSales}
         salesExpanded={salesExpanded}

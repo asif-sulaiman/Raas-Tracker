@@ -480,3 +480,16 @@ def test_relink_sale_company_helper(db):
     # missing sale -> False
     assert salesmod.relink_sale_company(db, 999999999, co1) is False
     db.rollback()
+
+
+def test_sale_serializers_project_lc_id(db):
+    """Reconciliation: list + detail project sales.lc_id for FK grouping."""
+    co = _company(db)
+    lc = lcsmod.create_lc(db, co, f"LC-PROJ-{_tag()}")
+    sid = _sale(db, co)
+    lcsmod.attach_pis(db, lc["id"], [sid])
+    listed = [s for s in salesmod.get_all_sales(db)["sales"] if s["id"] == sid]
+    assert listed and listed[0]["lc_id"] == lc["id"]
+    assert salesmod.get_sale_by_id(db, sid)["lc_id"] == lc["id"]
+    unlinked = _sale(db, co)
+    assert salesmod.get_sale_by_id(db, unlinked)["lc_id"] is None

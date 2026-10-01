@@ -87,7 +87,7 @@ def get_all_sales(conn: psycopg.Connection, stage: Optional[str] = None,
                 COALESCE(ROUND(SUM(si.quantity * si.unit_price)::numeric, 2)::float8, 0) AS total_value,
                 COUNT(si.id) AS item_count,
                COALESCE(spa.total_paid, 0) AS total_paid,
-               s.shipment_status,
+               s.shipment_status, s.lc_id,
                COUNT(*) OVER() AS total_count
         FROM sales s
         LEFT JOIN sale_items si ON si.sale_id = s.id
@@ -107,12 +107,12 @@ def get_all_sales(conn: psycopg.Connection, stage: Optional[str] = None,
         params.extend([like, like, like, like])
     if clauses:
         base_query += " WHERE " + " AND ".join(clauses)
-    base_query += " GROUP BY s.id, c.id, spa.total_paid ORDER BY s.created_at DESC, s.id DESC"
+    base_query += " GROUP BY s.id, c.id, spa.total_paid, s.lc_id ORDER BY s.created_at DESC, s.id DESC"
     base_query += " LIMIT %s OFFSET %s"
     params.extend([page_size, offset])
 
     rows = conn.execute(base_query, params).fetchall()
-    total = rows[0][21] if rows else 0  # total_count is the last column
+    total = rows[0][22] if rows else 0  # total_count is the last column
     sales = [
         {"id": r[0], "stage": r[1], "pi_number": r[2], "pi_date": r[3],
          "client_name": r[4], "pi_file_path": r[5], "lc_number": r[6],
@@ -121,7 +121,7 @@ def get_all_sales(conn: psycopg.Connection, stage: Optional[str] = None,
          "company_id": r[13], "maturity_date": r[14], "comments": r[15],
          "company_name": r[16],
          "total_value": r[17], "item_count": r[18], "total_paid": r[19],
-         "shipment_status": r[20],
+         "shipment_status": r[20], "lc_id": r[21],
          "balance": r[17] - r[19]}
         for r in rows
     ]
@@ -134,7 +134,8 @@ def get_sale_by_id(conn: psycopg.Connection, sale_id: int) -> Optional[Dict[str,
         "SELECT s.id, s.stage, s.pi_number, s.pi_date, s.client_name, "
         "s.pi_file_path, s.lc_number, s.lc_date, s.shipment_date, "
         "s.payment_date, s.payment_amount, s.created_at, s.updated_at, "
-        "s.company_id, s.maturity_date, s.comments, c.name, s.shipment_status "
+        "s.company_id, s.maturity_date, s.comments, c.name, s.shipment_status, "
+        "s.lc_id "
         "FROM sales s LEFT JOIN companies c ON c.id = s.company_id "
         "WHERE s.id = %s", (sale_id,)).fetchone()
     if not row:
@@ -146,7 +147,7 @@ def get_sale_by_id(conn: psycopg.Connection, sale_id: int) -> Optional[Dict[str,
         "payment_amount": row[10], "created_at": row[11], "updated_at": row[12],
         "company_id": row[13], "maturity_date": row[14], "comments": row[15],
         "company_name": row[16] or row[4],
-        "shipment_status": row[17],
+        "shipment_status": row[17], "lc_id": row[18],
     }
     sale["items"] = [
         {"id": r[0], "sale_id": r[1], "product_name": r[2],

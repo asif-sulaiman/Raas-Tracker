@@ -91,12 +91,14 @@ export function AuthProvider({ children }) {
     if (!res.ok) {
       let data = {};
       try { data = await res.json(); } catch { /* non-JSON error body */ }
-      throw new ApiError(
+      const err = new ApiError(
         res.status,
         data.error || data.message || `Request failed (HTTP ${res.status})`,
-        data.fields || data.errors || null,
+        data.fields || data.details || data.errors || null,
         res.headers.get('Retry-After')
       );
+      if (data.missing !== undefined) err.missing = data.missing;
+      throw err;
     }
     return res;
   }, [redirectToLogin]);
