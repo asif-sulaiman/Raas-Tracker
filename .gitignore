@@ -75,3 +75,6 @@ dist/
 
 # === Real client PI samples (never commit) ===
 samples/
+
+# === Deepwork local state (git-local, never commit) ===
+.slim/deepwork/
