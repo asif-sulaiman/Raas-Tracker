@@ -1,0 +1,340 @@
+"""Letters-of-credit domain services (Phase 2 lane A).
+
+One company holds one or many PIs under a single LC. The LC owns the
+pipeline journey; PIs always progress together. Legacy
+``sales.lc_number``/``lc_date`` TEXT mirrors are written from the LC in the
+same transaction (compat/display only); ``sales.lc_id`` is the link.
+
+Finding-5 invariants (service-enforced):
+  * trim ``lc_number`` on every insert/lookup;
+  * scope LC selects by ``(company_id, lc_number)``;
+  * when ``sales.company_id`` changes, clear ``sales.lc_id`` (see
+    ``raas_tracker.sales.relink_sale_company``, called from
+    ``update_sale_full``).
+"""
+
+import psycopg
+from datetime import datetime as _dt, timezone
+from typing import Optional, List, Dict, Any
+
+
+def _now_str() -> str:
+    return _dt.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _row_to_dict(row: Any) -> Dict[str, Any]:
+    return {
+        "id": row[0],
+        "lc_number": row[1],
+        "company_id": row[2],
+        "lc_date": row[3],
+        "expiry_date": row[4],
+        "bank_ref": row[5],
+        "stage": row[6],
+        "notes": row[7],
+        "created_at": row[8],
+        "updated_at": row[9],
+    }
+
+
+_LC_COLS = (
+    "id, lc_number, company_id, lc_date, expiry_date, bank_ref, "
+    "stage, notes, created_at, updated_at"
+)
+
+
+def create_lc(conn: psycopg.Connection, company_id: int, lc_number: str,
+              lc_date=None, expiry_date=None, bank_ref=None,
+              notes=None) -> dict:
+    """Create an LC for a company. Trims ``lc_number``; rejects blank.
+
+    Scoped UNIQUE per ``(company_id, lc_number)``: a trimmed duplicate for
+    the same company raises ``ValueError`` (race-safe via the DB unique
+    index); the same number for a different company is fine. Audits
+    ``LC_CREATE``.
+    """
+    from .audit import log_audit_action
+
+    lc_number = (lc_number or "").strip() if isinstance(lc_number, str) else ""
+    if not lc_number:
+        raise ValueError("lc_number is required")
+    company = conn.execute(
+        "SELECT id FROM companies WHERE id = %s", (company_id,)).fetchone()
+    if not company:
+        raise ValueError("unknown company")
+    # Scoped lookup on the trimmed value (Finding-5): legacy rows may carry
+    # padding, so compare on trim() rather than the raw column.
+    dup = conn.execute(
+        "SELECT id FROM letters_of_credit "
+        "WHERE company_id = %s AND trim(lc_number) = %s",
+        (company_id, lc_number)).fetchone()
+    if dup:
+        raise ValueError(
+            f"LC number '{lc_number}' already exists for this company")
+
+    def _clean(value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    try:
+        row = conn.execute(
+            f"INSERT INTO letters_of_credit (lc_number, company_id, lc_date,"
+            f" expiry_date, bank_ref, notes) VALUES (%s, %s, %s, %s, %s, %s)"
+            f" RETURNING {_LC_COLS}",
+            (lc_number, company_id, _clean(lc_date), _clean(expiry_date),
+             _clean(bank_ref), _clean(notes)),
+        ).fetchone()
+    except psycopg.errors.IntegrityError:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise ValueError(
+            f"LC number '{lc_number}' already exists for this company")
+    lc = _row_to_dict(row)
+    log_audit_action(conn, "LC_CREATE", "lc", lc["id"],
+                     new_value=lc_number, atomic=False)
+    conn.commit()
+    return lc
+
+
+def get_lc(conn: psycopg.Connection, lc_id: int) -> Optional[dict]:
+    """Return an LC with its linked PIs, or None when missing.
+
+    ``pis`` lists ``{id, pi_number, stage}`` for linked sales, oldest first.
+    """
+    row = conn.execute(
+        f"SELECT {_LC_COLS} FROM letters_of_credit WHERE id = %s",
+        (lc_id,)).fetchone()
+    if not row:
+        return None
+    lc = _row_to_dict(row)
+    lc["pis"] = [
+        {"id": r[0], "pi_number": r[1], "stage": r[2]}
+        for r in conn.execute(
+            "SELECT id, pi_number, stage FROM sales WHERE lc_id = %s "
+            "ORDER BY id",
+            (lc_id,)).fetchall()
+    ]
+    return lc
+
+
+def list_lcs(conn: psycopg.Connection, company_id=None) -> list:
+    """List LCs (optionally one company's), each with a ``pi_count``."""
+    if company_id is None:
+        rows = conn.execute(
+            f"SELECT {_LC_COLS} FROM letters_of_credit ORDER BY id"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"SELECT {_LC_COLS} FROM letters_of_credit "
+            "WHERE company_id = %s ORDER BY id",
+            (company_id,)).fetchall()
+    out = []
+    for row in rows:
+        lc = _row_to_dict(row)
+        lc["pi_count"] = conn.execute(
+            "SELECT COUNT(*) FROM sales WHERE lc_id = %s", (lc["id"],)
+        ).fetchone()[0]
+        out.append(lc)
+    return out
+
+
+def attach_pis(conn: psycopg.Connection, lc_id: int, sale_ids: list) -> dict:
+    """Link sales (PIs) to an LC in ONE transaction.
+
+    Every sale must share the LC's ``company_id`` or the whole call raises
+    ``ValueError`` and links nothing. Mirrors the trimmed ``lc_number`` /
+    ``lc_date`` onto each sale row (compat). Audits ``LC_ATTACH`` per sale.
+    """
+    from .audit import log_audit_action
+
+    sale_ids = sorted(set(sale_ids or []))
+    try:
+        lc_row = conn.execute(
+            "SELECT id, lc_number, company_id, lc_date "
+            "FROM letters_of_credit WHERE id = %s FOR UPDATE",
+            (lc_id,)).fetchone()
+        if not lc_row:
+            conn.rollback()
+            raise ValueError("LC not found")
+        _, raw_number, lc_company, lc_date = lc_row
+        lc_number = (raw_number or "").strip()
+        for sale_id in sale_ids:
+            sale = conn.execute(
+                "SELECT id, company_id FROM sales WHERE id = %s FOR UPDATE",
+                (sale_id,)).fetchone()
+            if not sale:
+                raise ValueError(f"sale {sale_id} not found")
+            if sale[1] != lc_company:
+                raise ValueError(
+                    f"sale {sale_id} belongs to a different company")
+        for sale_id in sale_ids:
+            conn.execute(
+                "UPDATE sales SET lc_id = %s, lc_number = %s, lc_date = %s,"
+                " updated_at = %s WHERE id = %s",
+                (lc_id, lc_number, lc_date, _now_str(), sale_id))
+            log_audit_action(conn, "LC_ATTACH", "lc", lc_id,
+                             new_value=f"sale={sale_id}", atomic=False)
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    return get_lc(conn, lc_id)
+
+
+def detach_pi(conn: psycopg.Connection, lc_id: int, sale_id: int) -> bool:
+    """Unlink one sale from an LC. Clears ``lc_id`` + legacy mirror columns.
+
+    One transaction: locks the LC row + the sale row (``FOR UPDATE``),
+    re-checks ``lc_id`` under lock, then clears the mirrors. Returns False
+    when the sale does not exist or is not linked to this LC.
+    """
+    from .audit import log_audit_action
+
+    try:
+        lc_row = conn.execute(
+            "SELECT id FROM letters_of_credit WHERE id = %s FOR UPDATE",
+            (lc_id,)).fetchone()
+        if not lc_row:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return False
+        row = conn.execute(
+            "SELECT lc_id FROM sales WHERE id = %s FOR UPDATE",
+            (sale_id,)).fetchone()
+        if not row or row[0] != lc_id:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return False
+        conn.execute(
+            "UPDATE sales SET lc_id = NULL, lc_number = NULL, lc_date = NULL,"
+            " updated_at = %s WHERE id = %s",
+            (_now_str(), sale_id))
+        log_audit_action(conn, "LC_DETACH", "lc", lc_id,
+                         old_value=f"sale={sale_id}",
+                         new_value="detached", atomic=False)
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    return True
+
+
+def move_lc_stage(conn: psycopg.Connection, lc_id: int, new_stage: str,
+                  notes=None) -> bool:
+    """Move an LC and ALL its child PIs to ``new_stage`` in a single commit.
+
+    Locks the LC row AND each child sale row (``SELECT ... FOR UPDATE``,
+    children in id order) before writing anything, so concurrent moves
+    serialize instead of interleaving. Validates ``new_stage`` against
+    ``SALE_STAGE_ORDER`` (``ValueError`` otherwise). When the move crosses
+    into ``shipment_ongoing`` from any earlier stage, the shipment gate is
+    enforced in-txn (after the locks, before any write) via the shared
+    ``_lc_shipment_readiness`` core — ``ValueError`` names the missing
+    preconditions (``recipes: ...``, ``invoices: ...``). Propagates
+    ``sales.stage`` + ``sales_stage_history`` + ``SALE_MOVE`` audit per child
+    (``via_lc=True``: linked PIs only travel via this path). Returns False
+    when the LC does not exist.
+    """
+    from .audit import log_audit_action
+    from .sales import SALE_STAGE_ORDER, _lc_shipment_readiness
+
+    if new_stage not in SALE_STAGE_ORDER:
+        raise ValueError(f"invalid stage: {new_stage}")
+    try:
+        lc_row = conn.execute(
+            "SELECT id, stage, company_id FROM letters_of_credit"
+            " WHERE id = %s FOR UPDATE",
+            (lc_id,)).fetchone()
+        if not lc_row:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return False
+        _, lc_stage, lc_company = lc_row
+        children = conn.execute(
+            "SELECT id, stage FROM sales WHERE lc_id = %s ORDER BY id FOR UPDATE",
+            (lc_id,)).fetchall()
+        # Gate inside the txn: crossing into shipment_ongoing from any
+        # earlier stage requires recipes + invoices (computed under lock).
+        # Crossing (not equality): jumps OVER shipment_ongoing are gated too.
+        try:
+            tgt_idx = SALE_STAGE_ORDER.index(new_stage)
+        except ValueError:
+            tgt_idx = -1
+        try:
+            cur_idx = SALE_STAGE_ORDER.index(lc_stage)
+        except ValueError:
+            cur_idx = -1
+        ship_idx = SALE_STAGE_ORDER.index("shipment_ongoing")
+        if tgt_idx >= ship_idx > cur_idx:
+                sale_ids = [c[0] for c in children]
+                readiness = _lc_shipment_readiness(
+                    conn, lc_company, sale_ids)
+                if not (readiness["recipes_ok"] and readiness["invoices_ok"]):
+                    detail = readiness.get("detail") or {}
+                    parts = []
+                    if detail.get("missing_recipes"):
+                        parts.append(
+                            "recipes: " + ", ".join(detail["missing_recipes"]))
+                    elif not readiness.get("recipes_ok"):
+                        parts.append("recipes: missing")
+                    if not readiness.get("invoices_ok"):
+                        parts.append(
+                            "invoices: at least one invoice required")
+                    msg = ("LC is not ready for shipment: "
+                           + ("; ".join(parts) if parts else "preconditions not met"))
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    raise ValueError(msg)
+        conn.execute(
+            "UPDATE letters_of_credit SET stage = %s, updated_at = %s"
+            " WHERE id = %s",
+            (new_stage, _now_str(), lc_id))
+        log_audit_action(conn, "LC_MOVE", "lc", lc_id,
+                         old_value=lc_row[1], new_value=new_stage,
+                         atomic=False)
+        # Child propagation bypasses the direct-move guard by design
+        # (LC-linked sales move only via the LC).
+        for child_id, child_stage in children:
+            if new_stage == "shipment_ongoing":
+                conn.execute(
+                    "UPDATE sales SET stage = %s,"
+                    " shipment_status = COALESCE(shipment_status,"
+                    " 'production_running'), updated_at = %s WHERE id = %s",
+                    (new_stage, _now_str(), child_id))
+            else:
+                conn.execute(
+                    "UPDATE sales SET stage = %s, updated_at = %s WHERE id = %s",
+                    (new_stage, _now_str(), child_id))
+            conn.execute(
+                "INSERT INTO sales_stage_history (sale_id, from_stage,"
+                " to_stage, notes) VALUES (%s, %s, %s, %s)",
+                (child_id, child_stage, new_stage, notes))
+            log_audit_action(conn, "SALE_MOVE", "sale", child_id,
+                             old_value=child_stage, new_value=new_stage,
+                             atomic=False)
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    return True

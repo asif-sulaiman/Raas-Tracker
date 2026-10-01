@@ -70,9 +70,13 @@ from chem_stock import (
     create_production_run, get_register_products, get_commercial_report,
     get_commercial_report_summary
 )
+from raas_tracker.lcs import (
+    create_lc, get_lc, list_lcs, attach_pis, detach_pi, move_lc_stage,
+)
 from raas_tracker.sales import (
     create_invoice, list_invoices, book_invoice, ship_invoice,
-    mark_invoice_paid, void_invoice, get_sale_completion, _now_str
+    mark_invoice_paid, void_invoice, get_sale_completion, _now_str,
+    check_lc_shipment_ready, create_invoice_item, list_invoice_items,
 )
 from raas_tracker.stock import sync_reorder_notifications
 
@@ -2179,8 +2183,8 @@ def api_production_source():
 
 class SaleItemIn(_StrippedModel):
     product_name: str = Field(min_length=1)
-    quantity: float = Field(ge=0)
-    unit_price: float = Field(ge=0)
+    quantity: float = Field(ge=0, allow_inf_nan=False)
+    unit_price: float = Field(ge=0, allow_inf_nan=False)
     unit: str = Field(default="KG", min_length=1)
     item_no: str | None = None
 
@@ -2191,6 +2195,7 @@ class SaleHeaderIn(_StrippedModel):
     client_name: str | None = None
     pi_file_path: str | None = None
     company_id: int | None = None
+    maturity_date: str | None = None
     comments: str | None = None
 
 
@@ -2445,6 +2450,12 @@ def api_update_lc(sale_id):
         return jsonify({"error": "lc_number is required"}), 400
     conn = get_db()
     try:
+        linked = conn.execute(
+            "SELECT lc_id FROM sales WHERE id = %s", (sale_id,)).fetchone()
+        if not linked:
+            return jsonify({"error": "Sale not found"}), 404
+        if linked[0] is not None:
+            return jsonify({"error": "sale is linked to an LC — use LC endpoints"}), 409
         if not update_sale_lc(conn, sale_id, lc_number, data.get("lc_date"),
                               data.get("shipment_date")):
             return jsonify({"error": "Sale not found"}), 404
@@ -2663,6 +2674,535 @@ def api_cron_maturity_check():
         return jsonify({"error": "internal server error"}), 500
     finally:
         conn.close()
+
+
+# Route-level LC helpers (permanent route-level helpers — no update/delete
+# service in raas_tracker/, so they live here, use parameterized SQL only,
+# and audit with atomic=False + one commit).
+def _lc_update_fields(conn, lc_id, fields):
+    allowed = ("lc_date", "expiry_date", "bank_ref", "notes")
+    clean = {k: v for k, v in fields.items() if k in allowed}
+    if not conn.execute("SELECT 1 FROM letters_of_credit WHERE id = %s",
+                        (lc_id,)).fetchone():
+        return False
+    if clean:
+        try:
+            sets = ", ".join(f"{k} = %s" for k in clean)
+            vals = list(clean.values()) + [_now_str(), lc_id]
+            conn.execute(
+                f"UPDATE letters_of_credit SET {sets}, updated_at = %s "
+                "WHERE id = %s", vals)
+            if "lc_date" in clean:
+                conn.execute(
+                    "UPDATE sales SET lc_date = %s, updated_at = %s"
+                    " WHERE lc_id = %s",
+                    (clean["lc_date"], _now_str(), lc_id))
+            log_audit_action(conn, "LC_UPDATE", "lc", lc_id,
+                             new_value=json.dumps(clean, default=str),
+                             atomic=False)
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+    return True
+
+
+def _lc_delete_guarded(conn, lc_id):
+    try:
+        lc_row = conn.execute(
+            "SELECT id FROM letters_of_credit WHERE id = %s FOR UPDATE",
+            (lc_id,)).fetchone()
+        if not lc_row:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return False
+        count = conn.execute(
+            "SELECT COUNT(*) FROM sales WHERE lc_id = %s", (lc_id,)).fetchone()[0]
+        if count and int(count) > 0:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return False
+        cur = conn.execute("DELETE FROM letters_of_credit WHERE id = %s",
+                           (lc_id,))
+        if cur.rowcount == 0:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return False
+        log_audit_action(conn, "LC_DELETE", "lc", lc_id, atomic=False)
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    return True
+
+
+def _lc_attach_error(message):
+    """Map attach/detach service errors: missing resources -> 404."""
+    msg = str(message)
+    low = msg.lower()
+    if low == "lc not found" or (
+            low.startswith("sale ") and low.endswith("not found")):
+        return jsonify({"error": msg}), 404
+    return jsonify({"error": msg}), 400
+
+
+def _invoice_item_error(message):
+    """Map invoice-item service errors: over-qty -> 409, missing -> 404."""
+    msg = str(message)
+    low = msg.lower()
+    if "remain" in low or "exceed" in low:
+        return jsonify({"error": msg}), 409
+    if low in ("invoice not found", "sale item not found"):
+        return jsonify({"error": msg}), 404
+    return jsonify({"error": msg}), 400
+
+
+def _shipment_missing_names(readiness):
+    """Named missing preconditions from the readiness payload (permanent
+    route-level helper supporting both the top-level missing list and
+    the detail/missing_recipes shape)."""
+    if readiness.get("missing"):
+        return list(readiness["missing"])
+    detail = readiness.get("detail") or {}
+    names = [f"recipes: {p}"
+             for p in detail.get("missing_recipes", [])]
+    if not readiness.get("invoices_ok"):
+        names.append("invoices: at least one invoice required")
+    return names or ["preconditions not met"]
+
+
+# ==================== API: LCS + BATCH + INVOICE ITEMS (Phase 2 lane B) ====
+class LcCreateIn(_StrippedModel):
+    company_id: int
+    lc_number: str = Field(min_length=1)
+    lc_date: str | None = None
+    expiry_date: str | None = None
+    bank_ref: str | None = None
+    notes: str | None = None
+
+
+class LcUpdateIn(BaseModel):
+    """Mutable LC fields only — lc_number/company_id are immutable."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    lc_date: str | None = None
+    expiry_date: str | None = None
+    bank_ref: str | None = None
+    notes: str | None = None
+
+
+class LcAttachIn(_StrippedModel):
+    sale_ids: list[int] = Field(min_length=1)
+
+
+class LcMoveIn(_StrippedModel):
+    new_stage: str = Field(min_length=1)
+    notes: str | None = None
+
+
+class SaleBatchIn(BaseModel):
+    sales: list[SaleCreateIn] = Field(min_length=1)
+
+
+class InvoiceItemCreateIn(_StrippedModel):
+    sale_item_id: int
+    quantity: float = Field(gt=0, allow_inf_nan=False)
+
+
+@app.route("/api/lcs")
+def api_list_lcs():
+    company_id = None
+    if "company_id" in request.args:
+        company_id = request.args.get("company_id", type=int)
+        if company_id is None:
+            return jsonify({"error": "company_id must be an integer"}), 400
+    conn = get_db()
+    try:
+        rows = list_lcs(conn, company_id)
+    finally:
+        conn.close()
+    return jsonify(rows)
+
+
+@app.route("/api/lcs", methods=["POST"])
+@admin_required
+@limiter.limit("15 per minute")
+def api_create_lc():
+    try:
+        payload = LcCreateIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    if not get_company(conn, payload.company_id):
+        conn.close()
+        return jsonify({"error": "unknown company"}), 400
+    try:
+        lc = create_lc(conn, payload.company_id, payload.lc_number,
+                       lc_date=payload.lc_date,
+                       expiry_date=payload.expiry_date,
+                       bank_ref=payload.bank_ref, notes=payload.notes)
+    except ValueError as e:
+        _rollback_close(conn)
+        msg = str(e)
+        if "already exists" in msg.lower():
+            return jsonify({"error": msg}), 409
+        return jsonify({"error": msg}), 400
+    except LookupError as e:
+        _rollback_close(conn)
+        return jsonify({"error": str(e)}), 404
+    except Exception:
+        _rollback_close(conn)
+        app.logger.exception("LC creation failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    return jsonify(lc), 201
+
+
+@app.route("/api/lcs/<int:lc_id>")
+def api_get_lc(lc_id):
+    conn = get_db()
+    try:
+        lc = get_lc(conn, lc_id)
+    finally:
+        conn.close()
+    if not lc:
+        return jsonify({"error": "LC not found"}), 404
+    return jsonify(lc)
+
+
+@app.route("/api/lcs/<int:lc_id>", methods=["PUT"])
+@admin_required
+@limiter.limit("15 per minute")
+def api_update_lc_record(lc_id):
+    try:
+        payload = LcUpdateIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    raw = request.get_json() or {}
+    fields = {k: v for k, v in payload.model_dump().items() if k in raw}
+    if not fields:
+        return jsonify({"error": "nothing to update"}), 400
+    conn = get_db()
+    try:
+        # Permanent route-level helper: no update service in
+        # raas_tracker/; explicit allowlist keeps number+company immutable.
+        ok = _lc_update_fields(conn, lc_id, fields)
+        lc = get_lc(conn, lc_id) if ok else None
+    except Exception:
+        _rollback_close(conn)
+        app.logger.exception("LC update failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    if not ok:
+        return jsonify({"error": "LC not found"}), 404
+    return jsonify(lc)
+
+
+@app.route("/api/lcs/<int:lc_id>", methods=["DELETE"])
+@admin_required
+@limiter.limit("15 per minute")
+def api_delete_lc_record(lc_id):
+    import psycopg as _psycopg
+    conn = get_db()
+    try:
+        lc = get_lc(conn, lc_id)
+        if not lc:
+            conn.close()
+            return jsonify({"error": "LC not found"}), 404
+        if lc.get("pis"):
+            conn.close()
+            return jsonify({"error": "LC still has attached PIs — "
+                                      "detach them first"}), 409
+        try:
+            # Permanent route-level helper: no delete service in raas_tracker/.
+            ok = _lc_delete_guarded(conn, lc_id)
+        except _psycopg.IntegrityError:
+            _rollback_close(conn)
+            return jsonify({"error": "LC still has attached PIs — "
+                                      "detach them first"}), 409
+        except Exception:
+            _rollback_close(conn)
+            app.logger.exception("LC delete failed")
+            return jsonify({"error": "internal server error"}), 500
+        conn.close()
+        if not ok:
+            # Guarded helper returns False under lock when PIs are attached
+            # (race with the pre-check above) as well as when missing.
+            check_conn = get_db()
+            try:
+                still = check_conn.execute(
+                    "SELECT 1 FROM letters_of_credit WHERE id = %s",
+                    (lc_id,)).fetchone()
+            finally:
+                check_conn.close()
+            if still:
+                return jsonify({"error": "LC still has attached PIs — "
+                                          "detach them first"}), 409
+            return jsonify({"error": "LC not found"}), 404
+        return jsonify({"success": True})
+    except Exception:
+        _rollback_close(conn)
+        app.logger.exception("LC delete failed")
+        return jsonify({"error": "internal server error"}), 500
+
+
+@app.route("/api/lcs/<int:lc_id>/pis", methods=["POST"])
+@admin_required
+@limiter.limit("15 per minute")
+def api_attach_pis(lc_id):
+    try:
+        payload = LcAttachIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        result = attach_pis(conn, lc_id, payload.sale_ids)
+    except LookupError as e:
+        _rollback_close(conn)
+        return jsonify({"error": str(e)}), 404
+    except ValueError as e:
+        _rollback_close(conn)
+        # Real lane-A service raises ValueError for missing LC/sale too.
+        return _lc_attach_error(str(e))
+    except Exception:
+        _rollback_close(conn)
+        app.logger.exception("LC attach failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    return jsonify(result)
+
+
+@app.route("/api/lcs/<int:lc_id>/pis/<int:sale_id>", methods=["DELETE"])
+@admin_required
+@limiter.limit("15 per minute")
+def api_detach_pi(lc_id, sale_id):
+    conn = get_db()
+    try:
+        ok = detach_pi(conn, lc_id, sale_id)
+    except Exception:
+        _rollback_close(conn)
+        app.logger.exception("LC detach failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    if not ok:
+        return jsonify({"error": "PI is not linked to this LC"}), 404
+    return jsonify({"success": True})
+
+
+@app.route("/api/lcs/<int:lc_id>/move", methods=["POST"])
+@admin_required
+@limiter.limit("15 per minute")
+def api_move_lc(lc_id):
+    try:
+        payload = LcMoveIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        lc = get_lc(conn, lc_id)
+        if not lc:
+            conn.close()
+            return jsonify({"error": "LC not found"}), 404
+        from raas_tracker.sales import SALE_STAGE_ORDER as _ORDER
+        try:
+            _crosses = (_ORDER.index(lc.get("stage"))
+                        < _ORDER.index("shipment_ongoing")
+                        <= _ORDER.index(payload.new_stage))
+        except ValueError:
+            _crosses = True
+        if _crosses:
+            try:
+                readiness = check_lc_shipment_ready(conn, lc_id)
+            except LookupError as e:
+                _rollback_close(conn)
+                return jsonify({"error": str(e)}), 404
+            ready = readiness.get("ready")
+            if ready is None:
+                ready = bool(readiness.get("recipes_ok")
+                             and readiness.get("invoices_ok"))
+            if not ready:
+                missing = _shipment_missing_names(readiness)
+                conn.close()
+                return jsonify({
+                    "error": "LC is not ready for shipment: "
+                             + "; ".join(str(m) for m in missing),
+                    "missing": missing,
+                    "recipes_ok": readiness.get("recipes_ok"),
+                    "invoices_ok": readiness.get("invoices_ok"),
+                }), 409
+        try:
+            ok = move_lc_stage(conn, lc_id, payload.new_stage,
+                               notes=payload.notes)
+        except ValueError as e:
+            msg = str(e)
+            low = msg.lower()
+            if "not ready for shipment" in low or "recipes:" in low \
+                    or "invoices:" in low:
+                _rollback_close(conn)
+                # Recompute readiness for the structured 409 shape.
+                rconn = get_db()
+                try:
+                    try:
+                        readiness = check_lc_shipment_ready(rconn, lc_id)
+                        missing = _shipment_missing_names(readiness)
+                        recipes_ok = readiness.get("recipes_ok")
+                        invoices_ok = readiness.get("invoices_ok")
+                    except Exception:
+                        missing = [msg]
+                        recipes_ok = False
+                        invoices_ok = False
+                finally:
+                    rconn.close()
+                return jsonify({
+                    "error": msg,
+                    "missing": missing,
+                    "recipes_ok": recipes_ok,
+                    "invoices_ok": invoices_ok,
+                }), 409
+            _rollback_close(conn)
+            return jsonify({"error": msg}), 400
+        if not ok:
+            _rollback_close(conn)
+            return jsonify({"error": "LC not found"}), 404
+    except Exception:
+        _rollback_close(conn)
+        app.logger.exception("LC move failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    return jsonify({"id": lc_id, "new_stage": payload.new_stage})
+
+
+@app.route("/api/sales/batch", methods=["POST"])
+@admin_required
+@limiter.limit("15 per minute")
+def api_create_sales_batch():
+    """Create N PIs in ONE transaction: any failure rolls back everything."""
+    try:
+        payload = SaleBatchIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        warnings: list[str] = []
+        seen: dict[str, int] = {}
+        ids: list[int] = []
+        for entry in payload.sales:
+            cid = entry.sale.company_id
+            if cid is not None and not get_company(conn, cid):
+                _rollback_close(conn)
+                return jsonify({"error": "unknown company"}), 400
+            warn = _duplicate_pi_warning(conn, entry.sale.pi_number)
+            if warn:
+                warnings.append(warn)
+            seen[entry.sale.pi_number] = \
+                seen.get(entry.sale.pi_number, 0) + 1
+        for pi, count in seen.items():
+            if count > 1:
+                warnings.append(
+                    f"PI number '{pi}' appears {count} times in this batch"
+                    " — saved anyway")
+        # Inline add_sale equivalent WITHOUT per-row commits: audit rows use
+        # atomic=False and a single conn.commit() below makes the batch atomic
+        # (add_sale() itself commits, so it cannot be reused here).
+        for entry in payload.sales:
+            sale_data = entry.sale.model_dump()
+            items = [i.model_dump() for i in entry.items]
+            if sale_data.get("company_id") is not None:
+                company = get_company(conn, sale_data["company_id"])
+                sale_data["client_name"] = company["name"]
+            sale_id = conn.execute(
+                """INSERT INTO sales
+                       (stage, pi_number, pi_date, client_name, pi_file_path,
+                        company_id, maturity_date, comments)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                ("pi_issued", sale_data.get("pi_number"),
+                 sale_data.get("pi_date"), sale_data.get("client_name"),
+                 sale_data.get("pi_file_path"), sale_data.get("company_id"),
+                 sale_data.get("maturity_date"), sale_data.get("comments"))).fetchone()[0]
+            for item in items:
+                unit = (item.get("unit") or "KG").strip().upper() or "KG"
+                conn.execute(
+                    """INSERT INTO sale_items
+                           (sale_id, product_name, quantity, unit_price, unit,
+                            item_no)
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (sale_id, item["product_name"],
+                     item.get("quantity", 0), item.get("unit_price", 0),
+                     unit, item.get("item_no")))
+            conn.execute(
+                """INSERT INTO sales_stage_history
+                       (sale_id, from_stage, to_stage, notes)
+                   VALUES (%s, NULL, %s, 'Created')""", (sale_id, "pi_issued"))
+            log_audit_action(conn, "SALE_CREATE", "sale", sale_id,
+                             new_value=sale_data.get("pi_number"),
+                             atomic=False)
+            ids.append(sale_id)
+        conn.commit()
+    except Exception:
+        _rollback_close(conn)
+        app.logger.exception("sales batch failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    return jsonify({"ids": ids, "warnings": warnings}), 201
+
+
+@app.route("/api/invoices/<int:invoice_id>/items", methods=["POST"])
+@admin_required
+@limiter.limit("15 per minute")
+def api_create_invoice_item(invoice_id):
+    """Add an invoice line. unit_price is inherited server-side from the PI
+    line; quantities beyond the PI remainder are refused with 409."""
+    try:
+        payload = InvoiceItemCreateIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    if not conn.execute("SELECT 1 FROM invoices WHERE id = %s",
+                        (invoice_id,)).fetchone():
+        conn.close()
+        return jsonify({"error": "Invoice not found"}), 404
+    try:
+        line = create_invoice_item(conn, invoice_id, payload.sale_item_id,
+                                   payload.quantity)
+    except LookupError as e:
+        _rollback_close(conn)
+        return jsonify({"error": str(e)}), 404
+    except ValueError as e:
+        _rollback_close(conn)
+        # Real lane-A service raises ValueError for missing invoice/sale
+        # item too — map those to 404, over-qty to 409.
+        return _invoice_item_error(str(e))
+    except Exception:
+        _rollback_close(conn)
+        app.logger.exception("invoice item creation failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    return jsonify(line), 201
+
+
+@app.route("/api/invoices/<int:invoice_id>/items")
+def api_list_invoice_items(invoice_id):
+    conn = get_db()
+    try:
+        if not conn.execute("SELECT 1 FROM invoices WHERE id = %s",
+                            (invoice_id,)).fetchone():
+            conn.close()
+            return jsonify({"error": "Invoice not found"}), 404
+        rows = list_invoice_items(conn, invoice_id)
+    finally:
+        conn.close()
+    return jsonify(rows)
 
 
 # ==================== MAIN ====================
