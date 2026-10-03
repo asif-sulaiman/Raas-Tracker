@@ -130,6 +130,41 @@ export default function Reports() {
 
   const retryCompanies = () => setCompaniesAttempt((n) => n + 1);
 
+  // LCs feed the report's LC filter. Same rule as companies: a failed load is
+  // recorded, never silently rendered as "there are no LCs".
+  const [lcs, setLcs] = useState([]);
+  const [lcsError, setLcsError] = useState(null);
+  useEffect(() => {
+    if (!isAdmin) return undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await apiFetch('/api/lcs');
+        const data = await res.json();
+        if (cancelled) return;
+        setLcs(Array.isArray(data) ? data : []);
+      } catch (err) {
+        if (cancelled) return;
+        setLcs([]);
+        setLcsError((err && err.message) || 'Unknown error');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [apiFetch, isAdmin]);
+
+  // A failed LC load must not read as "there are no LCs to filter by".
+  const lcsNotice = lcsError ? (
+    <div className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 dark:border-amber-800 dark:bg-amber-950/40">
+      <p className="text-xs font-medium text-amber-700 dark:text-amber-300">
+        Could not load LCs
+      </p>
+      <p className="text-xs text-slate-500 dark:text-slate-400">
+        The LC filter is limited to All LCs.
+      </p>
+      <p className="text-xs text-slate-500 dark:text-slate-400">{lcsError}</p>
+    </div>
+  ) : null;
+
   // CommercialFilters owns the dropdown markup, so the company load state is
   // surfaced beside it instead of inside it. A failed load must never read as
   // "there are no companies to filter by".
@@ -341,8 +376,9 @@ export default function Reports() {
       return (
         <div className="space-y-4">
           <>
-            <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+            <CommercialFilters companies={companies} lcs={lcs} onFiltersChange={() => {}} />
             {companiesNotice}
+            {lcsNotice}
           </>
           <CommercialTable
             data={isGrouped ? { periods: [] } : { rows: [] }}
@@ -361,8 +397,9 @@ export default function Reports() {
       return (
         <div className="space-y-4">
           <>
-            <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+            <CommercialFilters companies={companies} lcs={lcs} onFiltersChange={() => {}} />
             {companiesNotice}
+            {lcsNotice}
           </>
           <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 shadow-xs text-center">
             <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-rose-100 dark:bg-rose-950/40">
@@ -389,8 +426,9 @@ export default function Reports() {
       return (
         <div className="space-y-4">
           <>
-            <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+            <CommercialFilters companies={companies} lcs={lcs} onFiltersChange={() => {}} />
             {companiesNotice}
+            {lcsNotice}
           </>
           <CommercialTable
             data={isGrouped ? { periods: [] } : { rows: [] }}
@@ -472,8 +510,9 @@ export default function Reports() {
       return (
         <div className="space-y-6">
           <>
-            <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+            <CommercialFilters companies={companies} lcs={lcs} onFiltersChange={() => {}} />
             {companiesNotice}
+            {lcsNotice}
           </>
 
           {/* KPI Cards (USD) */}
@@ -531,7 +570,9 @@ export default function Reports() {
 
     return (
       <div className="space-y-6">
-        <CommercialFilters companies={companies} onFiltersChange={() => {}} />
+        <CommercialFilters companies={companies} lcs={lcs} onFiltersChange={() => {}} />
+        {companiesNotice}
+        {lcsNotice}
         
         {/* Period Navigator for grouped views */}
         <CommercialCalendarNavigator

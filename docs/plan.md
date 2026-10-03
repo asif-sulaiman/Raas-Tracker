@@ -18,6 +18,26 @@ This plan captures future work aligned with the Vibe Coding guidebook. The core 
 
 ---
 
+## ✅ Multi-PI under a single LC (2026-10)
+
+Delivered in four phases, each gated by a full test run + an Oracle review.
+
+| Phase | Scope | Gate |
+|---|---|---|
+| 1 | Schema foundation — `letters_of_credit` (UNIQUE company+number), `sales.lc_id`, `invoice_items`, idempotent legacy auto-group backfill, `_SCHEMA_VERSION` 1→2 | Oracle ✅ (1 re-review-free remediation pass) |
+| 2 | Domain services + API — `lcs.py` (CRUD, attach/detach, stage propagation with `FOR UPDATE`), `POST /api/sales/batch`, invoice-line CRUD with server-owned price, `lc_received → shipment_ongoing` gate | Oracle ✅ (attempt 1 blockers → 1 residual → closed with evidence) |
+| 3 | Frontend — LC board card with nested PIs, multi-PI create, LC linking, LC detail modal, partial-qty invoice line editor | Oracle ✅ PASS |
+| 4 | Reporting shift — commercial report/summary/exports compute quantity, total and due from `invoice_items` (row grain and columns unchanged, `lc_id` filter); LC filter in Reports; docs updated | ✅ gate green |
+
+**Business rules now in force**
+- A proforma is an offer, not a receivable: `due = max(invoiced_total − received, 0)`.
+- Invoice line quantity is independent of the PI — partial, split across invoices, or abandoned. Nothing records "abandoned"; an uninvoiced quantity never becomes due.
+- Unit price is always inherited from the PI line and enforced server-side.
+- An LC owns the journey for its PIs; all PIs under one LC progress together.
+- PIs without an LC are transient — created in batches, linked later, deleted if the LC never arrives.
+
+---
+
 ## 🔄 Phase M6: Vibe Coding Alignment (Current)
 
 **Goal:** Create missing docs, codify agent rules, add custom commands/skills per guidebook.

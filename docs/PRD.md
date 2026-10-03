@@ -65,15 +65,18 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 4. All mismatches resolved → click **Approve** → status `approved`
 5. Click **Apply** → system updates stock (`adjust_stock_from_upload`) → upload status `applied`
 
-### Flow 2: Proforma Invoice (PI) Parsing
-1. User goes to **Sales** page → **Parse PI** → uploads PDF/`.docx`
-2. System parses in-memory → returns extracted data (PI number, date, client, item list)
-3. User reviews data → clicks **Create Sale** → entry created in pipeline at `pi_issued`
+### Flow 2: Proforma Invoice (PI) Entry & Parsing
+1. User goes to **Sales** page
+2. **Parse PI** → uploads PDF/`.docx` → system parses in-memory → returns extracted data (PI number, date, client, item list) → user reviews → **Create** → entry created at `pi_issued`
+3. **Add multiple PIs** → one form holds N PI documents (each with its own PI number, date and item rows), created atomically: if any PI fails, nothing is saved
+4. **Link PIs → LC** → select one or more unlinked PIs and attach them to a new or existing LC. A PI created but never covered by an LC is transient — delete it
 
-### Flow 3: Sales Pipeline Advance
-1. `pi_issued` → enter LC details → **Update LC** → `lc_received`
-2. `lc_received` → enter shipment date → **Move** → `shipped`
-3. `shipped` → enter payment (date, amount, note) → **Record Payment** → `payment_received` (balance 0 → `completed`)
+### Flow 3: Sales Pipeline Advance (LC-driven)
+1. `pi_issued` → **Link PIs to LC** (the LC record carries the number, dates, bank ref) → the LC and all its PIs move to `lc_received`
+2. `lc_received` → **invoices are created on the LC's PIs** (see Flow 6 — invoice lines carry per-product quantities)
+3. `lc_received → shipment_ongoing` is **gated**: refused unless a recipe exists for every PI product **and** at least one invoice exists. The refusal names each missing precondition. Jumping over `shipment_ongoing` is gated too
+4. `shipment_ongoing` → payments recorded per invoice (falling back to per PI) → balance 0 → `completed`
+5. All PIs under one LC progress together — the pipeline board shows one LC card with its PIs nested
 
 ### Flow 4: Recipe/Production Reports
 1. User goes to **Reports** → selects recipes → enters production quantity → **Generate**
@@ -86,11 +89,19 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 3. Audit logs (`/api/audit-logs`) trace all actions
 
 ### Flow 6: Go for Production & Invoice Tracking
-1. Sale reaches `lc_received` → **Move** → `shipment_ongoing`; if the sale has no invoice yet, a warning toast reminds the user (non-blocking — the move still succeeds)
-2. Sale detail → **Invoice** panel → create invoice (invoice number + amount, defaults to the sale total)
-3. Recipes → detail → **Go for Production** → company → sale/PI → invoice (existing or new number) → material number (auto-filled from item no.), packing, batch, date, quantity, optional multi-recipe rows → production run created and linked
-4. Linked invoices advance `planned → produced`; pipeline card shows the shipment sub-step badge (Production running → Production done → Ship booked)
-5. Per invoice: **Book** (approx. ship date) → `booked`; **Ship** (actual date) → `shipped` + shipment record; **Pay** → `paid` once payments cover the amount — `paid` never reverts
+1. An invoice is created against a PI (existing or new number). Its **lines** carry the product, the invoiced quantity, the unit price and the line total. Quantity is **free relative to the PI**: it may be the full PI quantity, less than it, or split across several invoices. Unit price is inherited from the PI line and enforced server-side — the client cannot set it
+2. Because quantity may differ per invoice, a product can be partly shipped and the remainder abandoned. Nothing records "abandoned": a quantity that was never invoiced simply never becomes due
+3. `invoices.amount` starts from the sale's PI total when the invoice is created, and becomes a derived cache of its lines' totals (recomputed on every line write)
+4. Recipes → detail → **Go for Production** → company → sale/PI → invoice → material number (auto-filled from item no.), packing, batch, date, quantity, optional multi-recipe rows → production run created and linked
+5. Linked invoices advance `planned → produced`; pipeline card shows the shipment sub-step badge (Production running → Production done → Ship booked)
+6. Per invoice: **Book** (approx. ship date) → `booked`; **Ship** (actual date) → `shipped` + shipment record; **Pay** → `paid` once payments cover the amount — `paid` never reverts
+
+### Flow 7: Commercial Report (invoice-driven)
+- One row per **PI line** (unchanged grain), same columns as before
+- Quantity, total price and due come from **invoice lines**, not the PI: a proforma is an offer, not a receivable
+- Only sales with at least one invoice appear; a PI line with zero invoiced quantity shows 0
+- `due = max(invoiced_total − received, 0)`; payment status follows the invoice totals
+- Filters add **LC** (exact match on the LC), alongside quick search, dates, company, stage and status
 
 ## 6. Data Model
 

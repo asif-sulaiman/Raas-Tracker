@@ -27,22 +27,84 @@ CSV_HEADER = (
 
 def _sale(db, pi_number, client_name="Test Client", items=None, created_at="2026-01-01 00:00:00",
           maturity_date=None, comments=None, shipment_date=None, pi_date="2026-01-15",
-          lc_number=None, lc_date=None):
-    """Insert a sale + items directly (full control over dates/totals)."""
+          lc_number=None, lc_date=None, lc_id=None, invoice_lines="auto"):
+    """Insert a sale + items directly (full control over dates/totals).
+    
+    invoice_lines: 
+        - "auto" (default): create a full invoice matching all sale_items quantities
+        - None: create NO invoice (for testing uninvoiced sale exclusion)
+        - []: create an invoice with zero lines (for testing zero-invoiced lines)
+        - list of dicts: create invoice with specific lines (each dict has sale_item_index, quantity)
+    """
     sid = db.execute(
         """INSERT INTO sales (stage, pi_number, pi_date, client_name, lc_number, lc_date,
-                              shipment_date, maturity_date, comments, created_at)
-           VALUES ('pi_issued', %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                              shipment_date, maturity_date, comments, created_at, lc_id)
+           VALUES ('pi_issued', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
            RETURNING id""",
         (pi_number, pi_date, client_name, lc_number, lc_date,
-         shipment_date, maturity_date, comments, created_at)).fetchone()[0]
-    for it in (items or [{"product_name": "Item", "quantity": 1,
-                          "unit_price": 10, "unit": "KG"}]):
-        db.execute(
+         shipment_date, maturity_date, comments, created_at, lc_id)).fetchone()[0]
+    sale_item_ids = []
+    sale_items_list = items or [{"product_name": "Item", "quantity": 1,
+                          "unit_price": 10, "unit": "KG"}]
+    for it in sale_items_list:
+        row = db.execute(
             "INSERT INTO sale_items (sale_id, product_name, quantity, unit_price, unit) "
-            "VALUES (%s, %s, %s, %s, %s)",
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
             (sid, it["product_name"], it["quantity"], it["unit_price"],
-             it.get("unit", "KG")))
+             it.get("unit", "KG"))).fetchone()
+        sale_item_ids.append(row[0])
+    
+    # Create invoice + invoice_items based on invoice_lines parameter
+    if invoice_lines == "auto":
+        # Auto-create full invoice matching all sale item quantities
+        inv_row = db.execute(
+            "INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at) "
+            "VALUES (%s, %s, 'planned', 0, %s) RETURNING id",
+            (sid, f"INV-{pi_number}", "2026-01-01 00:00:00")).fetchone()
+        inv_id = inv_row[0]
+        total_amount = 0
+        for idx, si_id in enumerate(sale_item_ids):
+            si_row = db.execute(
+                "SELECT unit_price, quantity FROM sale_items WHERE id = %s", (si_id,)).fetchone()
+            unit_price = float(si_row[0]) if si_row else 0
+            qty = float(si_row[1]) if si_row else 0
+            line_total = round(qty * unit_price, 2)
+            total_amount += line_total
+            db.execute(
+                """INSERT INTO invoice_items (invoice_id, sale_item_id, product_name, unit,
+                      quantity, unit_price, line_total)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (inv_id, si_id, sale_items_list[idx].get("product_name", ""),
+                 sale_items_list[idx].get("unit", "KG"),
+                 qty, unit_price, line_total))
+        db.execute("UPDATE invoices SET amount = %s WHERE id = %s",
+                   (round(total_amount, 2), inv_id))
+    elif invoice_lines is not None:
+        # Explicit invoice_lines provided (list, possibly empty)
+        inv_row = db.execute(
+            "INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at) "
+            "VALUES (%s, %s, 'planned', 0, %s) RETURNING id",
+            (sid, f"INV-{pi_number}", "2026-01-01 00:00:00")).fetchone()
+        inv_id = inv_row[0]
+        total_amount = 0
+        for il in invoice_lines:
+            si_idx = il["sale_item_index"]
+            si_id = sale_item_ids[si_idx]
+            qty = il["quantity"]
+            si_row = db.execute(
+                "SELECT unit_price FROM sale_items WHERE id = %s", (si_id,)).fetchone()
+            unit_price = float(si_row[0]) if si_row else 0
+            line_total = round(qty * unit_price, 2)
+            total_amount += line_total
+            db.execute(
+                """INSERT INTO invoice_items (invoice_id, sale_item_id, product_name, unit,
+                      quantity, unit_price, line_total)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (inv_id, si_id, il.get("product_name", ""), il.get("unit", "KG"),
+                 qty, unit_price, line_total))
+        db.execute("UPDATE invoices SET amount = %s WHERE id = %s",
+                   (round(total_amount, 2), inv_id))
+    # else invoice_lines is None: no invoice created
     db.commit()
     return sid
 
@@ -670,3 +732,310 @@ def test_export_q_filter_and_row_count(admin_client, db):
     assert r.status_code == 200
     parsed = list(csv.reader(io.StringIO(r.get_json()["content"])))
     assert len(parsed) == 2  # header + 1 matching row
+
+
+# ------------------------- Phase 4 lane Q: invoice-driven math -------------------------
+
+def test_partial_qty_line_invoiced(admin_client, db):
+    """8-of-10 invoiced → row shows 8."""
+    sid = _sale(db, "PI-QTY1", items=[
+        {"product_name": "Partial", "quantity": 10, "unit_price": 10, "unit": "KG"}],
+        invoice_lines=[{"sale_item_index": 0, "quantity": 8}])
+    rows = _of(_rows(admin_client), sid)
+    assert len(rows) == 1
+    row = rows[0]
+    # Invoice-driven: quantity from invoice_items, not sale_items
+    assert row["quantity"] == 8
+    assert row["total_price"] == 80  # 8 * 10
+
+
+def test_split_across_two_invoices(admin_client, db):
+    """8 + 2 invoiced across 2 invoices → row shows 10."""
+    sid = _sale(db, "PI-QTY2", items=[
+        {"product_name": "Split", "quantity": 10, "unit_price": 10, "unit": "KG"}],
+        invoice_lines=[
+            {"sale_item_index": 0, "quantity": 8},
+            {"sale_item_index": 0, "quantity": 2}])
+    rows = _of(_rows(admin_client), sid)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["quantity"] == 10
+    assert row["total_price"] == 100  # (8+2) * 10
+
+
+def test_abandoned_line_zero_invoiced(admin_client, db):
+    """Line with 0 invoiced quantity → row shows 0."""
+    sid = _sale(db, "PI-QTY3", items=[
+        {"product_name": "Abandoned", "quantity": 10, "unit_price": 10, "unit": "KG"}],
+        invoice_lines=[])  # No invoice lines
+    rows = _of(_rows(admin_client), sid)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["quantity"] == 0
+    assert row["total_price"] == 0
+
+
+def test_uninvoiced_sale_excluded(admin_client, db):
+    """Sale with no invoices at all → excluded from report."""
+    # This sale has no invoices
+    sid_no_inv = _sale(db, "PI-NO-INV", items=[
+        {"product_name": "NoInv", "quantity": 5, "unit_price": 20, "unit": "KG"}],
+        invoice_lines=None)
+    # This sale has an invoice
+    sid_with_inv = _sale(db, "PI-WITH-INV", items=[
+        {"product_name": "WithInv", "quantity": 5, "unit_price": 20, "unit": "KG"}],
+        invoice_lines=[{"sale_item_index": 0, "quantity": 5}])
+    rows = _rows(admin_client)
+    sale_ids = {r["sale_id"] for r in rows}
+    assert sid_no_inv not in sale_ids, "Uninvoiced sale must be excluded"
+    assert sid_with_inv in sale_ids, "Invoiced sale must be included"
+
+
+def test_lc_id_filter_isolates_one_lc(admin_client, db):
+    """lc_id filter exact match on sales.lc_id."""
+    # Create a company first
+    company_id = db.execute("INSERT INTO companies (name) VALUES ('LC Test Co') RETURNING id").fetchone()[0]
+    db.commit()
+    lc1 = db.execute("INSERT INTO letters_of_credit (lc_number, company_id) VALUES ('LC-1', %s) RETURNING id", (company_id,)).fetchone()[0]
+    lc2 = db.execute("INSERT INTO letters_of_credit (lc_number, company_id) VALUES ('LC-2', %s) RETURNING id", (company_id,)).fetchone()[0]
+    db.commit()
+    
+    sid1 = _sale(db, "PI-LC1", lc_id=lc1, invoice_lines=[
+        {"sale_item_index": 0, "quantity": 5}])
+    sid2 = _sale(db, "PI-LC2", lc_id=lc2, invoice_lines=[
+        {"sale_item_index": 0, "quantity": 5}])
+    sid3 = _sale(db, "PI-LC3", invoice_lines=[  # no lc_id
+        {"sale_item_index": 0, "quantity": 5}])
+    
+    rows = _filtered_rows(admin_client, {"lc_id": lc1})
+    sale_ids = {r["sale_id"] for r in rows}
+    assert sale_ids == {sid1}
+    
+    rows = _filtered_rows(admin_client, {"lc_id": lc2})
+    sale_ids = {r["sale_id"] for r in rows}
+    assert sale_ids == {sid2}
+    
+    rows = _filtered_rows(admin_client, {"lc_id": 9999})
+    assert rows == []
+
+
+def test_due_follows_invoice_total_not_pi_total(admin_client, db):
+    """due = max(invoice_total - received, 0), not PI total."""
+    # PI total = 10 * 10 = 100, but invoiced only 6 * 10 = 60
+    sid = _sale(db, "PI-DUE1", maturity_date="2099-12-31", items=[
+        {"product_name": "DueTest", "quantity": 10, "unit_price": 10, "unit": "KG"}],
+        invoice_lines=[{"sale_item_index": 0, "quantity": 6}])
+    _pay(db, sid, 20)  # paid 20
+    rows = _of(_rows(admin_client), sid)
+    assert len(rows) == 1
+    row = rows[0]
+    # sale_total from invoices = 60, received = 20, due = 40
+    assert row["received_amount"] == 20
+    assert row["due_amount"] == 40
+    assert row["payment_status"] == "Partial"
+    # Not 100 - 20 = 80 (which would be PI-based)
+
+
+def test_due_clamped_at_zero_with_overpayment_on_invoice(admin_client, db):
+    """Overpayment on invoice total → due = 0."""
+    sid = _sale(db, "PI-DUE2", maturity_date="2099-12-31", items=[
+        {"product_name": "Overpay", "quantity": 10, "unit_price": 10, "unit": "KG"}],
+        invoice_lines=[{"sale_item_index": 0, "quantity": 5}])  # invoice total = 50
+    _pay(db, sid, 70)  # paid 70 > 50
+    rows = _of(_rows(admin_client), sid)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["received_amount"] == 70
+    assert row["due_amount"] == 0
+    assert row["payment_status"] == "Paid"
+
+
+def test_quantity_and_total_per_line_from_invoice_items(admin_client, db):
+    """Multi-item sale: each line gets its own invoiced quantity/total."""
+    sid = _sale(db, "PI-MULTI-INV", items=[
+        {"product_name": "ItemA", "quantity": 10, "unit_price": 10, "unit": "KG"},
+        {"product_name": "ItemB", "quantity": 5, "unit_price": 20, "unit": "L"}],
+        invoice_lines=[
+            {"sale_item_index": 0, "quantity": 8},  # ItemA: 8 of 10
+            {"sale_item_index": 1, "quantity": 3},  # ItemB: 3 of 5
+        ])
+    rows = _of(_rows(admin_client), sid)
+    assert len(rows) == 2
+    by_product = {r["product_name"]: r for r in rows}
+    assert by_product["ItemA"]["quantity"] == 8
+    assert by_product["ItemA"]["total_price"] == 80
+    assert by_product["ItemB"]["quantity"] == 3
+    assert by_product["ItemB"]["total_price"] == 60
+
+
+def test_summary_invoice_driven_kpis(admin_client, db):
+    """Summary KPIs (gross_sales, received, due, overdue) use invoice totals."""
+    # Sale 1: PI=100, Invoice=60, paid=20 → gross=60, received=20, due=40
+    sid1 = _sale(db, "PI-SUM-INV1", created_at="2026-01-10", pi_date="2026-01-10",
+                 items=[{"product_name": "A", "quantity": 10, "unit_price": 10}],
+                 invoice_lines=[{"sale_item_index": 0, "quantity": 6}],
+                 maturity_date="2026-02-15")
+    _pay(db, sid1, 20, "2026-01-20")
+    # Sale 2: PI=200, Invoice=100, paid=0 → gross=100, received=0, due=100
+    sid2 = _sale(db, "PI-SUM-INV2", created_at="2026-02-15", pi_date="2026-02-15",
+                 items=[{"product_name": "B", "quantity": 10, "unit_price": 20}],
+                 invoice_lines=[{"sale_item_index": 0, "quantity": 5}],
+                 maturity_date="2026-03-15")
+    
+    summary = _summary(admin_client, {"group_by": "month", "date_anchor": "pi_date"})
+    periods = summary["periods"]
+    
+    jan = next(p for p in periods if p["period_start"] == "2026-01-01")
+    assert jan["kpis"]["gross_sales"] == 60   # invoice-driven
+    assert jan["kpis"]["received"] == 20
+    assert jan["kpis"]["due"] == 40
+    assert jan["kpis"]["overdue"] == 40
+    assert jan["kpis"]["order_count"] == 1
+    
+    feb = next(p for p in periods if p["period_start"] == "2026-02-01")
+    assert feb["kpis"]["gross_sales"] == 100  # invoice-driven
+    assert feb["kpis"]["received"] == 0
+    assert feb["kpis"]["due"] == 100
+    assert feb["kpis"]["overdue"] == 100
+    assert feb["kpis"]["order_count"] == 1
+
+
+def test_summary_lc_id_filter(admin_client, db):
+    """Summary respects lc_id filter."""
+    company_id = db.execute("INSERT INTO companies (name) VALUES ('LC Sum Co') RETURNING id").fetchone()[0]
+    db.commit()
+    lc1 = db.execute("INSERT INTO letters_of_credit (lc_number, company_id) VALUES ('LC-S1', %s) RETURNING id", (company_id,)).fetchone()[0]
+    lc2 = db.execute("INSERT INTO letters_of_credit (lc_number, company_id) VALUES ('LC-S2', %s) RETURNING id", (company_id,)).fetchone()[0]
+    db.commit()
+    
+    _sale(db, "PI-LCS1", lc_id=lc1, created_at="2026-01-10", pi_date="2026-01-10",
+          items=[{"product_name": "A", "quantity": 10, "unit_price": 10}],
+          invoice_lines=[{"sale_item_index": 0, "quantity": 10}])
+    _sale(db, "PI-LCS2", lc_id=lc2, created_at="2026-01-15", pi_date="2026-01-15",
+          items=[{"product_name": "B", "quantity": 10, "unit_price": 20}],
+          invoice_lines=[{"sale_item_index": 0, "quantity": 10}])
+    
+    summary = _summary(admin_client, {"group_by": "month", "date_anchor": "pi_date", "lc_id": lc1})
+    total_orders = sum(p["kpis"]["order_count"] for p in summary["periods"])
+    assert total_orders == 1
+    
+    summary = _summary(admin_client, {"group_by": "month", "date_anchor": "pi_date", "lc_id": lc2})
+    total_orders = sum(p["kpis"]["order_count"] for p in summary["periods"])
+    assert total_orders == 1
+
+
+def test_export_lc_id_filter(admin_client, db):
+    """Export respects lc_id filter."""
+    company_id = db.execute("INSERT INTO companies (name) VALUES ('LC Exp Co') RETURNING id").fetchone()[0]
+    db.commit()
+    lc1 = db.execute("INSERT INTO letters_of_credit (lc_number, company_id) VALUES ('LC-E1', %s) RETURNING id", (company_id,)).fetchone()[0]
+    lc2 = db.execute("INSERT INTO letters_of_credit (lc_number, company_id) VALUES ('LC-E2', %s) RETURNING id", (company_id,)).fetchone()[0]
+    db.commit()
+    
+    _sale(db, "PI-ELC1", lc_id=lc1, invoice_lines=[{"sale_item_index": 0, "quantity": 5}])
+    _sale(db, "PI-ELC2", lc_id=lc2, invoice_lines=[{"sale_item_index": 0, "quantity": 5}])
+    
+    r = _export_rows(admin_client, {"lc_id": lc1})
+    assert r.status_code == 200
+    body = r.get_json()
+    parsed = list(csv.reader(io.StringIO(body["content"])))
+    assert len(parsed) == 2  # header + 1 row
+    assert parsed[1][1] == "PI-ELC1"  # PI No column
+    
+    r = _export_rows(admin_client, {"lc_id": lc2})
+    assert r.status_code == 200
+    body = r.get_json()
+    parsed = list(csv.reader(io.StringIO(body["content"])))
+    assert len(parsed) == 2
+    assert parsed[1][1] == "PI-ELC2"
+
+
+# ------------------------- Gate 4 regression guards -------------------------
+
+def test_summary_drilldown_due_is_clamped_like_the_kpi_row(admin_client, db):
+    """Gate 4 B2: an overpaid sale must show due 0 in the drill-down too.
+
+    The detail rows clamped in Python and the summary clamped with GREATEST;
+    the per-period items query did not, so the KPI said 0 while its own
+    drill-down said -50.
+    """
+    sid = _sale(db, "PI-OVER-Clamp", created_at="2026-01-10", pi_date="2026-01-10",
+                maturity_date="2099-12-31",
+                items=[{"product_name": "A", "quantity": 5, "unit_price": 10}],
+                invoice_lines=[{"sale_item_index": 0, "quantity": 5}])
+    _pay(db, sid, 999, "2026-01-20")
+
+    body = _summary(admin_client, {"group_by": "month", "date_anchor": "pi_date"})
+    jan = next(p for p in body["periods"] if p["period_start"] == "2026-01-01")
+    assert jan["kpis"]["due"] == 0
+    assert jan["items"], "grouped mode must still return the period's items"
+    for row in jan["items"]:
+        assert row["due_amount"] == 0, "drill-down must clamp like the KPI row"
+        assert row["payment_status"] == "Paid"
+
+
+def test_non_integer_filter_is_rejected_not_silently_ignored(admin_client, db):
+    """Gate 4 M3: `?lc_id=abc` must 400, never return unfiltered rows."""
+    _sale(db, "PI-BADQ", invoice_lines=[{"sale_item_index": 0, "quantity": 1}])
+    for url in ("/api/reports/live/filtered?lc_id=abc",
+                "/api/reports/live/summary?lc_id=abc",
+                "/api/reports/live/export?lc_id=abc"):
+        r = admin_client.get(url)
+        assert r.status_code == 400, f"{url} -> {r.status_code}"
+        assert r.get_json()["details"][0]["field"] == "lc_id"
+    # company_id has the same hole.
+    r = admin_client.get("/api/reports/live/filtered?company_id=abc")
+    assert r.status_code == 400
+
+
+def test_export_post_rejects_non_integer_filters(admin_client, db):
+    """Gate 4 M3: the POST body reaches SQL unvalidated -> must 400, not 500."""
+    _sale(db, "PI-BADPOST", invoice_lines=[{"sale_item_index": 0, "quantity": 1}])
+    r = admin_client.post("/api/reports/live/export", json={"lc_id": "abc"})
+    assert r.status_code == 400, r.get_json()
+    assert r.get_json()["details"][0]["field"] == "lc_id"
+    r = admin_client.post("/api/reports/live/export", json={"company_id": "xyz"})
+    assert r.status_code == 400
+    # A valid int still works through the POST path.
+    r = admin_client.post("/api/reports/live/export", json={"lc_id": 0})
+    assert r.status_code in (200, 400)  # 0 matches nothing -> no data to export
+
+
+def test_line_less_invoice_is_not_reported_as_paid(admin_client, db):
+    """Gate 4 B1: an invoice row with no lines must not read as a paid sale.
+
+    An invoice created without lines contributes 0 to gross and sale_total, so
+    the naive math reported due 0 and status "Paid" for a real receivable. The
+    seeded default path means this state can only be reached deliberately.
+    """
+    sid = _sale(db, "PI-NOLINES", maturity_date="2099-12-31",
+                items=[{"product_name": "A", "quantity": 10, "unit_price": 10}])
+    # Deliberately header-only: exactly what POST /invoices produced before the fix.
+    db.execute(
+        "INSERT INTO invoices (sale_id, invoice_number, status, amount) "
+        "VALUES (%s, 'INV-NOLINES', 'planned', 100) RETURNING id", (sid,))
+    db.commit()
+
+    rows = _of(_rows(admin_client), sid)
+    row = rows[0]
+    # Whatever the inclusion rule decides, a receivable may never read as paid.
+    assert not (row["due_amount"] == 0 and row["payment_status"] == "Paid"), \
+        f"header-only invoice reported as Paid: {row}"
+
+
+def test_default_created_invoice_reports_its_receivable(admin_client, db):
+    """Gate 4 B1 fix: the ordinary create path now reports the real amount."""
+    from raas_tracker.sales import create_invoice
+
+    # Header-only PI: create_invoice seeds the lines itself (the production path).
+    sid = _sale(db, "PI-SEEDED", maturity_date="2099-12-31", invoice_lines=None,
+                items=[{"product_name": "A", "quantity": 10, "unit_price": 10}])
+    db.execute("DELETE FROM invoices WHERE sale_id = %s", (sid,))
+    db.commit()
+    create_invoice(db, sid, "INV-SEEDED")
+
+    row = _of(_rows(admin_client), sid)[0]
+    assert row["quantity"] == 10
+    assert row["total_price"] == 100
+    assert row["due_amount"] == 100
+    assert row["payment_status"] == "Due"

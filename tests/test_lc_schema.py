@@ -341,3 +341,57 @@ def test_legacy_backfill_groups_shared_lc(lc_db):
 def test_schema_version_bumped_for_phase1():
     assert dbmod._SCHEMA_VERSION >= 2, \
         "Phase 1 DDL must bump _SCHEMA_VERSION 1 -> 2"
+
+
+# --------------------------------------------------------------------------- #
+# Gate 4 B1: legacy line-less invoices get their lines back
+# --------------------------------------------------------------------------- #
+def test_backfill_invoice_lines_seeds_and_is_idempotent(db):
+    """Legacy invoices with no lines are seeded from their PI lines, once."""
+    from raas_tracker import db as dbmod
+
+    sid = db.execute(
+        """INSERT INTO sales (stage, pi_number, pi_date, client_name)
+           VALUES ('pi_issued', 'PI-LEGACY-1', '2026-01-15', 'Legacy Co') RETURNING id"""
+    ).fetchone()[0]
+    item_id = db.execute(
+        "INSERT INTO sale_items (sale_id, product_name, quantity, unit_price, unit) "
+        "VALUES (%s, 'LegacyA', 12, 2.5, 'KG') RETURNING id", (sid,)).fetchone()[0]
+    db.execute(
+        "INSERT INTO sale_items (sale_id, product_name, quantity, unit_price, unit) "
+        "VALUES (%s, 'LegacyB', 4, 10, 'L')", (sid,))
+    # Two line-less invoices on the same sale: the first takes the lines, the
+    # second is left alone rather than double-billing the sale.
+    inv1 = db.execute(
+        "INSERT INTO invoices (sale_id, invoice_number, status, amount) "
+        "VALUES (%s, 'INV-LEG-1', 'planned', 70) RETURNING id", (sid,)).fetchone()[0]
+    inv2 = db.execute(
+        "INSERT INTO invoices (sale_id, invoice_number, status, amount) "
+        "VALUES (%s, 'INV-LEG-2', 'planned', 0) RETURNING id", (sid,)).fetchone()[0]
+    db.commit()
+
+    seeded = dbmod.backfill_invoice_lines(db)
+    db.commit()
+    assert seeded == 2, "one line per PI line of the first line-less invoice"
+
+    rows = db.execute(
+        "SELECT sale_item_id, quantity, unit_price, line_total "
+        "FROM invoice_items WHERE invoice_id = %s ORDER BY id", (inv1,)).fetchall()
+    assert len(rows) == 2
+    assert rows[0][0] == item_id
+    assert float(rows[0][1]) == pytest.approx(12)
+    assert float(rows[0][2]) == pytest.approx(2.5)
+    assert float(rows[0][3]) == pytest.approx(30.0)
+    assert float(rows[1][3]) == pytest.approx(40.0)
+    assert salesmod_leftover_count(db, inv2) == 0
+
+    # Idempotent: a second run seeds nothing new.
+    assert dbmod.backfill_invoice_lines(db) == 0
+    db.commit()
+    assert db.execute("SELECT COUNT(*) FROM invoice_items").fetchone()[0] == 2
+
+
+def salesmod_leftover_count(conn, invoice_id):
+    return conn.execute(
+        "SELECT COUNT(*) FROM invoice_items WHERE invoice_id = %s",
+        (invoice_id,)).fetchone()[0]

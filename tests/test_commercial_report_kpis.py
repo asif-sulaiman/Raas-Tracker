@@ -14,17 +14,39 @@ from raas_tracker.sales import get_commercial_report_summary
 # ---------- helpers ----------
 
 def _sale(db, pi_number, items, maturity_date=None, pi_date="2026-01-15"):
-    """Insert a sale + line items directly (full control of totals/dates)."""
+    """Insert a sale + line items directly (full control of totals/dates).
+
+    The report is invoice-driven, so each line is also invoiced in full. That
+    keeps invoiced total == PI total here, so these tests keep pinning what
+    they are about (per-sale money counted once, no float drift, due clamp)
+    rather than the PI-vs-invoice source.
+    """
     sid = db.execute(
         """INSERT INTO sales (stage, pi_number, pi_date, client_name, maturity_date)
            VALUES ('pi_issued', %s, %s, 'KPI Co', %s) RETURNING id""",
         (pi_number, pi_date, maturity_date)).fetchone()[0]
+    line_ids = []
     for it in items:
-        db.execute(
+        line_ids.append(db.execute(
             "INSERT INTO sale_items (sale_id, product_name, quantity, unit_price, unit) "
-            "VALUES (%s, %s, %s, %s, %s)",
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
             (sid, it["product_name"], it["quantity"], it["unit_price"],
-             it.get("unit", "KG")))
+             it.get("unit", "KG"))).fetchone()[0])
+    inv_id = db.execute(
+        "INSERT INTO invoices (sale_id, invoice_number, status, amount) "
+        "VALUES (%s, %s, 'planned', 0) RETURNING id",
+        (sid, f"INV-{pi_number}")).fetchone()[0]
+    total = 0.0
+    for line_id, it in zip(line_ids, items):
+        line_total = round(it["quantity"] * it["unit_price"], 2)
+        total = round(total + line_total, 2)
+        db.execute(
+            """INSERT INTO invoice_items (invoice_id, sale_item_id, product_name,
+                  unit, quantity, unit_price, line_total)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (inv_id, line_id, it["product_name"], it.get("unit", "KG"),
+             it["quantity"], it["unit_price"], line_total))
+    db.execute("UPDATE invoices SET amount = %s WHERE id = %s", (total, inv_id))
     db.commit()
     return sid
 

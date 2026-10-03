@@ -1502,6 +1502,27 @@ def api_report_export():
 
 
 # ==================== API: LIVE COMMERCIAL REPORT ====================
+def _bad_int_query_param(names):
+    """400 response when an int query param is present but not an integer.
+
+    `request.args.get(name, type=int)` silently drops an unparseable value, so
+    a typo like `?lc_id=abc` would return UNFILTERED rows that look filtered.
+    Refusing is the honest answer.
+    """
+    for name in names:
+        raw = request.args.get(name)
+        if raw is None or raw == "":
+            continue
+        try:
+            int(raw)
+        except (TypeError, ValueError):
+            return jsonify({
+                "error": "Invalid query parameter",
+                "details": [{"field": name, "message": "must be an integer"}],
+            }), 400
+    return None
+
+
 @app.route("/api/reports/live")
 @limiter.limit("15 per minute")
 @admin_required
@@ -1519,6 +1540,9 @@ def api_commercial_report():
 @admin_required
 def api_commercial_report_filtered():
     """Filtered commercial report with pagination."""
+    bad_int = _bad_int_query_param(("lc_id", "company_id"))
+    if bad_int:
+        return bad_int
     filters = {
         "date_anchor": request.args.get("date_anchor"),
         "date_from": request.args.get("date_from"),
@@ -1529,6 +1553,7 @@ def api_commercial_report_filtered():
         "company_id": request.args.get("company_id", type=int),
         "stage": request.args.get("stage"),
         "payment_status": request.args.get("payment_status"),
+        "lc_id": request.args.get("lc_id", type=int),
         "page": request.args.get("page", 1, type=int),
         "page_size": request.args.get("page_size", 50, type=int),
     }
@@ -1551,6 +1576,9 @@ def api_commercial_report_filtered():
 @admin_required
 def api_commercial_report_summary():
     """Period-aggregated commercial report summary."""
+    bad_int = _bad_int_query_param(("lc_id", "company_id"))
+    if bad_int:
+        return bad_int
     filters = {
         "date_anchor": request.args.get("date_anchor"),
         "date_from": request.args.get("date_from"),
@@ -1561,6 +1589,7 @@ def api_commercial_report_summary():
         "company_id": request.args.get("company_id", type=int),
         "stage": request.args.get("stage"),
         "payment_status": request.args.get("payment_status"),
+        "lc_id": request.args.get("lc_id", type=int),
         "group_by": request.args.get("group_by", "month"),
     }
     # Remove None values
@@ -1579,7 +1608,23 @@ def api_commercial_report_summary():
 def api_commercial_report_export():
     if request.method == "POST":
         filters = request.get_json() or {}
+        # Int filters reach SQL as parameters, so a non-int would surface as a
+        # 500 from the driver. Validate here instead: a bad filter is a client
+        # error, and 400 carries the field name.
+        for key in ("lc_id", "company_id"):
+            if key in filters and filters[key] is not None:
+                try:
+                    filters[key] = int(filters[key])
+                except (TypeError, ValueError):
+                    return jsonify({
+                        "error": "Invalid payload",
+                        "details": [{"field": key,
+                                     "message": "must be an integer"}],
+                    }), 400
     else:
+        bad_int = _bad_int_query_param(("lc_id", "company_id"))
+        if bad_int:
+            return bad_int
         filters = {
             "date_anchor": request.args.get("date_anchor", "pi_date"),
             "date_from": request.args.get("date_from"),
@@ -1590,6 +1635,7 @@ def api_commercial_report_export():
             "company_id": request.args.get("company_id", type=int),
             "stage": request.args.get("stage"),
             "payment_status": request.args.get("payment_status"),
+            "lc_id": request.args.get("lc_id", type=int),
         }
         # Remove None values
         filters = {k: v for k, v in filters.items() if v is not None}

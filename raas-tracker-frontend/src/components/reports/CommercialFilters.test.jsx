@@ -22,6 +22,11 @@ const mockCompanies = [
   { id: 2, name: 'Company B' },
 ];
 
+const mockLcs = [
+  { id: 11, lc_number: 'LC-77' },
+  { id: 12, lc_number: 'LC-88' },
+];
+
 function renderWithRouter(ui, { initialPath = '/reports' } = {}) {
   return render(<MemoryRouter initialEntries={[initialPath]}>{ui}</MemoryRouter>);
 }
@@ -63,6 +68,55 @@ describe('CommercialFilters', () => {
     expect(screen.getByRole('option', { name: 'All Companies' })).toBeTruthy();
     expect(screen.getByRole('option', { name: 'Company A' })).toBeTruthy();
     expect(screen.getByRole('option', { name: 'Company B' })).toBeTruthy();
+  });
+
+  // ---- Phase 4 lane F: LC filter ----
+
+  it('renders the LC dropdown with every LC and an All LCs option', () => {
+    renderWithRouter(
+      <CommercialFilters companies={mockCompanies} lcs={mockLcs} onFiltersChange={mockOnFiltersChange} />
+    );
+
+    const lcSelect = screen.getByLabelText('LC');
+    expect(lcSelect.value).toBe('');
+    expect(screen.getByRole('option', { name: 'All LCs' })).toBeTruthy();
+    expect(screen.getByRole('option', { name: 'LC-77' })).toBeTruthy();
+    expect(screen.getByRole('option', { name: 'LC-88' })).toBeTruthy();
+  });
+
+  it('sets lc_id and resets page to 1 when an LC is selected', () => {
+    renderWithRouter(
+      <CommercialFilters companies={mockCompanies} lcs={mockLcs} onFiltersChange={mockOnFiltersChange} />,
+      { initialPath: '/reports?page=4' }
+    );
+
+    fireEvent.change(screen.getByLabelText('LC'), { target: { value: '12' } });
+
+    expect(mockOnFiltersChange).toHaveBeenCalledWith(
+      expect.objectContaining({ lc_id: '12', page: 1 })
+    );
+  });
+
+  it('reflects lc_id from the URL on first render', () => {
+    renderWithRouter(
+      <CommercialFilters companies={mockCompanies} lcs={mockLcs} onFiltersChange={mockOnFiltersChange} />,
+      { initialPath: '/reports?lc_id=11' }
+    );
+
+    expect(screen.getByLabelText('LC').value).toBe('11');
+  });
+
+  it('Clear resets the LC filter', () => {
+    renderWithRouter(
+      <CommercialFilters companies={mockCompanies} lcs={mockLcs} onFiltersChange={mockOnFiltersChange} />,
+      { initialPath: '/reports?lc_id=11' }
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /clear/i }));
+
+    expect(mockOnFiltersChange).toHaveBeenCalledWith(
+      expect.objectContaining({ lc_id: '' })
+    );
   });
 
   it('updates URL and calls onFiltersChange when quick search changes', () => {

@@ -6,6 +6,7 @@ import { DATE_PRESETS, dateAnchorOptions } from '../../utils/datePresets';
 export default function CommercialFilters({
   onFiltersChange,
   companies = [],
+  lcs = [],
   _initialFilters = {},
 }) {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -22,6 +23,7 @@ export default function CommercialFilters({
     company_id: searchParams.get('company_id') || '',
     stage: searchParams.get('stage') || '',
     payment_status: searchParams.get('payment_status') || '',
+    lc_id: searchParams.get('lc_id') || '',
     group_by: searchParams.get('group_by') || 'none',
     page: parseInt(searchParams.get('page') || '1', 10),
   };
@@ -62,6 +64,7 @@ export default function CommercialFilters({
       company_id: '',
       stage: '',
       payment_status: '',
+      lc_id: '',
       group_by: currentGroupBy,
       page: 1,
     });
@@ -153,7 +156,7 @@ export default function CommercialFilters({
       </div>
 
       {/* Row 2 */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 items-end">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3 items-end">
         <div>
           <label htmlFor="stage" className="block text-xs font-medium text-slate-600 dark:text-slate-400 mb-1">
             Stage
@@ -206,6 +209,25 @@ export default function CommercialFilters({
             {companies.map((c) => (
               <option key={c.id} value={c.id}>
                 {c.name}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div>
+          <label htmlFor="lc" className="block text-xs font-medium text-slate-600 dark:text-slate-400 mb-1">
+            LC
+          </label>
+          <select
+            id="lc"
+            value={filters.lc_id}
+            onChange={(e) => updateFilters({ lc_id: e.target.value })}
+            className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500"
+          >
+            <option value="">All LCs</option>
+            {lcs.map((l) => (
+              <option key={l.id} value={l.id}>
+                {l.lc_number}
               </option>
             ))}
           </select>

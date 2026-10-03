@@ -368,7 +368,7 @@ def _invoiced_setup(db, tag, qty=10, price=5.0):
     co = _company(db, f"LC II {tag}")
     sid = _sale(db, f"PI-II-{tag}", company_id=co, qty=qty, price=price)
     item_id = _sale_item_id(db, sid)
-    inv = create_invoice(db, sid, f"INV-II-{tag}")
+    inv = create_invoice(db, sid, f"INV-II-{tag}", seed_lines=False)
     return inv["invoice_id"], item_id
 
 

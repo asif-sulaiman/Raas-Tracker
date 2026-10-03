@@ -507,7 +507,16 @@ CREATE TABLE app_settings (
 | GET | `/api/reports/live/filtered` | Admin | Filtered commercial report — detail rows with date_anchor, date_from/to, customer_name, product_name, company_id, stage, payment_status, `q` (quick search: PI number OR customer OR product), pagination. Sets `X-Total-Count` header = rows matching the filters across ALL pages (the pager keys off it; a full page is never mistaken for the whole report) |
 | GET | `/api/reports/live/summary` | Admin | Period-aggregated commercial report — month/week/year grouping with KPIs and optional detail items. Accepts the same filters as `/live/filtered` including `q`. `group_by=none` returns one period of whole-filter KPIs (the detail view's KPI cards source) |
 | GET | `/api/reports/live/export` | Admin (15/min) | Commercial report CSV export with same filter params as `/live/filtered` (including `q`). Response `{success, filename, content, row_count, truncated}` — `row_count` is the full filtered total, `truncated` true when it exceeds the 10 000-row export cap. Client `page`/`page_size` are ignored (export always starts at page 1) |
-| POST | `/api/reports/live/export` | Admin (15/min) | Commercial report CSV `{success, filename, content, row_count, truncated}` with filter params in body |
+| POST | `/api/reports/live/export` | Admin (15/min) | Commercial report CSV with filter params in body |
+
+**Commercial report money contract** (the report is invoice-driven; the row grain and columns never change)
+- Per-row `quantity` = `SUM(invoice_items.quantity)` matched on `sale_item_id`; a PI line with nothing invoiced shows `0`.
+- Per-row `total_price` = `ROUND(quantity × sale_items.unit_price, 2)` — the price is always the PI's.
+- Per-sale `sale_total` = `SUM(invoice_items.line_total)` over that sale's invoices.
+- `received_amount` = `SUM(sale_payments.payment_amount)` for the sale (unchanged).
+- `due_amount` = `GREATEST(sale_total − received_amount, 0)` — clamped at zero in the detail rows, the summary KPIs **and** the per-period drill-down alike.
+- Inclusion requires at least one invoice row for the sale.
+- `sale_rows` collapses the per-line `base` to one row per sale (`MAX` for the repeated sale scalars, `SUM` only for per-line gross), so sale-level money is never multiplied by the line count.
 
 ### Audit & Notifications
 | Method | Path | Auth | Description |
@@ -527,7 +536,8 @@ CREATE TABLE app_settings (
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | POST | `/api/sales/parse` | Session/Key (15/min) | Parse PI PDF/`.docx` → extraction |
-| GET | `/api/sales` | Session/Key | List (filter: stage, q); includes `shipment_status` |
+| GET | `/api/sales` | Session/Key | List (filter: stage, q, page, page_size) → `{sales, total}`; rows carry `lc_id` for grouping; includes `shipment_status` |
+| POST | `/api/sales/batch` | Session/Key (15/min) | Create **N PIs in ONE transaction** — `{sales:[{sale, items}]}` → `{ids, warnings}`. Any item failure rolls the whole batch back |
 | GET | `/api/sales/export` | Session/Key (15/min) | CSV export |
 | GET | `/api/sales/summary` | Session/Key | Stage-wise summary |
 | GET | `/api/sales/<id>` | Session/Key | Detail: items (incl. `item_no`), `invoices[]`, `shipment_status`, invoice total/balance |
@@ -535,7 +545,7 @@ CREATE TABLE app_settings (
 | PUT | `/api/sales/<id>` | Admin | Full update (header+items+removals) or patch header (incl. comments) |
 | DELETE | `/api/sales/<id>` | Admin | Delete |
 | POST | `/api/sales/<id>/move` | Admin | Advance stage (with notes) |
-| PUT | `/api/sales/<id>/lc` | Admin | LC details + move to `lc_received` |
+| PUT | `/api/sales/<id>/lc` | Admin | Legacy per-PI LC entry. **409 when the PI is already linked to an LC** — linked PIs use the `/api/lcs` endpoints instead (a half-linked PI has no UI to undo) |
 | PUT | `/api/sales/<id>/payment` | Admin | Record payment |
 | PUT | `/api/sales/<id>/payments/<pid>` | Admin | Edit payment |
 | DELETE | `/api/sales/<id>/payments/<pid>` | Admin | Delete payment |
@@ -545,11 +555,29 @@ CREATE TABLE app_settings (
 | POST | `/api/sales/<id>/shipments` | Admin | Record shipment (date required) |
 | DELETE | `/api/sales/<id>/shipments/<shid>` | Admin | Delete shipment |
 
+### Letters of Credit (LC) — owner of the pipeline journey
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/api/lcs` | Session/Key | List LCs (optional `company_id`); each row carries `pi_count` |
+| POST | `/api/lcs` | Admin (15/min) | Create `{company_id, lc_number, lc_date?, expiry_date?, bank_ref?, notes?}` — `lc_number` trimmed, UNIQUE per company |
+| GET | `/api/lcs/<id>` | Session/Key | LC detail + `pis[]` (id, pi_number, stage, client_name, company_id) |
+| PUT | `/api/lcs/<id>` | Admin (15/min) | Update `lc_date`/`expiry_date`/`bank_ref`/`notes` only (number + company immutable); mirrors `lc_date` onto linked PIs |
+| DELETE | `/api/lcs/<id>` | Admin (15/min) | Delete — **409 while PIs are attached** (locked count + FK backstop) |
+| POST | `/api/lcs/<id>/pis` | Admin (15/min) | Attach `{sale_ids:[...]}` — every PI must share the LC's company (400 otherwise); mirrors `lc_number`/`lc_date` onto the PIs |
+| DELETE | `/api/lcs/<id>/pis/<sale_id>` | Admin (15/min) | Detach one PI (clears `lc_id` + mirrors) |
+| POST | `/api/lcs/<id>/move` | Admin (15/min) | Move the LC stage; **gated** — crossing into (or over) `shipment_ongoing` is refused 409 with `missing`, `recipes_ok`, `invoices_ok` until a recipe exists for every PI product AND ≥1 invoice exists. Propagates the stage to every linked PI in one transaction |
+
+### Invoice Lines
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/api/invoices/<id>/items` | Session/Key | Invoice lines (product, quantity, unit_price, line_total) |
+| POST | `/api/invoices/<id>/items` | Admin (15/min) | Add a line `{sale_item_id, quantity}` — **unit_price is resolved server-side from the PI line**, never accepted from the client; quantity must be finite, >0 and within the remaining uninvoiced quantity (**409** when it would exceed). Recomputes `invoices.amount` from its lines in the same transaction |
+
 ### Sales Invoices
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/api/sales/<id>/invoices` | Session/Key | List invoices with `amount` + `paid_amount` each |
-| POST | `/api/sales/<id>/invoices` | Admin | Create (`invoice_number` required, `amount?` ≥ 0 — defaults to sale total; 400 duplicate); sets sale `shipment_status='production_running'` (COALESCE, never downgrades) |
+| POST | `/api/sales/<id>/invoices` | Admin | Create (`invoice_number` required, `amount?` ≥ 0 — defaults to the sale's **PI** total and creates NO lines; 400 duplicate); sets sale `shipment_status='production_running'` (COALESCE, never downgrades) |
 | POST | `/api/sales/<id>/invoices/<iid>/book` | Admin | Book (`approx_ship_date` required) → `booked`; sale → `ship_booked` (advance-only CASE) |
 | POST | `/api/sales/<id>/invoices/<iid>/ship` | Admin | Ship (`actual_ship_date` required) → `shipped` + creates a `shipments` row |
 | POST | `/api/sales/<id>/invoices/<iid>/pay` | Admin | Record payment (`payment_amount>0`, `payment_date`); flips invoice to `paid` when covered |

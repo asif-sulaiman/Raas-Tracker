@@ -396,6 +396,60 @@ def backfill_lc_links(conn: psycopg.Connection) -> int:
     return linked
 
 
+def backfill_invoice_lines(conn: psycopg.Connection) -> int:
+    """Give legacy line-less invoices their invoice_items rows.
+
+    The commercial report is invoice-driven, so an invoice with no lines
+    contributes 0 to gross and sale_total - a real receivable would report as
+    paid. Invoices created before invoice_items existed have no lines at all;
+    this seeds one line per PI line of the invoice's sale, quantity = the PI
+    quantity (these legacy invoices predate partial/split invoicing, so the PI
+    line IS the shipped line) and unit_price = the PI line's price.
+
+    Idempotent: only invoices with zero lines are touched, so re-running
+    changes nothing. When several line-less invoices share a sale, ONLY the
+    first (lowest id) is seeded - seeding each would bill the same PI lines
+    more than once. Any further line-less invoice on that sale keeps its
+    header amount as the only record it has.
+
+    Commit-free: _create_tables owns the single transaction.
+    """
+    cursor = conn.execute(
+        """SELECT i.id, i.sale_id
+           FROM invoices i
+           WHERE NOT EXISTS (SELECT 1 FROM invoice_items ii WHERE ii.invoice_id = i.id)
+             AND EXISTS (SELECT 1 FROM sale_items si WHERE si.sale_id = i.sale_id)
+             AND i.id = (SELECT MIN(i2.id)
+                         FROM invoices i2
+                         WHERE i2.sale_id = i.sale_id
+                           AND NOT EXISTS (SELECT 1 FROM invoice_items ii2
+                                           WHERE ii2.invoice_id = i2.id))
+             AND NOT EXISTS (SELECT 1 FROM invoices i3
+                             JOIN invoice_items ii3 ON ii3.invoice_id = i3.id
+                             WHERE i3.sale_id = i.sale_id)
+           ORDER BY i.id"""
+    )
+    seeded = 0
+    for invoice_id, sale_id in cursor.fetchall():
+        rows = conn.execute(
+            """SELECT si.id, si.product_name, si.unit, si.quantity, si.unit_price
+               FROM sale_items si WHERE si.sale_id = %s ORDER BY si.id""",
+            (sale_id,)).fetchall()
+        for item_id, product_name, unit, quantity, unit_price in rows:
+            conn.execute(
+                """INSERT INTO invoice_items
+                       (invoice_id, sale_item_id, product_name, unit,
+                        quantity, unit_price, line_total)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (invoice_id, item_id, product_name, unit or "KG",
+                 float(quantity or 0), float(unit_price or 0),
+                 round(float(quantity or 0) * float(unit_price or 0), 2)))
+            seeded += 1
+    if seeded:
+        logger.info("Seeded %s invoice_items rows for legacy invoices.", seeded)
+    return seeded
+
+
 def _run_migration(conn: psycopg.Connection) -> None:
     """Every DDL statement of the schema. NO commit/rollback in here.
 
@@ -842,6 +896,7 @@ def _run_migration(conn: psycopg.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_invoice_items_sale_item_id "
                  "ON invoice_items(sale_item_id)")
     backfill_lc_links(conn)
+    backfill_invoice_lines(conn)
 
     # Global name uniqueness gives way to one master per company x product.
     conn.execute("ALTER TABLE recipes DROP CONSTRAINT IF EXISTS recipes_name_key")

@@ -1,4 +1,4 @@
-"""Phase 2 lane A: invoice-line services + shipment-ready gate.
+﻿"""Phase 2 lane A: invoice-line services + shipment-ready gate.
 
 TDD RED first: `create_invoice_item` / `list_invoice_items` /
 `check_lc_shipment_ready` / `invoiced_total_for_sale` do not exist yet.
@@ -45,8 +45,14 @@ def _sale_item(conn, sale_id):
 
 
 def _invoice(conn, sale_id, number=None):
+    """Header-only invoice for the line-level unit tests.
+
+    ``amount=0`` stops create_invoice from seeding the PI's remaining lines
+    (seeding is covered by its own tests), so these tests own the full
+    remaining quantity and can exercise create_invoice_item's rules.
+    """
     number = number or f"INV-{_tag()}"
-    return salesmod.create_invoice(conn, sale_id, number)["invoice_id"]
+    return salesmod.create_invoice(conn, sale_id, number, seed_lines=False)["invoice_id"]
 
 
 def _recipe(conn, company_id, product, name=None):
@@ -267,3 +273,55 @@ def test_legacy_fallback_passes_gate(db):
     out = salesmod.check_lc_shipment_ready(db, lc_id)
     assert out["recipes_ok"] is True
     assert out["invoices_ok"] is True
+
+
+
+
+# --------------------------------------------------------------------------- #
+# Gate 4 B1: invoices are never line-less by default
+# --------------------------------------------------------------------------- #
+def test_create_invoice_seeds_remaining_pi_lines(db):
+    """A default invoice carries one line per PI line, so the report is truthful."""
+    co = _company(db)
+    sid = _sale(db, co, product="SeedProd", qty=10, price=7.5)
+    inv = salesmod.create_invoice(db, sid, f"INV-{_tag()}")["invoice_id"]
+
+    items = salesmod.list_invoice_items(db, inv)
+    assert len(items) == 1, "default invoice must seed its PI line"
+    line = items[0]
+    assert line["quantity"] == pytest.approx(10)
+    assert line["unit_price"] == pytest.approx(7.5)
+    assert line["line_total"] == pytest.approx(75.0)
+    assert line["sale_item_id"] == _sale_item(db, sid)[0]
+    # amount stays the PI total, matching the pre-seeding contract.
+    amount = db.execute("SELECT amount FROM invoices WHERE id = %s",
+                        (inv,)).fetchone()[0]
+    assert float(amount) == pytest.approx(75.0)
+
+
+def test_second_invoice_seeds_only_the_remainder(db):
+    """Partial first invoice leaves the rest for the follow-up invoice."""
+    co = _company(db)
+    sid = _sale(db, co, product="SplitSeed", qty=10, price=4)
+    si_id, _, _ = _sale_item(db, sid)
+
+    # First invoice covers 6 of 10 (24 of the 40 PI total).
+    first = salesmod.create_invoice(
+        db, sid, f"INV-{_tag()}", amount=24, seed_lines=False)["invoice_id"]
+    salesmod.create_invoice_item(db, first, si_id, 6)
+
+    # The follow-up states the remaining 16 and seeds the leftover 4 units.
+    second = salesmod.create_invoice(db, sid, f"INV-{_tag()}", amount=16)["invoice_id"]
+    items = salesmod.list_invoice_items(db, second)
+    assert len(items) == 1
+    assert items[0]["quantity"] == pytest.approx(4), "seeds only what is left"
+    assert items[0]["line_total"] == pytest.approx(16.0)
+
+
+def test_seed_lines_false_creates_a_header_only_invoice(db):
+    """Opt-out keeps a deliberately line-less invoice (used by line unit tests)."""
+    co = _company(db)
+    sid = _sale(db, co, product="NoSeed", qty=5, price=3)
+    inv = salesmod.create_invoice(
+        db, sid, f"INV-{_tag()}", amount=15, seed_lines=False)["invoice_id"]
+    assert salesmod.list_invoice_items(db, inv) == []
