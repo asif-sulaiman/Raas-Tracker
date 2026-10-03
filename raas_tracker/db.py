@@ -107,7 +107,7 @@ _SCHEMA_VERSION_KEY = "raas_schema_version"
 # that predates this key has no row at all, which counts as "not current" and
 # runs the full path exactly once.
 #
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 # Frozen legacy tokens from builds that shipped them — do NOT add
 # per-migration entries. _SCHEMA_VERSION is authoritative; these only preserve

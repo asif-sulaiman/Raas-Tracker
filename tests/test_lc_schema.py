@@ -395,3 +395,51 @@ def salesmod_leftover_count(conn, invoice_id):
     return conn.execute(
         "SELECT COUNT(*) FROM invoice_items WHERE invoice_id = %s",
         (invoice_id,)).fetchone()[0]
+
+
+def test_backfill_reachable_through_get_connection(db, pg_dsn):
+    """Gate 4 B1-a: the backfill must actually RUN on an up-to-date database.
+
+    `_run_migration` only executes when the stored schema version differs from
+    the code's, so a data migration added without bumping `_SCHEMA_VERSION`
+    silently never runs on any database that already migrated.
+    """
+    from raas_tracker import db as dbmod
+
+    sid = db.execute(
+        """INSERT INTO sales (stage, pi_number, pi_date, client_name)
+           VALUES ('pi_issued', 'PI-REACH-1', '2026-01-15', 'Reach Co') RETURNING id"""
+    ).fetchone()[0]
+    db.execute(
+        "INSERT INTO sale_items (sale_id, product_name, quantity, unit_price, unit) "
+        "VALUES (%s, 'ReachA', 3, 11, 'KG')", (sid,))
+    inv = db.execute(
+        "INSERT INTO invoices (sale_id, invoice_number, status, amount) "
+        "VALUES (%s, 'INV-REACH-1', 'planned', 33) RETURNING id", (sid,)).fetchone()[0]
+    db.commit()
+    assert db.execute("SELECT COUNT(*) FROM invoice_items").fetchone()[0] == 0
+
+    # Pretend the database is fully migrated at the PREVIOUS version: the
+    # signature matches, so only the version gate can trigger the migration.
+    db.execute("DELETE FROM app_settings WHERE key = %s",
+               (dbmod._SCHEMA_VERSION_KEY,))
+    db.execute(
+        "INSERT INTO app_settings (key, value) VALUES (%s, %s)",
+        (dbmod._SCHEMA_VERSION_KEY, str(dbmod._SCHEMA_VERSION - 1)))
+    db.commit()
+
+    # get_connection() must now run the migration (and re-stamp the version).
+    conn = dbmod.get_connection(pg_dsn)
+    try:
+        rows = conn.execute(
+            "SELECT quantity, unit_price, line_total FROM invoice_items "
+            "WHERE invoice_id = %s", (inv,)).fetchall()
+        assert len(rows) == 1, "backfill did not run on version bump"
+        assert float(rows[0][0]) == pytest.approx(3)
+        assert float(rows[0][2]) == pytest.approx(33.0)
+        stamped = conn.execute(
+            "SELECT value FROM app_settings WHERE key = %s",
+            (dbmod._SCHEMA_VERSION_KEY,)).fetchone()[0]
+        assert int(stamped) == dbmod._SCHEMA_VERSION
+    finally:
+        conn.close()

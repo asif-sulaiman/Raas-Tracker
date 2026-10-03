@@ -577,7 +577,7 @@ CREATE TABLE app_settings (
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/api/sales/<id>/invoices` | Session/Key | List invoices with `amount` + `paid_amount` each |
-| POST | `/api/sales/<id>/invoices` | Admin | Create (`invoice_number` required, `amount?` ≥ 0 — defaults to the sale's **PI** total and creates NO lines; 400 duplicate); sets sale `shipment_status='production_running'` (COALESCE, never downgrades) |
+| POST | `/api/sales/<id>/invoices` | Admin | Create (`invoice_number` required, `amount?` ≥ 0 — defaults to the sale's **PI** total and seeds one `invoice_items` line per remaining uninvoiced PI line, restating `amount` as the sum of those lines; 400 duplicate); sets sale `shipment_status='production_running'` (COALESCE, never downgrades) |
 | POST | `/api/sales/<id>/invoices/<iid>/book` | Admin | Book (`approx_ship_date` required) → `booked`; sale → `ship_booked` (advance-only CASE) |
 | POST | `/api/sales/<id>/invoices/<iid>/ship` | Admin | Ship (`actual_ship_date` required) → `shipped` + creates a `shipments` row |
 | POST | `/api/sales/<id>/invoices/<iid>/pay` | Admin | Record payment (`payment_amount>0`, `payment_date`); flips invoice to `paid` when covered |

@@ -1322,8 +1322,13 @@ def _seed_invoice_lines(conn: psycopg.Connection, invoice_id: int,
 
     Only the REMAINING (uninvoiced) quantity of each PI line is seeded, so a
     follow-up invoice picks up exactly the rest. Unit price comes from the PI
-    line, exactly as ``create_invoice_item`` does. Returns the number of lines
-    inserted.
+    line, exactly as ``create_invoice_item`` does.
+
+    The PI lines are locked ``FOR UPDATE`` (in id order, matching
+    ``create_invoice_item``) so two concurrent creates cannot both read the same
+    remaining quantity and seed it twice. Commit-free and audit-free: it runs
+    inside ``create_invoice``'s transaction, which owns the commit.
+    Returns the total value of the lines inserted.
     """
     rows = conn.execute(
         """SELECT si.id, si.product_name, si.unit, si.unit_price,
@@ -1333,9 +1338,11 @@ def _seed_invoice_lines(conn: psycopg.Connection, invoice_id: int,
                                WHERE ii.sale_item_id = si.id), 0)) AS remaining
            FROM sale_items si
            WHERE si.sale_id = %s
-           ORDER BY si.id""",
+           ORDER BY si.id
+           FOR UPDATE""",
         (sale_id,)).fetchall()
     inserted = 0
+    seeded_total = 0.0
     for item_id, product_name, unit, unit_price, remaining in rows:
         if remaining is None or _to_decimal(remaining) <= 0:
             continue
@@ -1348,7 +1355,8 @@ def _seed_invoice_lines(conn: psycopg.Connection, invoice_id: int,
             (invoice_id, item_id, product_name, unit or "KG",
              float(remaining), float(unit_price or 0), line_total))
         inserted += 1
-    return inserted
+        seeded_total = round(seeded_total + line_total, 2)
+    return seeded_total
 
 
 def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
@@ -1356,16 +1364,22 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
                    seed_lines: bool = True) -> Dict[str, Any]:
     """Create a new invoice for a sale.
 
-    ``amount`` defaults to the sale's invoice total (sum of line items).
-    An amount of 0 means nothing is owed, so the invoice is 'paid' at
-    creation. Legacy rows keep amount NULL (= unknown) and are handled by
-    _sync_invoice_paid_status.
+    With NO ``amount`` the header is derived: it takes the sale's PI total and
+    seeds one invoice line per remaining uninvoiced PI line, then restates
+    ``amount`` as the sum of those lines, so the header always equals its
+    lines. The commercial report is invoice-driven, so a line-less invoice would
+    sum to zero and report a real receivable as paid; that is why the derived
+    path seeds by default.
 
-    ``seed_lines`` creates one invoice line per remaining uninvoiced PI line.
-    It defaults on because the commercial report is invoice-driven: an invoice
-    with no lines sums to zero and would report a real receivable as paid. Pass
-    ``seed_lines=False`` to create a deliberate header-only invoice (the line
-    unit tests do this so they own the full remaining quantity).
+    An EXPLICIT ``amount`` is the caller stating the money, so it is kept
+    verbatim and no lines are seeded — the caller adds lines deliberately or
+    wants a header-only invoice. A sale that already has invoices must state an
+    amount, since there is nothing unambiguous left to derive it from.
+
+    Pass ``seed_lines=False`` to force a header-only invoice on the derived
+    path too (the line unit tests do this so they own the full remaining
+    quantity). An invoice whose amount is 0 is 'paid' at creation; legacy rows
+    keep amount NULL (= unknown) and are handled by _sync_invoice_paid_status.
     """
     if not invoice_number or not invoice_number.strip():
         raise ValueError("invoice_number is required")
@@ -1381,7 +1395,12 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
     existing = conn.execute(
         "SELECT amount FROM invoices WHERE sale_id = %s", (sale_id,)
     ).fetchall()
-    if amount is None:
+    # An explicit amount is the caller's statement of the money, so it is kept
+    # verbatim and no lines are seeded (the caller adds them, or wants none).
+    # With no amount the header is DERIVED from the lines we seed, keeping
+    # invoices.amount == SUM(invoice_items.line_total) as the contract requires.
+    amount_is_derived = amount is None
+    if amount_is_derived:
         if existing:
             raise ValueError("amount is required when the sale already has invoices")
         amount = get_sale_invoice_total(conn, sale_id)
@@ -1389,15 +1408,6 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
         amount = float(amount)
         if amount < 0:
             raise ValueError("amount must be >= 0")
-    # No-overstatement cap: invoiced total must not exceed the sale total.
-    # Legacy rows with NULL amount are unverifiable -> skip the sum check.
-    if not any(r[0] is None for r in existing):
-        sale_total = get_sale_invoice_total(conn, sale_id)
-        stated = round(sum(float(r[0]) for r in existing) + float(amount), 2)
-        if stated > round(float(sale_total), 2):
-            raise ValueError(
-                f"total invoice amounts ({stated:g}) would exceed sale total ({float(sale_total):g})"
-            )
     # paid_amount at creation is 0 -> covered when amount <= 0
     status = "paid" if amount <= 0 else "planned"
 
@@ -1414,9 +1424,28 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
     # Seed one line per remaining uninvoiced PI line. The report is invoice-
     # driven: an invoice with no lines would sum to zero and report a real
     # receivable as paid. Seeding the REMAINING quantity keeps a follow-up
-    # invoice picking up exactly the rest.
-    if seed_lines:
-        _seed_invoice_lines(conn, invoice_id, sale_id)
+    # invoice picking up exactly the rest. Only on the derived path, so the
+    # header is then restated from the lines it actually carries.
+    if seed_lines and amount_is_derived:
+        seeded_total = _seed_invoice_lines(conn, invoice_id, sale_id)
+        amount = round(seeded_total, 2)
+        conn.execute(
+            "UPDATE invoices SET amount = ROUND(%s::numeric, 2) WHERE id = %s",
+            (amount, invoice_id))
+
+    # No-overstatement cap: invoiced total must not exceed the sale total.
+    # Legacy rows with NULL amount are unverifiable -> skip the sum check.
+    if not any(r[0] is None for r in existing):
+        sale_total = get_sale_invoice_total(conn, sale_id)
+        stated = round(sum(float(r[0]) for r in existing) + float(amount), 2)
+        if stated > round(float(sale_total), 2):
+            # The header row is already inserted (and possibly seeded) by this
+            # point, so undo it here rather than leaving a stray invoice behind
+            # for callers that do not roll back on ValueError.
+            conn.rollback()
+            raise ValueError(
+                f"total invoice amounts ({stated:g}) would exceed sale total ({float(sale_total):g})"
+            )
     
     # Entering production: only set production_running when no status yet
     # (COALESCE so a sale already at production_done/ship_booked never downgrades)
