@@ -9,6 +9,7 @@ paid_amount 0 — a permanent silent financial misstatement.
 from raas_tracker.sales import (
     add_sale,
     create_invoice,
+    create_invoice_item,
     delete_sale_payment_record,
     mark_invoice_paid,
     record_sale_payment,
@@ -21,6 +22,24 @@ from raas_tracker.sales import (
 def _sale(db, pi_number="PI-SYNC-1", total=100.0):
     return add_sale(db, {"pi_number": pi_number, "client_name": "Sync Co"},
                     [{"product_name": "W", "quantity": 1, "unit_price": total}])
+
+
+def _invoice(db, sale_id, number, amount=None):
+    """Create an invoice. Its money is DERIVED (the sale's uninvoiced PI total),
+    so ``amount`` is only used to trim the seeded line down to a smaller
+    invoice — there is no way to state one any more."""
+    inv = create_invoice(db, sale_id, number)["invoice_id"]
+    if amount is not None:
+        sale_item_id = db.execute(
+            "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id",
+            (sale_id,)).fetchone()[0]
+        unit_price = float(db.execute(
+            "SELECT unit_price FROM sale_items WHERE id = %s",
+            (sale_item_id,)).fetchone()[0])
+        db.execute("DELETE FROM invoice_items WHERE invoice_id = %s", (inv,))
+        db.commit()
+        create_invoice_item(db, inv, sale_item_id, round(amount / unit_price, 6))
+    return inv
 
 
 def _status(db, invoice_id):
@@ -55,7 +74,7 @@ def _pay_row(db, sale_id, invoice_id, amount):
 
 def test_deleting_full_payment_unpays_invoice(db):
     sid = _sale(db, "PI-SYNC-DEL")
-    inv = create_invoice(db, sid, "INV-SYNC-DEL", amount=100)["invoice_id"]
+    inv = _invoice(db, sid, "INV-SYNC-DEL")
 
     out = mark_invoice_paid(db, inv, 100, "2026-10-30")
     assert out["status"] == "paid"
@@ -73,7 +92,7 @@ def test_deleting_full_payment_unpays_invoice(db):
 def test_deleting_partial_payment_keeps_paid_invoice(db):
     """Two payments, one covering the invoice: deleting the other keeps 'paid'."""
     sid = _sale(db, "PI-SYNC-DEL2", total=200)
-    inv = create_invoice(db, sid, "INV-SYNC-DEL2", amount=100)["invoice_id"]
+    inv = _invoice(db, sid, "INV-SYNC-DEL2", amount=100)
 
     mark_invoice_paid(db, inv, 100, "2026-10-30")   # covers the invoice
     extra = record_sale_payment(db, sid, "2026-10-31", 25)["payment_id"]
@@ -88,7 +107,7 @@ def test_deleting_partial_payment_keeps_paid_invoice(db):
 
 def test_editing_payment_down_unpays_invoice(db):
     sid = _sale(db, "PI-SYNC-EDIT")
-    inv = create_invoice(db, sid, "INV-SYNC-EDIT", amount=100)["invoice_id"]
+    inv = _invoice(db, sid, "INV-SYNC-EDIT")
 
     out = mark_invoice_paid(db, inv, 100, "2026-10-30")
     assert _status(db, inv) == "paid"
@@ -102,7 +121,7 @@ def test_editing_payment_down_unpays_invoice(db):
 
 def test_editing_payment_up_pays_invoice(db):
     sid = _sale(db, "PI-SYNC-EDIT2")
-    inv = create_invoice(db, sid, "INV-SYNC-EDIT2", amount=100)["invoice_id"]
+    inv = _invoice(db, sid, "INV-SYNC-EDIT2")
 
     out = mark_invoice_paid(db, inv, 40, "2026-10-30")
     assert out["status"] == "planned"
@@ -119,7 +138,7 @@ def test_editing_payment_up_pays_invoice(db):
 def test_sale_level_payment_leaves_invoices_alone(db):
     """A payment with no invoice_id must not touch any invoice status."""
     sid = _sale(db, "PI-SYNC-NONE", total=300)
-    inv = create_invoice(db, sid, "INV-SYNC-NONE", amount=100)["invoice_id"]
+    inv = _invoice(db, sid, "INV-SYNC-NONE", amount=100)
     mark_invoice_paid(db, inv, 100, "2026-10-30")
     assert _status(db, inv) == "paid"
 
@@ -139,7 +158,7 @@ def test_sale_level_payment_leaves_invoices_alone(db):
 def test_legacy_null_amount_invoice_unpays_when_payment_removed(db):
     """Legacy NULL-amount invoices: any payment pays, no payment un-pays."""
     sid = _sale(db, "PI-SYNC-LEG", total=200)
-    inv = create_invoice(db, sid, "INV-SYNC-LEG", amount=100)["invoice_id"]
+    inv = _invoice(db, sid, "INV-SYNC-LEG", amount=100)
     db.execute("UPDATE invoices SET amount = NULL WHERE id = %s", (inv,))
     db.commit()
 
@@ -155,7 +174,7 @@ def test_legacy_null_amount_invoice_unpays_when_payment_removed(db):
 def test_shipped_invoice_returns_to_shipped_when_unpaid(db):
     """Demotion targets the furthest provable state, not a hardcoded 'planned'."""
     sid = _sale(db, "PI-SYNC-SHIP", total=200)
-    inv = create_invoice(db, sid, "INV-SYNC-SHIP", amount=100)["invoice_id"]
+    inv = _invoice(db, sid, "INV-SYNC-SHIP", amount=100)
     db.execute(
         "UPDATE invoices SET status = 'shipped', actual_ship_date = %s WHERE id = %s",
         ("2026-10-20", inv))

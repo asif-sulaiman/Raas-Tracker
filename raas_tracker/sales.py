@@ -6,6 +6,7 @@ import json
 import os
 import re
 from datetime import date, datetime
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, List, Dict, Any, Union
 
 from .audit import log_audit_action
@@ -18,6 +19,16 @@ def _now_str() -> str:
     return _dt.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 SALE_STAGE_ORDER = ["pi_issued", "lc_received", "shipment_ongoing", "payment_due", "completed"]
+
+
+class InvoicedLineConflict(ValueError):
+    """A PI line that invoice_items already point at cannot be re-based.
+
+    Removing it, or changing its quantity/price, would desynchronise the
+    commercial report: its grain is the PI line while its money comes from
+    invoice_items, and the next invoice is sized from the PI total. Routes map
+    this to 409 (a conflict with existing money), never 400.
+    """
 
 
 def _next_stage(current: str) -> Optional[str]:
@@ -528,13 +539,28 @@ def update_sale_item(conn: psycopg.Connection, item_id: int,
                      quantity: Optional[float] = None,
                      unit_price: Optional[float] = None,
                      unit: Optional[str] = None) -> bool:
-    """Update fields of a sale line item."""
+    """Update fields of a sale line item.
+
+    Refuses (409 via the route) to change quantity or unit_price on a line that
+    already has invoice lines. The report's grain is the PI line while its money
+    comes from invoice_items, and the next invoice's amount is derived from the
+    PI total: moving quantity/price under existing invoice lines would size the
+    next invoice off a total that no longer matches what was billed, and
+    invoice_items.line_total would keep the old money. product_name and unit are
+    descriptive only, so they stay editable.
+    """
     # Fetch old item for audit
     old_row = conn.execute(
         "SELECT product_name, quantity, unit_price, unit FROM sale_items WHERE id = %s",
         (item_id,)).fetchone()
     if not old_row:
         return False
+    if quantity is not None or unit_price is not None:
+        if conn.execute("SELECT COUNT(*) FROM invoice_items WHERE sale_item_id = %s",
+                        (item_id,)).fetchone()[0]:
+            raise InvoicedLineConflict(
+                "cannot change quantity or price of a sale item that has invoice"
+                " lines (adjust the invoice lines instead)")
     old_item = {"product_name": old_row[0], "quantity": old_row[1],
                 "unit_price": old_row[2], "unit": old_row[3]}
     
@@ -567,7 +593,22 @@ def update_sale_item(conn: psycopg.Connection, item_id: int,
 
 
 def delete_sale_item(conn: psycopg.Connection, item_id: int) -> bool:
-    """Delete a single line item from a sale."""
+    """Delete a single line item from a sale.
+
+    Refuses (409 via the route) when the line has invoice_items. The commercial
+    report's grain is the PI line while its money comes from invoice_items, and
+    invoice_items.sale_item_id is ON DELETE SET NULL: deleting an invoiced line
+    would drop the row out of the grain while its money stayed in the sale's
+    total, so the rows would no longer sum to the sale's own receivable. Reduce
+    the invoice line instead.
+    """
+    invoiced = conn.execute(
+        "SELECT COUNT(*) FROM invoice_items WHERE sale_item_id = %s",
+        (item_id,)).fetchone()[0]
+    if invoiced:
+        raise InvoicedLineConflict(
+            "cannot delete a sale item that has invoice lines"
+            " (adjust the invoice lines instead)")
     conn.execute("DELETE FROM sale_items WHERE id = %s", (item_id,))
     conn.commit()
     return True
@@ -682,6 +723,13 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
                     (it["product_name"], it["quantity"], it["unit_price"], it["unit"], it["id"])
                 )
         for rid in removed_ids:
+            # Same rule as delete_sale_item: an invoiced PI line cannot be
+            # removed or the report's rows stop summing to the sale's money.
+            if conn.execute("SELECT COUNT(*) FROM invoice_items WHERE sale_item_id = %s",
+                            (rid,)).fetchone()[0]:
+                raise InvoicedLineConflict(
+                    f"cannot remove sale item {rid}: it has invoice lines"
+                    " (adjust the invoice lines instead)")
             conn.execute("DELETE FROM sale_items WHERE id = %s", (rid,))
         conn.commit()
         
@@ -875,9 +923,13 @@ def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> "tu
     all_where_clauses.extend(where_clauses)
     where_sql = "WHERE " + " AND ".join(all_where_clauses)
 
-    # Pagination
-    page = int(filters.get("page", 1))
-    page_size = int(filters.get("page_size", 50))
+    # Pagination. Clamped, not trusted: a negative or zero page reaches
+    # LIMIT/OFFSET as a negative OFFSET, which Postgres rejects with
+    # InvalidRowCountInResultOffsetClause -> a 500 on a mere query param. Only
+    # the lower bound is enforced here; the export path deliberately asks for a
+    # page_size above the interactive cap.
+    page = max(int(filters.get("page", 1) or 1), 1)
+    page_size = max(int(filters.get("page_size", 50) or 50), 1)
     offset = (page - 1) * page_size
     params["page_size"] = page_size
     params["offset"] = offset
@@ -1304,32 +1356,80 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
     return periods
 
 
-def _to_decimal(value) -> "Decimal":
+def _to_decimal(value) -> Decimal:
     """Exact Decimal for a DB numeric/REAL value (no float drift)."""
-    from decimal import Decimal as _Dec
-    if isinstance(value, _Dec):
+    if isinstance(value, Decimal):
         return value
-    return _Dec(str(value))
+    return Decimal(str(value))
+
+
+_CENT = Decimal("0.01")
+
+
+def _money(value) -> Decimal:
+    """Round a Decimal to 2dp half-up, the same rule the SQL money uses."""
+    return _to_decimal(value).quantize(_CENT, rounding=ROUND_HALF_UP)
+
+
+def _invoice_money_already_on_sale(conn: psycopg.Connection,
+                                   sale_id: int) -> Decimal:
+    """Money already committed against a sale, exactly (no float drift).
+
+    Summed from the invoice LINES, because the commercial report sums lines.
+    Legacy line-less invoices are the one exception: they carry money that the
+    report cannot see, so their header is added here too, otherwise the derived
+    remainder would re-bill it.
+    """
+    row = conn.execute(
+        """SELECT COALESCE((SELECT SUM(ii.line_total)
+                             FROM invoice_items ii
+                             JOIN invoices i ON i.id = ii.invoice_id
+                            WHERE i.sale_id = %s), 0)
+                + COALESCE((SELECT SUM(i.amount)
+                              FROM invoices i
+                             WHERE i.sale_id = %s
+                               AND i.amount IS NOT NULL
+                               AND NOT EXISTS (SELECT 1 FROM invoice_items x
+                                                WHERE x.invoice_id = i.id)), 0)""",
+        (sale_id, sale_id)).fetchone()
+    return _money(row[0] or 0)
+
+
+def remaining_invoice_money(conn: psycopg.Connection, sale_id: int) -> Decimal:
+    """PI total minus everything already invoiced, floored at zero."""
+    total = _money(get_sale_invoice_total(conn, sale_id) or 0)
+    return max(total - _invoice_money_already_on_sale(conn, sale_id), Decimal("0"))
 
 
 def _seed_invoice_lines(conn: psycopg.Connection, invoice_id: int,
-                        sale_id: int) -> int:
+                        sale_id: int, budget: Decimal) -> None:
     """Give a freshly created invoice one line per remaining uninvoiced PI line.
 
-    Commit-free and audit-free by design: it runs inside ``create_invoice``'s
-    transaction, which owns the commit. Without this an invoice row carries no
-    lines, and the invoice-driven report would sum zero for a real receivable.
+    Without this an invoice row carries no lines, and the invoice-driven report
+    would sum zero for a real receivable and report it as paid.
 
     Only the REMAINING (uninvoiced) quantity of each PI line is seeded, so a
     follow-up invoice picks up exactly the rest. Unit price comes from the PI
-    line, exactly as ``create_invoice_item`` does.
+    line, exactly as ``create_invoice_item`` does. ``line_total`` is computed by
+    the database in ``::numeric`` so the header and the report cannot disagree
+    through float drift.
 
-    The PI lines are locked ``FOR UPDATE`` (in id order, matching
-    ``create_invoice_item``) so two concurrent creates cannot both read the same
-    remaining quantity and seed it twice. Commit-free and audit-free: it runs
-    inside ``create_invoice``'s transaction, which owns the commit.
-    Returns the total value of the lines inserted.
+    ``budget`` caps the money this invoice may carry (the sale's remaining
+    money). On a clean sale it exactly covers the remaining quantity, so every
+    line is filled whole. It only bites when legacy line-less invoices already
+    claimed part of the PI: the last line is then filled partially so the
+    seeded total can never overstate the PI.
+
+    Concurrency: the lock MUST be a separate statement from the arithmetic. Under
+    READ COMMITTED a statement's snapshot is taken before it blocks on a lock, so
+    locking and reading the remaining quantity in one statement would read the
+    pre-wait value and seed the same units twice. ``create_invoice_item`` uses
+    this same two-statement shape. Callers must also hold the ``sales`` row lock
+    so two creates on one sale cannot both derive the same remainder.
     """
+    conn.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id FOR UPDATE",
+        (sale_id,)).fetchall()
     rows = conn.execute(
         """SELECT si.id, si.product_name, si.unit, si.unit_price,
                   (si.quantity::numeric
@@ -1338,76 +1438,83 @@ def _seed_invoice_lines(conn: psycopg.Connection, invoice_id: int,
                                WHERE ii.sale_item_id = si.id), 0)) AS remaining
            FROM sale_items si
            WHERE si.sale_id = %s
-           ORDER BY si.id
-           FOR UPDATE""",
+           ORDER BY si.id""",
         (sale_id,)).fetchall()
-    inserted = 0
-    seeded_total = 0.0
+    left = _money(budget)
     for item_id, product_name, unit, unit_price, remaining in rows:
-        if remaining is None or _to_decimal(remaining) <= 0:
+        if remaining is None or _to_decimal(remaining) <= 0 or left <= 0:
             continue
-        line_total = round(float(remaining) * float(unit_price or 0), 2)
-        conn.execute(
+        rem = _to_decimal(remaining)
+        price = _money(unit_price or 0)
+        qty = rem
+        if price > 0 and _money(rem * price) > left:
+            # Fill only as much as the remaining money can carry. Quantities are
+            # fractional in this domain (half-quantity KG), so a partial line is
+            # ordinary, not a rounding artefact.
+            qty = (left / price).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+            if qty <= 0:
+                break
+        row = conn.execute(
             """INSERT INTO invoice_items
                    (invoice_id, sale_item_id, product_name, unit,
                     quantity, unit_price, line_total)
-               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-            (invoice_id, item_id, product_name, unit or "KG",
-             float(remaining), float(unit_price or 0), line_total))
-        inserted += 1
-        seeded_total = round(seeded_total + line_total, 2)
-    return seeded_total
+               VALUES (%s, %s, %s, %s, %s, %s,
+                       ROUND(%s::numeric * %s::numeric, 2))
+               RETURNING line_total""",
+            (invoice_id, item_id, product_name, unit or "KG", qty, unit_price,
+             qty, unit_price)).fetchone()
+        left = max(left - _money(row[0] or 0), Decimal("0"))
+        # Seeded lines now drive the report, so they are audited like any other
+        # line write even though they are not operator-entered (AGENTS.md:
+        # audit every mutating action).
+        log_audit_action(conn, "INVOICE_ITEM_ADD", "invoice_item", None,
+                         new_value=(f"seeded from sale_item {item_id} "
+                                    f"qty={qty} total={_money(row[0] or 0)}"))
 
 
 def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
-                   amount: Optional[float] = None,
-                   seed_lines: bool = True) -> Dict[str, Any]:
-    """Create a new invoice for a sale.
+seed_lines: bool = True) -> Dict[str, Any]:
+    """Create a new invoice for a sale, deriving its money from the PI.
 
-    With NO ``amount`` the header is derived: it takes the sale's PI total and
-    seeds one invoice line per remaining uninvoiced PI line, then restates
-    ``amount`` as the sum of those lines, so the header always equals its
-    lines. The commercial report is invoice-driven, so a line-less invoice would
-    sum to zero and report a real receivable as paid; that is why the derived
-    path seeds by default.
+    The caller states only WHICH invoice this is; the money is always derived as
+    the sale's remaining uninvoiced amount (PI total minus what the invoice lines
+    already carry), and the invoice is seeded with one line per remaining
+    uninvoiced PI line. The header is then restated from those lines in SQL, so
+    ``invoices.amount == SUM(invoice_items.line_total)`` holds by construction.
 
-    An EXPLICIT ``amount`` is the caller stating the money, so it is kept
-    verbatim and no lines are seeded — the caller adds lines deliberately or
-    wants a header-only invoice. A sale that already has invoices must state an
-    amount, since there is nothing unambiguous left to derive it from.
+    There is deliberately no way to state an amount. A header carrying money that
+    no line backs is invisible to the invoice-driven report: it reported a real
+    receivable as quantity 0 / total 0 / due 0 / "Paid" and dropped the money
+    from ``gross_sales``. One source of truth is the only way to keep the report,
+    the KPIs and the CSV honest. To invoice less than the remainder, create the
+    invoice and then adjust its lines (InvoiceLineEditor), or invoice part now
+    and the rest later.
 
-    Pass ``seed_lines=False`` to force a header-only invoice on the derived
-    path too (the line unit tests do this so they own the full remaining
-    quantity). An invoice whose amount is 0 is 'paid' at creation; legacy rows
-    keep amount NULL (= unknown) and are handled by _sync_invoice_paid_status.
+    An invoice whose derived amount is 0 is 'paid' at creation; legacy rows keep
+    amount NULL (= unknown) and are handled by _sync_invoice_paid_status.
+
+    ``seed_lines=False`` is an internal seam for the line-level unit tests, which
+    need an invoice with no lines so they can own the full remaining quantity.
+    It is never exposed by the API and must not become one.
     """
     if not invoice_number or not invoice_number.strip():
         raise ValueError("invoice_number is required")
     invoice_number = invoice_number.strip()
-    # Duplicate check first so a repeated number still reports "already exists"
-    # even when the request omits amount on a sale that already has invoices.
+    # Duplicate check first so a repeated number still reports "already exists".
     dup = conn.execute(
         "SELECT id FROM invoices WHERE sale_id = %s AND invoice_number = %s",
         (sale_id, invoice_number)
     ).fetchone()
     if dup:
         raise ValueError(f"Invoice number '{invoice_number}' already exists for this sale")
-    existing = conn.execute(
-        "SELECT amount FROM invoices WHERE sale_id = %s", (sale_id,)
-    ).fetchall()
-    # An explicit amount is the caller's statement of the money, so it is kept
-    # verbatim and no lines are seeded (the caller adds them, or wants none).
-    # With no amount the header is DERIVED from the lines we seed, keeping
-    # invoices.amount == SUM(invoice_items.line_total) as the contract requires.
-    amount_is_derived = amount is None
-    if amount_is_derived:
-        if existing:
-            raise ValueError("amount is required when the sale already has invoices")
-        amount = get_sale_invoice_total(conn, sale_id)
-    else:
-        amount = float(amount)
-        if amount < 0:
-            raise ValueError("amount must be >= 0")
+    # Serialise invoice creation per sale BEFORE deriving the remainder. Two
+    # concurrent creates would otherwise both read the same "already invoiced"
+    # state and each seed the whole remainder, invoicing the sale twice. The cap
+    # this replaces could not catch that: it read the same stale rows.
+    if not conn.execute("SELECT id FROM sales WHERE id = %s FOR UPDATE",
+                        (sale_id,)).fetchone():
+        raise ValueError("sale not found")
+    amount = remaining_invoice_money(conn, sale_id)
     # paid_amount at creation is 0 -> covered when amount <= 0
     status = "paid" if amount <= 0 else "planned"
 
@@ -1421,44 +1528,29 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
     except psycopg.IntegrityError:
         raise ValueError(f"Invoice number '{invoice_number}' already exists for this sale")
 
-    # Seed one line per remaining uninvoiced PI line. The report is invoice-
-    # driven: an invoice with no lines would sum to zero and report a real
-    # receivable as paid. Seeding the REMAINING quantity keeps a follow-up
-    # invoice picking up exactly the rest. Only on the derived path, so the
-    # header is then restated from the lines it actually carries.
-    if seed_lines and amount_is_derived:
-        seeded_total = _seed_invoice_lines(conn, invoice_id, sale_id)
-        amount = round(seeded_total, 2)
-        conn.execute(
-            "UPDATE invoices SET amount = ROUND(%s::numeric, 2) WHERE id = %s",
-            (amount, invoice_id))
+    if seed_lines:
+        _seed_invoice_lines(conn, invoice_id, sale_id, amount)
+        # Restate the header from the lines actually written, in ::numeric, so
+        # the header is exactly the sum the report will compute.
+        amount = _money(conn.execute(
+            """UPDATE invoices SET amount =
+                   (SELECT COALESCE(SUM(line_total), 0) FROM invoice_items
+                     WHERE invoice_id = %s)
+               WHERE id = %s RETURNING amount""",
+            (invoice_id, invoice_id)).fetchone()[0])
 
-    # No-overstatement cap: invoiced total must not exceed the sale total.
-    # Legacy rows with NULL amount are unverifiable -> skip the sum check.
-    if not any(r[0] is None for r in existing):
-        sale_total = get_sale_invoice_total(conn, sale_id)
-        stated = round(sum(float(r[0]) for r in existing) + float(amount), 2)
-        if stated > round(float(sale_total), 2):
-            # The header row is already inserted (and possibly seeded) by this
-            # point, so undo it here rather than leaving a stray invoice behind
-            # for callers that do not roll back on ValueError.
-            conn.rollback()
-            raise ValueError(
-                f"total invoice amounts ({stated:g}) would exceed sale total ({float(sale_total):g})"
-            )
-    
     # Entering production: only set production_running when no status yet
     # (COALESCE so a sale already at production_done/ship_booked never downgrades)
     conn.execute(
         "UPDATE sales SET shipment_status = COALESCE(shipment_status, 'production_running'), updated_at = %s WHERE id = %s",
         (_now_str(), sale_id)
     )
-    
+
     conn.commit()
     log_audit_action(conn, "INVOICE_CREATE", "invoice", invoice_id,
-                     new_value=f"{invoice_number} amount={amount:g} status={status}")
+                     new_value=f"{invoice_number} amount={amount} status={status}")
     return {"invoice_id": invoice_id, "invoice_number": invoice_number,
-            "status": status, "amount": round(float(amount), 2)}
+            "status": status, "amount": float(amount)}
 
 
 # Forward-only invoice lifecycle. Every transition refuses no-op repeats and

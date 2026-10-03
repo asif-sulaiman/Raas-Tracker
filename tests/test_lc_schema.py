@@ -419,14 +419,19 @@ def test_backfill_reachable_through_get_connection(db, pg_dsn):
     db.commit()
     assert db.execute("SELECT COUNT(*) FROM invoice_items").fetchone()[0] == 0
 
-    # Pretend the database is fully migrated at the PREVIOUS version: the
-    # signature matches, so only the version gate can trigger the migration.
+# Pretend the database is fully migrated at the version that SHIPPED the
+    # bug: hardcoded on purpose. Using `_SCHEMA_VERSION - 1` here would make the
+    # stamp differ from the code version no matter what the version is, so the
+    # migration would always run and the test would pass even with the bump
+    # reverted - which is exactly what it did.
     db.execute("DELETE FROM app_settings WHERE key = %s",
                (dbmod._SCHEMA_VERSION_KEY,))
     db.execute(
         "INSERT INTO app_settings (key, value) VALUES (%s, %s)",
-        (dbmod._SCHEMA_VERSION_KEY, str(dbmod._SCHEMA_VERSION - 1)))
+        (dbmod._SCHEMA_VERSION_KEY, "2"))
     db.commit()
+    assert dbmod._SCHEMA_VERSION > 2, (
+        "the invoice-line backfill needs a schema bump past 2 or it never runs")
 
     # get_connection() must now run the migration (and re-stamp the version).
     conn = dbmod.get_connection(pg_dsn)

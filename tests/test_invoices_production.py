@@ -26,6 +26,9 @@ def _sale(admin_client, company_id, pi, product="ProdInv", item_no=None):
     return r.get_json()["id"]
 
 
+from raas_tracker.sales import create_invoice_item
+
+
 def _invoice(admin_client, sale_id, number, amount=None):
     payload = {"invoice_number": number}
     if amount is not None:
@@ -199,10 +202,20 @@ def test_completion_reflects_invoice_counts(admin_client, db):
     assert r.get_json() == {"status": "none", "paid": 0, "total": 0,
                             "invoices": []}
 
-    # Two invoices with explicit amounts fitting the 50 sale total
-    # (second invoice without amount is 400; amounts capped at sale total).
-    _invoice(admin_client, sid, "INV-CMP-1", amount=30)
-    _invoice(admin_client, sid, "INV-CMP-2", amount=20)
+    # Two invoices, neither paid. The first derives the whole 50 remainder, so it
+    # is trimmed to 30 to leave a real remainder for the second; otherwise the
+    # second would derive 0 and be born 'paid' (amount 0 = nothing owed).
+    first = _invoice(admin_client, sid, "INV-CMP-1")
+    unit_price, qty = db.execute(
+        "SELECT unit_price, quantity FROM sale_items WHERE sale_id = %s "
+        "ORDER BY id LIMIT 1", (sid,)).fetchone()
+    sale_item_id = db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id LIMIT 1",
+        (sid,)).fetchone()[0]
+    db.execute("DELETE FROM invoice_items WHERE invoice_id = %s", (first,))
+    db.commit()
+    create_invoice_item(db, first, sale_item_id, 30 / float(unit_price))
+    _invoice(admin_client, sid, "INV-CMP-2")  # derives the remaining 20
     body = admin_client.get(f"/api/sales/{sid}/completion").get_json()
     assert body["total"] == 2
     assert body["paid"] == 0

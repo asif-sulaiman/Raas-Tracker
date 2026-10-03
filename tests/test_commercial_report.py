@@ -4,6 +4,7 @@ import io
 from datetime import date
 
 import flask_app
+import pytest
 
 
 # Exact contract keys the API must emit per sale-item row.
@@ -1001,26 +1002,39 @@ def test_export_post_rejects_non_integer_filters(admin_client, db):
     assert r.status_code in (200, 400)  # 0 matches nothing -> no data to export
 
 
-def test_line_less_invoice_is_not_reported_as_paid(admin_client, db):
-    """Gate 4 B1: an invoice row with no lines must not read as a paid sale.
+def test_api_created_invoice_always_has_lines_backing_its_header(admin_client, db):
+    """Gate 4 M1, replacing a test that could never fail.
 
-    An invoice created without lines contributes 0 to gross and sale_total, so
-    the naive math reported due 0 and status "Paid" for a real receivable. The
-    seeded default path means this state can only be reached deliberately.
+    The old ``test_line_less_invoice_is_not_reported_as_paid`` built its sale
+    with the default ``invoice_lines="auto"``, which had already created a
+    fully-invoiced invoice, so the line-less invoice it then inserted changed
+    nothing and the assertion was satisfied by construction.
+
+    There is no report-level guard left to assert, because the API can no longer
+    produce the bad state: ``create_invoice`` takes no amount and always seeds
+    lines, and the migration backfills legacy ones. What is worth asserting is
+    the boundary itself - every invoice the UI can create is fully backed by
+    lines and reads as a real receivable. A stated ``amount`` in the body is
+    ignored, so the old phantom-Paid cannot come back through this route.
     """
-    sid = _sale(db, "PI-NOLINES", maturity_date="2099-12-31",
+    sid = _sale(db, "PI-API-LINES", maturity_date="2099-12-31", invoice_lines=None,
                 items=[{"product_name": "A", "quantity": 10, "unit_price": 10}])
-    # Deliberately header-only: exactly what POST /invoices produced before the fix.
-    db.execute(
-        "INSERT INTO invoices (sale_id, invoice_number, status, amount) "
-        "VALUES (%s, 'INV-NOLINES', 'planned', 100) RETURNING id", (sid,))
-    db.commit()
+    r = admin_client.post(f"/api/sales/{sid}/invoices",
+                          json={"invoice_number": "INV-API-1", "amount": 40})
+    assert r.status_code == 201, r.get_json()
+    invoice_id = r.get_json()["invoice_id"]
 
-    rows = _of(_rows(admin_client), sid)
-    row = rows[0]
-    # Whatever the inclusion rule decides, a receivable may never read as paid.
-    assert not (row["due_amount"] == 0 and row["payment_status"] == "Paid"), \
-        f"header-only invoice reported as Paid: {row}"
+    line_sum = float(db.execute(
+        "SELECT COALESCE(SUM(line_total), 0) FROM invoice_items WHERE invoice_id = %s",
+        (invoice_id,)).fetchone()[0])
+    header = float(db.execute("SELECT amount FROM invoices WHERE id = %s",
+                              (invoice_id,)).fetchone()[0])
+    assert line_sum == pytest.approx(100.0), "lines back the header, ignoring the stated 40"
+    assert header == pytest.approx(line_sum)
+
+    row = _of(_rows(admin_client), sid)[0]
+    assert row["due_amount"] == pytest.approx(100.0)
+    assert row["payment_status"] != "Paid", f"real receivable reported as paid: {row}"
 
 
 def test_default_created_invoice_reports_its_receivable(admin_client, db):

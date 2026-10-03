@@ -70,7 +70,9 @@ function installFetch({ companies = COMPANIES, companiesFailTimes = 0, companies
     if (u.includes('/invoices') && method === 'POST') {
       const body = options?.body ? JSON.parse(options.body) : null;
       invoicePosts.push({ url: u, body });
-      const created = invoiceBody || { invoice_id: 42, invoice_number: body?.invoice_number, status: 'planned' };
+      const created = invoiceBody || {
+        invoice_id: 42, invoice_number: body?.invoice_number, status: 'planned', amount: 2000,
+      };
       return jsonResponse(created, invoiceStatus < 400, invoiceStatus);
     }
     if (u.includes('/invoices') && method === 'DELETE') {
@@ -183,14 +185,15 @@ describe('ProductionRunModal', () => {
     await pickCompanyAndPi();
     fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
     fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-NEW-7' } });
-    // The fixture sale already has an invoice row, so an amount is required.
-    fireEvent.change(screen.getByLabelText('Amount'), { target: { value: '500' } });
     fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
 
     await waitFor(() => expect(posts).toHaveLength(1));
     expect(posts.invoicePosts).toHaveLength(1);
     expect(posts.invoicePosts[0].url).toContain('/api/sales/5/invoices');
-    expect(posts.invoicePosts[0].body).toEqual({ invoice_number: 'INV-NEW-7', amount: 500 });
+    // Money is server-derived from the remaining uninvoiced PI lines — the
+    // create body must never carry an amount.
+    expect(posts.invoicePosts[0].body).toEqual({ invoice_number: 'INV-NEW-7' });
+    expect(posts.invoicePosts[0].body).not.toHaveProperty('amount');
     // The invoice POST ran before the produce POST.
     const invIdx = posts.calls.findIndex((c) => c.url.endsWith('/api/sales/5/invoices') && c.method === 'POST');
     const prodIdx = posts.calls.findIndex((c) => c.url.includes('/produce'));
@@ -198,9 +201,13 @@ describe('ProductionRunModal', () => {
     expect(prodIdx).toBeGreaterThan(invIdx);
     expect(posts[0].body.invoice_number).toBe('INV-NEW-7');
     expect(posts[0].body.invoice_ids).toEqual([42]);
+    // The server-derived amount is reported back to the operator.
+    expect(toast.success).toHaveBeenCalledWith(
+      'Production run recorded · invoiced $2,000.00'
+    );
   });
 
-  it('prefills the sale remaining as the new-invoice amount', async () => {
+  it('never asks for an invoice amount and explains the derived total', async () => {
     installFetch({
       sales: [{ id: 5, pi_number: 'PI-9', client_name: 'Acme LLC', company_id: 7, total_value: 5000 }],
       invoices: [
@@ -212,39 +219,40 @@ describe('ProductionRunModal', () => {
 
     await pickCompanyAndPi();
     fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
-    // 5000 − 1200 − 800, computed in cents.
-    expect((await screen.findByLabelText('Amount')).value).toBe('3000');
+    await screen.findByLabelText('New invoice number');
+    // No amount is asked for, whatever the sale total and prior invoices are.
+    expect(screen.queryByLabelText('Amount')).toBeNull();
+    expect(screen.queryByLabelText('Payment amount')).toBeNull();
+    expect(
+      screen.getByText(/derived from this PI's lines that are not yet invoiced/i)
+    ).toBeTruthy();
   });
 
-  it('leaves the amount blank and omits it for a sale with no invoices', async () => {
+  it('omits the amount from the create body for a sale with no invoices', async () => {
     const posts = installFetch({ invoices: [] });
     renderModal();
 
     await pickCompanyAndPi();
     fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
     fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-FIRST' } });
-    expect(screen.getByLabelText('Amount').value).toBe('');
     fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
 
     await waitFor(() => expect(posts).toHaveLength(1));
     expect(posts.invoicePosts).toHaveLength(1);
-    // Blank stays omitted so the server defaults it to the sale total.
     expect(posts.invoicePosts[0].body).toEqual({ invoice_number: 'INV-FIRST' });
     expect(posts[0].body.invoice_ids).toEqual([42]);
   });
 
-  it('requires an amount for a new invoice when the sale already has invoices', async () => {
+  it('still needs a number for a new invoice, but never an amount', async () => {
     const posts = installFetch();
     renderModal();
 
     await pickCompanyAndPi();
     fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
-    fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-NEW-8' } });
-    // No sale total in this fixture, so nothing is prefilled — blank is blocked.
-    expect(screen.getByLabelText('Amount').value).toBe('');
+    await screen.findByLabelText('New invoice number');
     fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
 
-    expect(await screen.findByText('Amount is required when the sale already has invoices')).toBeTruthy();
+    expect(await screen.findByText('New invoice number is required')).toBeTruthy();
     expect(posts.invoicePosts).toHaveLength(0);
     expect(posts).toHaveLength(0);
   });
@@ -252,17 +260,16 @@ describe('ProductionRunModal', () => {
   it('shows the invoice-create error inline and does not produce', async () => {
     const posts = installFetch({
       invoiceStatus: 400,
-      invoiceBody: { error: 'Invoice amounts would exceed the sale total' },
+      invoiceBody: { error: 'No uninvoiced PI lines remain on this sale' },
     });
     const { onSaved } = renderModal();
 
     await pickCompanyAndPi();
     fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
-    fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-BIG' } });
-    fireEvent.change(screen.getByLabelText('Amount'), { target: { value: '999999' } });
+    fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-DONE' } });
     fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
 
-    expect(await screen.findByText('Invoice amounts would exceed the sale total')).toBeTruthy();
+    expect(await screen.findByText('No uninvoiced PI lines remain on this sale')).toBeTruthy();
     expect(posts.invoicePosts).toHaveLength(1);
     expect(posts).toHaveLength(0);
     expect(onSaved).not.toHaveBeenCalled();
@@ -309,7 +316,6 @@ describe('ProductionRunModal', () => {
     await pickCompanyAndPi();
     fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
     fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-NEW-7' } });
-    fireEvent.change(screen.getByLabelText('Amount'), { target: { value: '500' } });
     fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
 
     expect(await screen.findByText('Recipe has no ingredients')).toBeTruthy();

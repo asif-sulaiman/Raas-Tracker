@@ -504,9 +504,9 @@ CREATE TABLE app_settings (
 | POST | `/api/reports/generate` | Session/Key (15/min) | Multi-recipe report JSON |
 | POST | `/api/reports/export` | Session/Key (15/min) | CSV export |
 | GET | `/api/reports/live` | Admin | Live commercial report — one row per sale item, sale-level payment fields repeated (P4) |
-| GET | `/api/reports/live/filtered` | Admin | Filtered commercial report — detail rows with date_anchor, date_from/to, customer_name, product_name, company_id, stage, payment_status, `q` (quick search: PI number OR customer OR product), pagination. Sets `X-Total-Count` header = rows matching the filters across ALL pages (the pager keys off it; a full page is never mistaken for the whole report) |
-| GET | `/api/reports/live/summary` | Admin | Period-aggregated commercial report — month/week/year grouping with KPIs and optional detail items. Accepts the same filters as `/live/filtered` including `q`. `group_by=none` returns one period of whole-filter KPIs (the detail view's KPI cards source) |
-| GET | `/api/reports/live/export` | Admin (15/min) | Commercial report CSV export with same filter params as `/live/filtered` (including `q`). Response `{success, filename, content, row_count, truncated}` — `row_count` is the full filtered total, `truncated` true when it exceeds the 10 000-row export cap. Client `page`/`page_size` are ignored (export always starts at page 1) |
+| GET | `/api/reports/live/filtered` | Admin | Filtered commercial report — detail rows with date_anchor, date_from/to, customer_name, product_name, company_id, stage, payment_status, `lc_id`, `q` (quick search: PI number OR customer OR product), pagination. Non-integer `lc_id`/`company_id` is a 400, never a silently unfiltered result. Sets `X-Total-Count` header = rows matching the filters across ALL pages (the pager keys off it; a full page is never mistaken for the whole report) |
+| GET | `/api/reports/live/summary` | Admin | Period-aggregated commercial report — month/week/year grouping with KPIs and optional detail items. Accepts the same filters as `/live/filtered` including `q` and `lc_id`. `group_by=none` returns one period of whole-filter KPIs (the detail view's KPI cards source) |
+| GET | `/api/reports/live/export` | Admin (15/min) | Commercial report CSV export with same filter params as `/live/filtered` (including `q` and `lc_id`). Response `{success, filename, content, row_count, truncated}` — `row_count` is the full filtered total, `truncated` true when it exceeds the 10 000-row export cap. Client `page`/`page_size` are ignored (export always starts at page 1) |
 | POST | `/api/reports/live/export` | Admin (15/min) | Commercial report CSV with filter params in body |
 
 **Commercial report money contract** (the report is invoice-driven; the row grain and columns never change)
@@ -517,6 +517,8 @@ CREATE TABLE app_settings (
 - `due_amount` = `GREATEST(sale_total − received_amount, 0)` — clamped at zero in the detail rows, the summary KPIs **and** the per-period drill-down alike.
 - Inclusion requires at least one invoice row for the sale.
 - `sale_rows` collapses the per-line `base` to one row per sale (`MAX` for the repeated sale scalars, `SUM` only for per-line gross), so sale-level money is never multiplied by the line count.
+- **One source of truth:** because the row grain is the PI line while the money is `invoice_items`, a PI line that already has invoice lines can be neither deleted nor re-based. `DELETE /api/sales/<id>/items/<item_id>`, `PUT /api/sales/<id>/items/<item_id>` (quantity/price) and the bulk `PUT /api/sales/<id>` `removedIds` all return **409** (`InvoicedLineConflict`) rather than silently desynchronising the money. `product_name`/`unit` stay editable — they are descriptive only.
+- A legacy invoice with no lines is reconciled by the schema migration (each line-less invoice is filled from its **own header amount**, so a 30% advance is not inflated into a full receivable); a legacy invoice with a NULL amount is deliberately left alone and logged, because inventing lines for an unknown value would fabricate money.
 
 ### Audit & Notifications
 | Method | Path | Auth | Description |
@@ -577,7 +579,7 @@ CREATE TABLE app_settings (
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/api/sales/<id>/invoices` | Session/Key | List invoices with `amount` + `paid_amount` each |
-| POST | `/api/sales/<id>/invoices` | Admin | Create (`invoice_number` required, `amount?` ≥ 0 — defaults to the sale's **PI** total and seeds one `invoice_items` line per remaining uninvoiced PI line, restating `amount` as the sum of those lines; 400 duplicate); sets sale `shipment_status='production_running'` (COALESCE, never downgrades) |
+| POST | `/api/sales/<id>/invoices` | Admin | Create (`invoice_number` only — **no `amount` is accepted**). Money is derived: `amount` = PI total − what the invoice lines already carry, one `invoice_items` line is seeded per remaining uninvoiced PI line, then the header is restated in SQL as `SUM(invoice_items.line_total)` so header == lines by construction. A stated `amount` in the body is ignored, never honoured (400 on duplicate number); sets sale `shipment_status='production_running'` (COALESCE, never downgrades) |
 | POST | `/api/sales/<id>/invoices/<iid>/book` | Admin | Book (`approx_ship_date` required) → `booked`; sale → `ship_booked` (advance-only CASE) |
 | POST | `/api/sales/<id>/invoices/<iid>/ship` | Admin | Ship (`actual_ship_date` required) → `shipped` + creates a `shipments` row |
 | POST | `/api/sales/<id>/invoices/<iid>/pay` | Admin | Record payment (`payment_amount>0`, `payment_date`); flips invoice to `paid` when covered |

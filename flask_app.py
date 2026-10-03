@@ -76,8 +76,9 @@ from raas_tracker.lcs import (
 from raas_tracker.sales import (
     create_invoice, list_invoices, book_invoice, ship_invoice,
     mark_invoice_paid, void_invoice, get_sale_completion, _now_str,
-    check_lc_shipment_ready, create_invoice_item, list_invoice_items,
-)
+check_lc_shipment_ready, create_invoice_item, list_invoice_items,
+    InvoicedLineConflict,
+    )
 from raas_tracker.stock import sync_reorder_notifications
 
 # ---- AuthN/Z: sessions (humans) OR api_keys (scripts) ----
@@ -1976,7 +1977,6 @@ def api_get_production_run(name, run_id):
 
 class InvoiceCreateIn(_StrippedModel):
     invoice_number: str = Field(min_length=1)
-    amount: float | None = Field(default=None, ge=0)
 
 
 class InvoiceBookIn(_StrippedModel):
@@ -2012,8 +2012,7 @@ def api_create_invoice(sale_id):
         conn.close()
         return jsonify({"error": "Sale not found"}), 404
     try:
-        result = create_invoice(conn, sale_id, payload.invoice_number,
-                                payload.amount)
+        result = create_invoice(conn, sale_id, payload.invoice_number)
     except ValueError as e:
         _rollback_close(conn)
         return jsonify({"error": str(e)}), 400
@@ -2407,6 +2406,11 @@ def api_update_sale(sale_id):
             sale = update_sale_full(conn, sale_id, full.header.model_dump(exclude_unset=True),
                                     [i.model_dump() for i in full.items],
                                     full.removedIds)
+        except InvoicedLineConflict as e:
+            # 409, not 400: the same rule as the single-item delete/update guards,
+            # so a client can tell a money conflict from a validation error.
+            _rollback_close(conn)
+            return jsonify({"error": str(e)}), 409
         except ValueError as e:
             conn.close()
             return jsonify({"error": str(e)}), 400
@@ -2646,7 +2650,16 @@ def api_update_item(sale_id, item_id):
     except ValidationError as e:
         return _validation_error_response(e)
     conn = get_db()
-    update_sale_item(conn, item_id, patch.product_name, patch.quantity, patch.unit_price, patch.unit)
+    try:
+        update_sale_item(conn, item_id, patch.product_name, patch.quantity, patch.unit_price, patch.unit)
+    except InvoicedLineConflict as e:
+        # Same rule as the delete guard: money already invoiced against this PI
+        # line must not be silently re-based by editing quantity/price.
+        _rollback_close(conn)
+        return jsonify({"error": str(e)}), 409
+    except ValueError as e:
+        _rollback_close(conn)
+        return jsonify({"error": str(e)}), 400
     conn.close()
     return jsonify({"message": "Item updated"})
 
@@ -2660,7 +2673,17 @@ def api_delete_item(sale_id, item_id):
     if count <= 1:
         conn.close()
         return jsonify({"error": "A sale must keep at least one product item"}), 400
-    delete_sale_item(conn, item_id)
+    try:
+        delete_sale_item(conn, item_id)
+    except InvoicedLineConflict as e:
+        # A PI line that invoice_items point at cannot be deleted: the report's
+        # grain is the PI line but its money is the invoice line, so removing it
+        # would leave the rows not summing to the sale's receivable.
+        _rollback_close(conn)
+        return jsonify({"error": str(e)}), 409
+    except ValueError as e:
+        _rollback_close(conn)
+        return jsonify({"error": str(e)}), 400
     conn.close()
     return jsonify({"message": "Item deleted"})
 

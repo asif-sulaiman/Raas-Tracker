@@ -47,7 +47,7 @@ function jsonResponse(data, ok = true, status = 200) {
   return { ok, status, json: async () => data, headers: { get: () => null } };
 }
 
-function installFetch({ invoices = INVOICES, posts = [], completion, completionStatus = 200, payStatus = 'paid', deleteStatus = 200, deleteBody = null, failInvoicesAfterPost = false, failInvoicesAlways = false } = {}) {
+function installFetch({ invoices = INVOICES, posts = [], completion, completionStatus = 200, payStatus = 'paid', deleteStatus = 200, deleteBody = null, failInvoicesAfterPost = false, failInvoicesAlways = false, createAmount = 2400 } = {}) {
   const deletes = [];
   let invoiceReadsFail = failInvoicesAfterPost || failInvoicesAlways;
   // Lets a test flip the invoice read back to healthy to exercise a retry.
@@ -71,7 +71,7 @@ function installFetch({ invoices = INVOICES, posts = [], completion, completionS
       if (u.endsWith('/book')) return jsonResponse({ success: true, status: 'booked' });
       if (u.endsWith('/ship')) return jsonResponse({ invoice_id: 7, shipment_id: 3, status: 'shipped' }, true, 201);
       if (u.endsWith('/pay')) return jsonResponse({ payment_id: 4, status: payStatus }, true, 201);
-      return jsonResponse({ invoice_id: 10, invoice_number: 'NEW', status: 'planned' }, true, 201);
+      return jsonResponse({ invoice_id: 10, invoice_number: 'NEW', status: 'planned', amount: createAmount }, true, 201);
     }
     if (u.includes('/completion')) {
       if (completionStatus >= 400) {
@@ -101,7 +101,6 @@ function renderPanel(opts = {}) {
           <InvoicePanel
             saleId={5}
             isAdmin={opts.isAdmin ?? true}
-            totalValue={opts.totalValue ?? null}
             onChanged={opts.onChanged || vi.fn()}
           />
         </ConfirmProvider>
@@ -156,7 +155,7 @@ describe('InvoicePanel', () => {
     await waitFor(() => expect(onChanged).toHaveBeenCalled());
   });
 
-  it('adds an invoice from the inline number input', async () => {
+  it('adds an invoice from the inline number input without posting an amount', async () => {
     const posts = [];
     renderPanel({ posts });
     fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
@@ -167,8 +166,10 @@ describe('InvoicePanel', () => {
     await waitFor(() => expect(posts.filter((p) => p.body && p.body.invoice_number === 'INV-3')).toHaveLength(1));
     const post = posts.find((p) => p.body && p.body.invoice_number === 'INV-3');
     expect(post.url).toContain('/api/sales/5/invoices');
-    // Amount is optional — blank means the server defaults it to the sale total.
-    expect(post.body.amount).toBeUndefined();
+    // Money is server-derived from the remaining uninvoiced PI lines — the
+    // body must never carry an amount of its own.
+    expect(post.body).toEqual({ invoice_number: 'INV-3' });
+    expect(post.body).not.toHaveProperty('amount');
   });
 
   it('shows amount and paid progress on each invoice row', async () => {
@@ -194,17 +195,38 @@ describe('InvoicePanel', () => {
     expect(await screen.findByText('1/3 invoices paid · $800.00 of $2,400.00')).toBeTruthy();
   });
 
-  it('offers the sale total as the Amount placeholder and sends a typed amount', async () => {
+  it('offers no Amount input and explains the server-derived amount instead', async () => {
     const posts = [];
-    renderPanel({ posts, totalValue: 2400 });
+    renderPanel({ posts });
     fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
-    const amountInput = await screen.findByLabelText('Amount');
-    expect(amountInput.placeholder).toBe('$2,400.00');
-    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'INV-9' } });
-    fireEvent.change(amountInput, { target: { value: '1234.50' } });
+    // The invoice amount is derived from the remaining uninvoiced PI lines, so
+    // there is nothing for the operator to type.
+    expect(screen.queryByLabelText('Amount')).toBeNull();
+    expect(screen.queryByLabelText('Payment amount')).toBeNull();
+    expect(
+      await screen.findByText(/derived from the PI lines that are not yet invoiced/i)
+    ).toBeTruthy();
+  });
+
+  it('reports the server-derived amount after creating an invoice', async () => {
+    const posts = [];
+    renderPanel({ posts });
+    fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
+    fireEvent.change(await screen.findByLabelText('Invoice number'), {
+      target: { value: 'INV-9' },
+    });
     fireEvent.click(screen.getByRole('button', { name: 'Save invoice' }));
-    await waitFor(() => expect(posts.filter((p) => p.body && p.body.invoice_number === 'INV-9')).toHaveLength(1));
-    expect(posts.find((p) => p.body.invoice_number === 'INV-9').body.amount).toBe(1234.5);
+    // The create response carries the amount the server derived from the PI lines.
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Invoiced $2,400.00'));
+  });
+
+  it('falls back to a plain confirmation when the create response has no amount', async () => {
+    renderPanel({ createAmount: null });
+    fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
+    fireEvent.change(await screen.findByLabelText('Invoice number'), { target: { value: 'INV-9' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save invoice' }));
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Invoice added'));
+    expect(toast.success).not.toHaveBeenCalledWith(expect.stringContaining('Invoiced $-'));
   });
 
   it('shows the remaining balance while recording a payment', async () => {

@@ -73,7 +73,7 @@ function StatusChip({ status }) {
  * Rendered inside SaleDetailModal while the sale sits in Shipment Ongoing.
  * Mutations are admin-only (the API enforces that), so actions hide for users.
  */
-export default function InvoicePanel({ saleId, isAdmin = false, onChanged, totalValue = null }) {
+export default function InvoicePanel({ saleId, isAdmin = false, onChanged }) {
   const { apiFetch } = useAuth();
   const { confirm } = useConfirm();
   const [invoices, setInvoices] = useState([]);
@@ -88,7 +88,6 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged, total
   const [totalsUnavailable, setTotalsUnavailable] = useState(false);
   const [adding, setAdding] = useState(false);
   const [invoiceNumber, setInvoiceNumber] = useState('');
-  const [invoiceAmount, setInvoiceAmount] = useState('');
   const [step, setStep] = useState(null); // { invoiceId, kind: 'book' | 'ship' | 'pay' }
   const [stepDate, setStepDate] = useState('');
   const [payAmount, setPayAmount] = useState('');
@@ -188,14 +187,12 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged, total
   const openAdd = () => {
     setAdding(true);
     setInvoiceNumber('');
-    setInvoiceAmount('');
     setFormError(null);
   };
 
   const closeAdd = () => {
     setAdding(false);
     setInvoiceNumber('');
-    setInvoiceAmount('');
     setFormError(null);
   };
 
@@ -205,25 +202,23 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged, total
       setFormError('Invoice number is required');
       return;
     }
-    const body = { invoice_number: number };
-    const rawAmount = invoiceAmount.trim();
-    if (rawAmount) {
-      // Allow pasted "$2,400.00" hints; strip separators before parsing.
-      const value = parseFloat(rawAmount.replace(/,/g, ''));
-      if (Number.isNaN(value) || value < 0) {
-        setFormError('Enter an amount of 0 or more');
-        return;
-      }
-      body.amount = fromCents(toCents(value));
-    }
     setSaving(true);
     try {
-      await apiFetch(`/api/sales/${saleId}/invoices`, {
+      // Money is server-owned: the amount always comes from the sale's
+      // remaining uninvoiced PI lines, so the body carries the number only.
+      const res = await apiFetch(`/api/sales/${saleId}/invoices`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ invoice_number: number }),
       });
-      toast.success('Invoice added');
+      const created = await res.json().catch(() => ({}));
+      // The server-derived amount is the only money figure on this form, so it
+      // is what the operator is told was invoiced.
+      toast.success(
+        typeof created?.amount === 'number'
+          ? `Invoiced ${usd(created.amount)}`
+          : 'Invoice added'
+      );
       closeAdd();
       await reload();
       onChanged?.();
@@ -330,7 +325,6 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged, total
   // Balance hint for the open "Record payment" form (exact, in cents).
   const stepInvoice = step ? invoices.find((i) => i.invoice_id === step.invoiceId) : null;
   const stepBalance = stepInvoice ? balanceCents(stepInvoice.amount, stepInvoice.paid_amount) : null;
-  const amountPlaceholder = totalValue === null || totalValue === undefined ? '0.00' : usd(totalValue);
 
   return (
     <div>
@@ -516,24 +510,10 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged, total
                 placeholder="INV-2026-001"
                 className={`${inputCls} flex-1 min-w-40`}
               />
-              <div>
-                <label
-                  htmlFor="invoice-amount"
-                  className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1"
-                >
-                  Amount
-                </label>
-                <input
-                  id="invoice-amount"
-                  type="number"
-                  min="0"
-                  step="any"
-                  value={invoiceAmount}
-                  onChange={(e) => setInvoiceAmount(e.target.value)}
-                  placeholder={amountPlaceholder}
-                  className={`${inputCls} w-28`}
-                />
-              </div>
+              <p className="basis-full text-[11px] text-slate-400 dark:text-slate-500">
+                The amount is derived from the PI lines that are not yet invoiced — to invoice
+                less, add fewer lines in the invoice line editor below.
+              </p>
               <Button variant="primary" size="sm" onClick={handleAdd} loading={saving} disabled={saving}>
                 Save invoice
               </Button>

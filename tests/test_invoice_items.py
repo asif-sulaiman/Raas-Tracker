@@ -300,48 +300,54 @@ def test_create_invoice_seeds_remaining_pi_lines(db):
 
 
 def test_second_invoice_seeds_only_the_remainder(db):
-    """Partial first invoice leaves the rest for the follow-up invoice."""
+    """A partial first invoice leaves exactly the rest for the follow-up."""
     co = _company(db)
-    sid = _sale(db, co, product="SplitSeed", qty=10, price=4)
+    sid = _sale(db, co, product="SplitSeed", qty=10, price=4)  # PI total 40
     si_id, _, _ = _sale_item(db, sid)
 
-    # First invoice covers 6 of 10 (24 of the 40 PI total), stated explicitly.
-    first = salesmod.create_invoice(
-        db, sid, f"INV-{_tag()}", amount=24, seed_lines=False)["invoice_id"]
+    first = salesmod.create_invoice(db, sid, f"INV-{_tag()}")["invoice_id"]
+    # The operator trims the first invoice to 6 of the 10 units (24 of the 40).
+    db.execute("DELETE FROM invoice_items WHERE invoice_id = %s", (first,))
+    db.commit()
     salesmod.create_invoice_item(db, first, si_id, 6)
 
-    # A sale with prior invoices requires an amount, so the follow-up states 16
-    # and its lines are added explicitly for the leftover 4 units.
-    second = salesmod.create_invoice(db, sid, f"INV-{_tag()}", amount=16,
-                                     seed_lines=False)["invoice_id"]
-    line = salesmod.create_invoice_item(db, second, si_id, 4)
-    assert line["quantity"] == pytest.approx(4), "only what is left"
-    assert line["line_total"] == pytest.approx(16.0)
+    second = salesmod.create_invoice(db, sid, f"INV-{_tag()}")["invoice_id"]
+    items = salesmod.list_invoice_items(db, second)
+    assert len(items) == 1, "seeds only the lines that still have quantity left"
+    assert items[0]["quantity"] == pytest.approx(4), "only what is left"
+    assert items[0]["line_total"] == pytest.approx(16.0)
+    # The derived header is the remainder, not the PI total, and it equals its
+    # own lines exactly.
+    second_amount = float(db.execute("SELECT amount FROM invoices WHERE id = %s",
+                                     (second,)).fetchone()[0])
+    assert second_amount == pytest.approx(16.0)
     assert salesmod.invoiced_total_for_sale(db, sid) == pytest.approx(40.0)
 
 
 def test_seed_lines_false_creates_a_header_only_invoice(db):
-    """Opt-out keeps a deliberately line-less invoice (used by line unit tests)."""
+    """The internal test seam still derives the money, it just skips the lines."""
     co = _company(db)
-    sid = _sale(db, co, product="NoSeed", qty=5, price=3)
+    sid = _sale(db, co, product="HeaderOnly", qty=5, price=20)  # PI total 100
     inv = salesmod.create_invoice(
-        db, sid, f"INV-{_tag()}", amount=15, seed_lines=False)["invoice_id"]
-    assert salesmod.list_invoice_items(db, inv) == []
+        db, sid, f"INV-{_tag()}", seed_lines=False)["invoice_id"]
+
+    assert salesmod.list_invoice_items(db, inv) == [], "no seeded lines"
+    amount = float(db.execute("SELECT amount FROM invoices WHERE id = %s",
+                              (inv,)).fetchone()[0])
+    assert amount == pytest.approx(100.0), "still derived, never a stated 0"
 
 
-def test_explicit_amount_is_never_contradicted_by_seeded_lines(db):
-    """Gate 4 B1-b: a stated amount must not sprout lines worth more.
+def test_create_invoice_takes_no_stated_amount(db):
+    """Gate 4 B2: there is no way to put a number on an invoice any more.
 
-    Seeding used to run even with an explicit amount, so `amount=40` on a $100
-    PI produced a $100 line: the header, the report and paid-status all
-    disagreed, with no way to shrink the line afterwards.
+    A header carrying money no line backs was invisible to the invoice-driven
+    report: it showed a real receivable as quantity 0 / total 0 / due 0 / Paid
+    and dropped the money from gross_sales. The parameter is gone, so the bug
+    cannot come back through this entry point.
     """
-    co = _company(db)
-    sid = _sale(db, co, product="ExplicitAmt", qty=10, price=10)
-    inv = salesmod.create_invoice(db, sid, f"INV-{_tag()}", amount=40)["invoice_id"]
+    import inspect
 
-    assert salesmod.list_invoice_items(db, inv) == [], "explicit amount must not seed lines"
-    amount = db.execute("SELECT amount FROM invoices WHERE id = %s",
-                        (inv,)).fetchone()[0]
-    assert float(amount) == pytest.approx(40.0)
-    assert salesmod.invoiced_total_for_sale(db, sid) == pytest.approx(0.0)
+    params = inspect.signature(salesmod.create_invoice).parameters
+    assert "amount" not in params, (
+        "create_invoice must not accept a stated amount; the money is derived")
+    assert set(params) == {"conn", "sale_id", "invoice_number", "seed_lines"}
