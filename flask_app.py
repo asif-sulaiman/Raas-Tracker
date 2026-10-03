@@ -76,9 +76,9 @@ from raas_tracker.lcs import (
 from raas_tracker.sales import (
     create_invoice, list_invoices, book_invoice, ship_invoice,
     mark_invoice_paid, void_invoice, get_sale_completion, _now_str,
-check_lc_shipment_ready, create_invoice_item, list_invoice_items,
+    check_lc_shipment_ready, create_invoice_item, list_invoice_items,
     InvoicedLineConflict,
-    )
+)
 from raas_tracker.stock import sync_reorder_notifications
 
 # ---- AuthN/Z: sessions (humans) OR api_keys (scripts) ----

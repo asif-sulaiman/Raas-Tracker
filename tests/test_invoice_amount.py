@@ -736,3 +736,147 @@ def test_bulk_update_removing_invoiced_pi_line_refused_with_409(admin_client, db
     assert "invoice lines" in r.get_json()["error"]
     assert _detail(admin_client, sid)["items"] == before_items
     assert _header(db, inv) == before_amount
+
+
+def test_concurrent_creates_cannot_over_invoice_the_sale(admin_client, db, pg_dsn):
+    """Best-effort invariant check under real concurrency, NOT a race reproducer.
+
+    `log_audit_action` defaults to atomic=True, which COMMITs. Calling it per
+    seeded line therefore committed on the first line, dropping the sales and
+    sale_items locks before the remaining lines were inserted; a concurrent
+    create could then derive the same remainder and the sale was invoiced to
+    162% of its PI. Whether the interleaving happens depends on timing, so this
+    asserts the invariant the lock exists to protect - the sale is never billed
+    past its PI and no invoice header disagrees with its own lines - while
+    `test_seeded_line_audit_never_commits_mid_seed` is the deterministic guard
+    that actually pins the cause.
+    """
+    import threading
+
+    from raas_tracker.sales import create_invoice
+    from chem_stock import get_connection
+
+    cid = _company(admin_client, db, name="AmtConcurrent")
+    sid = _sale_lines(admin_client, cid, "PI-AMT-19", [
+        {"product_name": "Conc1", "quantity": 5, "unit_price": 25, "unit": "KG"},
+        {"product_name": "Conc2", "quantity": 3, "unit_price": 40, "unit": "KG"},
+        {"product_name": "Conc3", "quantity": 8, "unit_price": 12.5, "unit": "KG"},
+        {"product_name": "Conc4", "quantity": 2, "unit_price": 99.99, "unit": "KG"},
+])
+    pi_total = _pi_total(db, sid)
+    assert pi_total == Decimal("544.98")   # 125 + 120 + 100 + 199.98
+
+    errors = []
+
+    def _create(number):
+        conn = get_connection(pg_dsn)
+        try:
+            create_invoice(conn, sid, number)
+        except Exception as e:            # noqa: BLE001 - recorded, asserted below
+            errors.append(e)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=_create, args=(f"INV-RACE-{i}",))
+               for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Whatever interleaving occurred, the sale can never be billed past its PI,
+    # and every created invoice is fully backed by its own lines.
+    billed = db.execute(
+        "SELECT COALESCE(SUM(line_total), 0) FROM invoice_items ii "
+        "JOIN invoices i ON i.id = ii.invoice_id WHERE i.sale_id = %s",
+        (sid,)).fetchone()[0]
+    assert billed <= pi_total, f"over-invoiced: billed {billed} > PI {pi_total}"
+
+    rows = db.execute(
+        "SELECT i.id, i.amount, "
+        "  (SELECT COALESCE(SUM(line_total), 0) FROM invoice_items WHERE invoice_id = i.id) "
+        "FROM invoices i WHERE i.sale_id = %s", (sid,)).fetchall()
+    assert rows, "at least one invoice must have been created"
+    for invoice_id, amount, lines in rows:
+        assert Decimal(str(amount or 0)) == Decimal(str(lines)), (
+            f"invoice {invoice_id} header {amount} != its lines {lines}")
+
+
+def test_seeded_line_audit_never_commits_mid_seed(admin_client, db, monkeypatch):
+    """Deterministic guard for the race the threaded test only sometimes wins.
+
+    `log_audit_action` commits when `atomic=True`. A commit inside
+    `_seed_invoice_lines` releases the `sales` and `sale_items` row locks the
+    seed depends on, so a concurrent create derives the same remainder and bills
+    the sale twice - and a mid-seed failure would persist a header that no line
+    backs. Asserting the call is non-atomic is deterministic; provoking the race
+    is not.
+    """
+    from raas_tracker import sales as salesmod
+
+    cid = _company(admin_client, db, name="AmtAuditAtomic")
+    sid = _sale_lines(admin_client, cid, "PI-AMT-20", [
+        {"product_name": "Aud1", "quantity": 4, "unit_price": 25, "unit": "KG"},
+        {"product_name": "Aud2", "quantity": 3, "unit_price": 40, "unit": "KG"},
+    ])
+    seen = []
+    real = salesmod.log_audit_action
+
+    def spy(conn, action, *args, **kwargs):
+        seen.append((action, kwargs.get("atomic")))
+        return real(conn, action, *args, **kwargs)
+
+    monkeypatch.setattr(salesmod, "log_audit_action", spy)
+    salesmod.create_invoice(db, sid, "INV-AMT-20")
+
+    seeded = [flag for action, flag in seen if action == "INVOICE_ITEM_ADD"]
+    assert len(seeded) == 2, f"both seeded lines must be audited: {seen}"
+    assert all(flag is False for flag in seeded), (
+        "seeding must not commit mid-transaction; it would release the row locks"
+        f" the derivation depends on (saw atomic={seeded})")
+
+
+def test_bulk_update_rebasing_an_invoiced_pi_line_refused(admin_client, db):
+    """The bulk PUT's in-place item rewrite needs the same 409 guard as removals.
+
+    `removedIds` was guarded but `items[].id` was not, so the full-edit form could
+    raise an invoiced line's price or cut its quantity: the PI total (which the
+    NEXT invoice is derived from) moved while invoice_items.line_total kept the
+    old money, leaving a phantom receivable that can never be billed.
+    """
+    cid = _company(admin_client, db, name="AmtBulkRebase")
+    sid = _sale_lines(admin_client, cid, "PI-AMT-21", [
+        {"product_name": "Reb1", "quantity": 4, "unit_price": 25, "unit": "KG"},
+        {"product_name": "Reb2", "quantity": 2, "unit_price": 15, "unit": "KG"}])
+    ids = _sale_item_ids(db, sid)
+    inv = _invoice(admin_client, sid, "INV-AMT-21")
+    before_amount = _header(db, inv)
+    before_items = _detail(admin_client, sid)["items"]
+
+    detail = admin_client.get(f"/api/sales/{sid}").get_json()
+    base_header = {"client_name": detail["client_name"], "pi_number": detail["pi_number"],
+                   "pi_date": detail["pi_date"], "company_id": cid}
+    # Untouched line + the invoiced line re-priced -> refused.
+    r = admin_client.put(f"/api/sales/{sid}", json={
+        "header": base_header,
+        "items": [{"id": ids[1], "product_name": "Reb2", "quantity": 2,
+                   "unit_price": 15, "unit": "KG"},
+                  {"id": ids[0], "product_name": "Reb1", "quantity": 4,
+                   "unit_price": 99, "unit": "KG"}],
+        "removedIds": [],
+    })
+    assert r.status_code == 409, r.get_json()
+    assert "invoice lines" in r.get_json()["error"]
+
+    # A descriptive-only change to the same invoiced line stays allowed.
+    ok = admin_client.put(f"/api/sales/{sid}", json={
+        "header": base_header,
+        "items": [{"id": ids[0], "product_name": "Reb1 renamed", "quantity": 4,
+                   "unit_price": 25, "unit": "KG"},
+                  {"id": ids[1], "product_name": "Reb2", "quantity": 2,
+                   "unit_price": 15, "unit": "KG"}],
+        "removedIds": [],
+    })
+    assert ok.status_code == 200, ok.get_json()
+    assert _header(db, inv) == before_amount, "money must be untouched"
+    assert _detail(admin_client, sid)["items"][0]["product_name"] == "Reb1 renamed"

@@ -718,6 +718,27 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
                     (sale_id, it["product_name"], it["quantity"], it["unit_price"], it["unit"])
                 )
             else:
+                # Same rule as delete_sale_item / update_sale_item: an invoiced
+                # PI line cannot be re-based. The next invoice's amount is
+                # derived from the PI total, so moving quantity/price here would
+                # size it off a total the invoice set no longer matches while
+                # invoice_items.line_total keeps the old money - leaving a
+                # phantom receivable that can never be billed. Descriptive
+                # fields (product_name/unit) and no-op writes stay allowed.
+                stored = conn.execute(
+                    "SELECT quantity, unit_price FROM sale_items WHERE id = %s",
+                    (it["id"],)).fetchone()
+                rebased = (
+                    stored is not None
+                    and (float(stored[0] or 0) != float(it["quantity"] or 0)
+                         or float(stored[1] or 0) != float(it["unit_price"] or 0))
+                )
+                if rebased and conn.execute(
+                        "SELECT COUNT(*) FROM invoice_items WHERE sale_item_id = %s",
+                        (it["id"],)).fetchone()[0]:
+                    raise InvoicedLineConflict(
+                        f"cannot change quantity or price of sale item {it['id']}:"
+                        " it has invoice lines (adjust the invoice lines instead)")
                 conn.execute(
                     "UPDATE sale_items SET product_name = %s, quantity = %s, unit_price = %s, unit = %s WHERE id = %s",
                     (it["product_name"], it["quantity"], it["unit_price"], it["unit"], it["id"])
@@ -1460,16 +1481,24 @@ def _seed_invoice_lines(conn: psycopg.Connection, invoice_id: int,
                     quantity, unit_price, line_total)
                VALUES (%s, %s, %s, %s, %s, %s,
                        ROUND(%s::numeric * %s::numeric, 2))
-               RETURNING line_total""",
+               RETURNING id, line_total""",
             (invoice_id, item_id, product_name, unit or "KG", qty, unit_price,
              qty, unit_price)).fetchone()
-        left = max(left - _money(row[0] or 0), Decimal("0"))
+        line_id, line_total = row
+        left = max(left - _money(line_total or 0), Decimal("0"))
         # Seeded lines now drive the report, so they are audited like any other
         # line write even though they are not operator-entered (AGENTS.md:
         # audit every mutating action).
-        log_audit_action(conn, "INVOICE_ITEM_ADD", "invoice_item", None,
+        # atomic=False is REQUIRED, not stylistic: atomic=True commits, and a
+        # commit here would release the sales/sale_items row locks this whole
+        # operation depends on, letting a concurrent create_invoice derive the
+        # same remainder and bill the sale twice. It would also persist a
+        # partially seeded header that no line backs if a later line fails.
+        # create_invoice owns the single commit at the end.
+        log_audit_action(conn, "INVOICE_ITEM_ADD", "invoice_item", line_id,
                          new_value=(f"seeded from sale_item {item_id} "
-                                    f"qty={qty} total={_money(row[0] or 0)}"))
+                                    f"qty={qty} total={_money(line_total or 0)}"),
+                         atomic=False)
 
 
 def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
