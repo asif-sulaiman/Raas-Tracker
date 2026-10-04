@@ -2230,16 +2230,30 @@ def api_production_source():
         # Real recipe list for the sale's company (single connection).
         company_id = sale.get("company_id")
         recipes = list_recipes(conn, company_id) if company_id is not None else []
+        # Production is scoped to what was invoiced, not to the raw PI. A sale
+        # whose PI covers two products but whose invoice ships only one must
+        # offer only that product here, and the recipe/production gate must
+        # key off the same invoice lines. item_no comes from the sale item.
+        invoiced = conn.execute(
+            """SELECT ii.product_name, ii.unit,
+                      SUM(ii.quantity::numeric) AS invoiced_qty,
+                      MAX(si.item_no) AS item_no
+               FROM invoice_items ii
+               JOIN invoices i ON i.id = ii.invoice_id
+               LEFT JOIN sale_items si ON si.id = ii.sale_item_id
+              WHERE i.sale_id = %s
+              GROUP BY ii.product_name, ii.unit
+              ORDER BY ii.product_name""",
+            (sale_id,)).fetchall()
     finally:
         conn.close()
 
-    # Recipes whose product matches the line item (case-insensitive).
+    # Recipes whose product matches the invoiced product (case-insensitive).
     named = [r for r in recipes if (r.get("product_name") or "").strip()]
     # Legacy datasets have no product-linked recipes: show all of them.
     unassigned_only = not named
     products = []
-    for item in sale.get("items", []):
-        product_name = item["product_name"]
+    for product_name, unit, invoiced_qty, item_no in invoiced:
         if unassigned_only:
             product_recipes = recipes
         else:
@@ -2247,12 +2261,12 @@ def api_production_source():
                                if (r.get("product_name") or "").lower() == product_name.lower()]
         products.append({
             "product_name": product_name,
-            "quantity": item["quantity"],
-            "unit": item["unit"],
-            "item_no": item.get("item_no"),
+            "quantity": float(invoiced_qty or 0),
+            "unit": unit,
+            "item_no": item_no,
             "recipes": product_recipes
         })
-    
+
     return jsonify({
         "sale_id": sale["id"],
         "company_id": sale.get("company_id"),

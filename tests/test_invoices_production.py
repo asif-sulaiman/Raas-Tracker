@@ -402,6 +402,10 @@ def test_production_source_products_with_recipes(admin_client, db):
         "product_name": "SrcProd"})
     assert r.status_code == 201, r.get_json()
 
+    # Production products are now invoice-scoped: a sale with no invoice
+    # offers nothing, so create one (it seeds lines for SrcProd).
+    _invoice(admin_client, sid, "INV-SRC-1")
+
     r = admin_client.get(f"/api/production-source?sale_id={sid}")
     assert r.status_code == 200, r.get_json()
     data = r.get_json()
