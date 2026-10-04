@@ -243,7 +243,19 @@ def test_move_happy_skips_gate_for_other_stages(admin_client, db):
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
     assert add_recipe(db, f"R-MV-{tag}", 100, 0, co, product) is not False
-    create_invoice(db, sid, f"INV-MV-{tag}")
+    inv_id = create_invoice(db, sid, f"INV-MV-{tag}")['invoice_id']
+    recipe_id = db.execute(
+        "SELECT id FROM recipes WHERE company_id = %s AND lower(name)=lower(%s)",
+        (co, f"R-MV-{tag}")).fetchone()[0]
+    sale_item_id = db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id LIMIT 1",
+        (sid,)).fetchone()[0]
+    run_id = db.execute(
+        "INSERT INTO production_runs (recipe_id, sale_item_id, order_number, batch_number, production_date, qty_produced, created_by) VALUES (%s, %s, NULL, NULL, NULL, 10, NULL) RETURNING id",
+        (recipe_id, sale_item_id)).fetchone()[0]
+    db.execute("INSERT INTO production_run_links (run_id, sale_id, invoice_id) VALUES (%s, %s, %s)",
+               (run_id, sid, inv_id))
+    db.commit()
     r = admin_client.post(f"/api/lcs/{lc['id']}/move",
                           json={"new_stage": "payment_due"})
     assert r.status_code == 200, r.get_json()
@@ -279,7 +291,19 @@ def test_move_passes_gate_with_recipe_and_invoice(admin_client, db):
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
     assert add_recipe(db, f"R-GP-{tag}", 100, 0, co, product) is not False
-    create_invoice(db, sid, f"INV-GP-{tag}")
+    inv_id = create_invoice(db, sid, f"INV-GP-{tag}")['invoice_id']
+    recipe_id = db.execute(
+        "SELECT id FROM recipes WHERE company_id = %s AND lower(name)=lower(%s)",
+        (co, f"R-GP-{tag}")).fetchone()[0]
+    sale_item_id = db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id LIMIT 1",
+        (sid,)).fetchone()[0]
+    run_id = db.execute(
+        "INSERT INTO production_runs (recipe_id, sale_item_id, order_number, batch_number, production_date, qty_produced, created_by) VALUES (%s, %s, NULL, NULL, NULL, 10, NULL) RETURNING id",
+        (recipe_id, sale_item_id)).fetchone()[0]
+    db.execute("INSERT INTO production_run_links (run_id, sale_id, invoice_id) VALUES (%s, %s, %s)",
+               (run_id, sid, inv_id))
+    db.commit()
     r = admin_client.post(f"/api/lcs/{lc['id']}/move",
                           json={"new_stage": "shipment_ongoing"})
     assert r.status_code == 200, r.get_json()

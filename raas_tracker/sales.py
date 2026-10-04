@@ -1582,6 +1582,136 @@ seed_lines: bool = True) -> Dict[str, Any]:
             "status": status, "amount": float(amount)}
 
 
+def create_invoices_batch(conn: psycopg.Connection, sale_id: int,
+                          invoices: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Create N invoices for one sale in ONE transaction.
+
+    Every failure rolls the whole batch back (mirrors /api/sales/batch). Each
+    invoice's ``lines`` explicitly allocate a quantity per remaining PI line,
+    so a true partial shipment (some products, some quantities) is expressible
+    without inventing money: the header is restated in SQL as
+    ``SUM(invoice_items.line_total)`` exactly as ``create_invoice`` does, so
+    ``invoices.amount`` is always the real line sum and never a typed figure.
+
+    Guards: every invoice needs ≥1 line; each line quantity finite and > 0;
+    each ``sale_item_id`` belongs to this sale; Σ per sale item across the
+    batch never exceeds what is still uninvoiced; no duplicate invoice number
+    within the batch or against the sale. The caller owns no separate commit —
+    this function commits once, atomically.
+    """
+    if not invoices:
+        raise ValueError("at least one invoice required")
+    if not conn.execute("SELECT id FROM sales WHERE id = %s FOR UPDATE",
+                        (sale_id,)).fetchone():
+        raise ValueError("sale not found")
+    # Lock every PI line up front so concurrent batches cannot double-bill.
+    conn.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id FOR UPDATE",
+        (sale_id,)).fetchall()
+    remaining: Dict[int, Decimal] = {}
+    for r in conn.execute(
+        """SELECT si.id,
+                  (si.quantity::numeric
+                   - COALESCE((SELECT SUM(ii.quantity)::numeric
+                                FROM invoice_items ii
+                               WHERE ii.sale_item_id = si.id), 0)) AS rem
+             FROM sale_items si WHERE si.sale_id = %s ORDER BY si.id""",
+        (sale_id,)).fetchall():
+        remaining[r[0]] = _to_decimal(r[1]) if r[1] is not None else Decimal("0")
+    sale_item_ids = set(remaining.keys())
+
+    # Validate the whole batch BEFORE any write.
+    batch_qty: Dict[int, Decimal] = {}
+    for inv in invoices:
+        num = (inv.get("invoice_number") or "").strip()
+        if not num:
+            raise ValueError("invoice_number is required")
+        lines = inv.get("lines") or []
+        if not lines:
+            raise ValueError(f"Invoice '{num}' must have at least one line")
+        for ln in lines:
+            sid_i = ln.get("sale_item_id")
+            if sid_i not in sale_item_ids:
+                raise ValueError(
+                    f"sale item {sid_i} does not belong to this sale")
+            try:
+                qty = _to_decimal(ln.get("quantity"))
+            except (TypeError, ValueError):
+                raise ValueError("quantity must be a number")
+            if not qty.is_finite() or qty <= 0:
+                raise ValueError("quantity must be finite and > 0")
+            batch_qty[sid_i] = batch_qty.get(sid_i, Decimal("0")) + qty
+    for sid_i, q in batch_qty.items():
+        if q > remaining[sid_i]:
+            raise ValueError(
+                f"quantity {float(q):g} exceeds remaining"
+                f" {float(remaining[sid_i]):g} for sale item {sid_i}")
+    seen_nums: set = set()
+    for inv in invoices:
+        num = inv["invoice_number"].strip()
+        if num in seen_nums:
+            raise ValueError(f"Invoice number '{num}' appears multiple times")
+        seen_nums.add(num)
+        if conn.execute(
+            "SELECT id FROM invoices WHERE sale_id = %s AND invoice_number = %s",
+            (sale_id, num)).fetchone():
+            raise ValueError(
+                f"Invoice number '{num}' already exists for this sale")
+
+    results = []
+    for inv in invoices:
+        num = inv["invoice_number"].strip()
+        try:
+            cur = conn.execute(
+                """INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at)
+                   VALUES (%s, %s, 'planned', 0, %s) RETURNING id""",
+                (sale_id, num, _now_str()))
+            invoice_id = cur.fetchone()[0]
+        except psycopg.IntegrityError:
+            raise ValueError(
+                f"Invoice number '{num}' already exists for this sale")
+        amount = Decimal("0")
+        for ln in inv["lines"]:
+            sid_i = ln["sale_item_id"]
+            qty = _to_decimal(ln["quantity"])
+            si = conn.execute(
+                "SELECT product_name, unit, unit_price FROM sale_items WHERE id = %s",
+                (sid_i,)).fetchone()
+            if not si:
+                raise ValueError(f"sale item {sid_i} not found")
+            product_name, unit, unit_price = si
+            row = conn.execute(
+                """INSERT INTO invoice_items
+                       (invoice_id, sale_item_id, product_name, unit,
+                        quantity, unit_price, line_total)
+                   VALUES (%s, %s, %s, %s, %s, %s,
+                           ROUND(%s::numeric * %s::numeric, 2))
+                   RETURNING id, line_total""",
+                (invoice_id, sid_i, product_name, unit or "KG", qty, unit_price,
+                 qty, unit_price)).fetchone()
+            line_id, line_total = row
+            amount += _money(line_total or 0)
+            log_audit_action(conn, "INVOICE_ITEM_ADD", "invoice_item", line_id,
+                             new_value=(f"invoice={invoice_id} item={sid_i}"
+                                        f" qty={qty}"), atomic=False)
+        conn.execute(
+            "UPDATE invoices SET amount = (SELECT COALESCE(SUM(line_total), 0)"
+            " FROM invoice_items WHERE invoice_id = %s) WHERE id = %s",
+            (invoice_id, invoice_id))
+        log_audit_action(conn, "INVOICE_CREATE", "invoice", invoice_id,
+                         new_value=f"{num} amount={amount}", atomic=False)
+        results.append({"invoice_id": invoice_id, "invoice_number": num,
+                        "status": "planned", "amount": float(amount)})
+
+    # Entering production: only set production_running when no status yet
+    # (never downgrade an LC's later shipment_status).
+    conn.execute(
+        "UPDATE sales SET shipment_status = COALESCE(shipment_status, 'production_running'), updated_at = %s WHERE id = %s",
+        (_now_str(), sale_id))
+    conn.commit()
+    return {"invoices": results}
+
+
 # Forward-only invoice lifecycle. Every transition refuses no-op repeats and
 # backward moves (route maps these to 409); pay-on-paid is the only exception
 # and flows through mark_invoice_paid, never here.
@@ -2059,59 +2189,79 @@ def invoiced_total_for_sale(conn: psycopg.Connection, sale_id: int) -> float:
     return float(row[0]) if row else 0.0
 
 
-def _lc_shipment_readiness(conn: psycopg.Connection, company_id: int,
-                           sale_ids: List[int]) -> Dict[str, Any]:
-    """Shared gate core for ``check_lc_shipment_ready`` + ``move_lc_stage``.
+def invoice_readiness(conn: psycopg.Connection,
+                      sale_ids: List[int]) -> Dict[str, Any]:
+    """Gate core for ``lc_received -> shipment_ongoing``.
 
-    Called with the LC + child sale locks held (in ``move_lc_stage``) or
-    without locks (in ``check_lc_shipment_ready``); the queries are identical
-    so the gate cannot drift from the reported readiness. Honors the
-    ``/api/production-source`` ``unassigned_only`` fallback: when the company
-    has recipes but NONE carry a ``product_name`` (legacy data), every
-    product counts as covered — legacy rows that show "producible" are not
-    409'd.
+    Requires at least one invoice. ``sale_count`` and ``invoice_count`` are kept
+    identical to the previous `_lc_shipment_readiness` shape so the route and
+    readiness endpoints can keep using ``invoices_ok``/``detail`` unchanged.
     """
-    products: List[str] = []
-    if sale_ids:
-        products = [
-            r[0] for r in conn.execute(
-                "SELECT DISTINCT product_name FROM sale_items"
-                " WHERE sale_id = ANY(%s)",
-                (sale_ids,)).fetchall()
-            if r[0]
-        ]
-    recipe_rows = conn.execute(
-        "SELECT product_name FROM recipes WHERE company_id = %s",
-        (company_id,)).fetchall()
-    named = [(r[0] or "").strip() for r in recipe_rows]
-    named = [n for n in named if n]
-    unassigned_only = not named
-    missing: List[str] = []
-    if products and unassigned_only:
-        # Legacy fallback: production-source lists ALL recipes per product.
-        if not recipe_rows:
-            missing = sorted(products)
-    else:
-        for product in products:
-            found = conn.execute(
-                "SELECT 1 FROM recipes WHERE company_id = %s"
-                " AND lower(product_name) = lower(%s)",
-                (company_id, product)).fetchone()
-            if not found:
-                missing.append(product)
     invoice_count = 0
     if sale_ids:
         invoice_count = conn.execute(
             "SELECT COUNT(*) FROM invoices WHERE sale_id = ANY(%s)",
             (sale_ids,)).fetchone()[0]
     return {
-        "recipes_ok": not missing,
         "invoices_ok": invoice_count >= 1,
         "detail": {
             "sale_count": len(sale_ids),
             "invoice_count": invoice_count,
+        },
+    }
+
+
+def production_readiness(conn: psycopg.Connection, company_id: int,
+                         sale_ids: List[int]) -> Dict[str, Any]:
+    """Gate core for ``shipment_ongoing -> payment_due``.
+
+    Barrier 2: every distinct product covered by an invoice of this LC must have
+    a recipe for the company, and a production run for that recipe linked to an
+    invoice belonging to the same LC. Strict match — no legacy fallback.
+    """
+    products: List[str] = []
+    if sale_ids:
+        products = [
+            r[0] for r in conn.execute(
+                """SELECT DISTINCT ii.product_name
+                     FROM invoice_items ii
+                     JOIN invoices i ON i.id = ii.invoice_id
+                    WHERE i.sale_id = ANY(%s)""",
+                (sale_ids,)).fetchall()
+            if r[0]
+        ]
+    missing_recipes: List[str] = []
+    missing_production: List[str] = []
+    for product in sorted(products):
+        recipe = conn.execute(
+            """SELECT id FROM recipes
+                WHERE company_id = %s
+                  AND lower(product_name) = lower(%s)""",
+            (company_id, product)).fetchone()
+        if not recipe:
+            missing_recipes.append(product)
+            # A product with no recipe cannot have been produced for that
+            # recipe either, so produced_ok must also be False for it.
+            missing_production.append(product)
+            continue
+        run_rows = conn.execute(
+            """SELECT pr.id
+                 FROM production_runs pr
+                 JOIN production_run_links prl ON prl.run_id = pr.id
+                 JOIN invoices i ON i.id = prl.invoice_id
+                WHERE pr.recipe_id = %s
+                  AND i.sale_id = ANY(%s)""",
+            (recipe[0], sale_ids)).fetchall()
+        if not run_rows:
+            missing_production.append(product)
+    return {
+        "recipes_ok": not missing_recipes,
+        "produced_ok": not missing_production,
+        "detail": {
+            "sale_count": len(sale_ids),
             "products": sorted(products),
-            "missing_recipes": sorted(missing),
+            "missing_recipes": sorted(missing_recipes),
+            "missing_production": sorted(missing_production),
         },
     }
 
@@ -2120,18 +2270,30 @@ def check_lc_shipment_ready(conn: psycopg.Connection,
                             lc_id: int) -> Dict[str, Any]:
     """Gate for ``lc_received -> shipment_ongoing``.
 
-    * ``recipes_ok``: every distinct product on the LC's PIs has a recipe
-      row for the LC's company (case-insensitive ``product_name`` match,
-      mirroring ``/api/production-source`` incl. its legacy fallback).
-    * ``invoices_ok``: at least one invoice exists across the LC's sales.
+    Returns both barriers from one snapshot so the route can report the full
+    picture in a single 409 payload, while the move primitive only enforces the
+    barrier(s) actually crossed by the target stage.
     """
     lc = conn.execute(
         "SELECT id, company_id FROM letters_of_credit WHERE id = %s",
         (lc_id,)).fetchone()
     if not lc:
-        raise ValueError("LC not found")
+        raise LookupError(f"LC {lc_id} not found")
     company_id = lc[1]
     sale_rows = conn.execute(
         "SELECT id FROM sales WHERE lc_id = %s", (lc_id,)).fetchall()
     sale_ids = [r[0] for r in sale_rows]
-    return _lc_shipment_readiness(conn, company_id, sale_ids)
+    invoice = invoice_readiness(conn, sale_ids)
+    production = production_readiness(conn, company_id, sale_ids)
+    return {
+        "recipes_ok": production["recipes_ok"],
+        "invoices_ok": invoice["invoices_ok"],
+        "produced_ok": production["produced_ok"],
+        "detail": {
+            "sale_count": invoice["detail"]["sale_count"],
+            "invoice_count": invoice["detail"]["invoice_count"],
+            "products": production["detail"]["products"],
+            "missing_recipes": production["detail"]["missing_recipes"],
+            "missing_production": production["detail"]["missing_production"],
+        },
+    }

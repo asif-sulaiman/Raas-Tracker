@@ -185,8 +185,11 @@ def test_shipment_ready_neither(db):
     co = _company(db, f"Gate N {_tag()}")
     lc_id, _ = _lc_with_sale(db, co, product=f"Nope-{_tag()}")
     out = salesmod.check_lc_shipment_ready(db, lc_id)
-    assert out["recipes_ok"] is False
+    # Barrier 1 (invoices) must fail; with no invoices yet there are no
+    # invoiced products, so both recipe and production checks are vacuous.
     assert out["invoices_ok"] is False
+    assert out["recipes_ok"] is True
+    assert out["produced_ok"] is True
     assert "detail" in out
 
 
@@ -197,6 +200,8 @@ def test_shipment_ready_recipe_only(db):
     lc_id, _ = _lc_with_sale(db, co, product=prod)
     _recipe(db, co, prod)
     out = salesmod.check_lc_shipment_ready(db, lc_id)
+    # No invoicing yet, so no product is invoice-scoped: recipe/produced are
+    # vacuously ok, and the invoice barrier is still what blocks the move.
     assert out["recipes_ok"] is True
     assert out["invoices_ok"] is False
 
@@ -204,10 +209,13 @@ def test_shipment_ready_recipe_only(db):
 def test_shipment_ready_invoice_only(db):
     co = _company(db, f"Gate I {_tag()}")
     lc_id, sid = _lc_with_sale(db, co, product=f"IProd-{_tag()}")
-    _invoice(db, sid)
+    # Seeded invoice so the sale's product is actually invoiced/under the LC.
+    salesmod.create_invoice(db, sid, f"INV-{_tag()}")
     out = salesmod.check_lc_shipment_ready(db, lc_id)
-    assert out["recipes_ok"] is False
     assert out["invoices_ok"] is True
+    # A real recipe and an invoice-linked production run are both still owed.
+    assert out["recipes_ok"] is False
+    assert out["produced_ok"] is False
 
 
 def test_shipment_ready_both(db):
@@ -216,10 +224,12 @@ def test_shipment_ready_both(db):
     prod = f"BProd-{tag}"
     lc_id, sid = _lc_with_sale(db, co, product=prod)
     _recipe(db, co, prod)
-    _invoice(db, sid)
+    salesmod.create_invoice(db, sid, f"INV-{_tag()}")
     out = salesmod.check_lc_shipment_ready(db, lc_id)
     assert out["recipes_ok"] is True
     assert out["invoices_ok"] is True
+    # Recipe+big invoices exist, but no production run is linked yet.
+    assert out["produced_ok"] is False
 
 
 # --------------------------------------------------------------------------- #

@@ -77,7 +77,7 @@ from raas_tracker.sales import (
     create_invoice, list_invoices, book_invoice, ship_invoice,
     mark_invoice_paid, void_invoice, get_sale_completion, _now_str,
     check_lc_shipment_ready, create_invoice_item, list_invoice_items,
-    InvoicedLineConflict,
+    InvoicedLineConflict, create_invoices_batch,
 )
 from raas_tracker.stock import sync_reorder_notifications
 
@@ -1979,6 +1979,20 @@ class InvoiceCreateIn(_StrippedModel):
     invoice_number: str = Field(min_length=1)
 
 
+class InvoiceBatchLineIn(_StrippedModel):
+    sale_item_id: int
+    quantity: float
+
+
+class InvoiceBatchEntryIn(_StrippedModel):
+    invoice_number: str = Field(min_length=1)
+    lines: list[InvoiceBatchLineIn] = Field(min_length=1)
+
+
+class InvoiceBatchCreateIn(_StrippedModel):
+    invoices: list[InvoiceBatchEntryIn] = Field(min_length=1)
+
+
 class InvoiceBookIn(_StrippedModel):
     approx_ship_date: str = Field(min_length=1)
 
@@ -2019,6 +2033,32 @@ def api_create_invoice(sale_id):
     except Exception:
         _rollback_close(conn)
         app.logger.exception("Invoice creation failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    return jsonify(result), 201
+
+
+@app.route("/api/sales/<int:sale_id>/invoices/batch", methods=["POST"])
+@admin_required
+@limiter.limit("15 per minute")
+def api_create_invoices_batch(sale_id):
+    """Create N invoices in ONE transaction: any failure rolls back all."""
+    try:
+        payload = InvoiceBatchCreateIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    if not conn.execute("SELECT 1 FROM sales WHERE id = %s", (sale_id,)).fetchone():
+        conn.close()
+        return jsonify({"error": "Sale not found"}), 404
+    try:
+        result = create_invoices_batch(conn, sale_id, [i.model_dump() for i in payload.invoices])
+    except ValueError as e:
+        _rollback_close(conn)
+        return jsonify({"error": str(e)}), 400
+    except Exception:
+        _rollback_close(conn)
+        app.logger.exception("Invoices batch failed")
         return jsonify({"error": "internal server error"}), 500
     conn.close()
     return jsonify(result), 201
@@ -2847,8 +2887,13 @@ def _shipment_missing_names(readiness):
     detail = readiness.get("detail") or {}
     names = [f"recipes: {p}"
              for p in detail.get("missing_recipes", [])]
+    names += [f"production: {p}"
+              for p in detail.get("missing_production", [])]
     if not readiness.get("invoices_ok"):
         names.append("invoices: at least one invoice required")
+    if (not readiness.get("produced_ok")
+            and not detail.get("missing_production")):
+        names.append("production: at least one invoice-linked run required")
     return names or ["preconditions not met"]
 
 
@@ -3085,30 +3130,37 @@ def api_move_lc(lc_id):
             return jsonify({"error": "LC not found"}), 404
         from raas_tracker.sales import SALE_STAGE_ORDER as _ORDER
         try:
-            _crosses = (_ORDER.index(lc.get("stage"))
-                        < _ORDER.index("shipment_ongoing")
-                        <= _ORDER.index(payload.new_stage))
+            cur_idx = _ORDER.index(lc.get("stage"))
+            tgt_idx = _ORDER.index(payload.new_stage)
         except ValueError:
-            _crosses = True
-        if _crosses:
+            cur_idx = -1
+            tgt_idx = -1
+        ship_idx = _ORDER.index("shipment_ongoing")
+        pay_idx = _ORDER.index("payment_due")
+        crossing_shipment = cur_idx < ship_idx <= tgt_idx
+        crossing_payment = cur_idx < pay_idx <= tgt_idx
+        if crossing_shipment or crossing_payment:
             try:
                 readiness = check_lc_shipment_ready(conn, lc_id)
             except LookupError as e:
                 _rollback_close(conn)
                 return jsonify({"error": str(e)}), 404
-            ready = readiness.get("ready")
-            if ready is None:
-                ready = bool(readiness.get("recipes_ok")
-                             and readiness.get("invoices_ok"))
-            if not ready:
-                missing = _shipment_missing_names(readiness)
+            missing = _shipment_missing_names(readiness)
+            issues = []
+            if crossing_shipment and not readiness.get("invoices_ok"):
+                issues.append("LC is not ready for shipment:")
+            if crossing_payment and not (readiness.get("recipes_ok")
+                                         and readiness.get("produced_ok")):
+                issues.append("LC is not ready to go past shipment:")
+            if issues:
                 conn.close()
                 return jsonify({
-                    "error": "LC is not ready for shipment: "
+                    "error": ("; ".join(issues[:1]) + " " if issues else "")
                              + "; ".join(str(m) for m in missing),
                     "missing": missing,
                     "recipes_ok": readiness.get("recipes_ok"),
                     "invoices_ok": readiness.get("invoices_ok"),
+                    "produced_ok": readiness.get("produced_ok"),
                 }), 409
         try:
             ok = move_lc_stage(conn, lc_id, payload.new_stage,
@@ -3117,7 +3169,8 @@ def api_move_lc(lc_id):
             msg = str(e)
             low = msg.lower()
             if "not ready for shipment" in low or "recipes:" in low \
-                    or "invoices:" in low:
+                    or "invoices:" in low or "not ready to go past shipment" in low \
+                    or "production:" in low:
                 _rollback_close(conn)
                 # Recompute readiness for the structured 409 shape.
                 rconn = get_db()
@@ -3127,10 +3180,12 @@ def api_move_lc(lc_id):
                         missing = _shipment_missing_names(readiness)
                         recipes_ok = readiness.get("recipes_ok")
                         invoices_ok = readiness.get("invoices_ok")
+                        produced_ok = readiness.get("produced_ok")
                     except Exception:
                         missing = [msg]
                         recipes_ok = False
                         invoices_ok = False
+                        produced_ok = False
                 finally:
                     rconn.close()
                 return jsonify({
@@ -3138,6 +3193,7 @@ def api_move_lc(lc_id):
                     "missing": missing,
                     "recipes_ok": recipes_ok,
                     "invoices_ok": invoices_ok,
+                    "produced_ok": produced_ok,
                 }), 409
             _rollback_close(conn)
             return jsonify({"error": msg}), 400

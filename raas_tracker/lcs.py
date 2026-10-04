@@ -240,17 +240,19 @@ def move_lc_stage(conn: psycopg.Connection, lc_id: int, new_stage: str,
     Locks the LC row AND each child sale row (``SELECT ... FOR UPDATE``,
     children in id order) before writing anything, so concurrent moves
     serialize instead of interleaving. Validates ``new_stage`` against
-    ``SALE_STAGE_ORDER`` (``ValueError`` otherwise). When the move crosses
-    into ``shipment_ongoing`` from any earlier stage, the shipment gate is
-    enforced in-txn (after the locks, before any write) via the shared
-    ``_lc_shipment_readiness`` core — ``ValueError`` names the missing
-    preconditions (``recipes: ...``, ``invoices: ...``). Propagates
+    ``SALE_STAGE_ORDER`` (``ValueError`` otherwise). When the move carries the
+    LC into ``shipment_ongoing`` the gate requires merely that at least one
+    invoice exists. When it carries the LC into ``payment_due`` the gate
+    additionally requires progress from every invoiced product through a
+    company recipe verified by an invoice-linked production run. ``ValueError``
+    names the missing preconditions (``invoices: ...`` or
+    ``recipes: ...`` / ``production: ...``). Propagates
     ``sales.stage`` + ``sales_stage_history`` + ``SALE_MOVE`` audit per child
     (``via_lc=True``: linked PIs only travel via this path). Returns False
     when the LC does not exist.
     """
     from .audit import log_audit_action
-    from .sales import SALE_STAGE_ORDER, _lc_shipment_readiness
+    from .sales import SALE_STAGE_ORDER, invoice_readiness, production_readiness
 
     if new_stage not in SALE_STAGE_ORDER:
         raise ValueError(f"invalid stage: {new_stage}")
@@ -269,9 +271,11 @@ def move_lc_stage(conn: psycopg.Connection, lc_id: int, new_stage: str,
         children = conn.execute(
             "SELECT id, stage FROM sales WHERE lc_id = %s ORDER BY id FOR UPDATE",
             (lc_id,)).fetchall()
-        # Gate inside the txn: crossing into shipment_ongoing from any
-        # earlier stage requires recipes + invoices (computed under lock).
-        # Crossing (not equality): jumps OVER shipment_ongoing are gated too.
+        # Gate inside the txn: which barrier(s) apply depends on how far this
+        # stage move carries the LC. Crossing into ``shipment_ongoing`` means at
+        # least one invoice exists. Crossing into ``payment_due`` means every
+        # product on those invoices has a recipe AND an invoice-linked
+        # production run. Jumps directly to either stage trigger both.
         try:
             tgt_idx = SALE_STAGE_ORDER.index(new_stage)
         except ValueError:
@@ -281,28 +285,42 @@ def move_lc_stage(conn: psycopg.Connection, lc_id: int, new_stage: str,
         except ValueError:
             cur_idx = -1
         ship_idx = SALE_STAGE_ORDER.index("shipment_ongoing")
+        pay_idx = SALE_STAGE_ORDER.index("payment_due")
+        sale_ids = [c[0] for c in children]
+
         if tgt_idx >= ship_idx > cur_idx:
-                sale_ids = [c[0] for c in children]
-                readiness = _lc_shipment_readiness(
-                    conn, lc_company, sale_ids)
-                if not (readiness["recipes_ok"] and readiness["invoices_ok"]):
-                    detail = readiness.get("detail") or {}
-                    parts = []
-                    if detail.get("missing_recipes"):
-                        parts.append(
-                            "recipes: " + ", ".join(detail["missing_recipes"]))
-                    elif not readiness.get("recipes_ok"):
-                        parts.append("recipes: missing")
-                    if not readiness.get("invoices_ok"):
-                        parts.append(
-                            "invoices: at least one invoice required")
-                    msg = ("LC is not ready for shipment: "
-                           + ("; ".join(parts) if parts else "preconditions not met"))
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
-                    raise ValueError(msg)
+            inv = invoice_readiness(conn, sale_ids)
+            if not inv["invoices_ok"]:
+                msg = ("LC is not ready for shipment: "
+                       "invoices: at least one invoice required")
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise ValueError(msg)
+
+        if tgt_idx >= pay_idx > cur_idx:
+            prod = production_readiness(conn, lc_company, sale_ids)
+            if not (prod["recipes_ok"] and prod["produced_ok"]):
+                detail = prod.get("detail") or {}
+                parts = []
+                if detail.get("missing_recipes"):
+                    parts.append(
+                        "recipes: " + ", ".join(detail["missing_recipes"]))
+                elif not prod.get("recipes_ok"):
+                    parts.append("recipes: missing")
+                if not prod.get("produced_ok") and detail.get("missing_production"):
+                    parts.append(
+                        "production: " + ", ".join(detail["missing_production"]))
+                elif not prod.get("produced_ok"):
+                    parts.append("production: missing")
+                msg = ("LC is not ready to go past shipment: "
+                       + ("; ".join(parts) if parts else "preconditions not met"))
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise ValueError(msg)
         conn.execute(
             "UPDATE letters_of_credit SET stage = %s, updated_at = %s"
             " WHERE id = %s",
