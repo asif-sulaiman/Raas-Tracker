@@ -43,6 +43,18 @@ const [showCreateModal, setShowCreateModal] = useState(false);
   const [newName, setNewName] = useState('');
   const [newYield, setNewYield] = useState('');
   const [newWater, setNewWater] = useState('');
+  const [companies, setCompanies] = useState([]);
+  const [allSales, setAllSales] = useState([]);
+  const [allLcs, setAllLcs] = useState([]);
+  const [companyId, setCompanyId] = useState('');
+  const [lcId, setLcId] = useState('');
+  const [saleId, setSaleId] = useState('');
+  const [invoices, setInvoices] = useState([]);
+  const [invoiceId, setInvoiceId] = useState('');
+  const [invoiceItems, setInvoiceItems] = useState([]);
+  const [productName, setProductName] = useState('');
+  const [loadingRefs, setLoadingRefs] = useState(false);
+  const [loadingInvoiceItems, setLoadingInvoiceItems] = useState(false);
 
   const [editYield, setEditYield] = useState('');
   const [editWater, setEditWater] = useState('');
@@ -76,6 +88,80 @@ const [showCreateModal, setShowCreateModal] = useState(false);
     })();
   }, [fetchData]);
 
+  useEffect(() => {
+    if (!showCreateModal) return;
+    (async () => {
+      setLoadingRefs(true);
+      try {
+        const [coRes, saleRes, lcRes] = await Promise.all([
+          apiFetch('/api/companies'),
+          apiFetch('/api/sales?page_size=1000'),
+          apiFetch('/api/lcs'),
+        ]);
+        const [cos, salesBody, lcs] = await Promise.all([coRes.json(), saleRes.json(), lcRes.json()]);
+        setCompanies(Array.isArray(cos) ? cos : []);
+        setAllSales(Array.isArray(salesBody) ? salesBody : Array.isArray(salesBody?.sales) ? salesBody.sales : []);
+        setAllLcs(Array.isArray(lcs) ? lcs : []);
+      } catch (err) {
+        toast.error(err?.message || 'Could not load companies and PIs');
+      } finally {
+        setLoadingRefs(false);
+      }
+    })();
+  }, [showCreateModal, apiFetch]);
+
+  const handleCompanyChange = (value) => {
+    setCompanyId(value);
+    setLcId('');
+    setSaleId('');
+    setInvoices([]);
+    setInvoiceId('');
+    setInvoiceItems([]);
+    setProductName('');
+  };
+
+  const handleLcChange = (value) => {
+    setLcId(value);
+    setSaleId('');
+    setInvoices([]);
+    setInvoiceId('');
+    setInvoiceItems([]);
+    setProductName('');
+  };
+
+  const handleSaleChange = async (value) => {
+    setSaleId(value);
+    setInvoices([]);
+    setInvoiceId('');
+    setInvoiceItems([]);
+    setProductName('');
+    if (!value) return;
+    try {
+      const res = await apiFetch(`/api/sales/${encodeURIComponent(value)}/invoices`);
+      const invs = await res.json();
+      setInvoices(Array.isArray(invs) ? invs : []);
+    } catch {
+      setInvoices([]);
+    }
+  };
+
+  const handleInvoiceChange = async (value) => {
+    setInvoiceId(value);
+    setInvoiceItems([]);
+    setProductName('');
+    if (!value) return;
+    setLoadingInvoiceItems(true);
+    try {
+      const res = await apiFetch(`/api/invoices/${encodeURIComponent(value)}/items`);
+      const items = await res.json();
+      setInvoiceItems(Array.isArray(items) ? items : []);
+    } catch (err) {
+      toast.error(err?.message || 'Could not load invoice items');
+    } finally {
+      setLoadingInvoiceItems(false);
+    }
+  };
+
   const fetchRecipeDetail = async (name, companyId) => {
     try {
       const res = await apiFetch(
@@ -94,28 +180,39 @@ const [showCreateModal, setShowCreateModal] = useState(false);
 
   const handleCreate = async () => {
     if (!newName.trim()) return toast.error('Recipe name required');
+    if (!companyId) return toast.error('Company is required');
+    if (!lcId) return toast.error('LC is required');
+    if (!saleId) return toast.error('PI / Sale is required');
+    if (!invoiceId) return toast.error('Invoice is required');
+    if (!productName) return toast.error('Product name is required');
     try {
       const res = await apiFetch('/api/recipes', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name: newName.trim(),
-          yield: parseFloat(newYield) || 1,
-          water_percentage: parseFloat(newWater) || 0
+          yield_qty: parseFloat(newYield) || 1,
+          water_percentage: parseFloat(newWater) || 0,
+          company_id: Number(companyId),
+          product_name: productName
         })
       });
       const data = await res.json();
-      if (data.success) {
-        setShowCreateModal(false);
-        setNewName('');
-        setNewYield('');
-        setNewWater('');
-        toast.success(`Recipe "${newName.trim()}" created`);
-        setLoading(true);
-        fetchData();
-      } else {
-        toast.error('Failed to create recipe');
-      }
+      if (!res.ok) throw new Error(data?.error || `Failed to create recipe (${res.status})`);
+      setShowCreateModal(false);
+      setNewName('');
+      setNewYield('');
+      setNewWater('');
+      setCompanyId('');
+      setLcId('');
+      setSaleId('');
+      setInvoices([]);
+      setInvoiceId('');
+      setInvoiceItems([]);
+      setProductName('');
+      toast.success(`Recipe "${newName.trim()}" created`);
+      setLoading(true);
+      fetchData();
     } catch (err) {
       toast.error(err.message || 'Failed to create recipe');
     }
@@ -581,8 +678,89 @@ const [showCreateModal, setShowCreateModal] = useState(false);
               value={newName}
               onChange={e => setNewName(e.target.value)}
               placeholder="e.g. Product name"
-              className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
             />
+          </div>
+          <div className="grid grid-cols-1 gap-3">
+            <div>
+              <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Company *</label>
+              <select
+                value={companyId}
+                onChange={e => handleCompanyChange(e.target.value)}
+                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              >
+                <option value="">Select company…</option>
+                {loadingRefs ? <option disabled>Loading…</option> : companies.map(c => (
+                  <option key={c.id} value={c.id}>{c.name}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">LC *</label>
+              <select
+                value={lcId}
+                onChange={e => handleLcChange(e.target.value)}
+                disabled={!companyId}
+                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-60"
+              >
+                <option value="">{companyId ? 'Select LC…' : 'Select a company first'}</option>
+                {companyId && allLcs
+                  .filter(l => String(l.company_id) === companyId)
+                  .map(l => (
+                    <option key={l.id} value={l.id}>
+                      {l.lc_number}{l.stage ? ` — ${l.stage}` : ''}
+                    </option>
+                  ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">PI / Sale *</label>
+              <select
+                value={saleId}
+                onChange={e => handleSaleChange(e.target.value)}
+                disabled={!companyId || !lcId}
+                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-60"
+              >
+                <option value="">{companyId && lcId ? 'Select PI/Sale…' : !companyId ? 'Select a company first' : 'Select an LC first'}</option>
+                {companyId && lcId && allSales
+                  .filter(s => String(s.company_id) === companyId && String(s.lc_id) === lcId)
+                  .map(s => (
+                    <option key={s.id} value={s.id}>
+                      {s.pi_number || `PI #${s.id}`}{s.client_name ? ` — ${s.client_name}` : ''}
+                    </option>
+                  ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Invoice *</label>
+              <select
+                value={invoiceId}
+                onChange={e => handleInvoiceChange(e.target.value)}
+                disabled={!saleId}
+                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-60"
+              >
+                <option value="">{saleId ? 'Select invoice…' : 'Select a PI first'}</option>
+                {invoices.map(inv => (
+                  <option key={inv.invoice_id ?? inv.id} value={inv.invoice_id ?? inv.id}>
+                    {inv.invoice_number || `Invoice #${inv.invoice_id ?? inv.id}`}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Product *</label>
+              <select
+                value={productName}
+                onChange={e => setProductName(e.target.value)}
+                disabled={!invoiceId || loadingInvoiceItems}
+                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-60"
+              >
+                <option value="">{loadingInvoiceItems ? 'Loading items…' : invoiceId ? 'Select product…' : 'Select an invoice first'}</option>
+                {[...new Set(invoiceItems.map(i => i.product_name))].map((name, i) => (
+                  <option key={i} value={name}>{name}</option>
+                ))}
+              </select>
+            </div>
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div>
