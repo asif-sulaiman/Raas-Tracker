@@ -179,14 +179,43 @@ export default function Sales() {
   };
 
   // LC lane: one card per LC moves/unlinks as a unit; PIs always travel
-  // together. A 409 names the missing shipment preconditions (recipes +
-  // invoice) — surface the server message verbatim.
+  // together. Before attempting a barriered move, probe readiness and, when
+  // blocked, do NOT POST — point the operator at the missing precondition
+  // (the missing products for recipe/production, or invoices for Barrier 1).
   const handleLcMove = async (lc) => {
     if (typeof lc?.id !== 'number') return;
     const next = nextStageFor(lc.stage);
     if (!next) return;
     setMovingId(`lc-${lc.id}`);
     try {
+      const res = await apiFetch(`/api/lcs/${lc.id}/readiness`);
+      const body = await res.json().catch(() => null);
+      if (!res.ok) {
+        toast.error(body?.error || 'Readiness check failed');
+        return;
+      }
+      const blocked =
+        next === 'shipment_ongoing' && !body.invoices_ok
+          ? { barrier: 'invoices' }
+          : (next === 'payment_due' && (!body.recipes_ok || !body.produced_ok))
+            ? { barrier: 'production', detail: body.detail }
+            : null;
+      if (blocked) {
+        if (blocked.barrier === 'invoices') {
+          toast.error('Cannot start shipment: at least one invoice is required.');
+        } else if (blocked.barrier === 'production') {
+          const missing = [
+            ...(blocked.detail?.missing_recipes || []),
+            ...(blocked.detail?.missing_production || []),
+          ].filter(Boolean);
+          toast.error(
+            `Cannot move to payment due: ${missing.length ? missing.join(', ') : 'recipe/production required'}`
+          );
+        } else {
+          toast.error('Blocked by a shipment prerequisite.');
+        }
+        return;
+      }
       await apiFetch(`/api/lcs/${lc.id}/move`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
