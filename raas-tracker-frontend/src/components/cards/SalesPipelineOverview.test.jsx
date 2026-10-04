@@ -114,32 +114,33 @@ describe('SalesPipelineOverview hero', () => {
     expect(onToggleExpanded).toHaveBeenCalled();
   });
 
-  it('F5b preserves input order by interleaving groups and unlinked', () => {
+  it('F5b keeps one row per visible sale in input order', () => {
     const ordered = [
       { id: 1, pi_number: 'PI-U1', client_name: 'Solo', total_value: 100, stage: 'pi_issued', pi_date: '2026-09-01' },
       { id: 2, pi_number: 'PI-G1', client_name: 'Acme', company_id: 7, company_name: 'Acme', lc_id: 10, lc_number: 'LC-100', total_value: 200, stage: 'pi_issued', pi_date: '2026-09-02' },
       { id: 3, pi_number: 'PI-U2', client_name: 'Solo2', total_value: 300, stage: 'pi_issued', pi_date: '2026-09-03' },
     ];
-    const lcs = [{ id: 10, lc_number: 'LC-100', company_id: 7, company_name: 'Acme', stage: 'pi_issued' }];
-    renderHero({ sales: ordered, salesSummary: null, visibleSales: ordered, lcs });
+    renderHero({ sales: ordered, salesSummary: null, visibleSales: ordered });
     const table = document.querySelector('table tbody');
     const text = table.textContent;
     const u1 = text.indexOf('PI-U1');
-    const lc = text.indexOf('LC-100');
+    const g1 = text.indexOf('PI-G1');
     const u2 = text.indexOf('PI-U2');
     expect(u1).toBeGreaterThanOrEqual(0);
-    expect(lc).toBeGreaterThanOrEqual(0);
-    expect(u2).toBeGreaterThanOrEqual(0);
-    expect(u1).toBeLessThan(lc);
-    expect(lc).toBeLessThan(u2);
+    expect(g1).toBeGreaterThan(u1);
+    expect(u2).toBeGreaterThan(g1);
   });
 
-  it('F5c+F9 labels LC slice totals as PI total (visible)', () => {
+  it('F5c shows LC number in its own column, never in the PI Number column', () => {
     const ordered = [
       { id: 2, pi_number: 'PI-G1', client_name: 'Acme', company_id: 7, company_name: 'Acme', lc_id: 10, lc_number: 'LC-100', total_value: 200, stage: 'pi_issued', pi_date: '2026-09-02' },
     ];
-    const lcs = [{ id: 10, lc_number: 'LC-100', company_id: 7, company_name: 'Acme', stage: 'pi_issued' }];
-    renderHero({ sales: ordered, salesSummary: null, visibleSales: ordered, lcs });
-    expect(screen.getByText(/PI total \(visible\)/i)).toBeTruthy();
+    renderHero({ sales: ordered, salesSummary: null, visibleSales: ordered });
+    expect(screen.getByText('LC Number')).toBeTruthy();
+    const piCell = screen.getByText('PI-G1');
+    expect(piCell.textContent).toBe('PI-G1');
+    expect(screen.getByText('LC-100')).toBeTruthy();
+    // No more LC header row duplicating LC-100 outside its own column
+    expect(screen.queryByText(/PI total \(visible\)/i)).toBeNull();
   });
 });

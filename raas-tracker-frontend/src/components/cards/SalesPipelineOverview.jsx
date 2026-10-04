@@ -1,4 +1,3 @@
-import { Fragment } from 'react';
 import { Link } from 'react-router-dom';
 import {
   DollarSign,
@@ -17,7 +16,7 @@ import clsx from 'clsx';
 import Badge from '../ui/Badge';
 import Button from '../ui/Button';
 import { formatNumber, formatDate } from '../../utils/format';
-import { STAGES, STAGE_LABELS, STAGE_BADGE, isOverdue, groupSalesByLc } from '../../utils/sales';
+import { STAGES, STAGE_LABELS, STAGE_BADGE, isOverdue } from '../../utils/sales';
 
 // Stage accents follow the Sales page pipeline columns
 // (PipelineColumn HEADER_STYLES): sky → indigo → amber → orange → emerald.
@@ -70,7 +69,6 @@ function money(value) {
 
 export default function SalesPipelineOverview({
   sales = [],
-  lcs = [],
   salesSummary = null,
   visibleSales = [],
   salesExpanded = false,
@@ -369,6 +367,7 @@ export default function SalesPipelineOverview({
                   <thead className="bg-slate-50 font-semibold uppercase tracking-wider text-slate-500 dark:bg-slate-800/60 dark:text-slate-400">
                     <tr>
                       <th className="px-3 py-2.5">PI Number</th>
+                      <th className="px-3 py-2.5">LC Number</th>
                       <th className="px-3 py-2.5">Client</th>
                       <th className="px-3 py-2.5 text-right">Value (USD)</th>
                       <th className="px-3 py-2.5">Stage</th>
@@ -376,93 +375,40 @@ export default function SalesPipelineOverview({
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 dark:divide-slate-800/60">
-                    {(() => {
-                      const { groups, unlinked } = groupSalesByLc(visibleSales, lcs);
-                      const saleRow = (s, nested = false) => (
-                        <tr
-                          key={s.id}
-                          className="transition-colors hover:bg-slate-50/80 dark:hover:bg-slate-800/40"
-                        >
-                          <td className={`px-3 py-2.5 font-medium text-slate-900 dark:text-white ${nested ? 'pl-6' : ''}`}>
-                            {s.pi_number || `#${s.id}`}
-                          </td>
-                          <td className="px-3 py-2.5 text-slate-500 dark:text-slate-400">
-                            {s.client_name || '—'}
-                          </td>
-                          <td className="px-3 py-2.5 text-right font-bold tabular-nums text-slate-800 dark:text-slate-100">
-                            ${formatNumber(s.total_value || 0)}
-                          </td>
-                          <td className="px-3 py-2.5">
-                            <span className="inline-flex items-center gap-1.5">
-                              <Badge variant={STAGE_BADGE[s.stage] || 'default'}>
-                                {STAGE_LABELS[s.stage] || s.stage}
+                    {visibleSales.map((s) => (
+                      <tr
+                        key={s.id}
+                        className="transition-colors hover:bg-slate-50/80 dark:hover:bg-slate-800/40"
+                      >
+                        <td className="px-3 py-2.5 font-medium text-slate-900 dark:text-white">
+                          {s.pi_number || `#${s.id}`}
+                        </td>
+                        <td className="px-3 py-2.5 text-slate-500 dark:text-slate-400">
+                          {(s.lc_number || '').trim() || '—'}
+                        </td>
+                        <td className="px-3 py-2.5 text-slate-500 dark:text-slate-400">
+                          {s.client_name || '—'}
+                        </td>
+                        <td className="px-3 py-2.5 text-right font-bold tabular-nums text-slate-800 dark:text-slate-100">
+                          ${formatNumber(s.total_value || 0)}
+                        </td>
+                        <td className="px-3 py-2.5">
+                          <span className="inline-flex items-center gap-1.5">
+                            <Badge variant={STAGE_BADGE[s.stage] || 'default'}>
+                              {STAGE_LABELS[s.stage] || s.stage}
+                            </Badge>
+                            {isOverdue(s) && (
+                              <Badge variant="error" dot>
+                                Overdue
                               </Badge>
-                              {isOverdue(s) && (
-                                <Badge variant="error" dot>
-                                  Overdue
-                                </Badge>
-                              )}
-                            </span>
-                          </td>
-                          <td className="px-3 py-2.5 text-slate-500 dark:text-slate-400">
-                            {formatDate(s.pi_date)}
-                          </td>
-                        </tr>
-                      );
-                      const lcRow = (g) => (
-                        <Fragment key={g.key}>
-                          <tr
-                            className="bg-indigo-50/60 dark:bg-indigo-950/20 transition-colors hover:bg-indigo-50 dark:hover:bg-indigo-950/30"
-                          >
-                            <td className="px-3 py-2.5 font-semibold text-slate-900 dark:text-white">
-                              {g.lc.lc_number}
-                            </td>
-                            <td className="px-3 py-2.5 text-slate-500 dark:text-slate-400">
-                              {g.lc.company_name || '—'}
-                            </td>
-                            <td className="px-3 py-2.5 text-right font-bold tabular-nums text-slate-800 dark:text-slate-100">
-                              ${formatNumber(g.lc.total_value || 0)}{' '}
-                              <span className="font-normal text-slate-400">PI total (visible)</span>
-                            </td>
-                            <td className="px-3 py-2.5">
-                              <Badge variant={STAGE_BADGE[g.lc.stage] || 'default'}>
-                                {STAGE_LABELS[g.lc.stage] || g.lc.stage}
-                              </Badge>
-                            </td>
-                            <td className="px-3 py-2.5 text-slate-500 dark:text-slate-400">
-                              {formatDate(g.lc.lc_date)}
-                            </td>
-                          </tr>
-                          {g.pis.map((s) => saleRow(s, true))}
-                        </Fragment>
-                      );
-                      if (groups.length === 0) return visibleSales.map((s) => saleRow(s));
-                      // Preserve input order: interleave groups/unlinked by
-                      // first appearance index, not groups-then-unlinked.
-                      const byKey = new Map(groups.map((g) => [g.key, g]));
-                      const unlinkedIds = new Set(unlinked.map((s) => s.id));
-                      const emitted = new Set();
-                      const ordered = [];
-                      for (const s of visibleSales) {
-                        if (unlinkedIds.has(s.id)) {
-                          ordered.push(saleRow(s));
-                          continue;
-                        }
-                        const g = [...byKey.values()].find((grp) =>
-                          grp.pis.some((p) => p.id === s.id)
-                        );
-                        if (g && !emitted.has(g.key)) {
-                          emitted.add(g.key);
-                          ordered.push(lcRow(g));
-                        }
-                      }
-                      // Any groups whose PIs were absent from visibleSales
-                      // (should not happen) still render to avoid data loss.
-                      for (const g of groups) {
-                        if (!emitted.has(g.key)) ordered.push(lcRow(g));
-                      }
-                      return <>{ordered}</>;
-                    })()}
+                            )}
+                          </span>
+                        </td>
+                        <td className="px-3 py-2.5 text-slate-500 dark:text-slate-400">
+                          {formatDate(s.pi_date)}
+                        </td>
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
               </div>
