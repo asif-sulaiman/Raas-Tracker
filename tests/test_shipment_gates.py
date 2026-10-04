@@ -223,10 +223,43 @@ def test_direct_jump_from_lc_received_to_payment_due_requires_both_gates(admin_c
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
 
-    # No invoice, no recipe, no run: both barriers fail.
+    # No invoice, no recipe, no run: invoice barrier blocks first.
     r = admin_client.post(f"/api/lcs/{lc['id']}/move",
                           json={"new_stage": "payment_due"})
     assert r.status_code == 409, r.get_json()
     body = r.get_json()
     missing = body["missing"]
     assert any("invoices" in str(m).lower() for m in missing)
+
+
+def test_readiness_endpoint_reports_barrier_state(admin_client, db):
+    tag = _tag()
+    co = _company(db, f"G8 {tag}")
+    lc = _mk_lc(admin_client, co, f"LC-G8-{tag}")
+    product = f"G8Prod-{tag}"
+    sid = _sale(db, f"PI-G8-{tag}", company_id=co, product=product)
+    assert admin_client.post(
+        f"/api/lcs/{lc['id']}/pis",
+        json={"sale_ids": [sid]}).status_code == 200
+
+    # Nothing yet: invoices_ok False, both production checks vacuous-truth.
+    r = admin_client.get(f"/api/lcs/{lc['id']}/readiness")
+    assert r.status_code == 200, r.get_json()
+    out = r.get_json()
+    assert out["invoices_ok"] is False
+    assert out["recipes_ok"] is True
+    assert out["produced_ok"] is True
+    assert out["pis"][0]["id"] == sid
+    # The invoice-draft view exposes the PI's remaining lines.
+    drafts = out["invoice_drafts"]
+    assert drafts[0]["sale_id"] == sid
+    assert drafts[0]["items"][0]["product_name"] == product
+    assert drafts[0]["items"][0]["remaining"] == pytest.approx(10)
+
+    # After invoicing, the invoice barrier clears and the draft empties.
+    create_invoice(db, sid, f"INV-G8-{tag}")
+    out = admin_client.get(f"/api/lcs/{lc['id']}/readiness").get_json()
+    assert out["invoices_ok"] is True
+    # Seeded invoice consumed the remaining qty, so the draft is empty now.
+    assert admin_client.get(
+        f"/api/lcs/{lc['id']}/readiness").get_json()["invoice_drafts"][0]["items"] == []

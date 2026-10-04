@@ -2995,6 +2995,56 @@ def api_get_lc(lc_id):
     return jsonify(lc)
 
 
+@app.route("/api/lcs/<int:lc_id>/readiness")
+def api_lc_readiness(lc_id):
+    """Barrier state for the LC, so the UI can render the right form before
+    attempting the move. Read-only; never mutates."""
+    conn = get_db()
+    try:
+        lc = get_lc(conn, lc_id)
+        if not lc:
+            conn.close()
+            return jsonify({"error": "LC not found"}), 404
+        try:
+            readiness = check_lc_shipment_ready(conn, lc_id)
+        except LookupError as e:
+            conn.close()
+            return jsonify({"error": str(e)}), 404
+        sale_ids = [p["id"] for p in (lc.get("pis") or [])]
+        drafts = []
+        for sid in sale_ids:
+            rows = conn.execute(
+                """SELECT si.id, si.product_name, si.unit, si.unit_price,
+                          (si.quantity::numeric
+                           - COALESCE((SELECT SUM(ii.quantity)::numeric
+                                        FROM invoice_items ii
+                                       WHERE ii.sale_item_id = si.id), 0)) AS remaining
+                     FROM sale_items si WHERE si.sale_id = %s ORDER BY si.id""",
+                (sid,)).fetchall()
+            drafts.append({
+                "sale_id": sid,
+                "items": [
+                    {"sale_item_id": r[0], "product_name": r[1], "unit": r[2],
+                     "unit_price": float(r[3] or 0),
+                     "remaining": float(r[4]) if r[4] is not None else 0.0}
+                    for r in rows if r[4] is None or float(r[4]) > 0
+                ],
+            })
+    finally:
+        conn.close()
+    return jsonify({
+        "lc_id": lc_id,
+        "stage": lc.get("stage"),
+        "invoices_ok": readiness.get("invoices_ok"),
+        "recipes_ok": readiness.get("recipes_ok"),
+        "produced_ok": readiness.get("produced_ok"),
+        "detail": readiness.get("detail"),
+        "pis": [{"id": p["id"], "pi_number": p.get("pi_number"), "stage": p.get("stage")}
+                for p in (lc.get("pis") or [])],
+        "invoice_drafts": drafts,
+    })
+
+
 @app.route("/api/lcs/<int:lc_id>", methods=["PUT"])
 @admin_required
 @limiter.limit("15 per minute")
