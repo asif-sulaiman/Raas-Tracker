@@ -11,6 +11,8 @@ import UploadPI from '../components/sales/UploadPI';
 import ReviewModal from '../components/sales/ReviewModal';
 import PaymentModal from '../components/sales/PaymentModal';
 import SaleDetailModal from '../components/sales/SaleDetailModal';
+import InvoicesRequiredModal from '../components/sales/InvoicesRequiredModal';
+import ProductionRequiredModal from '../components/sales/ProductionRequiredModal';
 import { STAGES, groupSalesByLc, lcGroupKey, nextStageFor } from '../utils/sales';
 import { formatNumber, toCents, fromCents } from '../utils/format';
 import { useAuth } from '../context/AuthContext';
@@ -47,6 +49,13 @@ export default function Sales() {
   const [query, setQuery] = useState('');
   const [page, setPage] = useState(1);
   const [totalSales, setTotalSales] = useState(0);
+
+  // Barrier modals
+  const [showInvoicesRequired, setShowInvoicesRequired] = useState(false);
+  const [showProductionRequired, setShowProductionRequired] = useState(false);
+  const [barrierLcId, setBarrierLcId] = useState(null);
+  const [barrierSaleId, setBarrierSaleId] = useState(null);
+  const [barrierDetail, setBarrierDetail] = useState(null);
   const pageSize = 50;
 
   const abortRef = useRef(null);
@@ -202,17 +211,17 @@ export default function Sales() {
             : null;
       if (blocked) {
         if (blocked.barrier === 'invoices') {
-          toast.error('Cannot start shipment: at least one invoice is required.');
+          setBarrierLcId(lc.id);
+          setBarrierSaleId(null);
+          setBarrierDetail(blocked.detail || {});
+          setShowInvoicesRequired(true);
         } else if (blocked.barrier === 'production') {
-          const missing = [
-            ...(blocked.detail?.missing_recipes || []),
-            ...(blocked.detail?.missing_production || []),
-          ].filter(Boolean);
-          toast.error(
-            `Cannot move to payment due: ${missing.length ? missing.join(', ') : 'recipe/production required'}`
-          );
-        } else {
-          toast.error('Blocked by a shipment prerequisite.');
+          setBarrierLcId(lc.id);
+          setBarrierSaleId(null);
+          setBarrierDetail(blocked.detail || {});
+          setShowProductionRequired(true);
+        } else if (blocked.barrier === 'error') {
+          toast.error(blocked.message);
         }
         return;
       }
@@ -572,6 +581,37 @@ export default function Sales() {
         onViewPI={(pi) => {
           setLcDetailId(null);
           setDetailSaleId(pi.id);
+        }}
+      />
+
+      <InvoicesRequiredModal
+        isOpen={showInvoicesRequired}
+        onClose={() => {
+          setShowInvoicesRequired(false);
+          setBarrierLcId(null);
+          setBarrierSaleId(null);
+          setBarrierDetail({});
+        }}
+        lcId={barrierLcId}
+        saleId={barrierSaleId}
+        onSuccess={() => {
+          fetchData();
+        }}
+      />
+
+      <ProductionRequiredModal
+        isOpen={showProductionRequired}
+        onClose={() => {
+          setShowProductionRequired(false);
+          setBarrierLcId(null);
+          setBarrierSaleId(null);
+          setBarrierDetail({});
+        }}
+        lcId={barrierLcId}
+        saleId={barrierSaleId}
+        missingDetail={barrierDetail}
+        onSuccess={() => {
+          fetchData();
         }}
       />
     </div>
