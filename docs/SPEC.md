@@ -569,7 +569,8 @@ CREATE TABLE app_settings (
 | DELETE | `/api/lcs/<id>` | Admin (15/min) | Delete — **409 while PIs are attached** (locked count + FK backstop) |
 | POST | `/api/lcs/<id>/pis` | Admin (15/min) | Attach `{sale_ids:[...]}` — every PI must share the LC's company (400 otherwise); mirrors `lc_number`/`lc_date` onto the PIs |
 | DELETE | `/api/lcs/<id>/pis/<sale_id>` | Admin (15/min) | Detach one PI (clears `lc_id` + mirrors) |
-| POST | `/api/lcs/<id>/move` | Admin (15/min) | Move the LC stage; **gated** — crossing into (or over) `shipment_ongoing` is refused 409 with `missing`, `recipes_ok`, `invoices_ok` until a recipe exists for every PI product AND ≥1 invoice exists. Propagates the stage to every linked PI in one transaction |
+| POST | `/api/lcs/<id>/move` | Admin (15/min) | Move the LC stage; **two barriers** — crossing into `shipment_ongoing` requires **≥1 invoice** (recipes no longer required here); crossing into `payment_due` requires **every invoiced product to have a company recipe AND an invoice-linked production run**. Both barriers enforced under row locks; stage propagated to all child PIs in one transaction |
+| GET | `/api/lcs/<id>/readiness` | Session/Key | Readiness snapshot — `invoices_ok`, `recipes_ok`, `produced_ok`, `detail` with per-PI remaining uninvoiced lines, `missing_recipes`, `missing_production` |
 
 ### Invoice Lines
 | Method | Path | Auth | Description |
@@ -582,6 +583,7 @@ CREATE TABLE app_settings (
 |---|---|---|---|
 | GET | `/api/sales/<id>/invoices` | Session/Key | List invoices with `amount` + `paid_amount` each |
 | POST | `/api/sales/<id>/invoices` | Admin | Create (`invoice_number` only — **no `amount` is accepted**). Money is derived: `amount` = PI total − what the invoice lines already carry, one `invoice_items` line is seeded per remaining uninvoiced PI line, then the header is restated in SQL as `SUM(invoice_items.line_total)` so header == lines by construction. A stated `amount` in the body is ignored, never honoured (400 on duplicate number); sets sale `shipment_status='production_running'` (COALESCE, never downgrades) |
+| POST | `/api/sales/<id>/invoices/batch` | Admin (15/min) | Create N invoices in ONE transaction: body `{invoices:[{invoice_number, lines:[{sale_item_id, quantity}]}]}` — each invoice gets ≥1 line; per `sale_item` the sum of quantities across the batch must not exceed the remaining uninvoiced quantity; headers restated as `SUM(line_total)`; atomic (one commit or full rollback) |
 | POST | `/api/sales/<id>/invoices/<iid>/book` | Admin | Book (`approx_ship_date` required) → `booked`; sale → `ship_booked` (advance-only CASE) |
 | POST | `/api/sales/<id>/invoices/<iid>/ship` | Admin | Ship (`actual_ship_date` required) → `shipped` + creates a `shipments` row |
 | POST | `/api/sales/<id>/invoices/<iid>/pay` | Admin | Record payment (`payment_amount>0`, `payment_date`); flips invoice to `paid` when covered |
@@ -604,11 +606,19 @@ CREATE TABLE app_settings (
 - **Auto-advances (all advance-only; `paid` is terminal — book/ship/produce can never downgrade it):**
   - invoice create → sale `shipment_status = 'production_running'` (`COALESCE`, never overwrites a later value)
   - production run linked to invoices → those invoices `'produced'` (guarded `status <> 'paid'`) + sale `'production_done'` (CASE: only from NULL/`production_running`)
-  - book (requires `approx_ship_date`) → `'booked'`; sale → `'ship_booked'` (CASE: only from NULL/`production_running`/`production_done`)
+  - book (requires `approx_ship_date`) → `'booked'`; sale → `'ship_booked'` (advance-only CASE)
   - ship (requires `actual_ship_date`) → `'shipped'` + `shipments` row
   - pay → `'paid'` when `paid_amount >= amount`; `amount = 0` → `paid` at creation; `amount IS NULL` (legacy) → any payment marks it paid
 - **Sale `shipment_status` sub-steps** (surfaced as SaleCard badges in `shipment_ongoing`): `production_running` → `production_done` → `ship_booked`.
 - **Stage hook:** `lc_received → shipment_ongoing` sets `shipment_status = 'production_running'`; the frontend shows a non-blocking warning toast when the sale has 0 invoices.
+- **LC Stage Gates:**
+  - **Barrier 1 (`lc_received → shipment_ongoing`):** requires **≥1 invoice** on the LC. Recipes are no longer required at this stage.
+  - **Barrier 2 (`shipment_ongoing → payment_due`):** requires that **every distinct `invoice_items.product_name` across the LC's invoices** has (a) a company recipe, **and** (b) an invoice-linked production run (`production_run_links.invoice_id` points to one of that sale's invoices).
+  - **Readiness endpoint:** `GET /api/lcs/<id>/readiness` returns `{invoices_ok, recipes_ok, produced_ok, detail{missing_recipes, missing_production, per-PI remaining lines}}` so the UI can render the correct form before the user attempts a move.
+- **New invariant:** a sale cannot advance to `lc_received` (or beyond) while its `lc_id` is NULL — the move is refused until an LC is attached.
+
+### Readiness Endpoint
+- `GET /api/lcs/<id>/readiness` — Session/Key; returns `{invoices_ok, recipes_ok, produced_ok, detail:{missing_recipes, missing_production, per-PI remaining lines}}` so the UI can render the correct barrier form before the user attempts a move.
 
 ## 5. Authentication & Authorization
 

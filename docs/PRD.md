@@ -74,8 +74,9 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 ### Flow 3: Sales Pipeline Advance (LC-driven)
 1. `pi_issued` → **Link PIs to LC** (the LC record carries the number, dates, bank ref) → the LC and all its PIs move to `lc_received`
 2. `lc_received` → **invoices are created on the LC's PIs** (see Flow 6 — invoice lines carry per-product quantities)
-3. `lc_received → shipment_ongoing` is **gated**: refused unless a recipe exists for every PI product **and** at least one invoice exists. The refusal names each missing precondition. Jumping over `shipment_ongoing` is gated too
-4. `shipment_ongoing` → payments recorded per invoice (falling back to per PI) → balance 0 → `completed`
+3. `lc_received → shipment_ongoing` is **gated**: refused unless **at least one invoice exists** on the LC. Recipe requirements have been removed from this gate. The refusal names the missing invoice count.
+4. `shipment_ongoing → payment_due` is **gated**: refused unless **every distinct product in the LC's invoice lines** has a corresponding company recipe **and** an invoice-linked production run (a production run linked via `production_run_links.invoice_id` to one of that sale's invoices, with a recipe matching the product). The refusal names each missing product's missing recipe or missing production run.
+5. `shipment_ongoing` → payments recorded per invoice (falling back to per PI) → balance 0 → `completed`
 5. All PIs under one LC progress together — the pipeline board shows one LC card with its PIs nested
 
 ### Flow 4: Recipe/Production Reports
@@ -92,9 +93,10 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 1. An invoice is created against a PI (existing or new number). Its **lines** carry the product, the invoiced quantity, the unit price and the line total. Quantity is **free relative to the PI**: it may be the full PI quantity, less than it, or split across several invoices. Unit price is inherited from the PI line and enforced server-side — the client cannot set it
 2. Because quantity may differ per invoice, a product can be partly shipped and the remainder abandoned. Nothing records "abandoned": a quantity that was never invoiced simply never becomes due
 3. The invoice's money is **always derived**, never typed: `amount` = the PI total minus what the invoice lines already carry, and the invoice is seeded with one line per remaining uninvoiced PI line before its header is restated as the sum of those lines. So `invoices.amount` always equals the sum of its lines, and every invoice reads correctly on the commercial report. A typed amount is not accepted — a header carrying money no line backs is invisible to the report, which showed a real receivable as "Paid" and dropped it from gross sales. To invoice less than the remainder, create the invoice and then adjust its lines
-4. Recipes → detail → **Go for Production** → company → sale/PI → invoice → material number (auto-filled from item no.), packing, batch, date, quantity, optional multi-recipe rows → production run created and linked
-5. Linked invoices advance `planned → produced`; pipeline card shows the shipment sub-step badge (Production running → Production done → Ship booked)
-6. Per invoice: **Book** (approx. ship date) → `booked`; **Ship** (actual date) → `shipped` + shipment record; **Pay** → `paid` once payments cover the amount — `paid` never reverts
+4. **Multi-invoice creation:** Use `POST /api/sales/<id>/invoices/batch` to create N invoices in one atomic transaction. Body: `{invoices:[{invoice_number, lines:[{sale_item_id, quantity}]}]}`. Each invoice gets ≥1 line; per `sale_item` the sum of quantities across the batch must not exceed the remaining uninvoiced quantity; headers are restated as `SUM(invoice_items.line_total)`; atomic (one commit or full rollback)
+5. Recipes → detail → **Go for Production** → company → sale/PI → invoice → material number (auto-filled from item no.), packing, batch, date, quantity, optional multi-recipe rows → production run created and linked
+6. Linked invoices advance `planned → produced`; pipeline card shows the shipment sub-step badge (Production running → Production done → Ship booked)
+7. Per invoice: **Book** (approx. ship date) → `booked`; **Ship** (actual date) → `shipped` + shipment record; **Pay** → `paid` once payments cover the amount — `paid` never reverts
 
 ### Flow 7: Commercial Report (invoice-driven)
 - One row per **PI line** (unchanged grain), same columns as before
