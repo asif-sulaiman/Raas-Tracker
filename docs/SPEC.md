@@ -529,6 +529,39 @@ CREATE TABLE app_settings (
 | GET | `/api/notifications` | Session | User's notifications + unread count |
 | POST | `/api/notifications/read` | Session | Mark read (ids or all) |
 
+#### Audit identity (who is recorded in `audit_logs.user_id`)
+
+Labels are deliberately distinct so an unauthenticated action can never be
+mistaken for a trusted background job:
+
+| Label | Meaning |
+|---|---|
+| `<username>` | Verified human session |
+| `api-key:<name>` | Verified API key |
+| `anonymous` | No verified credential — any path in `_PUBLIC_API` (`/api/auth/login`, `/api/auth/setup`, `/api/auth/logout`, `/api/auth/status`, `/api/auth/forgot-password`, `/api/auth/reset-password`, `/api/cron/maturity-check`) **and** every rejected request (401/403/429, retired `X-API-Token`) |
+| `cron` | The maturity-check scheduled job |
+| `system` | No request context at all (CLI/seed/background work) |
+
+Determinism rules:
+
+- `_gate_api` stamps `anonymous` at the **start** of every `/api` request, so a
+  public or rejected request can never inherit the previous request's identity
+  from the worker thread. Only after authentication succeeds is it replaced by
+  the verified actor.
+- A `teardown_request` hook clears the thread-local, so waitress's thread pool
+  carries no identity between requests.
+- `log_audit_action`'s `atomic` default stays `True` (each caller commits);
+  multi-statement mutations pass `atomic=False` and commit once at the end.
+
+#### Audit `ip_address`
+
+- Defaults to the live request's `remote_addr` for every call site, so no
+  endpoint has to opt in. A caller-supplied `ip_address` always wins —
+  `ADJUST_STOCK` passes the operator's free-text reason there by design.
+- `remote_addr` is rewritten by `ProxyFix(x_for=1)` from the rightmost
+  `X-Forwarded-For` entry, so audit IPs are evidence, not proof: a client that
+  sends the header itself influences the recorded value.
+
 ### Reference Data
 | Method | Path | Auth | Description |
 |---|---|---|---|
@@ -733,6 +766,8 @@ CREATE TABLE app_settings (
 | **Frontend build output in git?** | `react_frontend/` gitignored; Vercel buildCommand builds → `public/`. |
 | **Session cookie domain** | Same-site only; cross-origin use `CORS_ALLOWED_ORIGINS` + API key. |
 | **Database clock vs app clock** | Use `clock_timestamp()` + `make_interval` (DB clock authoritative). |
+| **`ProxyFix(x_for=1)` trusts one `X-Forwarded-For` hop unconditionally (P1, open)** | `remote_addr` is client-influenceable when the app is reached directly (the container publishes its port), and that value gates the API-key IP allowlist (`auth.py:_ip_allowed`) and login lockout-by-IP. Not exploitable when a trusted platform proxy appends to the header. Fix is `x_for=0` or gating header trust on a `TRUSTED_PROXY` env var — tracked, not yet applied. |
+| **`audit_logs.ip_address` column is overloaded** | Holds a real IP for most actions, but operator free-text reasons for `ADJUST_STOCK` (`stock.py`) and a client-influenceable value via ProxyFix. Schema-safe (`TEXT`, rendered as escaped JSX), but do not treat the column as a validated IP field. |
 
 ---
 

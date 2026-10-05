@@ -79,6 +79,30 @@ Vertical slices, each independently testable.
 
 ---
 
+## 🔐 Phase P0: Audit Attribution Hardening (Completed 2026-10-06)
+
+Fixes audit-trail defects found by a read-only security review.
+
+| Task | Description | Files Touched | Acceptance |
+|---|---|---|---|
+| P0-1 ✓ | **Actor no longer leaks across requests** — `_gate_api` seeds `anonymous` at the *top* of every `/api` request (before the retired-token branch) and a `teardown_request` hook clears the thread-local. Pre-fix a public `forgot-password` recorded `user_id='admin'` (the last authenticated user on that waitress thread) | `flask_app.py`, `raas_tracker/audit.py` | Public/rejected writes record `anonymous`, never a prior user |
+| P0-2 ✓ | **Audit `ip_address` populated** — defaults to the request's `remote_addr` for all 62 call sites; a caller-supplied value still wins (`ADJUST_STOCK` reason) | `raas_tracker/audit.py` | Mutating rows carry an IP; no per-call-site opt-in needed |
+| P0-3 ✓ | **Distinct actor labels** — `username` / `api-key:<name>` / `anonymous` / `cron` / `system`; `_actor()` falls back to `anonymous`, never `system` | `flask_app.py`, `raas_tracker/audit.py` | A verified write can never be downgraded to `anonymous` |
+| P0-4 ✓ | **Maturity cron audited** — `CRON_MATURITY_CHECK` row with `checked`/`notified`; was the one mutating route with no audit trail | `flask_app.py` | Every cron run leaves a row attributed to `cron` |
+| P0-5 ✓ | **Conn-leak fix in the audited legacy-token path** — `conn.close()` in a `finally`; previously skipped whenever the INSERT failed | `flask_app.py` | No pooled connection lost per rejected request |
+
+**P1 backlog (identified, not started):**
+
+| Task | Description |
+|---|---|
+| P1-a | `ProxyFix(x_for=1)` trusts one `X-Forwarded-For` hop unconditionally; that `remote_addr` gates the API-key IP allowlist and login lockout-by-IP. Fix = `x_for=0` or gate on `TRUSTED_PROXY`. Recorded in SPEC §9 |
+| P1-b | `audit_logs.ip_address` is overloaded (real IP / operator reason / spoofable value); consider a separate `reason` column |
+| P1-c | No concurrent regression test — the suite is single-threaded, so the `threading.local` bug class is only covered sequentially. Add a threaded `Barrier` test, and revisit if the app ever moves to gevent |
+| P1-d | API keys can reach **no** audited mutation (every audited entity is `@admin_required`), so the `api-key:<name>` label is currently unreachable in practice |
+| P1-e | `atomic=True` default: 8 of 62 sites pass `atomic=False`; review the other ~54 for ghost audit rows that survive a rollback |
+
+---
+
 ## 🚀 Phase M9: Sales–Production–Live Epic (Current)
 
 Locked: USD only · admin-only financials/history/mutations · partial shipments real ·

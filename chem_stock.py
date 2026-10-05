@@ -15,9 +15,13 @@ from raas_tracker.db import (
 )
 
 from raas_tracker.audit import (
-    _audit_state,
+    ANONYMOUS_ACTOR,
+    CRON_ACTOR,
+    clear_audit_actor,
+    get_audit_actor,
     get_audit_logs,
     log_audit_action,
+    request_ip,
     set_audit_actor,
 )
 

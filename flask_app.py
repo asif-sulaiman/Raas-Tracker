@@ -91,6 +91,7 @@ from chem_stock import (get_session_user, validate_api_key,
                         revoke_user_sessions, cleanup_expired_sessions,
                         record_login_attempt, is_login_blocked, create_api_key,
                         list_api_keys, revoke_api_key, set_audit_actor,
+                        ANONYMOUS_ACTOR, CRON_ACTOR, clear_audit_actor,
                         create_first_admin, ensure_setup_token, check_setup_token,
                         log_audit_action, check_api_key_rate_limit, record_api_key_hit,
                         set_password, issue_reset_token, redeem_reset_token)
@@ -158,11 +159,16 @@ def _resolve_identity():
 
 
 def _actor() -> str:
-    """Audit actor string: username for humans, api-key:<name> for scripts."""
+    """Audit actor string: username for humans, api-key:<name> for scripts.
+
+    Falls back to ``anonymous`` rather than ``system``: this runs only on
+    authenticated requests, so an identity without a username is a gap in
+    attribution and must not look like a trusted background job.
+    """
     ident = getattr(g, "current_identity", None) or {}
     if ident.get("type") == "api-key":
         return f"api-key:{ident.get('name')}"
-    return ident.get("username", "system")
+    return ident.get("username") or ANONYMOUS_ACTOR
 
 
 @app.before_request
@@ -174,13 +180,23 @@ def _gate_api():
         # automatic OPTIONS response plus after_request ACA headers
         # complete it for allowed origins.
         return None
+    # Every /api request starts from a deterministic actor. Without this, a
+    # public route or a rejected request writes audit rows carrying whatever
+    # username last used this worker thread, mis-attributing security events
+    # (password resets, rejected tokens) to an unrelated user.
+    set_audit_actor(ANONYMOUS_ACTOR)
     # Audited rejection of retired X-API-Token header — checked before everything.
     if request.headers.get("X-API-Token"):
         try:
             conn = get_db()
-            log_audit_action(conn, "LEGACY_TOKEN_USED", request.path,
-                             new_value=f"ip={request.remote_addr}")
-            conn.close()
+            try:
+                log_audit_action(conn, "LEGACY_TOKEN_USED", request.path,
+                                 new_value=f"ip={request.remote_addr}")
+            finally:
+                # Always return the connection: the previous single try/except
+                # skipped close() whenever the INSERT failed, leaking one
+                # pooled connection per rejected request.
+                conn.close()
         except Exception:
             pass
         return jsonify({
@@ -216,12 +232,21 @@ def _gate_api():
         }:
             return jsonify({"error": "password change required"}), 403
     g.current_identity = ident
-    # U1.7: thread-local audit actor for this request's thread.
-    try:
-        set_audit_actor(_actor())
-    except Exception:
-        pass
+    # U1.7: thread-local audit actor for this request's thread. The verified
+    # identity replaces the anonymous seed set above. No try/except: a failure
+    # here must not silently downgrade attribution to anonymous.
+    set_audit_actor(_actor())
     return None
+
+
+@app.teardown_request
+def _clear_audit_actor(_exc):
+    """Drop the thread's audit actor once the request is done.
+
+    waitress serves from a fixed thread pool, so without this the identity of
+    the last request handled by a thread leaks into the next one.
+    """
+    clear_audit_actor()
 
 
 # ==================== SECURITY: HEADERS, CORS, HTTPS ====================
@@ -2756,6 +2781,8 @@ def api_cron_maturity_check():
         return jsonify({"error": "CRON_SECRET not configured"}), 500
     if auth_header != f"Bearer {cron_secret}":
         return jsonify({"error": "unauthorized"}), 401
+    # Label this thread's audit rows as the scheduled job, not anonymous.
+    set_audit_actor(CRON_ACTOR)
     
     conn = get_db()
     try:
@@ -2791,6 +2818,10 @@ def api_cron_maturity_check():
                 if mat <= today - timedelta(days=7):
                     notify_maturity_escalation(conn, sale_id, client_name, maturity_date, (today - mat).days)
                     notified += 1
+        # This endpoint was the one mutating route that wrote no audit row, so
+        # a run (or a silent no-op) left no trace. atomic=True commits here.
+        log_audit_action(conn, "CRON_MATURITY_CHECK", "cron", None,
+                         new_value=f"checked={len(rows)} notified={notified}")
         return jsonify({"success": True, "checked": len(rows), "notified": notified})
     except Exception as e:
         app.logger.exception("cron maturity check failed")

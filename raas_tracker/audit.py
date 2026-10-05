@@ -9,17 +9,59 @@ from typing import Optional, List, Dict, Any, Union
 
 import threading as _threading
 
+from flask import has_request_context, request
+
 
 _audit_state = _threading.local()
+
+# Actor labels written to audit_logs.user_id.
+SYSTEM_ACTOR = "system"
+# A write made without a verified credential (public route, rejected request).
+# Deliberately distinct from SYSTEM_ACTOR so an unauthenticated action can
+# never be mistaken for a trusted background job.
+ANONYMOUS_ACTOR = "anonymous"
+# The scheduled maturity-check job, set by its route handler.
+CRON_ACTOR = "cron"
+
+_MAX_IP_LEN = 45  # longest sane IPv6 text form, with room for a scope id
 
 
 def set_audit_actor(name: Optional[str]) -> None:
     """Set the acting user for the current thread (called per request by Flask)."""
-    _audit_state.name = name or "system"
+    _audit_state.name = name or ANONYMOUS_ACTOR
+
+
+def clear_audit_actor() -> None:
+    """Drop this thread's actor.
+
+    Called at request teardown: waitress serves from a thread pool, so without
+    this a thread keeps the identity of the request it last handled and stamps
+    it onto the next, unauthenticated one.
+    """
+    _audit_state.name = None
+
+
+def get_audit_actor() -> str:
+    """This thread's actor, or ``system`` for work with no request context."""
+    return getattr(_audit_state, "name", None) or SYSTEM_ACTOR
+
+
+def request_ip() -> Optional[str]:
+    """Client IP for an audit row, or None when there is no request context.
+
+    This is ``request.remote_addr``, which ``ProxyFix(x_for=1)`` (flask_app.py)
+    rewrites from the rightmost ``X-Forwarded-For`` entry. That entry is the
+    real client only when a trusted proxy actually appends it: a client that
+    reaches the app directly can supply the header itself. Audit IPs are
+    therefore evidence, not proof — see the ProxyFix trust item in Risks.
+    """
+    if not has_request_context():
+        return None
+    return (request.remote_addr or "").strip()[:_MAX_IP_LEN] or None
 
 
 def log_audit_action(conn: psycopg.Connection, action: str, entity_type: str = None,
-                     entity_id: int = None, user_id: str = "system",
+                     entity_id: int = None, user_id: Optional[str] = None,
                      old_value: str = None, new_value: str = None,
                      ip_address: str = None, atomic: bool = True) -> int:
     """Log an audit action.
@@ -42,8 +84,12 @@ def log_audit_action(conn: psycopg.Connection, action: str, entity_type: str = N
     Returns:
         Log ID
     """
-    if user_id == "system":
-        user_id = getattr(_audit_state, "name", "system")
+    if user_id is None:
+        user_id = get_audit_actor()
+    if ip_address is None:
+        # Default the IP from the live request so every call site is covered.
+        # A caller-supplied value (e.g. ADJUST_STOCK's free-text reason) wins.
+        ip_address = request_ip()
     cursor = conn.execute(
         """INSERT INTO audit_logs (action, entity_type, entity_id, user_id, old_value, new_value, ip_address)
            VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
