@@ -75,7 +75,8 @@ Without Redis, rate limits are per-process only — not shared across workers.
 The app is stateless (all state in Postgres) and PaaS-ready. Set these env
 vars on your host: `DATABASE_URL` (Supabase session-pooler URI),
 `RAAS_SECRET` (generate: `python -c "import secrets; print(secrets.token_urlsafe(64))"`),
-`PRODUCTION=1`, `FORCE_HTTPS=1`, `COOKIE_SECURE=1`, and start with:
+`PRODUCTION=1`, `FORCE_HTTPS=1`, `COOKIE_SECURE=1`, `TRUSTED_PROXY=1`, and start
+with:
 
 ```bash
 pip install -r requirements.txt
@@ -84,6 +85,23 @@ waitress-serve --host=0.0.0.0 --port=$PORT --threads=4 wsgi:app
 
 (`$PORT` is provided by the host; default `5000` locally.) Behind a TLS
 proxy, HTTPS redirect and secure cookies are on by default (`COOKIE_SECURE=1`).
+
+**`TRUSTED_PROXY=1` is required whenever a proxy sits in front of the app**
+(Vercel, Cloudflare, nginx). It tells the app to read the client IP from
+`X-Forwarded-For`; that IP is what gates the API-key IP allowlist, login
+lockout-by-IP and the IP-keyed rate limits.
+
+Leaving it **unset** behind a proxy is a real outage, not a silent degradation:
+the header is ignored, so every request looks like it came from the same
+address. `is_login_blocked` counts failures per username *or* per IP, so five
+failed logins from anyone would lock every user out for 10 minutes, and
+`forgot-password` would be capped at 5/min for the whole application. The app
+prints its resolved setting at startup so you can confirm which mode it is in.
+
+Conversely, do **not** set it when anything can reach the app directly: the
+header is client-supplied, and trusting it lets a caller forge its own IP and
+bypass all three controls. `docker-compose.yml` therefore binds
+`127.0.0.1:5000` so only a co-located proxy can reach it.
 
 Docker files (`Dockerfile`, `docker-compose.yml`) are retained for future
 use; the current path is online hosting against Supabase (no DB container).
