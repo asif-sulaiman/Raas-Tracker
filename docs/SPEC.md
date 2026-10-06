@@ -589,6 +589,12 @@ future call sites are covered without opting in:
 - `entity_type` must stay a **type name** — it is indexed and filtered on.
   Attacker-controlled text (a request path, a filename) goes in `new_value`.
   Server-side paths (`pi_file_path`) are excluded from the snapshot entirely.
+- Some actions record **field names rather than values** when the value is
+  sensitive. `COMPANY_UPDATE` writes `changed=swift,lc_bank`: `swift`,
+  `lc_bank`, `address` and `contact_person` hold bank and contact data, so
+  keeping them out of `audit_logs` is deliberate. A company *name* keeps its
+  before/after because a name is an identifier, not PII. The field list is
+  written **before** any free text so truncation can never clip it.
 
 ### Reference Data
 | Method | Path | Auth | Description |

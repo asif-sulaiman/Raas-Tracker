@@ -8,6 +8,11 @@ from .audit import log_audit_action
 _FIELDS = ("name", "code", "country", "address", "contact_person",
            "swift", "lc_bank")
 
+# Derived from _FIELDS, never a hand-copied list: P1-4 audit coverage depends
+# on this tuple matching _FIELDS, so a newly added column must not be able to
+# skip auditing by being forgotten here.
+_PATCH_FIELDS = tuple(f for f in _FIELDS if f != "name")
+
 
 def _row_to_dict(row: Any) -> Dict[str, Any]:
     return {
@@ -63,8 +68,7 @@ def update_company(conn: psycopg.Connection, cid: int,
     if not current:
         return None
     updates = {}
-    for key in ("code", "country", "address", "contact_person", "swift",
-                "lc_bank"):
+    for key in _PATCH_FIELDS:
         if key in fields:
             updates[key] = fields[key] or None
     if "name" in fields:
@@ -83,9 +87,28 @@ def update_company(conn: psycopg.Connection, cid: int,
                 ", ".join(f"{k} = %s" for k in updates)),
             (*updates.values(), cid))
         conn.commit()
-    if "name" in updates and updates["name"] != current["name"]:
+    # Audit every genuine change, not just a rename (P1-4). Previously the
+    # row was gated on a name change, so moving swift/lc_bank/address/
+    # contact_person/code/country left no trace at all.
+    #
+    # Non-name values are deliberately NOT recorded: those columns hold bank
+    # and contact data, and keeping them out of audit_logs is a property worth
+    # preserving. The field NAMES are the evidence. A name keeps its
+    # before/after because a company name is an identifier, not PII.
+    changed = sorted(k for k, v in updates.items() if current.get(k) != v)
+    if changed:
+        name_moved = "name" in changed
+        extras = [k for k in changed if k != "name"]
+        # Field list FIRST: `new_value` is capped at 2000 chars and a company
+        # name has no length limit, so with the name appended last, truncation
+        # could eat the list of what changed — the actual evidence.
+        new_value = ("changed=" + ",".join(extras)) if extras else None
+        if name_moved:
+            new_value = (f"{new_value} ({updates['name']})" if new_value
+                         else updates["name"])
         log_audit_action(conn, "COMPANY_UPDATE", "company", cid,
-                         old_value=current["name"], new_value=updates["name"])
+                         old_value=current["name"] if name_moved else None,
+                         new_value=new_value)
     return True
 
 
