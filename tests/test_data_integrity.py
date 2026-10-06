@@ -208,12 +208,12 @@ def test_proxyfix_remote_addr(client):
     
     assert found_proxy_fix, "ProxyFix middleware not found in WSGI chain"
     
-    # Verify configuration by checking the ProxyFix object's attributes
-    # Find the ProxyFix instance again to check its config
+# Verify configuration by checking the ProxyFix object's attributes.
+    # `x_for` is deliberately NOT asserted here: P1-7 gates header trust on
+    # TRUSTED_PROXY, and both states are asserted in tests/test_proxy_trust.py.
     wsgi_app = app.wsgi_app
     while hasattr(wsgi_app, 'app'):
         if isinstance(wsgi_app, ProxyFix):
-            assert wsgi_app.x_for == 1
             assert wsgi_app.x_proto == 1
             assert wsgi_app.x_host == 1
             assert wsgi_app.x_prefix == 1

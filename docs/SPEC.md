@@ -561,9 +561,9 @@ Determinism rules:
   that permanently suppressed the real IP.
 - Operator-supplied text (a stock-adjustment reason, an upload provenance
   string) belongs in `new_value`, never in `ip_address`.
-- `remote_addr` is rewritten by `ProxyFix(x_for=1)` from the rightmost
-  `X-Forwarded-For` entry, so audit IPs are evidence, not proof: a client that
-  sends the header itself influences the recorded value.
+- With `TRUSTED_PROXY=1` (P1-7) `remote_addr` is `ProxyFix`'s rewrite of the
+  rightmost `X-Forwarded-For` entry; with it unset the header is ignored and
+  `remote_addr` is the socket address.
 
 #### Audit value bounds
 
@@ -792,6 +792,7 @@ future call sites are covered without opting in:
 | `CORS_ALLOWED_ORIGINS` | No | `""` | Comma-separated origins (empty = same-origin only) |
 | `RAAS_RATE_LIMITS` | No | `on` | `off` disables Flask-Limiter (tests) |
 | `REDIS_URL` | **Prod (multi-process)** | unset → in-memory | Shared rate-limit storage (Flask-Limiter). **Required on serverless/multi-process** so limits are global, not per-process; optional for single-process dev |
+| `TRUSTED_PROXY` | **Behind a proxy** | unset → header ignored | `1` trusts one `X-Forwarded-For` hop (`ProxyFix x_for`), making `remote_addr` the client IP. Unset means `remote_addr` is the socket address. `remote_addr` gates the API-key IP allowlist, login lockout-by-IP and the IP-keyed rate limits, so set this **only** when a proxy is the sole entry point |
 | `MAX_CONTENT_LENGTH_MB` | No | `50` | Upload body cap in MB (float allowed, e.g. `4.5` on Vercel) |
 | `RAAS_DATA_DIR` | No | repo root | Writable data dir (uploads, reports) |
 
@@ -807,8 +808,8 @@ future call sites are covered without opting in:
 | **Frontend build output in git?** | `react_frontend/` gitignored; Vercel buildCommand builds → `public/`. |
 | **Session cookie domain** | Same-site only; cross-origin use `CORS_ALLOWED_ORIGINS` + API key. |
 | **Database clock vs app clock** | Use `clock_timestamp()` + `make_interval` (DB clock authoritative). |
-| **`ProxyFix(x_for=1)` trusts one `X-Forwarded-For` hop unconditionally (P1, open)** | `remote_addr` is client-influenceable when the app is reached directly (the container publishes its port), and that value gates the API-key IP allowlist (`auth.py:_ip_allowed`) and login lockout-by-IP. Not exploitable when a trusted platform proxy appends to the header. Fix is `x_for=0` or gating header trust on a `TRUSTED_PROXY` env var — tracked, not yet applied. |
-| **`audit_logs.ip_address` is client-influenceable** | Since P1-6 it holds a real value everywhere (free-text reasons moved to `new_value`), but `ProxyFix(x_for=1)` still lets a client that reaches the app directly choose it. Evidence, not proof. Schema-safe (`TEXT`, rendered as escaped JSX); do not treat it as a validated IP field. |
+| **`X-Forwarded-For` trust (P1-7, closed)** | `ProxyFix`'s `x_for` is gated on `TRUSTED_PROXY=1`; unset means the header is ignored and `remote_addr` is the socket address. `remote_addr` gates the API-key IP allowlist, login lockout-by-IP **and** the IP-keyed rate-limit buckets, so trusting the header unconditionally let a direct client forge its IP and bypass all three. `docker-compose.yml` now binds 5000 to loopback and expects a TLS proxy in front. Residual: setting `TRUSTED_PROXY=1` while any direct path exists re-opens it |
+| **`audit_logs.ip_address` is not proof of client identity** | Since P1-6 it holds a real value everywhere (free-text reasons moved to `new_value`). P1-7 gates `X-Forwarded-For` on `TRUSTED_PROXY`: with the flag unset it is the socket address, with it set it is whatever the trusted proxy appended. Schema-safe (`TEXT`, rendered as escaped JSX); do not treat it as a validated IP field. |
 
 ---
 

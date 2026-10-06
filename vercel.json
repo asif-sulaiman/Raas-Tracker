@@ -1,5 +1,8 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "env": {
+    "TRUSTED_PROXY": "1"
+  },
   "buildCommand": "cd raas-tracker-frontend && npm ci && npm run build && mkdir -p ../public ../react_frontend && cp -r dist/. ../public/ && cp -r dist/. ../react_frontend/",
   "rewrites": [
     { "source": "/((?!api/|.*\\.).*)", "destination": "/index.html" }

@@ -2,10 +2,20 @@ services:
   raas-tracker:
     build: .
     ports:
-      - "5000:5000"
+      # Loopback only (P1-7). The app terminates no TLS of its own (see
+      # FORCE_HTTPS/COOKIE_SECURE below), so publishing 5000 on all interfaces
+      # let any client reach it directly and forge X-Forwarded-For — which gates
+      # the API-key IP allowlist and login lockout-by-IP. Put a TLS-terminating
+      # reverse proxy in front, and set TRUSTED_PROXY=1 only when that proxy is
+      # the sole entry point.
+      - "127.0.0.1:5000:5000"
     environment:
       RAAS_SECRET: ${RAAS_SECRET:?Set RAAS_SECRET before starting}
       PRODUCTION: "1"
       FORCE_HTTPS: "0"
       COOKIE_SECURE: "0"
+      # P1-7. Empty by default, which makes the app IGNORE X-Forwarded-For —
+      # the safe state for the loopback-bound port above. Export TRUSTED_PROXY=1
+      # only once a reverse proxy in front of this container is the sole way in.
+      TRUSTED_PROXY: "${TRUSTED_PROXY:-}"
     restart: unless-stopped

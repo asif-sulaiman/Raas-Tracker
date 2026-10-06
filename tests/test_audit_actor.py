@@ -124,14 +124,14 @@ def test_mutation_records_client_ip(admin_client, db):
     assert _last(db, "COMPANY_CREATE")[2] == "127.0.0.1"
 
 
-def test_audit_ip_follows_proxy_fix_forwarded_for(admin_client, db):
-    """The recorded IP is ProxyFix's remote_addr (one trusted hop).
+def test_audit_ip_follows_the_rightmost_forwarded_entry(admin_client, db, proxy_trust):
+    """With a proxy declared, remote_addr is the rightmost X-Forwarded-For entry.
 
-    ``ProxyFix(x_for=1)`` rewrites remote_addr from the *rightmost*
-    X-Forwarded-For entry — the hop the proxy itself appended. Pinned so the
-    IP behaviour is explicit rather than incidental, and so any change to
-    ProxyFix's trust is a deliberate diff here.
+    ProxyFix(x_for=1) trusts one hop from the RIGHT — the entry the proxy
+    appended — not the leftmost, client-supplied one. The untrusted path is
+    covered in tests/test_proxy_trust.py.
     """
+    proxy_trust("1")
     assert admin_client.post(
         "/api/companies", json={"name": "ProxyCo"},
         headers={"X-Forwarded-For": "203.0.113.9, 70.41.3.18"}).status_code == 201

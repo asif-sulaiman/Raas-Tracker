@@ -49,9 +49,49 @@ app.config["MAX_CONTENT_LENGTH"] = _max_content_length_bytes(
 )
 REACT_BUILD_DIR = os.path.join(os.path.dirname(__file__), "react_frontend")
 
-# ProxyFix for correct remote_addr behind proxy (e.g., nginx, Cloudflare)
+# ProxyFix for correct remote_addr behind a trusted proxy (nginx, Cloudflare,
+# Vercel). Only `x_for` is gated, on TRUSTED_PROXY=1: `remote_addr` gates real
+# access controls — the API-key IP allowlist (auth.py:_ip_allowed), login
+# lockout by IP, and the IP-keyed rate-limit buckets in _limit_key — so
+# trusting the header unconditionally let any client that could reach the app
+# directly choose its own IP. The other hops stay unconditional on purpose:
+# x_proto/x_host/x_prefix drive the HTTPS redirect and URL building, where
+# over-trust is a correctness problem rather than an authz bypass.
 from werkzeug.middleware.proxy_fix import ProxyFix
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
+_BASE_WSGI_APP = app.wsgi_app
+
+
+def _trusted_proxy() -> bool:
+    """Is a reverse proxy the declared sole entry point?
+
+    Strict ``== "1"`` matches the repo's other switches (FORCE_HTTPS,
+    COOKIE_SECURE): anything else fails closed, which is the safe direction for
+    a header the client itself can send.
+    """
+    return os.getenv("TRUSTED_PROXY") == "1"
+
+
+def _apply_proxy_fix() -> None:
+    """(Re)install ProxyFix using the current TRUSTED_PROXY setting.
+
+    A function rather than a bare call so the trust decision can be tested in
+    both states; the env var is otherwise read once, at import.
+    """
+    app.wsgi_app = ProxyFix(
+        _BASE_WSGI_APP,
+        x_for=1 if _trusted_proxy() else 0,
+        x_proto=1, x_host=1, x_prefix=1,
+    )
+
+
+_apply_proxy_fix()
+# Surface the resolved decision. The two states differ sharply for API-key IP
+# allowlists, login lockout-by-IP and the IP-keyed rate-limit buckets, so an
+# operator flipping TRUSTED_PROXY should not have to guess which one is live.
+print("ProxyFix: X-Forwarded-For trust "
+      + ("ENABLED (TRUSTED_PROXY=1)" if _trusted_proxy()
+         else "disabled - remote_addr is the socket address"))
 
 from chem_stock import (
     get_connection, get_all_chemicals, update_stock, add_chemical, set_reorder_level,

@@ -132,3 +132,25 @@ def user_client(pg_dsn, db, monkeypatch):
     r = c.post("/api/auth/login", json={"username": "user", "password": "user-pass-123"})
     assert r.status_code == 200
     return c
+
+
+@pytest.fixture()
+def proxy_trust(monkeypatch):
+    """Re-evaluate ProxyFix's `x_for` for this test's env, then restore it.
+
+    `TRUSTED_PROXY` is otherwise read once at import, which would leave this
+    security control with no black-box evidence in either state.
+    Pass None to model "no proxy declared".
+    """
+    import flask_app
+    original = flask_app.app.wsgi_app
+
+    def _apply(value):
+        if value is None:
+            monkeypatch.delenv("TRUSTED_PROXY", raising=False)
+        else:
+            monkeypatch.setenv("TRUSTED_PROXY", value)
+        flask_app._apply_proxy_fix()
+
+    yield _apply
+    flask_app.app.wsgi_app = original

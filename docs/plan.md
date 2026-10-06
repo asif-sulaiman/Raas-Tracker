@@ -108,6 +108,7 @@ Baseline established by enumeration: **64 mutating routes — 49 covered, 1 part
 | P1-6 ✓ | **Reason moved out of `ip_address`** into `new_value` as `"<qty> (<reason>)"`, restoring the real client IP. Stock-history feed taught to parse it, with a fallback so pre-P1-6 rows still render | `stock.py`, `uploads.py`, `tests/test_stock_audit.py` | Adjustments record reason **and** IP; history keeps delta + purpose |
 | P1-4 ✓ | **Company field coverage** — `COMPANY_UPDATE` was gated on a *name* change, so moving `swift`/`lc_bank`/`address`/`contact_person`/`code`/`country` left no trace. Records the changed **field names** (values would push bank/contact PII into the audit trail), only for genuine changes. Patch fields derived from `_FIELDS` so a new column cannot skip auditing | `companies.py`, `tests/test_company_audit.py` | Any field edit leaves a row; no-op resubmits do not; no bank/contact value in `audit_logs` |
 | P1-5 ✓ | **Admin deletes + kill switch audited** — `SALE_ITEM_DELETE`, `SHIPMENT_DELETE`, `UPLOAD_DELETE` (with cascaded row count), `SESSION_REVOKE` (with live-session count). Each captures an identifying summary read **before** the DELETE, since the delete destroys its own evidence; gated on `rowcount` so a refused or no-op delete leaves no row. Revoke audited at the admin route only, not in the shared `revoke_user_sessions`. Follow-ups: records `runs=N` — the production runs the cascade destroys, placed **first** so the 2000-char bound can never clip it — and names the PI; the delete is scoped by `sale_id`, so a line cannot be removed through another PI's URL, and 404s when nothing was deleted; the kill switch 404s an unknown user and carries `@admin_required` | `sales.py`, `flask_app.py`, `tests/test_delete_audit.py` | Every admin delete leaves a truthful row; `AuditLogs.jsx` renders `old_value` so the evidence is actually visible |
+| P1-7 ✓ | **`X-Forwarded-For` trust gated** — `ProxyFix`'s `x_for` is now conditional on `TRUSTED_PROXY=1`; unset means the header is ignored and `remote_addr` is the socket address. Scope was **wider** than recorded: `remote_addr` gates the API-key IP allowlist (an authorisation bypass), login lockout-by-IP **and** Flask-Limiter's IP-keyed buckets. `docker-compose.yml` binds 5000 to loopback and now expects a TLS proxy in front. `x_proto`/`x_host`/`x_prefix` deliberately stay unconditional — they drive the HTTPS redirect and URL building, where over-trust is a correctness issue, not an authz bypass | `flask_app.py`, `docker-compose.yml`, `.env.example`, `tests/test_proxy_trust.py` | A forged header cannot satisfy the API-key IP allowlist; a declared proxy still yields real client IPs |
 
 **Corrections made during P1** (recorded because both were stated earlier and were wrong):
 
@@ -120,7 +121,7 @@ Baseline established by enumeration: **64 mutating routes — 49 covered, 1 part
 
 | Task | Description |
 |---|---|
-| P1-7 | `ProxyFix(x_for=1)` trusts one `X-Forwarded-For` hop unconditionally; that `remote_addr` gates the API-key IP allowlist and login lockout-by-IP. Fix = `x_for=0` or gate on `TRUSTED_PROXY`. In SPEC §9 |
+| P1-8 | Stale docstring at `flask_app.py` claims the raw reset token is server-logged; only `token_hash[:8]` is |
 | P1-8 | Stale docstring at `flask_app.py` claims the raw reset token is server-logged; only `token_hash[:8]` is |
 | P1-9 | No concurrent regression test — suite is single-threaded, so the `threading.local` bug class is only covered sequentially |
 | P1-10 | `_is_ip` only recognises IPv4 + two literals, so an IPv6 client with no reason renders its IP as the movement `purpose` |
@@ -135,7 +136,6 @@ Baseline established by enumeration: **64 mutating routes — 49 covered, 1 part
 
 | Task | Description |
 |---|---|
-| P1-a | `ProxyFix(x_for=1)` trusts one `X-Forwarded-For` hop unconditionally; that `remote_addr` gates the API-key IP allowlist and login lockout-by-IP. Fix = `x_for=0` or gate on `TRUSTED_PROXY`. Recorded in SPEC §9 |
 | P1-b | `audit_logs.ip_address` is overloaded (real IP / operator reason / spoofable value); consider a separate `reason` column |
 | P1-c | No concurrent regression test — the suite is single-threaded, so the `threading.local` bug class is only covered sequentially. Add a threaded `Barrier` test, and revisit if the app ever moves to gevent |
 | P1-d | API keys can reach **no** audited mutation (every audited entity is `@admin_required`), so the `api-key:<name>` label is currently unreachable in practice |

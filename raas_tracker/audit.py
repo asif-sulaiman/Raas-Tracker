@@ -81,11 +81,12 @@ def get_audit_actor() -> str:
 def request_ip() -> Optional[str]:
     """Client IP for an audit row, or None when there is no request context.
 
-    This is ``request.remote_addr``, which ``ProxyFix(x_for=1)`` (flask_app.py)
-    rewrites from the rightmost ``X-Forwarded-For`` entry. That entry is the
-    real client only when a trusted proxy actually appends it: a client that
-    reaches the app directly can supply the header itself. Audit IPs are
-    therefore evidence, not proof — see the ProxyFix trust item in Risks.
+    This is ``request.remote_addr``. When ``TRUSTED_PROXY=1`` (P1-7),
+    ``ProxyFix`` rewrites it from the rightmost ``X-Forwarded-For`` entry — the
+    hop a trusted proxy appended. With the flag unset that header is ignored and
+    this is the socket address. Either way it is the same value that gates the
+    API-key IP allowlist and login lockout-by-IP, so an audit IP is evidence of
+    the address the app saw, not proof of who the client was.
     """
     if not has_request_context():
         return None
