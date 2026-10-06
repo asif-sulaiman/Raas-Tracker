@@ -885,7 +885,7 @@ def adjust_stock_from_upload(conn: psycopg.Connection, upload_id: int,
                     (new_qty, date.isoformat(date.today()), chem_id)
                 )
                 
-# Log the adjustment. Provenance goes in new_value, not
+                # Log the adjustment. Provenance goes in new_value, not
                 # ip_address: passing it as the IP would permanently suppress
                 # the real client IP captured in P0-2.
                 log_audit_action(conn, "ADJUST_STOCK", "chemical", chem_id,
