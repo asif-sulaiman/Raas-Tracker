@@ -754,15 +754,25 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
             conn.execute("DELETE FROM sale_items WHERE id = %s", (rid,))
         conn.commit()
         
-        # Audit log
+        # Audit log. pi_file_path is a server-side path, so it must not enter
+        # the audit trail — that would disclose the filesystem layout to anyone
+        # who can read audit logs. Scrubbed from both sides so a path already
+        # stored on the sale is not leaked by the "old" snapshot either.
+        def _without_server_path(snapshot):
+            cleaned = dict(snapshot)
+            header_part = cleaned.get("header") or {}
+            cleaned["header"] = {k: v for k, v in header_part.items()
+                                 if k != "pi_file_path"}
+            return cleaned
+
         new_snapshot = {
             "header": header,
             "items": items,
             "removed_ids": removed_ids,
         }
         log_audit_action(conn, "SALE_UPDATE", "sale", sale_id,
-                         old_value=json.dumps(old_snapshot, default=str),
-                         new_value=json.dumps(new_snapshot, default=str))
+                         old_value=json.dumps(_without_server_path(old_snapshot), default=str),
+                         new_value=json.dumps(_without_server_path(new_snapshot), default=str))
         
         return get_sale_by_id(conn, sale_id)
     except Exception:

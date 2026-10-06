@@ -91,6 +91,45 @@ Fixes audit-trail defects found by a read-only security review.
 | P0-4 ✓ | **Maturity cron audited** — `CRON_MATURITY_CHECK` row with `checked`/`notified`; was the one mutating route with no audit trail | `flask_app.py` | Every cron run leaves a row attributed to `cron` |
 | P0-5 ✓ | **Conn-leak fix in the audited legacy-token path** — `conn.close()` in a `finally`; previously skipped whenever the INSERT failed | `flask_app.py` | No pooled connection lost per rejected request |
 
+---
+
+## 🔐 Phase P1: Audit Coverage & Value Bounds (Completed 2026-10-06)
+
+Baseline established by enumeration: **64 mutating routes — 49 covered, 1 partial,
+10 uncovered**, 4 read-only POSTs. Payloads classified across all 62 call sites:
+**zero** secrets and effectively zero PII (every `auth.py` row logs a username;
+`redeem_reset_token` logs `row[1]`=username, one column from the hash).
+
+| Task | Description | Files Touched | Acceptance |
+|---|---|---|---|
+| P1-1 ✓ | **Credential lifecycle audited** — `API_KEY_CREATE` / `API_KEY_REVOKE`; `create_api_key` gained `RETURNING id`. Raw key and hash never audited | `raas_tracker/auth.py`, `tests/test_api_key_audit.py` | Mint/revoke leave a row naming the admin and the key name |
+| P1-2 ✓ | **Unit-conversion factors audited** — `UNIT_CONVERSION_UPSERT` with old→new factor. Route was unaudited *and* reachable by any session **or API key** | `raas_tracker/stock.py`, `tests/test_stock_audit.py` | Factor changes leave a before/after trail |
+| P1-3 ✓ | **Central value bounds** — `_bounded()` caps every text column, strips control chars **including CR**, marks truncation. Also fixed: `LEGACY_TOKEN_USED` used the request path as `entity_type`; `SALE_UPDATE` leaked `pi_file_path` on **both** paths | `audit.py`, `flask_app.py`, `sales.py`, `tests/test_audit_limits.py` | No unbounded value; a NUL can no longer abort the INSERT |
+| P1-6 ✓ | **Reason moved out of `ip_address`** into `new_value` as `"<qty> (<reason>)"`, restoring the real client IP. Stock-history feed taught to parse it, with a fallback so pre-P1-6 rows still render | `stock.py`, `uploads.py`, `tests/test_stock_audit.py` | Adjustments record reason **and** IP; history keeps delta + purpose |
+
+**Corrections made during P1** (recorded because both were stated earlier and were wrong):
+
+- ~~P1-d: `api-key:<name>` is unreachable~~ — **wrong**. `POST /api/sales`,
+  `/api/recipes`, `/api/recipes/<name>/items` have no admin gate, so API keys
+  reach audited mutations. Now proven by a test that stamps a real key.
+- ~~Flip the `atomic` default~~ — rejected; would silently lose audit rows.
+
+**Remaining backlog (not started):**
+
+| Task | Description |
+|---|---|
+| P1-4 | `PUT /api/companies/<id>` audits **only** name changes (`companies.py`); `code`/`country`/`address`/`contact_person`/`swift`/`lc_bank` commit with no row |
+| P1-5 | Unaudited admin deletes: `DELETE /api/sales/<id>/items/<item_id>` (money-affecting PI line), `/shipments/<id>`, `/api/uploads/<id>`, and `POST /api/users/<id>/revoke` (mass session kill) |
+| P1-7 | `ProxyFix(x_for=1)` trusts one `X-Forwarded-For` hop unconditionally; that `remote_addr` gates the API-key IP allowlist and login lockout-by-IP. Fix = `x_for=0` or gate on `TRUSTED_PROXY`. In SPEC §9 |
+| P1-8 | Stale docstring at `flask_app.py` claims the raw reset token is server-logged; only `token_hash[:8]` is |
+| P1-9 | No concurrent regression test — suite is single-threaded, so the `threading.local` bug class is only covered sequentially |
+| P1-10 | `_is_ip` only recognises IPv4 + two literals, so an IPv6 client with no reason renders its IP as the movement `purpose` |
+| P1-11 | Upload filename has three identities: `secure_filename` (extension gate), `_safe_upload_filename` (stored/audited), raw `file.filename` (response). Simplify to one |
+| P1-12 | `API_KEY_CREATE` does not record `expires_at`; `allowed_ips`/`expires_at` are unvalidated and unbounded at the route |
+| P1-13 | `atomic=True` default: 8 of 62 sites pass `atomic=False`; review the other ~54 for ghost rows that survive a rollback |
+| P1-14 | **Pre-existing, unrelated to audit:** 4 failures in `tests/test_lcs.py` assert on single-barrier readiness messages (`recipes:`) while the code emits the two-barrier message. Verified identical at `051ea30` and `b798f6c` in clean worktrees |
+| P1-15 | **Pre-existing:** `update_sale_full`'s UPDATE never writes `pi_file_path`, so the audit recorded a field change that did not happen (masked now by excluding it) |
+
 **P1 backlog (identified, not started):**
 
 | Task | Description |

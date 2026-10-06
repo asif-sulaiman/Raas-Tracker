@@ -138,18 +138,20 @@ def test_audit_ip_follows_proxy_fix_forwarded_for(admin_client, db):
     assert _last(db, "COMPANY_CREATE")[2] == "70.41.3.18"
 
 
-def test_explicit_ip_argument_is_not_overridden(admin_client, db):
-    """ADJUST_STOCK passes the operator's free-text reason as ip_address.
+def test_explicit_ip_argument_is_not_overridden(db):
+    """The request-IP default only applies when ip_address is None.
 
-    The new IP default must not overwrite it (that reason is contractual and
-    asserted by test_chemicals_api.py::..._persists_reason_in_audit).
+    P1-6 removed the last two production call sites that passed an explicit
+    value (ADJUST_STOCK's reason, an upload provenance string), so the
+    "explicit wins" branch is now exercised directly rather than through a
+    route.
     """
-    assert admin_client.post("/api/chemicals", json={"name": "ReasonKeep", "qty": 10}).status_code in (200, 201)
-    assert admin_client.post("/api/chemicals/update", json={
-        "name": "ReasonKeep", "delta": 5, "reason": "Supplier delivery"}).status_code == 200
-    row = db.execute("SELECT old_value, new_value, ip_address FROM audit_logs "
-                     "WHERE action = 'ADJUST_STOCK' ORDER BY id DESC LIMIT 1").fetchone()
-    assert (row[0], row[1], row[2]) == ("10.0", "15.0", "Supplier delivery")
+    from raas_tracker.audit import log_audit_action
+    log_audit_action(db, "IP_EXPLICIT", "probe", 1, ip_address="203.0.113.7")
+    row = db.execute(
+        "SELECT ip_address FROM audit_logs WHERE action = 'IP_EXPLICIT' "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    assert row[0] == "203.0.113.7"
 
 
 def test_ip_is_none_outside_request_context(db):

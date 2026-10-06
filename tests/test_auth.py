@@ -172,10 +172,14 @@ def test_stale_token_audited_401(client, db):
     r = client.get("/api/chemicals", headers={"X-API-Token": "stale"})
     assert r.status_code == 401
     assert "retired" in r.get_json()["error"]
-    row = db.execute(
-        "SELECT entity_type FROM audit_logs WHERE action = 'LEGACY_TOKEN_USED'"
+    # P1-3: entity_type must stay a type name. It used to hold the request
+    # path, which is attacker-controlled, unbounded and semantically wrong
+    # (the column is indexed and filtered on by type).
+    entity_type, new_value = db.execute(
+        "SELECT entity_type, new_value FROM audit_logs WHERE action = 'LEGACY_TOKEN_USED'"
     ).fetchone()
-    assert row is not None and row[0] == "/api/chemicals"
+    assert entity_type == "request"
+    assert "/api/chemicals" in new_value
 
 
 def test_logout_revokes_session(admin_client, db):

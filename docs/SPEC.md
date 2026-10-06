@@ -556,11 +556,39 @@ Determinism rules:
 #### Audit `ip_address`
 
 - Defaults to the live request's `remote_addr` for every call site, so no
-  endpoint has to opt in. A caller-supplied `ip_address` always wins —
-  `ADJUST_STOCK` passes the operator's free-text reason there by design.
+  endpoint has to opt in. A caller-supplied `ip_address` still wins, but since
+  P1-6 **no production caller does** — every previous override was free text
+  that permanently suppressed the real IP.
+- Operator-supplied text (a stock-adjustment reason, an upload provenance
+  string) belongs in `new_value`, never in `ip_address`.
 - `remote_addr` is rewritten by `ProxyFix(x_for=1)` from the rightmost
   `X-Forwarded-For` entry, so audit IPs are evidence, not proof: a client that
   sends the header itself influences the recorded value.
+
+#### Audit value bounds
+
+Every text column is bare `TEXT` and no Pydantic model in the app sets
+`max_length`, so `log_audit_action` enforces the bounds centrally — current and
+future call sites are covered without opting in:
+
+| Column | Bound |
+|---|---|
+| `action`, `entity_type` | 64 chars |
+| `user_id` | 128 chars |
+| `old_value`, `new_value` | 2000 chars |
+| `ip_address` | 255 chars |
+
+- Control characters are stripped, **including CR**; `\n` and `\t` survive
+  because legitimate values (`json.dumps` output) contain them. A NUL byte is
+  not merely untidy — PostgreSQL rejects it, so an unfiltered control character
+  turns an audit write into a failed statement.
+- A truncated value is marked `...[truncated N chars]` so an investigator can
+  tell a complete record from a clipped one.
+- Two `SALE_UPDATE` paths `json.dumps` a whole request body; a payload above
+  ~20 line items exceeds the 2000-char bound and is marked accordingly.
+- `entity_type` must stay a **type name** — it is indexed and filtered on.
+  Attacker-controlled text (a request path, a filename) goes in `new_value`.
+  Server-side paths (`pi_file_path`) are excluded from the snapshot entirely.
 
 ### Reference Data
 | Method | Path | Auth | Description |
@@ -767,7 +795,7 @@ Determinism rules:
 | **Session cookie domain** | Same-site only; cross-origin use `CORS_ALLOWED_ORIGINS` + API key. |
 | **Database clock vs app clock** | Use `clock_timestamp()` + `make_interval` (DB clock authoritative). |
 | **`ProxyFix(x_for=1)` trusts one `X-Forwarded-For` hop unconditionally (P1, open)** | `remote_addr` is client-influenceable when the app is reached directly (the container publishes its port), and that value gates the API-key IP allowlist (`auth.py:_ip_allowed`) and login lockout-by-IP. Not exploitable when a trusted platform proxy appends to the header. Fix is `x_for=0` or gating header trust on a `TRUSTED_PROXY` env var — tracked, not yet applied. |
-| **`audit_logs.ip_address` column is overloaded** | Holds a real IP for most actions, but operator free-text reasons for `ADJUST_STOCK` (`stock.py`) and a client-influenceable value via ProxyFix. Schema-safe (`TEXT`, rendered as escaped JSX), but do not treat the column as a validated IP field. |
+| **`audit_logs.ip_address` is client-influenceable** | Since P1-6 it holds a real value everywhere (free-text reasons moved to `new_value`), but `ProxyFix(x_for=1)` still lets a client that reaches the app directly choose it. Evidence, not proof. Schema-safe (`TEXT`, rendered as escaped JSX); do not treat it as a validated IP field. |
 
 ---
 

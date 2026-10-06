@@ -419,11 +419,17 @@ def create_api_key(conn: psycopg.Connection, name: str, created_by: Optional[int
     if not (1 <= len(name) <= 64):
         raise ValueError("key name must be 1-64 characters")
     raw = "ck_live_" + _secrets.token_urlsafe(32)
-    conn.execute(
+    cursor = conn.execute(
         """INSERT INTO api_keys (key_hash, name, created_by, expires_at, allowed_ips)
-           VALUES (%s, %s, %s, %s, %s)""",
+           VALUES (%s, %s, %s, %s, %s) RETURNING id""",
         (_api_key_hash(raw), name, created_by, expires_at, allowed_ips or "")
     )
+    key_id = cursor.fetchone()[0]
+    # Audit the credential's creation. Never the raw key or its hash — only
+    # the name and the allowlist, which is the access control on the key.
+    log_audit_action(conn, "API_KEY_CREATE", "api_key", key_id,
+                     new_value=f"name={name} allowed_ips={allowed_ips or 'any'}",
+                     atomic=False)
     conn.commit()
     return raw
 
@@ -484,7 +490,13 @@ def validate_api_key(conn: psycopg.Connection, raw_key: Optional[str],
 
 def revoke_api_key(conn: psycopg.Connection, key_id: int) -> bool:
     """Permanent revocation. Independent of user sessions (separate kill switch)."""
+    row = conn.execute("SELECT name FROM api_keys WHERE id = %s", (key_id,)).fetchone()
     cursor = conn.execute("UPDATE api_keys SET revoked = 1 WHERE id = %s", (key_id,))
+    if cursor.rowcount > 0:
+        # Audit only a real revocation, and record the name so the trail says
+        # *which* credential died rather than just an id.
+        log_audit_action(conn, "API_KEY_REVOKE", "api_key", key_id,
+                         old_value=row[0] if row else None, atomic=False)
     conn.commit()
     return cursor.rowcount > 0
 

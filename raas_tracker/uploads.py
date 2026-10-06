@@ -212,6 +212,20 @@ def compare_stock_upload(conn: psycopg.Connection, upload_data: List[Dict[str, A
     }
 
 
+def _safe_upload_filename(filename: str) -> str:
+    """Strip control characters and path traversal from an uploaded filename.
+
+    The HTTP layer passes the raw client-supplied name through. A NUL byte in
+    particular aborts the INSERT outright (psycopg DataError), so a hostile
+    filename is a 500, not just untidy storage. werkzeug's ``secure_filename``
+    is deliberately not used here: it also flattens unicode, which would
+    change what operators see for legitimate non-ASCII names.
+    """
+    cleaned = re.sub(r"[\x00-\x1f\x7f]", "", filename or "")
+    cleaned = cleaned.replace("\\", "/").split("/")[-1]
+    return cleaned.strip() or "upload"
+
+
 def save_upload(conn: psycopg.Connection, filename: str, results: Dict[str, Any]) -> int:
     """Save upload results to database.
     
@@ -223,6 +237,7 @@ def save_upload(conn: psycopg.Connection, filename: str, results: Dict[str, Any]
     Returns:
         Upload ID
     """
+    filename = _safe_upload_filename(filename)
     stats = results["stats"]
     status = "flagged" if results.get("unmapped_units") else "completed"
     cursor = conn.execute(
@@ -870,10 +885,12 @@ def adjust_stock_from_upload(conn: psycopg.Connection, upload_id: int,
                     (new_qty, date.isoformat(date.today()), chem_id)
                 )
                 
-                # Log the adjustment
+# Log the adjustment. Provenance goes in new_value, not
+                # ip_address: passing it as the IP would permanently suppress
+                # the real client IP captured in P0-2.
                 log_audit_action(conn, "ADJUST_STOCK", "chemical", chem_id,
-                               reviewed_by, str(old_qty), str(new_qty),
-                               f"Adjusted from upload {upload_id}")
+                                reviewed_by, str(old_qty),
+                                f"{new_qty} (Adjusted from upload {upload_id})")
                 
                 adjustments += 1
         

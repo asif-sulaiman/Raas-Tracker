@@ -190,8 +190,11 @@ def _gate_api():
         try:
             conn = get_db()
             try:
-                log_audit_action(conn, "LEGACY_TOKEN_USED", request.path,
-                                 new_value=f"ip={request.remote_addr}")
+                # entity_type must stay a type name: it is indexed and filtered on.
+                # The path is attacker-influenced, so it belongs in the
+                # bounded detail column, not the type column.
+                log_audit_action(conn, "LEGACY_TOKEN_USED", "request", None,
+                                 new_value=f"path={request.path} ip={request.remote_addr}")
             finally:
                 # Always return the connection: the previous single try/except
                 # skipped close() whenever the INSERT failed, leaking one
@@ -2528,7 +2531,7 @@ def api_update_sale(sale_id):
             vals.append(_dt.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
             vals.append(sale_id)
             conn.execute(f"UPDATE sales SET {', '.join(fields)}, updated_at = %s WHERE id = %s", vals)
-            changed = [k for k in data if k in old]
+            changed = [k for k in data if k in old and k != "pi_file_path"]
             log_audit_action(conn, "SALE_UPDATE", "sale", sale_id,
                              old_value=json.dumps({k: old[k] for k in changed}, default=str),
                              new_value=json.dumps({k: data[k] for k in changed}, default=str),

@@ -152,13 +152,26 @@ def get_all_unit_conversions(conn: psycopg.Connection) -> List[Dict[str, Any]]:
 
 
 def add_unit_conversion(conn: psycopg.Connection, from_unit: str, to_unit: str, factor: float) -> bool:
-    """Add a new unit conversion."""
+    """Add a new unit conversion.
+
+    Audited: the factor governs every stock/quantity conversion in the system,
+    and this route is reachable by any session *or* API key, so an unaudited
+    change here silently alters every derived quantity in the product.
+    """
+    fu, tu = from_unit.upper().strip(), to_unit.upper().strip()
     try:
+        prev = conn.execute(
+            "SELECT factor FROM unit_conversions WHERE from_unit = %s AND to_unit = %s",
+            (fu, tu)).fetchone()
         conn.execute(
             "INSERT INTO unit_conversions (from_unit, to_unit, factor) VALUES (%s, %s, %s) "
             "ON CONFLICT (from_unit, to_unit) DO UPDATE SET factor = EXCLUDED.factor",
-            (from_unit.upper().strip(), to_unit.upper().strip(), factor)
+            (fu, tu, factor)
         )
+        log_audit_action(conn, "UNIT_CONVERSION_UPSERT", "unit_conversion", None,
+                         old_value=str(prev[0]) if prev else None,
+                         new_value=f"{fu}->{tu} factor={factor}",
+                         atomic=False)
         conn.commit()
         return True
     except Exception as e:
@@ -254,9 +267,13 @@ def update_stock(conn: psycopg.Connection, name: str, delta: float, unit: str = 
     )
     if atomic:
         conn.commit()
+    # Collapse the reason onto one line: the audited format is
+    # "<qty> (<reason>)", and an embedded newline both reads badly in the
+    # history feed and used to break its parser outright.
+    reason_text = " ".join((reason or "").split())[:120]
     log_audit_action(conn, "ADJUST_STOCK", "chemical", chem_id,
-                     old_value=str(current_qty), new_value=str(new_qty),
-                     ip_address=(reason or "").strip()[:120] or None,
+                     old_value=str(current_qty),
+                     new_value=f"{new_qty} ({reason_text})" if reason_text else str(new_qty),
                      atomic=atomic)
     if atomic:
         notify_reorder_status(conn, chem_id, chem_name, new_qty, reorder_level)
@@ -331,6 +348,29 @@ def _is_ip(note: str) -> bool:
     return bool(re.match(r"^(\d{1,3}\.){3}\d{1,3}$", note or "")) or (note or "") in ("::1", "localhost")
 
 
+# re.DOTALL matters: without it `.` does not match a newline, so a multi-line
+# reason made the whole value unparseable and the movement's delta came back
+# null — which silently removes the adjustment from the history chart.
+_QTY_WITH_REASON_RE = re.compile(r"^\s*([-+]?\d+(?:\.\d+)?)\s*(?:\((.*)\))?\s*$",
+                                 re.DOTALL)
+
+
+def _split_qty_reason(value) -> tuple:
+    """Split an audit value into ``(quantity, reason)``.
+
+    P1-6 moved the operator's reason out of the ``ip_address`` column and into
+    ``new_value`` as ``"<qty> (<reason>)"``, so the quantity is no longer the
+    whole string. Rows written before P1-6 still hold a bare number here, so
+    anything that does not match falls back to a plain float parse.
+    """
+    if value is None:
+        return None, None
+    match = _QTY_WITH_REASON_RE.match(str(value))
+    if not match:
+        return _to_float(value), None
+    return float(match.group(1)), (match.group(2) or "").strip() or None
+
+
 def get_stock_movements(conn: psycopg.Connection, chemical_id: int = None,
                         actions=None, since: str = None, until: str = None,
                         limit: int = 200) -> List[Dict[str, Any]]:
@@ -365,9 +405,14 @@ def get_stock_movements(conn: psycopg.Connection, chemical_id: int = None,
     params.append(limit)
     out = []
     for row in conn.execute(query, params).fetchall():
-        old, new = _to_float(row[5]), _to_float(row[6])
+        old, _old_reason = _split_qty_reason(row[5])
+        new, reason = _split_qty_reason(row[6])
         delta = (new - old) if old is not None and new is not None else new
-        note = row[8] if row[8] and not _is_ip(row[8]) else None
+        # Purpose: prefer the reason embedded in new_value (P1-6 onward).
+        # Fall back to the ip_address note, which is where rows written before
+        # P1-6 kept it — otherwise historical movements would lose their
+        # purpose and silently read as "Manual adjustment".
+        note = reason or (row[8] if row[8] and not _is_ip(row[8]) else None)
         if row[1] == "ADD_CHEMICAL":
             purpose, source = "New registration", "registration"
         elif note and re.search(r"upload", note, re.IGNORECASE):

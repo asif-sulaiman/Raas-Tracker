@@ -108,6 +108,12 @@ def test_reorder_anon_unauthorized():
 
 
 def test_update_stock_persists_reason_in_audit(admin_client, db):
+    """P1-6: the operator's reason belongs in new_value, not in ip_address.
+
+    Passing the reason as ip_address meant the P0 client-IP default could never
+    fire for a manual adjustment, so the row most likely to be investigated
+    carried no IP at all.
+    """
     admin_client.post("/api/chemicals", json={"name": "ReasonAcid", "qty": 10})
     r = admin_client.post("/api/chemicals/update", json={
         "name": "ReasonAcid", "delta": 5, "reason": "Supplier delivery"})
@@ -115,7 +121,10 @@ def test_update_stock_persists_reason_in_audit(admin_client, db):
     row = db.execute(
         "SELECT old_value, new_value, ip_address FROM audit_logs "
         "WHERE action = 'ADJUST_STOCK' ORDER BY id DESC LIMIT 1").fetchone()
-    assert (row[0], row[1], row[2]) == ("10.0", "15.0", "Supplier delivery")
+    assert row[0] == "10.0"
+    assert "15.0" in row[1]
+    assert "Supplier delivery" in row[1]
+    assert row[2] == "127.0.0.1"
 
 
 def test_add_chemical_logs_birth_audit(admin_client, db):
