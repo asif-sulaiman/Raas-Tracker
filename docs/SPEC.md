@@ -595,6 +595,13 @@ future call sites are covered without opting in:
   keeping them out of `audit_logs` is deliberate. A company *name* keeps its
   before/after because a name is an identifier, not PII. The field list is
   written **before** any free text so truncation can never clip it.
+- **Deletes** capture an identifying summary *before* the `DELETE` (product,
+  quantity and unit price; ship date and invoice number; upload filename and
+  the number of cascaded rows; username and live-session count). A delete
+  destroys its own evidence, so that row is the only surviving record. Each is
+  gated on `rowcount`, so a refused or no-op delete leaves no row.
+- `AuditLogs.jsx` renders `new_value || old_value`, since delete rows carry
+  their evidence in `old_value`.
 
 ### Reference Data
 | Method | Path | Auth | Description |

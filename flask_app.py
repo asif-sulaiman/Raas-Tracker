@@ -674,7 +674,17 @@ def api_delete_user(user_id):
 def api_revoke_user_sessions(user_id):
     """Kill switch: revoke all sessions of a user (API keys untouched — separate switch)."""
     conn = get_db()
+    # P1-5: capture the target and the blast radius first. Audited HERE rather
+    # than inside revoke_user_sessions, which the voluntary password-change
+    # path also calls — auditing there would add a row to every password change.
+    row = conn.execute(
+        "SELECT u.username, COUNT(s.id) FROM users u "
+        "LEFT JOIN sessions s ON s.user_id = u.id AND s.revoked = 0 "
+        "WHERE u.id = %s GROUP BY u.username", (user_id,)).fetchone()
     revoke_user_sessions(conn, user_id)
+    if row:
+        log_audit_action(conn, "SESSION_REVOKE", "user", user_id,
+                         new_value=f"username={row[0]} sessions={row[1]}")
     conn.close()
     return jsonify({"message": "sessions revoked"})
 
@@ -1318,14 +1328,22 @@ def api_upload_detail(upload_id):
 @admin_required
 def api_delete_upload(upload_id):
     conn = get_db()
-    upload = conn.execute("SELECT id FROM uploads WHERE id = %s", (upload_id,)).fetchone()
+    # P1-5: capture the filename and the cascade size first. Both are
+    # unrecoverable once the upload and its rows are gone.
+    upload = conn.execute("SELECT filename FROM uploads WHERE id = %s",
+                          (upload_id,)).fetchone()
     if not upload:
         conn.close()
         return jsonify({"error": "Upload not found"}), 404
+    row_count = conn.execute(
+        "SELECT COUNT(*) FROM upload_rows WHERE upload_id = %s",
+        (upload_id,)).fetchone()[0]
 
     conn.execute("DELETE FROM upload_rows WHERE upload_id = %s", (upload_id,))
     conn.execute("DELETE FROM uploads WHERE id = %s", (upload_id,))
     conn.commit()
+    log_audit_action(conn, "UPLOAD_DELETE", "upload", upload_id,
+                     old_value=f"filename={upload[0]} rows={row_count}")
     conn.close()
     return jsonify({"success": True, "deleted_id": upload_id})
 

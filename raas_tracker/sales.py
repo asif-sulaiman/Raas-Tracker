@@ -308,10 +308,19 @@ def list_shipments(conn: psycopg.Connection, sale_id: int) -> List[Dict[str, Any
 def delete_shipment(conn: psycopg.Connection, sale_id: int,
                     shipment_id: int) -> bool:
     """Delete one shipment row. Returns False when not found."""
+    row = conn.execute(
+        "SELECT ship_date, invoice_number FROM shipments "
+        "WHERE id = %s AND sale_id = %s", (shipment_id, sale_id)).fetchone()
     cursor = conn.execute(
         "DELETE FROM shipments WHERE id = %s AND sale_id = %s",
         (shipment_id, sale_id))
     conn.commit()
+    if cursor.rowcount > 0:
+        # P1-5: captured before the DELETE, because afterwards the row that
+        # described this shipment no longer exists.
+        log_audit_action(conn, "SHIPMENT_DELETE", "shipment", shipment_id,
+                         old_value=(f"ship_date={row[0]} "
+                                    f"invoice_number={row[1]}" if row else None))
     return cursor.rowcount > 0
 
 
@@ -609,8 +618,19 @@ def delete_sale_item(conn: psycopg.Connection, item_id: int) -> bool:
         raise InvoicedLineConflict(
             "cannot delete a sale item that has invoice lines"
             " (adjust the invoice lines instead)")
-    conn.execute("DELETE FROM sale_items WHERE id = %s", (item_id,))
+    # P1-5: capture the line before the DELETE. A PI line is money-affecting,
+    # and once the row is gone this summary is the only surviving evidence.
+    row = conn.execute(
+        "SELECT product_name, quantity, unit, unit_price FROM sale_items "
+        "WHERE id = %s", (item_id,)).fetchone()
+    cursor = conn.execute("DELETE FROM sale_items WHERE id = %s", (item_id,))
     conn.commit()
+    # Gate on rowcount, not the return value: a delete that matched no row is
+    # not a delete and must not leave an audit row claiming one happened.
+    if cursor.rowcount > 0 and row:
+        log_audit_action(conn, "SALE_ITEM_DELETE", "sale_item", item_id,
+                         old_value=f"product={row[0]} qty={row[1]} "
+                                   f"{row[2]} unit_price={row[3]}")
     return True
 
 

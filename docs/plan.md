@@ -107,6 +107,7 @@ Baseline established by enumeration: **64 mutating routes — 49 covered, 1 part
 | P1-3 ✓ | **Central value bounds** — `_bounded()` caps every text column, strips control chars **including CR**, marks truncation. Also fixed: `LEGACY_TOKEN_USED` used the request path as `entity_type`; `SALE_UPDATE` leaked `pi_file_path` on **both** paths | `audit.py`, `flask_app.py`, `sales.py`, `tests/test_audit_limits.py` | No unbounded value; a NUL can no longer abort the INSERT |
 | P1-6 ✓ | **Reason moved out of `ip_address`** into `new_value` as `"<qty> (<reason>)"`, restoring the real client IP. Stock-history feed taught to parse it, with a fallback so pre-P1-6 rows still render | `stock.py`, `uploads.py`, `tests/test_stock_audit.py` | Adjustments record reason **and** IP; history keeps delta + purpose |
 | P1-4 ✓ | **Company field coverage** — `COMPANY_UPDATE` was gated on a *name* change, so moving `swift`/`lc_bank`/`address`/`contact_person`/`code`/`country` left no trace. Records the changed **field names** (values would push bank/contact PII into the audit trail), only for genuine changes. Patch fields derived from `_FIELDS` so a new column cannot skip auditing | `companies.py`, `tests/test_company_audit.py` | Any field edit leaves a row; no-op resubmits do not; no bank/contact value in `audit_logs` |
+| P1-5 ✓ | **Admin deletes + kill switch audited** — `SALE_ITEM_DELETE`, `SHIPMENT_DELETE`, `UPLOAD_DELETE` (with cascaded row count), `SESSION_REVOKE` (with live-session count). Each captures an identifying summary read **before** the DELETE, since the delete destroys its own evidence; gated on `rowcount` so a refused or no-op delete leaves no row. Revoke audited at the admin route only, not in the shared `revoke_user_sessions` | `sales.py`, `flask_app.py`, `tests/test_delete_audit.py` | Every admin delete leaves a truthful row; `AuditLogs.jsx` renders `old_value` so the evidence is actually visible |
 
 **Corrections made during P1** (recorded because both were stated earlier and were wrong):
 
@@ -119,7 +120,6 @@ Baseline established by enumeration: **64 mutating routes — 49 covered, 1 part
 
 | Task | Description |
 |---|---|
-| P1-5 | Unaudited admin deletes: `DELETE /api/sales/<id>/items/<item_id>` (money-affecting PI line), `/shipments/<id>`, `/api/uploads/<id>`, and `POST /api/users/<id>/revoke` (mass session kill) |
 | P1-7 | `ProxyFix(x_for=1)` trusts one `X-Forwarded-For` hop unconditionally; that `remote_addr` gates the API-key IP allowlist and login lockout-by-IP. Fix = `x_for=0` or gate on `TRUSTED_PROXY`. In SPEC §9 |
 | P1-8 | Stale docstring at `flask_app.py` claims the raw reset token is server-logged; only `token_hash[:8]` is |
 | P1-9 | No concurrent regression test — suite is single-threaded, so the `threading.local` bug class is only covered sequentially |

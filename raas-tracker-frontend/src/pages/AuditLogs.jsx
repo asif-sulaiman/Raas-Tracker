@@ -129,9 +129,9 @@ export default function AuditLogs() {
                       {log.entity_type} #{log.entity_id}
                     </span>
                   </div>
-                  {log.new_value && (
+                  {(log.new_value || log.old_value) && (
                     <p className="text-xs text-slate-600 dark:text-slate-300 mt-1">
-                      {log.new_value}
+                      {log.new_value || log.old_value}
                     </p>
                   )}
                   <div className="flex items-center gap-3 mt-1.5 text-[10px] text-slate-400 dark:text-slate-500">
