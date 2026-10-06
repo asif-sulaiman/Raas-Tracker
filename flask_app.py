@@ -671,6 +671,7 @@ def api_delete_user(user_id):
 
 
 @app.route("/api/users/<int:user_id>/revoke", methods=["POST"])
+@admin_required
 def api_revoke_user_sessions(user_id):
     """Kill switch: revoke all sessions of a user (API keys untouched — separate switch)."""
     conn = get_db()
@@ -681,10 +682,14 @@ def api_revoke_user_sessions(user_id):
         "SELECT u.username, COUNT(s.id) FROM users u "
         "LEFT JOIN sessions s ON s.user_id = u.id AND s.revoked = 0 "
         "WHERE u.id = %s GROUP BY u.username", (user_id,)).fetchone()
+    if not row:
+        # 404 like api_delete_user and api_admin_set_password, so the switch
+        # cannot be fired at arbitrary ids for a uniform 200 that leaves no row.
+        conn.close()
+        return jsonify({"error": "user not found"}), 404
     revoke_user_sessions(conn, user_id)
-    if row:
-        log_audit_action(conn, "SESSION_REVOKE", "user", user_id,
-                         new_value=f"username={row[0]} sessions={row[1]}")
+    log_audit_action(conn, "SESSION_REVOKE", "user", user_id,
+                     new_value=f"username={row[0]} sessions={row[1]}")
     conn.close()
     return jsonify({"message": "sessions revoked"})
 
@@ -2774,7 +2779,7 @@ def api_delete_item(sale_id, item_id):
         conn.close()
         return jsonify({"error": "A sale must keep at least one product item"}), 400
     try:
-        delete_sale_item(conn, item_id)
+        deleted = delete_sale_item(conn, sale_id, item_id)
     except InvoicedLineConflict as e:
         # A PI line that invoice_items point at cannot be deleted: the report's
         # grain is the PI line but its money is the invoice line, so removing it
@@ -2785,6 +2790,10 @@ def api_delete_item(sale_id, item_id):
         _rollback_close(conn)
         return jsonify({"error": str(e)}), 400
     conn.close()
+    if not deleted:
+        # The line did not belong to this sale, or is already gone. Answering
+        # 200 here claimed a delete that never happened.
+        return jsonify({"error": "Item not found"}), 404
     return jsonify({"message": "Item deleted"})
 
 

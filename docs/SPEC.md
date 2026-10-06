@@ -442,7 +442,7 @@ CREATE TABLE app_settings (
 | GET | `/api/users` | Admin | List users |
 | POST | `/api/users` | Admin | Create user |
 | DELETE | `/api/users/<id>` | Admin | Delete user (not last admin) |
-| POST | `/api/users/<id>/revoke` | Admin | Revoke all sessions |
+| POST | `/api/users/<id>/revoke` | Admin | Revoke all sessions — audited `SESSION_REVOKE`; 404 unknown user |
 | POST | `/api/users/<id>/password` | Admin | Force-reset (`temp_password?`, generated if absent); temp returned ONCE; sets `must_change_password` |
 | POST | `/api/users/<id>/reset-token` | Admin | Issue reset token; `{token, link}` returned ONCE; sets `must_change_password` |
 
@@ -629,7 +629,7 @@ future call sites are covered without opting in:
 | DELETE | `/api/sales/<id>/payments/<pid>` | Admin | Delete payment |
 | POST | `/api/sales/<id>/items` | Admin | Add item (product, qty, price, unit) |
 | PUT | `/api/sales/<id>/items/<iid>` | Admin | Update item (incl. unit) |
-| DELETE | `/api/sales/<id>/items/<iid>` | Admin | Delete item (min 1 item) |
+| DELETE | `/api/sales/<id>/items/<iid>` | Admin | Delete item (min 1 item); **scoped to `<id>`** — 404 if the line belongs to another sale or is already gone |
 | POST | `/api/sales/<id>/shipments` | Admin | Record shipment (date required) |
 | DELETE | `/api/sales/<id>/shipments/<shid>` | Admin | Delete shipment |
 

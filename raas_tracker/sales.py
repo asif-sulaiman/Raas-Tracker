@@ -601,7 +601,7 @@ def update_sale_item(conn: psycopg.Connection, item_id: int,
     return True
 
 
-def delete_sale_item(conn: psycopg.Connection, item_id: int) -> bool:
+def delete_sale_item(conn: psycopg.Connection, sale_id: int, item_id: int) -> bool:
     """Delete a single line item from a sale.
 
     Refuses (409 via the route) when the line has invoice_items. The commercial
@@ -610,6 +610,10 @@ def delete_sale_item(conn: psycopg.Connection, item_id: int) -> bool:
     would drop the row out of the grain while its money stayed in the sale's
     total, so the rows would no longer sum to the sale's own receivable. Reduce
     the invoice line instead.
+
+    `sale_id` scopes the delete: the line must belong to that sale, so it
+    cannot be removed through another PI's URL. Returns False when it does
+    not, which lets the route answer 404 instead of claiming success.
     """
     invoiced = conn.execute(
         "SELECT COUNT(*) FROM invoice_items WHERE sale_item_id = %s",
@@ -618,20 +622,30 @@ def delete_sale_item(conn: psycopg.Connection, item_id: int) -> bool:
         raise InvoicedLineConflict(
             "cannot delete a sale item that has invoice lines"
             " (adjust the invoice lines instead)")
-    # P1-5: capture the line before the DELETE. A PI line is money-affecting,
-    # and once the row is gone this summary is the only surviving evidence.
+    # P1-5 / D2 / D3: capture the line BEFORE the DELETE — including the PI it
+    # came from and the production runs the cascade is about to destroy. Once
+    # the row is gone this is the only surviving record, so the BOUNDED fields
+    # lead: `product_name` and `pi_number` have no max_length and old_value is
+    # capped at 2000 chars, so unbounded client text last would clip the
+    # evidence — the same rule as COMPANY_UPDATE.
     row = conn.execute(
-        "SELECT product_name, quantity, unit, unit_price FROM sale_items "
-        "WHERE id = %s", (item_id,)).fetchone()
-    cursor = conn.execute("DELETE FROM sale_items WHERE id = %s", (item_id,))
+        "SELECT si.product_name, si.quantity, si.unit, si.unit_price, "
+        "       s.pi_number, "
+        "       (SELECT COUNT(*) FROM production_runs pr "
+        "         WHERE pr.sale_item_id = si.id) "
+        "FROM sale_items si JOIN sales s ON s.id = si.sale_id "
+        "WHERE si.id = %s AND si.sale_id = %s", (item_id, sale_id)).fetchone()
+    cursor = conn.execute("DELETE FROM sale_items WHERE id = %s AND sale_id = %s",
+                          (item_id, sale_id))
     conn.commit()
-    # Gate on rowcount, not the return value: a delete that matched no row is
-    # not a delete and must not leave an audit row claiming one happened.
+    # Gate on rowcount: a delete that matched no row is not a delete and must
+    # not leave an audit row claiming one happened.
     if cursor.rowcount > 0 and row:
         log_audit_action(conn, "SALE_ITEM_DELETE", "sale_item", item_id,
-                         old_value=f"product={row[0]} qty={row[1]} "
-                                   f"{row[2]} unit_price={row[3]}")
-    return True
+                         old_value=f"runs={row[5]} qty={row[1]} {row[2]} "
+                                   f"unit_price={row[3]} pi={row[4]} "
+                                   f"product={row[0]}")
+    return cursor.rowcount > 0
 
 
 def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, Any],

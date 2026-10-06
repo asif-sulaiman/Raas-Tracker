@@ -39,7 +39,9 @@ def _sale_with_item(db, pi_number="PI-DEL"):
     """
     from raas_tracker.companies import create_company
     from raas_tracker.sales import add_sale
-    cid = create_company(db, name="DelCo")
+    # Reuse the company across calls so this helper can build several sales.
+    existing = db.execute("SELECT id FROM companies WHERE name = 'DelCo'").fetchone()
+    cid = existing[0] if existing else create_company(db, name="DelCo")
     add_sale(db, {"pi_number": pi_number, "client_name": "DelCo", "company_id": cid},
              [{"product_name": "Acetone", "quantity": 100,
                "unit_price": 12.5, "unit": "KG"},
@@ -88,6 +90,9 @@ def test_deleting_a_pi_line_is_audited(admin_client, db):
     assert "Acetone" in old_value
     assert "100" in old_value
     assert "12.5" in old_value
+    # The zero case is the one that catches a dropped column or a subquery that
+    # silently degrades to no rows.
+    assert "runs=0" in old_value
 
 
 def test_refused_invoiced_pi_line_delete_writes_no_audit_row(admin_client, db):
@@ -107,17 +112,86 @@ def test_refused_invoiced_pi_line_delete_writes_no_audit_row(admin_client, db):
     assert _count(db, "SALE_ITEM_DELETE") == 0
 
 
-def test_missing_pi_line_delete_writes_no_audit_row(admin_client, db):
-    """A delete that matched no row must not write a delete row.
+def _recipe_id(admin_client, db, name="DelRecipe"):
+    cid = db.execute("SELECT id FROM companies WHERE name = 'DelCo'").fetchone()[0]
+    r = admin_client.post("/api/recipes", json={
+        "name": name, "yield": 5, "company_id": cid, "product_name": "Acetone"})
+    assert r.status_code == 201, r.get_json()
+    # The create response does not carry an id, so read it back.
+    return db.execute("SELECT id FROM recipes WHERE name = %s", (name,)).fetchone()[0]
 
-    The status code is deliberately not asserted: `delete_sale_item` ignores
-    `rowcount`, so this route answers 200 even when nothing was deleted. That
-    is a pre-existing defect, reported separately — changing a route's response
-    is outside P1-5's scope. What matters here is that the audit trail stays
-    truthful about what actually happened.
+
+def test_sale_item_delete_names_the_pi(admin_client, db):
+    """The row must say which PI lost the line.
+
+    The sibling action `SALE_ITEM_ADD` records the sale id; without the PI the
+    loss cannot be attributed to anything.
+    """
+    sale_id, item_id = _sale_with_item(db, "PI-DEL-PI")
+    assert admin_client.delete(f"/api/sales/{sale_id}/items/{item_id}").status_code == 200
+    _e, _i, _u, old_value, _n, _ip = _rows(db, "SALE_ITEM_DELETE")[-1]
+    assert "PI-DEL-PI" in old_value, "the row cannot say which PI lost the line"
+
+
+def test_sale_item_delete_records_destroyed_production_runs(admin_client, db):
+    """`production_runs.sale_item_id` is ON DELETE CASCADE.
+
+    Deleting the line destroys the runs and their per-chemical `deducted_qty`
+    rows — stock already physically consumed, batch numbers gone. The audit
+    count is the only surviving record that this happened.
+    """
+    sale_id, item_id = _sale_with_item(db, "PI-DEL-RUNS")
+    recipe_id = _recipe_id(admin_client, db)
+    db.execute(
+        "INSERT INTO production_runs (recipe_id, sale_item_id, order_number, "
+        "batch_number, production_date, qty_produced) "
+        "VALUES (%s, %s, 'PO-1', 'BATCH-9', '2026-09-01', 50)",
+        (recipe_id, item_id))
+    db.commit()
+
+    assert admin_client.delete(f"/api/sales/{sale_id}/items/{item_id}").status_code == 200
+    # The cascade really happened — that is why the count must be recorded.
+    assert db.execute("SELECT COUNT(*) FROM production_runs WHERE sale_item_id = %s",
+                      (item_id,)).fetchone()[0] == 0
+    _e, _i, _u, old_value, _n, _ip = _rows(db, "SALE_ITEM_DELETE")[-1]
+    assert "runs=1" in old_value, "production history was destroyed with no record"
+
+
+def test_cross_sale_delete_is_refused_and_unaudited(admin_client, db):
+    """A line must not be deletable through another sale's URL.
+
+    The route takes `sale_id` in the path but used it only for the "keep at
+    least one item" count, so it could delete another PI's line. Admin-only, so
+    no privilege boundary was crossed — but the data was wrong.
+    """
+    _sale_a, item_a = _sale_with_item(db, "PI-DEL-A")
+    sale_b, _item_b = _sale_with_item(db, "PI-DEL-B")
+
+    r = admin_client.delete(f"/api/sales/{sale_b}/items/{item_a}")
+    assert r.status_code == 404, r.get_json()
+    assert db.execute("SELECT COUNT(*) FROM sale_items WHERE id = %s",
+                      (item_a,)).fetchone()[0] == 1, \
+        "the line was deleted through the wrong sale's URL"
+    assert _count(db, "SALE_ITEM_DELETE") == 0
+
+
+def test_kill_switch_on_unknown_user_is_404_and_unaudited(admin_client, db):
+    """A kill switch aimed at a nonexistent user must not answer 200."""
+    r = admin_client.post("/api/users/999999/revoke")
+    assert r.status_code == 404, r.get_json()
+    assert _count(db, "SESSION_REVOKE") == 0
+
+
+def test_missing_pi_line_delete_writes_no_audit_row(admin_client, db):
+    """A delete that matched no row answers 404 and leaves no audit row.
+
+    This route used to answer 200 "Item deleted" here, claiming work that never
+    happened. The sale-scoped delete plus the rowcount check fixed that, so the
+    status code is now asserted rather than deliberately skipped.
     """
     sale_id, _item_id = _sale_with_item(db, "PI-DEL-3")
-    admin_client.delete(f"/api/sales/{sale_id}/items/999999")
+    r = admin_client.delete(f"/api/sales/{sale_id}/items/999999")
+    assert r.status_code == 404, r.get_json()
     assert _count(db, "SALE_ITEM_DELETE") == 0
 
 
@@ -238,6 +312,21 @@ def test_kill_switch_on_user_with_no_live_sessions_still_audits(admin_client, db
 
 
 def test_admin_session_revoke_requires_admin(user_client, db):
+    uid = _user_with_sessions(db, "user", 1)
+    assert user_client.post(f"/api/users/{uid}/revoke").status_code == 403
+    assert _count(db, "SESSION_REVOKE") == 0
+
+
+def test_kill_switch_gate_does_not_rest_on_admin_paths(user_client, db, monkeypatch):
+    """D4 must not depend solely on the `_ADMIN_PATHS` prefix match.
+
+    `_ADMIN_PATHS` already 403s a non-admin, so `test_admin_session_revoke_requires_admin`
+    passes with the decorator removed — D4 could be reverted with every other
+    test still green. Emptying `_ADMIN_PATHS` leaves the route's own
+    `@admin_required` as the only gate, which is what this pins.
+    """
+    import flask_app
+    monkeypatch.setattr(flask_app, "_ADMIN_PATHS", ())
     uid = _user_with_sessions(db, "user", 1)
     assert user_client.post(f"/api/users/{uid}/revoke").status_code == 403
     assert _count(db, "SESSION_REVOKE") == 0
