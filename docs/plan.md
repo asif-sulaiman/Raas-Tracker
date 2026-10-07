@@ -117,16 +117,28 @@ Baseline established by enumeration: **64 mutating routes — 49 covered, 1 part
   reach audited mutations. Now proven by a test that stamps a real key.
 - ~~Flip the `atomic` default~~ — rejected; would silently lose audit rows.
 
+- ~~P1-13 as originally written: "8 of 62 sites pass `atomic=False`; review the
+  other ~54 for ghost rows that survive a rollback"~~ — **inverted.** With
+  `if atomic: conn.commit()` (`audit.py:141-142`), `atomic=True` is the
+  *committing* mode: it flushes the caller's entire open transaction. `False`
+  leaves the INSERT inside the caller's transaction, where a rollback takes it
+  along — the safe direction. Ghost rows and partial commits are therefore an
+  `atomic=True` problem. Counts restated as **69** sites (50 `True` / 18
+  literal `False` / 1 forwarded at `stock.py:278`). Worst site is
+  `uploads.py:891`, inside the `adjust_stock_from_upload` row loop, whose
+  `except` at `uploads.py:906` returns `False` without a rollback.
+  P1-13 itself stays **open**; only the row's wording is corrected.
+
 **Tail batch completed** — P1-8, P1-10, P1-12, P1-14, P1-15 (see git log).
 
 **Remaining backlog (not started):**
 
 | Task | Description |
 |---|---|
-| P1-9 | No concurrent regression test — suite is single-threaded, so the `threading.local` bug class is only covered sequentially |
+| ~~P1-9~~ ✓ | **Concurrent regression test added** — `tests/test_concurrency.py` drives the per-thread actor store (`raas_tracker/audit._audit_state`) from 8 barrier-synchronised threads, one DB connection each: each thread reads back its own actor, a peer's `clear_audit_actor` never disturbs another thread mid-flight, an unset thread falls back to `system` rather than inheriting, and 8 concurrent `UPLOAD`-style audit writes stay attributed to their own writer. Exercises the resolver directly (not HTTP) because the Flask test client's cookie jar is shared mutable state and is not thread-safe | `tests/test_concurrency.py` | The `threading.local` bug class has concurrent coverage, not just sequential |
 | P1-11 | Upload filename has three identities: `secure_filename` (extension gate), `_safe_upload_filename` (stored/audited), raw `file.filename` (response). Simplify to one |
-| P1-13 | `atomic=True` default: 8 of 62 sites pass `atomic=False`; review the other ~54 for ghost rows that survive a rollback |
-| P1-17 | `tests/test_auth.py:16` assigns `auth_mod._DUMMY_HASH = None` as a bare module global instead of via `monkeypatch`, so it is never restored across tests (`conftest.py:88` does it correctly). Harmless today — `_dummy_hash()` recomputes on demand — but it is shared mutable state leaking between tests |
+| P1-13 | **Audit atomicity, restated (earlier wording was inverted — see the correction below).** `atomic=True` **commits immediately** (`audit.py:141-142`), flushing the caller's whole open transaction; `atomic=False` leaves the INSERT in the caller's transaction so it rolls back with it — that is the *safe* direction. So ghost-row / partial-commit risk lives in the **`atomic=True`** sites, not the `atomic=False` ones. Real counts: **69 production call sites** — 50 `atomic=True`, 18 literal `atomic=False`, 1 variable-forwarded (`stock.py:278`). Highest severity: `uploads.py:891` `log_audit_action` sits **inside a per-row loop** in `adjust_stock_from_upload`; with `atomic=True` its commit durably flushes each row's `UPDATE chemicals` plus every earlier row, and the `except` at `uploads.py:906` returns `False` with **no rollback** — partial writes reported as failure |
+| ~~P1-17~~ ✓ | `tests/test_auth.py:16` assigned `auth_mod._DUMMY_HASH = None` as a bare module global instead of via `monkeypatch`, so it was never restored across tests (`conftest.py:88` does it correctly). Now set with `monkeypatch.setattr(auth_mod, "_DUMMY_HASH", None)` so it is restored at teardown; the anti-timing-oracle assertion is unchanged |
 | P1-18 | `tests/test_proxy_trust.py::test_forged_forwarded_for_cannot_reset_the_login_lockout` is **intermittent**: observed failing once as `401×6` in a full-suite run, then passing in three consecutive runs (full suite + the same `test_auth.py` ordering twice) with no code change. Production code was verified correct in both states — `x_for=0`, ProxyFix depth 2, `remote_addr='127.0.0.1'`, rows recorded verbatim, and the per-IP lockout itself behaves correctly. Stale `NOW()` vs `clock_timestamp()`, shared connections, live `x_for=1`, and bcrypt straddling a second boundary were each investigated and ruled out. Cause unknown; not reproducible on demand. Needs a bisect or an in-test assertion of the observed windowed count before the assertion can be trusted |
 | P1-16 | Delete paths `conn.commit()` **before** `log_audit_action`, so a failed audit INSERT leaves a committed delete with no row and a 500. Pre-existing repo-wide (`update_sale_item`, `delete_company` are identical), not a P1 regression. A `WITH del AS (DELETE ... RETURNING ...)` CTE would make capture + delete + audit one statement and one snapshot. Cannot be applied to the session-revoke route: `revoke_user_sessions` commits internally (`auth.py`, off-limits) |
 
@@ -135,9 +147,9 @@ Baseline established by enumeration: **64 mutating routes — 49 covered, 1 part
 | Task | Description |
 |---|---|
 | P1-b | `audit_logs.ip_address` is overloaded (real IP / operator reason / spoofable value); consider a separate `reason` column |
-| P1-c | No concurrent regression test — the suite is single-threaded, so the `threading.local` bug class is only covered sequentially. Add a threaded `Barrier` test, and revisit if the app ever moves to gevent |
+| ~~P1-c~~ | **Duplicate of P1-9** — the concurrent `Barrier` test for the `threading.local` bug class. Closed as P1-9 (`tests/test_concurrency.py`) |
 | P1-d | API keys can reach **no** audited mutation (every audited entity is `@admin_required`), so the `api-key:<name>` label is currently unreachable in practice |
-| P1-e | `atomic=True` default: 8 of 62 sites pass `atomic=False`; review the other ~54 for ghost audit rows that survive a rollback |
+| ~~P1-e~~ | **Duplicate of P1-13** — same `atomic=True` row, same inverted wording. Removed in favour of the corrected P1-13 above |
 
 ---
 

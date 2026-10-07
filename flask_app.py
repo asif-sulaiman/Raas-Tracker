@@ -1303,12 +1303,21 @@ def api_upload():
         return jsonify({"error": "No file selected"}), 400
 
     # V3: never trust the client filename (path traversal). Store under a
-    # random name; keep the original only for display/DB records.
-    from werkzeug.utils import secure_filename
+    # random name; keep the sanitised original only for display/DB records.
+    #
+    # P1-11: ONE canonical name for the whole request. This used to compute
+    # three: secure_filename() for the extension gate (then discarded),
+    # _safe_upload_filename() inside save_upload() for the stored column, and
+    # the RAW client name in the response below — so the caller was told a
+    # different string from the one stored and audited, and a legitimate
+    # non-Latin name was 400'd because secure_filename flattened it to a bare
+    # "xlsx" with no extension. The on-disk name below stays a uuid4 and is
+    # deliberately NOT this value.
     import uuid
+    from raas_tracker.uploads import _safe_upload_filename
     ALLOWED_UPLOAD_EXTS = {".pdf", ".xlsx", ".xls"}
-    safe_display = secure_filename(file.filename)
-    ext = os.path.splitext(safe_display)[1].lower()
+    safe_filename = _safe_upload_filename(file.filename)
+    ext = os.path.splitext(safe_filename)[1].lower()
     if ext not in ALLOWED_UPLOAD_EXTS:
         return jsonify({"error": "Only PDF and Excel files are accepted"}), 400
     from raas_tracker.db import data_dir as _data_dir
@@ -1339,13 +1348,14 @@ def api_upload():
 
     conn = get_db()
     results = compare_stock_upload(conn, upload_data)
-    upload_id = save_upload(conn, file.filename, results)
+    upload_id = save_upload(conn, safe_filename, results)
     conn.close()
 
     return jsonify({
         "success": True,
         "upload_id": upload_id,
-        "filename": file.filename,
+        # The canonical name, i.e. exactly what was stored and audited (P1-11).
+        "filename": safe_filename,
         "results": results
     })
 

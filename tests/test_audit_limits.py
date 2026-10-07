@@ -159,8 +159,12 @@ def test_full_update_audit_excludes_the_server_file_path(admin_client, db):
 
 
 def test_upload_create_audit_strips_a_hostile_filename(db):
-    """The upload route already computes secure_filename; the audit row must
-    not carry the raw client-supplied name (control chars, traversal)."""
+    """The audit row must not carry the raw client-supplied name.
+
+    The route now derives one canonical name via `_safe_upload_filename`
+    (P1-11) and that is what save_upload sanitises again and audits, so the
+    audit row never shows control chars or traversal.
+    """
     from raas_tracker.uploads import save_upload
     results = {
         "stats": {"total": 0, "matched": 0, "last_month_mismatches": 0,

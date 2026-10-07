@@ -11,9 +11,12 @@ from chem_stock import (
 )
 
 
-def test_unknown_user_401_and_dummy_work_done(client, db):
+def test_unknown_user_401_and_dummy_work_done(client, db, monkeypatch):
     import raas_tracker.auth as auth_mod
-    auth_mod._DUMMY_HASH = None
+    # Restored at teardown: a bare assignment here would leak `_DUMMY_HASH`
+    # into every later test in the session (conftest._fast_bcrypt does the
+    # same thing correctly via monkeypatch).
+    monkeypatch.setattr(auth_mod, "_DUMMY_HASH", None)
     r = client.post("/api/auth/login", json={"username": "ghost", "password": "whatever-123"})
     assert r.status_code == 401
     # Unknown usernames burn the same bcrypt work as real ones (no timing oracle).

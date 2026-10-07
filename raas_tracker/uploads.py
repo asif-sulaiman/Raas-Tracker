@@ -212,17 +212,61 @@ def compare_stock_upload(conn: psycopg.Connection, upload_data: List[Dict[str, A
     }
 
 
-def _safe_upload_filename(filename: str) -> str:
-    """Strip control characters and path traversal from an uploaded filename.
+# Windows reserved device names (CON, PRN, ... COM1-9, LPT1-9). A file with
+# one of these stems is a live device rather than a document on Windows, so a
+# name that would resolve to one is neutralised with a leading underscore —
+# the same treatment werkzeug's secure_filename gives it.
+_WINDOWS_RESERVED = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + [f"COM{i}" for i in range(1, 10)]
+    + [f"LPT{i}" for i in range(1, 10)]
+)
 
-    The HTTP layer passes the raw client-supplied name through. A NUL byte in
-    particular aborts the INSERT outright (psycopg DataError), so a hostile
-    filename is a 500, not just untidy storage. werkzeug's ``secure_filename``
-    is deliberately not used here: it also flattens unicode, which would
-    change what operators see for legitimate non-ASCII names.
+# Bidi control characters. U+202E (RTL OVERRIDE) is the dangerous one: it
+# reverses how everything after it renders, so a stored name can display as a
+# different name in the upload history — a spoofing vector in an audit-visible
+# list. U+200E / U+200F are its LRM/RLM siblings and are stripped with it.
+# None of these are legitimate in a filename an operator supplies.
+_BIDI_CONTROLS = "\u202e\u200e\u200f"  # escaped, so the source
+# itself contains no invisible bidi characters
+
+
+def _safe_upload_filename(filename: str) -> str:
+    """Canonical sanitiser for an uploaded filename — the single source of truth.
+
+    Strips control characters, path traversal, bidi controls, leading dots and
+    Windows reserved device names, while deliberately PRESERVING unicode.
+
+    werkzeug's ``secure_filename`` is deliberately not used here: it also
+    flattens unicode, which would change what operators see for legitimate
+    non-ASCII names. Flattening is not cosmetic either — a legitimate Arabic
+    name collapsed to a bare ``xlsx`` with no extension, so the route's
+    extension gate rejected a real file with 400. The two properties
+    ``secure_filename`` provides that *do* matter here, dotfile handling and
+    reserved device names, are implemented directly below instead.
+
+    The HTTP layer used to compute three different names for one file: this
+    function's output for the stored column, the raw client name in the JSON
+    response, and ``secure_filename``'s (discarded) output for the extension
+    gate. The route now computes the name once here and reuses that single
+    value for all three, so what is stored, what is audited and what the
+    caller is told always agree.
+
+    Returns ``"upload"`` when nothing usable survives.
     """
     cleaned = re.sub(r"[\x00-\x1f\x7f]", "", filename or "")
+    for mark in _BIDI_CONTROLS:
+        cleaned = cleaned.replace(mark, "")
+    # Trailing path component only: both separators, so a Windows-style
+    # "..\\..\\x.xlsx" is reduced exactly like a posix one.
     cleaned = cleaned.replace("\\", "/").split("/")[-1]
+    cleaned = cleaned.strip()
+    # A leading dot makes it a dotfile on POSIX and a hidden attribute on
+    # Windows. werkzeug drops the whole leading run; do the same, so
+    # ".hidden.xlsx" is stored as "hidden.xlsx".
+    cleaned = cleaned.lstrip(".")
+    if cleaned.split(".")[0].upper() in _WINDOWS_RESERVED:
+        cleaned = f"_{cleaned}"
     return cleaned.strip() or "upload"
 
 
