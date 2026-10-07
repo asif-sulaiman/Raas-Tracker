@@ -292,9 +292,10 @@ def add_shipment(conn: psycopg.Connection, sale_id: int, ship_date: str,
         (sale_id, ship_date.strip(), (invoice_number or "").strip() or None,
          (invoice_date or "").strip() or None, (notes or "").strip() or None)
     ).fetchone()
-    conn.commit()
+    # atomic=False, commit below: the INSERT and its audit row are one unit.
     log_audit_action(conn, "SHIPMENT_RECORD", "sale", sale_id,
-                     new_value=f"{ship_date.strip()}")
+                     new_value=f"{ship_date.strip()}", atomic=False)
+    conn.commit()
     return row[0]
 
 
@@ -321,13 +322,17 @@ def delete_shipment(conn: psycopg.Connection, sale_id: int,
     cursor = conn.execute(
         "DELETE FROM shipments WHERE id = %s AND sale_id = %s",
         (shipment_id, sale_id))
-    conn.commit()
     if cursor.rowcount > 0:
         # P1-5: captured before the DELETE, because afterwards the row that
         # described this shipment no longer exists.
+        # atomic=False, commit below: the DELETE and its audit row are one
+        # unit. A committed delete with no audit row is the worst outcome —
+        # the row is gone and nothing records that it ever existed.
         log_audit_action(conn, "SHIPMENT_DELETE", "shipment", shipment_id,
                          old_value=(f"ship_date={row[0]} "
-                                    f"invoice_number={row[1]}" if row else None))
+                                    f"invoice_number={row[1]}" if row else None),
+                         atomic=False)
+        conn.commit()
     return cursor.rowcount > 0
 
 
@@ -542,11 +547,13 @@ def add_sale_item(conn: psycopg.Connection, sale_id: int, product_name: str,
         (sale_id, product_name, quantity, unit_price, unit)
     )
     item_id = cursor.fetchone()[0]
-    conn.commit()
+    # atomic=False, commit below: the INSERT and its audit row are one unit.
     log_audit_action(conn, "SALE_ITEM_ADD", "sale_item", item_id,
                      new_value=json.dumps({"sale_id": sale_id, "product_name": product_name,
                                            "quantity": quantity, "unit_price": unit_price, "unit": unit},
-                                          default=str))
+                                          default=str),
+                     atomic=False)
+    conn.commit()
     return item_id
 
 
@@ -597,14 +604,15 @@ def update_sale_item(conn: psycopg.Connection, item_id: int,
         return False
     vals.append(item_id)
     conn.execute(f"UPDATE sale_items SET {', '.join(fields)} WHERE id = %s", vals)
-    conn.commit()
-    
+
     # Audit log
     new_item = {"product_name": product_name, "quantity": quantity,
                 "unit_price": unit_price, "unit": unit}
+    # atomic=False, commit below: the UPDATE and its audit row are one unit.
     log_audit_action(conn, "SALE_ITEM_UPDATE", "sale_item", item_id,
                      old_value=json.dumps(old_item, default=str),
-                     new_value=json.dumps(new_item, default=str))
+                     new_value=json.dumps(new_item, default=str), atomic=False)
+    conn.commit()
     return True
 
 
@@ -644,14 +652,18 @@ def delete_sale_item(conn: psycopg.Connection, sale_id: int, item_id: int) -> bo
         "WHERE si.id = %s AND si.sale_id = %s", (item_id, sale_id)).fetchone()
     cursor = conn.execute("DELETE FROM sale_items WHERE id = %s AND sale_id = %s",
                           (item_id, sale_id))
-    conn.commit()
     # Gate on rowcount: a delete that matched no row is not a delete and must
     # not leave an audit row claiming one happened.
     if cursor.rowcount > 0 and row:
+        # atomic=False, commit below: the DELETE and its audit row are one
+        # unit. The cascade here destroys production history, so a committed
+        # delete whose audit failed loses the only record that it happened.
         log_audit_action(conn, "SALE_ITEM_DELETE", "sale_item", item_id,
                          old_value=f"runs={row[5]} qty={row[1]} {row[2]} "
                                    f"unit_price={row[3]} pi={row[4]} "
-                                   f"product={row[0]}")
+                                   f"product={row[0]}",
+                         atomic=False)
+        conn.commit()
     return cursor.rowcount > 0
 
 
@@ -1632,9 +1644,15 @@ seed_lines: bool = True) -> Dict[str, Any]:
         (_now_str(), sale_id)
     )
 
-    conn.commit()
+    # atomic=False, commit below: the header, its seeded lines, the shipment
+    # status flip and the audit row are one transaction. This commit is also
+    # what releases the `sales ... FOR UPDATE` lock taken above, so it must stay
+    # AFTER the audit write — committing first would release the lock early and
+    # leave a durable invoice nobody recorded.
     log_audit_action(conn, "INVOICE_CREATE", "invoice", invoice_id,
-                     new_value=f"{invoice_number} amount={amount} status={status}")
+                     new_value=f"{invoice_number} amount={amount} status={status}",
+                     atomic=False)
+    conn.commit()
     return {"invoice_id": invoice_id, "invoice_number": invoice_number,
             "status": status, "amount": float(amount)}
 
@@ -1878,11 +1896,15 @@ def ship_invoice(conn: psycopg.Connection, invoice_id: int, actual_ship_date: st
         ).fetchone()
         raise ValueError(f"invoice already {(lost[0] if lost else 'shipped')}")
 
-    conn.commit()
+    # atomic=False on both, single commit below: the shipment row, the guarded
+    # status flip and their two audit rows are one transaction. The commit
+    # here is also what releases the invoice lock the guarded flip depends on,
+    # so it must stay after the audit writes.
     log_audit_action(conn, "SHIPMENT_RECORD", "sale", sale_id,
-                     new_value=f"{actual_ship_date}")
+                     new_value=f"{actual_ship_date}", atomic=False)
     log_audit_action(conn, "INVOICE_SHIP", "invoice", invoice_id,
-                     new_value=f"Shipped on {actual_ship_date}")
+                     new_value=f"Shipped on {actual_ship_date}", atomic=False)
+    conn.commit()
     return {"invoice_id": invoice_id, "shipment_id": shipment_id, "status": "shipped"}
 
 
@@ -2042,9 +2064,12 @@ def void_invoice(conn: psycopg.Connection, sale_id: int, invoice_id: int) -> boo
     if not row or row[0] != sale_id:
         return False
     conn.execute("DELETE FROM invoices WHERE id = %s", (invoice_id,))
-    conn.commit()
+    # atomic=False, commit below: the DELETE and its audit row are one unit.
+    # A voided invoice's money is gone from the report, so an unaudited void is
+    # a silent discrepancy between the ledger and the books.
     log_audit_action(conn, "INVOICE_VOID", "invoice", invoice_id,
-                     new_value=f"voided from sale {sale_id}")
+                     new_value=f"voided from sale {sale_id}", atomic=False)
+    conn.commit()
     return True
 
 

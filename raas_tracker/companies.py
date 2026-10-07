@@ -56,8 +56,10 @@ def create_company(conn: psycopg.Connection, *, name: str, code: str = None,
         "swift, lc_bank) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
         (name, code or None, country or None, address or None,
          contact_person or None, swift or None, lc_bank or None)).fetchone()
+    # One transaction for the row and its audit row (see delete_company).
+    log_audit_action(conn, "COMPANY_CREATE", "company", row[0], new_value=name,
+                     atomic=False)
     conn.commit()
-    log_audit_action(conn, "COMPANY_CREATE", "company", row[0], new_value=name)
     return row[0]
 
 
@@ -86,7 +88,6 @@ def update_company(conn: psycopg.Connection, cid: int,
             "UPDATE companies SET {} WHERE id = %s".format(
                 ", ".join(f"{k} = %s" for k in updates)),
             (*updates.values(), cid))
-        conn.commit()
     # Audit every genuine change, not just a rename (P1-4). Previously the
     # row was gated on a name change, so moving swift/lc_bank/address/
     # contact_person/code/country left no trace at all.
@@ -106,9 +107,14 @@ def update_company(conn: psycopg.Connection, cid: int,
         if name_moved:
             new_value = (f"{new_value} ({updates['name']})" if new_value
                          else updates["name"])
+        # atomic=False, and the single commit moved below: the UPDATE and its
+        # audit row are one unit, so a failing audit INSERT cannot leave a
+        # changed company with no record of the change.
         log_audit_action(conn, "COMPANY_UPDATE", "company", cid,
                          old_value=current["name"] if name_moved else None,
-                         new_value=new_value)
+                         new_value=new_value, atomic=False)
+    if updates:
+        conn.commit()
     return True
 
 
@@ -116,12 +122,15 @@ def delete_company(conn: psycopg.Connection, cid: int):
     """Delete a company. True = deleted, False = missing, 'linked' = referenced."""
     try:
         cursor = conn.execute("DELETE FROM companies WHERE id = %s", (cid,))
-        conn.commit()
     except psycopg.errors.ForeignKeyViolation:
         conn.rollback()
         return "linked"
     if cursor.rowcount:
-        log_audit_action(conn, "COMPANY_DELETE", "company", cid)
+        # atomic=False: the DELETE and its audit row are ONE unit. Committing
+        # first (as this used to) meant a failing audit INSERT left a deleted
+        # company with no trace of the deletion.
+        log_audit_action(conn, "COMPANY_DELETE", "company", cid, atomic=False)
+        conn.commit()
         return True
     return False
 

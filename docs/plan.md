@@ -117,6 +117,10 @@ Baseline established by enumeration: **64 mutating routes — 49 covered, 1 part
   reach audited mutations. Now proven by a test that stamps a real key.
 - ~~Flip the `atomic` default~~ — rejected; would silently lose audit rows.
 
+- ~~P1-13 ~~ and ~~P1-16~~: **both closed** — see the corrected backlog rows
+  below, which state exactly what is fixed and which two commit-before-audit
+  sites are deliberately left (load-bearing route-level commits). The audit
+  listing now orders by `id`, recorded in "P1-18 data migration" below.
 - ~~P1-13 as originally written: "8 of 62 sites pass `atomic=False`; review the
   other ~54 for ghost rows that survive a rollback"~~ — **inverted.** With
   `if atomic: conn.commit()` (`audit.py:141-142`), `atomic=True` is the
@@ -153,16 +157,18 @@ every run and could **not** have caught this — hence
 | All business `created_at` / `updated_at` / `hit_at` / `read_at` / `reviewed_at` / `changed_at` / `upload_date` | historical rows left as-is, **DEFAULT corrected going forward** | These are display/sort data with no control attached; rewriting history is not worth the risk. |
 | `sessions.expires_at`, `api_keys.expires_at` | **no migration needed** | Written by Python `strftime("%Y-%m-%d %H:%M:%S")`, which was always correct. They became *correct in comparison* once the SQL floor was fixed. Confirmed, not assumed. |
 
-**Known residual (found, NOT fixed — needs a decision):** `audit_logs.timestamp`
-historical rows are malformed and new rows are not, and the audit-log listing
-orders by that column (`raas_tracker/audit.py:172`, `ORDER BY timestamp DESC`).
-So `/api/audit-logs` ordering is inconsistent for rows spanning the migration,
-and would also have been inverted across the afternoon before the fix. Audit
-*tests* and the other audit read paths use `ORDER BY id` (correct, monotonic)
-and are unaffected. Fixing the listing means either backfilling the ledger
-(explicitly rejected above) or ordering by `id` — a one-line change to
-`audit.py:172`, deliberately left alone because it alters the audit read path
-and belongs to a separate decision.
+**Resolved (the residual previously flagged here):** the audit-log listing now
+orders by `id` — `raas_tracker/audit.py:180`, `ORDER BY id DESC`. Deciding
+between backfilling the ledger and reordering was unnecessary: backfilling is
+still rejected (the ledger is immutable), so the listing uses `id`, the
+append-only IDENTITY that is both monotonic and the order rows were actually
+written in. The `timestamp` column is still returned as evidence, just never
+used as a sort key. `/api/audit-logs` therefore reads newest-first for rows
+spanning the migration and for rows written across an afternoon (which the old
+textual sort inverted outright, `HH` being a 12-hour clock). Pinned by
+`test_audit_listing_orders_by_insertion_not_by_the_timestamp_text`, which
+inserts two rows whose timestamps sort the opposite way to their ids.
+Historical `audit_logs` rows remain untouched — no rewrite, ever.
 
 **Remaining backlog (not started):**
 
@@ -170,10 +176,10 @@ and belongs to a separate decision.
 |---|---|
 | ~~P1-9~~ ✓ | **Concurrent regression test added** — `tests/test_concurrency.py` drives the per-thread actor store (`raas_tracker/audit._audit_state`) from 8 barrier-synchronised threads, one DB connection each: each thread reads back its own actor, a peer's `clear_audit_actor` never disturbs another thread mid-flight, an unset thread falls back to `system` rather than inheriting, and 8 concurrent `UPLOAD`-style audit writes stay attributed to their own writer. Exercises the resolver directly (not HTTP) because the Flask test client's cookie jar is shared mutable state and is not thread-safe | `tests/test_concurrency.py` | The `threading.local` bug class has concurrent coverage, not just sequential |
 | P1-11 | Upload filename has three identities: `secure_filename` (extension gate), `_safe_upload_filename` (stored/audited), raw `file.filename` (response). Simplify to one |
-| P1-13 | **Audit atomicity, restated (earlier wording was inverted — see the correction below).** `atomic=True` **commits immediately** (`audit.py:141-142`), flushing the caller's whole open transaction; `atomic=False` leaves the INSERT in the caller's transaction so it rolls back with it — that is the *safe* direction. So ghost-row / partial-commit risk lives in the **`atomic=True`** sites, not the `atomic=False` ones. Real counts: **69 production call sites** — 50 `atomic=True`, 18 literal `atomic=False`, 1 variable-forwarded (`stock.py:278`). Highest severity: `uploads.py:891` `log_audit_action` sits **inside a per-row loop** in `adjust_stock_from_upload`; with `atomic=True` its commit durably flushes each row's `UPDATE chemicals` plus every earlier row, and the `except` at `uploads.py:906` returns `False` with **no rollback** — partial writes reported as failure |
+| ~~P1-13~~ ✓ | **CLOSED for the enumerated sites — mutation and audit now share one transaction.** 24 `atomic=True` call sites that committed *before* auditing now pass `atomic=False` and commit once, after the audit write. Highest severity first: `adjust_stock_from_upload` (`uploads.py:896`) no longer audits inside its row loop — the audit rows are **collected** and written after the loop with `atomic=False`, and the `except` now `conn.rollback()`s, so a failure on row N applies **nothing** (before: rows 1..N-1 durably flushed, audited, and reported as a failure the caller could not distinguish from success). Also fixed: the 6 delete paths (see P1-16) plus `create_user`, `create_company`, `update_company`, `add_recipe`, `add_recipe_item`, `update_recipe_item`, `update_recipe`, `add_shipment`, `add_sale_item`, `update_sale_item`, `create_invoice`, `ship_invoice` (2 rows), `void_invoice`, `save_upload`, `update_stock` (its own `atomic` param now forwarded to the audit instead of committing first), `set_reorder_level`, `add_chemical` (whose `except psycopg.IntegrityError` `rollback()` was dead code while the INSERT was already committed, and is now live). Class-3 swallowed rollbacks added in `approve_upload_row`, `reject_upload_row`, `approve_upload`, `lock_reconciliation_period`, `api_cron_maturity_check`. **Deliberately NOT changed** (each read in full first): `log_audit_action`'s global `atomic=True` default — changing it would silently alter ~50 sites (rejected in a prior decision); `update_sale_full` (`sales.py:814` commit → `:832` audit) and `book_invoice` (`update_invoice_status` commits at `:1835` → audit at `:1846`) still commit before auditing — both are **load-bearing commits that the route depends on for its own one-transaction guarantee** (`flask_app.py:2213-2230` books the sale badge and the invoice together via `book_invoice`'s commit; `test_production_atomicity.py:221` pins it), so moving them is a route-level redesign, not a call-site edit; `revoke_user_sessions` commits internally (`auth.py:527`), which is why the `SESSION_REVOKE` audit at `flask_app.py:731` commits separately — documented on P1-16. Test: `tests/test_audit_atomicity.py` (23 tests, TDD red-first) |
 | ~~P1-17~~ ✓ | `tests/test_auth.py:16` assigned `auth_mod._DUMMY_HASH = None` as a bare module global instead of via `monkeypatch`, so it was never restored across tests (`conftest.py:88` does it correctly). Now set with `monkeypatch.setattr(auth_mod, "_DUMMY_HASH", None)` so it is restored at teardown; the anti-timing-oracle assertion is unchanged |
 | ~~P1-18~~ ✓ | **CLOSED — a production timestamp defect, not a flaky test.** Root cause: `to_char(ts, 'YYYY-MM-DD HH:MM:SS')` is a *strftime* pattern, and `to_char` reads the codes differently — `MM` = MONTH (minutes are `MI`) and `HH` = 12-hour (24-hour is `HH24`). So every datetime this schema produced stored the **month** in the minute slot and lost both the real minutes and any AM/PM distinction: real `2026-10-07 07:06:58` → stored `2026-10-07 07:10:58`, real `2026-03-15 14:22:41` → `2026-03-15 02:03:41`. Because the columns are TEXT and every window is a **string comparison**, each time-window control silently degraded into a comparison of the **seconds field**: `is_login_blocked`'s 10-minute window became `second_row >= second_now`, so an attempt written seconds earlier could be judged outside the window the moment the clock ticked past its recorded second. That is exactly the `401×6` flake — it reproduces in `tests/test_proxy_trust.py` **alone** (~6% of runs, 3/48 measured), and captured failures showed all 6 rows present, all `ip=127.0.0.1`, `route_eval=4` vs 5. Fix: `'YYYY-MM-DD HH24:MI:SS'` in every SQL `to_char`, `db.py` docstring rewritten to name the `MM`/`MI` and `HH`/`HH24` traps, `_SCHEMA_VERSION` 3 → 4. Same defect also broke `check_api_key_rate_limit` (300/min shed hits every minute) and made session/API-key expiry wrong by ~9 min early / ~59 min late (a 1-hour TTL was really ~10 hours). See "P1-18 data migration" below |
-| P1-16 | Delete paths `conn.commit()` **before** `log_audit_action`, so a failed audit INSERT leaves a committed delete with no row and a 500. Pre-existing repo-wide (`update_sale_item`, `delete_company` are identical), not a P1 regression. A `WITH del AS (DELETE ... RETURNING ...)` CTE would make capture + delete + audit one statement and one snapshot. Cannot be applied to the session-revoke route: `revoke_user_sessions` commits internally (`auth.py`, off-limits) |
+| ~~P1-16~~ ✓ | **CLOSED — all 6 delete paths now commit AFTER the audit.** `api_delete_upload` (`flask_app.py:1397`), `delete_company`, `delete_recipe_item`, `delete_recipe`, `delete_shipment`, `delete_sale_item` each pass `atomic=False` and commit once, so a failing audit INSERT leaves the row **intact and unrecorded** rather than deleted and unrecorded. The rowcount gates are preserved, so a delete that matched no row still writes no audit row. The CTE idea in the original wording was not needed: each site already captured its evidence with a SELECT *before* the DELETE (P1-5), so capture + delete + audit is one transaction without rewriting the deletes. Not applicable to the session-revoke route, as originally noted: `revoke_user_sessions` commits internally (`auth.py:527`) — see P1-13 |
 
 **P1 backlog (identified, not started):**
 

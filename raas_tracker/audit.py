@@ -169,7 +169,20 @@ def get_audit_logs(conn: psycopg.Connection, entity_type: str = None,
         query += " WHERE entity_id = %s"
         params.append(entity_id)
 
-    query += " ORDER BY timestamp DESC LIMIT %s"
+    # ORDER BY id DESC, not timestamp DESC.
+    #
+    # `audit_logs.timestamp` is bare TEXT, and rows written before P1-18 carry
+    # the malformed `to_char` format (the MONTH in the minute slot, and a
+    # 12-hour clock), so a textual sort puts the ledger in the wrong order —
+    # badly so for anything recorded in an afternoon, and irreparably so for
+    # rows spanning the format fix. Those historical rows are deliberately NOT
+    # backfilled: the ledger is immutable.
+    #
+    # `id` is an append-only IDENTITY, so it is both monotonic and the order
+    # the rows were actually written in, which is what a ledger listing claims
+    # to show. The timestamp is still returned — it is evidence, just not a
+    # reliable sort key.
+    query += " ORDER BY id DESC LIMIT %s"
     params.append(limit)
     
     cursor = conn.execute(query, params)

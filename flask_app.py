@@ -1396,9 +1396,13 @@ def api_delete_upload(upload_id):
 
     conn.execute("DELETE FROM upload_rows WHERE upload_id = %s", (upload_id,))
     conn.execute("DELETE FROM uploads WHERE id = %s", (upload_id,))
-    conn.commit()
+    # atomic=False, commit below: both DELETEs and the audit row are one unit.
+    # The cascade destroys the comparison result, so a committed delete whose
+    # audit failed leaves no record that this upload ever existed.
     log_audit_action(conn, "UPLOAD_DELETE", "upload", upload_id,
-                     old_value=f"filename={upload[0]} rows={row_count}")
+                     old_value=f"filename={upload[0]} rows={row_count}",
+                     atomic=False)
+    conn.commit()
     conn.close()
     return jsonify({"success": True, "deleted_id": upload_id})
 
@@ -2904,6 +2908,16 @@ def api_cron_maturity_check():
                          new_value=f"checked={len(rows)} notified={notified}")
         return jsonify({"success": True, "checked": len(rows), "notified": notified})
     except Exception as e:
+        # Roll back before returning 500. A failed run leaves statements this
+        # handler issued after the last committing `notify()` still open; without
+        # this the pooled connection carries them into the next request, which
+        # then commits them (notifications.py:36) on its behalf. Note the limit:
+        # `notify()` commits internally, so notifications already written by an
+        # earlier loop iteration cannot be undone here.
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         app.logger.exception("cron maturity check failed")
         return jsonify({"error": "internal server error"}), 500
     finally:

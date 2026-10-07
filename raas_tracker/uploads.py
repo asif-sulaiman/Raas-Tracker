@@ -347,8 +347,12 @@ def save_upload(conn: psycopg.Connection, filename: str, results: Dict[str, Any]
              row.get("upload_unit", ""), row["upload_last"], row["upload_this"])
         )
     
+    # atomic=False, commit below: the header, every upload_row and the audit
+    # row are one transaction. A committed upload whose audit failed would be a
+    # reconciliation record that exists with no record of who filed it.
+    log_audit_action(conn, "UPLOAD_CREATE", "upload", upload_id,
+                     new_value=filename, atomic=False)
     conn.commit()
-    log_audit_action(conn, "UPLOAD_CREATE", "upload", upload_id, new_value=filename)
     _notify_upload_outcome(conn, upload_id, filename, results)
     return upload_id
 
@@ -689,6 +693,11 @@ def approve_upload_row(conn: psycopg.Connection, workflow_id: int, reason_code: 
         conn.commit()
         return True
     except Exception as e:
+        # Roll back: the audit write commits (atomic=True), so without this the
+        # UPDATE approval_workflow and whatever earlier statements this
+        # transaction already flushed stay applied while the caller is told the
+        # approval failed.
+        conn.rollback()
         logger.exception("Error approving row")
         return False
 
@@ -729,6 +738,8 @@ def reject_upload_row(conn: psycopg.Connection, workflow_id: int, reason_code: s
         conn.commit()
         return True
     except Exception as e:
+        # Roll back: see approve_upload_row.
+        conn.rollback()
         logger.exception("Error rejecting row")
         return False
 
@@ -780,6 +791,11 @@ def approve_upload(conn: psycopg.Connection, upload_id: int, reviewed_by: str = 
         conn.commit()
         return True
     except Exception as e:
+        # Roll back: this loop creates workflow rows and approves them, and
+        # each of those inner calls commits. Without an explicit rollback the
+        # batch that failed leaves a partially approved upload behind while the
+        # caller is told approval failed.
+        conn.rollback()
         logger.exception("Error approving upload")
         return False
 
@@ -874,6 +890,9 @@ def lock_reconciliation_period(conn: psycopg.Connection, period_id: int, locked_
         conn.commit()
         return True
     except Exception as e:
+        # Roll back: a lock that reports failure but takes effect would block
+        # every later correction to the period.
+        conn.rollback()
         logger.exception("Error locking period")
         return False
 
@@ -901,6 +920,14 @@ def adjust_stock_from_upload(conn: psycopg.Connection, upload_id: int,
         )
         
         adjustments = 0
+        # Audit rows are COLLECTED, not written inside the loop, and written
+        # after it with atomic=False. Written inside the loop they committed
+        # (atomic=True), so every iteration durably flushed that row's UPDATE
+        # plus every earlier row: a failure on row N left rows 1..N-1 applied
+        # and audited, the function reported failure, and the caller could not
+        # tell the batch had half-applied. The whole batch is now one
+        # transaction that either lands complete or not at all.
+        pending_audit = []
         for row in cursor.fetchall():
             chemical_name = row[0]
             new_qty = row[1]
@@ -935,13 +962,12 @@ def adjust_stock_from_upload(conn: psycopg.Connection, upload_id: int,
                     (new_qty, date.isoformat(date.today()), chem_id)
                 )
                 
-                # Log the adjustment. Provenance goes in new_value, not
+                # Queue the adjustment. Provenance goes in new_value, not
                 # ip_address: passing it as the IP would permanently suppress
                 # the real client IP captured in P0-2.
-                log_audit_action(conn, "ADJUST_STOCK", "chemical", chem_id,
-                                reviewed_by, str(old_qty),
-                                f"{new_qty} (Adjusted from upload {upload_id})")
-                
+                pending_audit.append((chem_id, str(old_qty),
+                                      f"{new_qty} (Adjusted from upload {upload_id})"))
+
                 adjustments += 1
         
         # Update upload status
@@ -949,10 +975,18 @@ def adjust_stock_from_upload(conn: psycopg.Connection, upload_id: int,
             "UPDATE uploads SET status = 'adjusted' WHERE id = %s",
             (upload_id,)
         )
-        
+
+        # The whole batch and its trail land together, in one commit.
+        for chem_id, old_qty, new_value in pending_audit:
+            log_audit_action(conn, "ADJUST_STOCK", "chemical", chem_id,
+                             reviewed_by, old_qty, new_value, atomic=False)
+
         conn.commit()
         logger.info("Applied %s stock adjustments from upload %s", adjustments, upload_id)
         return True
     except Exception as e:
+        # Roll back: every UPDATE above is still uncommitted, so this is what
+        # stops a failed batch from leaving stock half-corrected.
+        conn.rollback()
         logger.exception("Error adjusting stock")
         return False

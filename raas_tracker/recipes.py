@@ -54,9 +54,12 @@ def add_recipe(conn: psycopg.Connection, name: str, total_quantity: float = 1, w
             (name, total_quantity, water_percentage, company_id, product_name)
         )
         recipe_id = cursor.fetchone()[0]
-        conn.commit()
         logger.info("Created recipe: '%s' (total quantity: %s)", name, total_quantity)
-        log_audit_action(conn, "RECIPE_CREATE", "recipe", recipe_id, new_value=name)
+        # atomic=False, commit below: INSERT and RECIPE_CREATE are one unit, so
+        # a failing audit INSERT cannot leave a recipe nobody can account for.
+        log_audit_action(conn, "RECIPE_CREATE", "recipe", recipe_id,
+                         new_value=name, atomic=False)
+        conn.commit()
         return True
     except psycopg.IntegrityError:
         try:
@@ -161,10 +164,12 @@ def add_recipe_item(conn: psycopg.Connection, company_id: int, recipe_name: str,
         (recipe["id"], chemical[0], percentage, required_qty_per_unit)
     )
     item_id = cursor.fetchone()[0]
-    conn.commit()
     logger.info("Added '%s' to recipe '%s': %s%%", chemical_name, recipe_name, percentage)
+    # atomic=False, commit below: see add_recipe.
     log_audit_action(conn, "RECIPE_ITEM_ADD", "recipe_item", item_id,
-                     new_value=f"{recipe_name}:{chemical_name}:{percentage}")
+                     new_value=f"{recipe_name}:{chemical_name}:{percentage}",
+                     atomic=False)
+    conn.commit()
     return True
 
 
@@ -257,12 +262,14 @@ def update_recipe_item(conn: psycopg.Connection, company_id: int, recipe_name: s
         "UPDATE recipe_items SET percentage = %s, required_qty_per_unit = %s WHERE recipe_id = %s AND chemical_id = %s",
         (new_percentage, new_qty_per_unit, recipe["id"], chemical[0])
     )
-    conn.commit()
 
     if result.rowcount > 0:
         logger.info("Updated '%s' in '%s': now %s%%", chemical_name, recipe_name, new_percentage)
+        # atomic=False, commit below: the UPDATE and its audit row are one unit.
         log_audit_action(conn, "RECIPE_ITEM_UPDATE", "recipe_item", old[0],
-                         old_value=str(old[1]), new_value=str(new_percentage))
+                         old_value=str(old[1]), new_value=str(new_percentage),
+                         atomic=False)
+        conn.commit()
         return True
     else:
         logger.warning("'%s' not found in recipe '%s'.", chemical_name, recipe_name)
@@ -293,12 +300,16 @@ def delete_recipe_item(conn: psycopg.Connection, company_id: int, recipe_name: s
         "DELETE FROM recipe_items WHERE recipe_id = %s AND chemical_id = %s",
         (recipe["id"], chemical[0])
     )
-    conn.commit()
 
     if result.rowcount > 0:
         logger.info("Removed '%s' from recipe '%s'", chemical_name, recipe_name)
+        # atomic=False, commit below. A delete destroys its own evidence, so a
+        # committed delete with no audit row is the worst of both: the row is
+        # gone and nothing records that it ever existed.
         log_audit_action(conn, "RECIPE_ITEM_DELETE", "recipe_item", old[0],
-                         old_value=f"{recipe_name}:{chemical_name}:{old[1]}")
+                         old_value=f"{recipe_name}:{chemical_name}:{old[1]}",
+                         atomic=False)
+        conn.commit()
         return True
     else:
         logger.warning("'%s' was not in recipe '%s'.", chemical_name, recipe_name)
@@ -314,9 +325,11 @@ def delete_recipe(conn: psycopg.Connection, company_id: int, name: str) -> bool:
     
     conn.execute("DELETE FROM recipe_items WHERE recipe_id = %s", (recipe["id"],))
     conn.execute("DELETE FROM recipes WHERE id = %s", (recipe["id"],))
-    conn.commit()
     logger.info("Deleted recipe '%s' and all its items.", name)
-    log_audit_action(conn, "RECIPE_DELETE", "recipe", recipe["id"], old_value=name)
+    # atomic=False, commit below: both DELETEs and the audit row are one unit.
+    log_audit_action(conn, "RECIPE_DELETE", "recipe", recipe["id"],
+                     old_value=name, atomic=False)
+    conn.commit()
     return True
 
 
@@ -357,10 +370,11 @@ def update_recipe(conn: psycopg.Connection, company_id: int, name: str,
 
     params.append(recipe["id"])
     conn.execute(f"UPDATE recipes SET {', '.join(updates)} WHERE id = %s", params)
-    conn.commit()
     logger.info("Updated recipe '%s': %s", name, updates)
+    # atomic=False, commit below: the UPDATE and its audit row are one unit.
     log_audit_action(conn, "RECIPE_UPDATE", "recipe", recipe["id"],
-                     old_value=name, new_value=",".join(updates))
+                     old_value=name, new_value=",".join(updates), atomic=False)
+    conn.commit()
     return True
 
 

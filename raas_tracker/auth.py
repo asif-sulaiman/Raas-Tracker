@@ -76,8 +76,11 @@ def create_user(conn: psycopg.Connection, username: str, password: str,
         uid = cursor.fetchone()[0]
     except psycopg.IntegrityError:
         raise ValueError(f"username '{name}' already exists")
-    conn.commit()
-    log_audit_action(conn, "USER_CREATE", "user", uid, new_value=f"{name}:{role}")
+    # atomic=False + one commit below: the INSERT and its audit row are one
+    # unit. The commit used to sit BETWEEN them, so a failing audit INSERT
+    # returned a 500 while the user account persisted with no USER_CREATE row.
+    log_audit_action(conn, "USER_CREATE", "user", uid,
+                     new_value=f"{name}:{role}", atomic=False)
     conn.commit()
     return uid
 

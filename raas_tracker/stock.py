@@ -266,12 +266,14 @@ def update_stock(conn: psycopg.Connection, name: str, delta: float, unit: str = 
         "UPDATE chemicals SET current_qty = %s, last_updated = %s WHERE id = %s",
         (new_qty, date.isoformat(date.today()), chem_id)
     )
-    if atomic:
-        conn.commit()
     # Collapse the reason onto one line: the audited format is
     # "<qty> (<reason>)", and an embedded newline both reads badly in the
     # history feed and used to break its parser outright.
     reason_text = " ".join((reason or "").split())[:120]
+    # atomic=atomic FORWARDS the caller's choice, so the UPDATE and the
+    # ADJUST_STOCK row commit or roll back together. This used to commit the
+    # UPDATE at line 270 when atomic=True and only then write the audit row,
+    # so a failing audit INSERT left the quantity changed with no record.
     log_audit_action(conn, "ADJUST_STOCK", "chemical", chem_id,
                      old_value=str(current_qty),
                      new_value=f"{new_qty} ({reason_text})" if reason_text else str(new_qty),
@@ -300,9 +302,11 @@ def set_reorder_level(conn: psycopg.Connection, name: str, level: float) -> bool
         return False
     chem_id, chem_name, qty, old_level = row
     conn.execute("UPDATE chemicals SET reorder_level = %s WHERE id = %s", (level, chem_id))
-    conn.commit()
+    # atomic=False, commit below: the UPDATE and its audit row are one unit.
+    # notify_reorder_status commits internally, so it must stay after the commit.
     log_audit_action(conn, "SET_REORDER_LEVEL", "chemical", chem_id,
-                     old_value=str(old_level), new_value=str(level))
+                     old_value=str(old_level), new_value=str(level), atomic=False)
+    conn.commit()
     notify_reorder_status(conn, chem_id, chem_name, qty, level)
     return True
 
@@ -321,16 +325,16 @@ def add_chemical(conn: psycopg.Connection, name: str, qty: float, unit: str = "K
             "INSERT INTO chemicals (name, current_qty, unit, last_updated) VALUES (%s, %s, %s, %s) RETURNING id",
             (name, qty, unit, date.isoformat(date.today()))
         ).fetchone()
-        conn.commit()
+        # atomic=False, commit below: the INSERT and its audit row are one unit.
         log_audit_action(conn, "ADD_CHEMICAL", "chemical", row[0],
-                         new_value=str(qty))
+                         new_value=str(qty), atomic=False)
+        conn.commit()
         logger.info("Added chemical: %s = %s %s", name, qty, unit)
         return True
     except psycopg.IntegrityError:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        # Now a live rollback, not a no-op: the INSERT is no longer committed
+        # before the audit, so the failed transaction is genuinely open here.
+        conn.rollback()
         logger.warning("Chemical '%s' already exists. Use update_stock instead.", name)
         return False
 
