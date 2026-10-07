@@ -177,3 +177,30 @@ def test_split_qty_reason(value, expected_qty, expected_reason):
     qty, reason = _split_qty_reason(value)
     assert qty == expected_qty
     assert reason == expected_reason
+
+
+
+def test_history_does_not_render_an_ipv6_address_as_the_purpose(admin_client, db):
+    """P1-10: _is_ip only recognised IPv4.
+
+    An IPv6 client that made an adjustment with no reason had its own address
+    rendered as the movement's `purpose` instead of the "Manual adjustment"
+    fallback, because the dotted-quad regex could not match it. The stock
+    history feed is what operators read to answer "why did stock move?".
+    """
+    admin_client.post("/api/chemicals", json={"name": "Ipv6Chem", "qty": 10})
+    r = admin_client.post("/api/chemicals/update",
+                          json={"name": "Ipv6Chem", "delta": -3},
+                          environ_base={"REMOTE_ADDR": "2001:db8::1"})
+    assert r.status_code == 200, r.get_json()
+
+    ip = db.execute("SELECT ip_address FROM audit_logs WHERE action = 'ADJUST_STOCK' "
+                    "ORDER BY id DESC LIMIT 1").fetchone()[0]
+    assert ip == "2001:db8::1", "the IPv6 address was not captured at all"
+
+    movements = [m for m in admin_client.get("/api/chemicals/history").get_json()
+                 if m["action"] == "ADJUST_STOCK"]
+    assert movements, "the adjustment is missing from the history feed"
+    assert movements[0]["purpose"] == "Manual adjustment", (
+        "the client address leaked into the purpose field: %r"
+        % movements[0]["purpose"])

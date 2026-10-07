@@ -628,8 +628,8 @@ def api_forgot_password():
     """Public reset request. Generic 200 either way (no account oracle).
 
     Both paths do one cheap lookup; a ~200ms delay floor masks residual
-    timing. The raw token is server-logged (setup-token precedent), never
-    returned.
+    timing. The raw token is never returned and never logged - only an
+    8-character prefix of its SHA-256, as a correlation handle (P1-8).
     """
     import time as _time
     try:

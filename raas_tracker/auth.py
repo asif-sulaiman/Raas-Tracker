@@ -20,6 +20,11 @@ MAX_LOGIN_FAILS = 5
 LOGIN_WINDOW_MINUTES = 10
 SETUP_TOKEN_TTL_MINUTES = 60
 
+# P1-12: ceiling on an API key's IP allowlist. The column is unbounded TEXT and
+# the value is parsed per request, so an unbounded list is both a storage and a
+# per-request-parsing hazard.
+MAX_KEY_ALLOWED_IPS_CHARS = 1000
+
 
 def _hash_password(password: str) -> str:
     """bcrypt-12 over a SHA256 pre-hash (avoids bcrypt's 72-byte truncation)."""
@@ -418,6 +423,36 @@ def create_api_key(conn: psycopg.Connection, name: str, created_by: Optional[int
     name = (name or "").strip()
     if not (1 <= len(name) <= 64):
         raise ValueError("key name must be 1-64 characters")
+
+    # P1-12: `validate_api_key` compares expires_at lexicographically against
+    # to_char(clock_timestamp(), 'YYYY-MM-DD HH:MM:SS'), so a malformed value
+    # ("banana", or an impossible date) sorts after every real timestamp and the
+    # key would silently never expire. Validate here, at the only write path.
+    expires_at = (expires_at or "").strip() or None
+    if expires_at is not None:
+        from datetime import datetime as _dt
+        try:
+            _dt.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            raise ValueError("expires_at must be formatted 'YYYY-MM-DD HH:MM:SS'")
+
+    # P1-12: `_ip_allowed` skips entries it cannot parse, so a typo in a
+    # non-first position quietly narrowed access instead of erroring.
+    import ipaddress as _ip
+    entries = [p.strip() for p in (allowed_ips or "").split(",") if p.strip()]
+    if len(",".join(entries)) > MAX_KEY_ALLOWED_IPS_CHARS:
+        raise ValueError(
+            "allowed_ips must be at most %d characters" % MAX_KEY_ALLOWED_IPS_CHARS)
+    for entry in entries:
+        try:
+            if "/" in entry:
+                _ip.ip_network(entry, strict=False)
+            else:
+                _ip.ip_address(entry)
+        except ValueError:
+            raise ValueError("allowed_ips entry %r is not a valid IP or CIDR" % entry)
+    allowed_ips = ",".join(entries)
+
     raw = "ck_live_" + _secrets.token_urlsafe(32)
     cursor = conn.execute(
         """INSERT INTO api_keys (key_hash, name, created_by, expires_at, allowed_ips)
@@ -428,7 +463,8 @@ def create_api_key(conn: psycopg.Connection, name: str, created_by: Optional[int
     # Audit the credential's creation. Never the raw key or its hash — only
     # the name and the allowlist, which is the access control on the key.
     log_audit_action(conn, "API_KEY_CREATE", "api_key", key_id,
-                     new_value=f"name={name} allowed_ips={allowed_ips or 'any'}",
+                     new_value=f"name={name} expires={expires_at or 'never'} "
+                               f"allowed_ips={allowed_ips or 'any'}",
                      atomic=False)
     conn.commit()
     return raw

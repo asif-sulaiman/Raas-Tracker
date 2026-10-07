@@ -249,6 +249,26 @@ def test_move_lc_stage_sequential_double_move(db):
     )
     db.commit()
     salesmod.create_invoice(db, s1, f"INV-SEQ-{_tag()}")
+    # P1-14: reaching payment_due is a SECOND barrier. It needs a production
+    # run linked to the invoice line, not merely a recipe, so the
+    # single-barrier setup this test carried could no longer finish the move.
+    recipe_id = db.execute(
+        "SELECT id FROM recipes WHERE company_id = %s AND product_name = %s",
+        (co, "PSeq")).fetchone()[0]
+    inv_id = db.execute(
+        "SELECT id FROM invoices WHERE sale_id = %s ORDER BY id DESC LIMIT 1",
+        (s1,)).fetchone()[0]
+    sale_item_id = db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id LIMIT 1",
+        (s1,)).fetchone()[0]
+    run_id = db.execute(
+        "INSERT INTO production_runs (recipe_id, sale_item_id, qty_produced) "
+        "VALUES (%s, %s, 42.5) RETURNING id",
+        (recipe_id, sale_item_id)).fetchone()[0]
+    db.execute(
+        "INSERT INTO production_run_links (run_id, sale_id, invoice_id) "
+        "VALUES (%s, %s, %s)", (run_id, s1, inv_id))
+    db.commit()
     assert lcsmod.move_lc_stage(db, lc["id"], "shipment_ongoing") is True
     assert lcsmod.move_lc_stage(db, lc["id"], "payment_due") is True
     assert lcsmod.get_lc(db, lc["id"])["stage"] == "payment_due"
@@ -360,19 +380,23 @@ def _lc_ready_setup(db, co, product, with_recipe=True, with_invoice=True):
 
 
 def test_move_lc_stage_gate_unready_raises(db):
-    """B4+B6: lc_received -> shipment_ongoing unready raises ValueError."""
+    """Two barriers: invoices gate reaching shipment_ongoing; recipes and
+    production gate reaching payment_due. P1-14: this asserted a single
+    combined "recipes:" gate that the two-barrier design replaced."""
     co = _company(db)
     tag = _tag()
-    lc_id, _ = _lc_ready_setup(db, co, f"GateUn-{tag}",
-                               with_recipe=False, with_invoice=False)
-    with pytest.raises(ValueError, match="recipes:"):
-        lcsmod.move_lc_stage(db, lc_id, "shipment_ongoing")
-    db.rollback()
+    lc_id, sid = _lc_ready_setup(db, co, f"GateUn-{tag}",
+                                 with_recipe=False, with_invoice=False)
+    # Barrier 1: no invoice at all.
     with pytest.raises(ValueError, match="invoices:"):
         lcsmod.move_lc_stage(db, lc_id, "shipment_ongoing")
     db.rollback()
     # stage must not have moved
     assert lcsmod.get_lc(db, lc_id)["stage"] == "lc_received"
+    # An invoice alone satisfies barrier 1 - a recipe is NOT required to
+    # reach shipment_ongoing; it belongs to barrier 2.
+    salesmod.create_invoice(db, sid, f"INV-{_tag()}")
+    assert lcsmod.move_lc_stage(db, lc_id, "shipment_ongoing") is True
 
 
 def test_move_lc_stage_gate_ready_passes(db):
@@ -399,7 +423,9 @@ def test_move_lc_stage_direct_jump_gated(db):
     db.execute("UPDATE letters_of_credit SET stage = 'pi_issued' WHERE id = %s",
                (lc_id,))
     db.commit()
-    with pytest.raises(ValueError, match="recipes:"):
+    # P1-14: barrier 1 (invoices) is what gates this jump; the old
+    # assertion expected a single combined "recipes:" gate.
+    with pytest.raises(ValueError, match="invoices:"):
         lcsmod.move_lc_stage(db, lc_id, "shipment_ongoing")
     db.rollback()
     assert lcsmod.get_lc(db, lc_id)["stage"] == "pi_issued"
@@ -412,7 +438,9 @@ def test_move_lc_stage_overshoot_gated(db):
     tag = _tag()
     lc_id, _ = _lc_ready_setup(db, co, f"GateOver-{tag}",
                                with_recipe=False, with_invoice=False)
-    with pytest.raises(ValueError, match="recipes:"):
+    # P1-14: payment_due is past shipment_ongoing, so barrier 1 (invoices)
+    # trips first. Recipes and production are barrier 2, never reached here.
+    with pytest.raises(ValueError, match="invoices:"):
         lcsmod.move_lc_stage(db, lc_id, "payment_due")
     db.rollback()
     assert lcsmod.get_lc(db, lc_id)["stage"] == "lc_received"

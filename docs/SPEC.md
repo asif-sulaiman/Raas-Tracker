@@ -433,7 +433,7 @@ CREATE TABLE app_settings (
 | POST | `/api/auth/logout` | Public | Revoke session cookie |
 | GET | `/api/auth/me` | Session/Key | Current identity details + `must_change_password`, `has_pending_reset` |
 | PUT | `/api/auth/password` | Session (human) | Voluntary change (`current_password`, `new_password`); keeps current session, revokes others |
-| POST | `/api/auth/forgot-password` | Public (5/min) | Reset request (`username`); always generic 200; raw token server-logged once |
+| POST | `/api/auth/forgot-password` | Public (5/min) | Reset request (`username`); always generic 200; only `token_hash[:8]` logged, never the raw token |
 | POST | `/api/auth/reset-password` | Public (10/min) | Single-use redeem (`token`, `new_password`); 200 or generic 400 |
 
 ### Users (admin only)

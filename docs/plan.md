@@ -117,19 +117,17 @@ Baseline established by enumeration: **64 mutating routes — 49 covered, 1 part
   reach audited mutations. Now proven by a test that stamps a real key.
 - ~~Flip the `atomic` default~~ — rejected; would silently lose audit rows.
 
+**Tail batch completed** — P1-8, P1-10, P1-12, P1-14, P1-15 (see git log).
+
 **Remaining backlog (not started):**
 
 | Task | Description |
 |---|---|
-| P1-8 | Stale docstring at `flask_app.py` claims the raw reset token is server-logged; only `token_hash[:8]` is |
-| P1-8 | Stale docstring at `flask_app.py` claims the raw reset token is server-logged; only `token_hash[:8]` is |
 | P1-9 | No concurrent regression test — suite is single-threaded, so the `threading.local` bug class is only covered sequentially |
-| P1-10 | `_is_ip` only recognises IPv4 + two literals, so an IPv6 client with no reason renders its IP as the movement `purpose` |
 | P1-11 | Upload filename has three identities: `secure_filename` (extension gate), `_safe_upload_filename` (stored/audited), raw `file.filename` (response). Simplify to one |
-| P1-12 | `API_KEY_CREATE` does not record `expires_at`; `allowed_ips`/`expires_at` are unvalidated and unbounded at the route |
 | P1-13 | `atomic=True` default: 8 of 62 sites pass `atomic=False`; review the other ~54 for ghost rows that survive a rollback |
-| P1-14 | **Pre-existing, unrelated to audit:** 4 failures in `tests/test_lcs.py` assert on single-barrier readiness messages (`recipes:`) while the code emits the two-barrier message. Verified identical at `051ea30` and `b798f6c` in clean worktrees |
-| P1-15 | **Pre-existing:** `update_sale_full`'s UPDATE never writes `pi_file_path`, so the audit recorded a field change that did not happen (masked now by excluding it) |
+| P1-17 | `tests/test_auth.py:16` assigns `auth_mod._DUMMY_HASH = None` as a bare module global instead of via `monkeypatch`, so it is never restored across tests (`conftest.py:88` does it correctly). Harmless today — `_dummy_hash()` recomputes on demand — but it is shared mutable state leaking between tests |
+| P1-18 | `tests/test_proxy_trust.py::test_forged_forwarded_for_cannot_reset_the_login_lockout` is **intermittent**: observed failing once as `401×6` in a full-suite run, then passing in three consecutive runs (full suite + the same `test_auth.py` ordering twice) with no code change. Production code was verified correct in both states — `x_for=0`, ProxyFix depth 2, `remote_addr='127.0.0.1'`, rows recorded verbatim, and the per-IP lockout itself behaves correctly. Stale `NOW()` vs `clock_timestamp()`, shared connections, live `x_for=1`, and bcrypt straddling a second boundary were each investigated and ruled out. Cause unknown; not reproducible on demand. Needs a bisect or an in-test assertion of the observed windowed count before the assertion can be trusted |
 | P1-16 | Delete paths `conn.commit()` **before** `log_audit_action`, so a failed audit INSERT leaves a committed delete with no row and a 500. Pre-existing repo-wide (`update_sale_item`, `delete_company` are identical), not a P1 regression. A `WITH del AS (DELETE ... RETURNING ...)` CTE would make capture + delete + audit one statement and one snapshot. Cannot be applied to the session-revoke route: `revoke_user_sessions` commits internally (`auth.py`, off-limits) |
 
 **P1 backlog (identified, not started):**

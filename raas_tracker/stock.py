@@ -4,6 +4,7 @@ import psycopg
 import json
 import os
 import re
+import ipaddress
 from datetime import date, datetime
 from typing import Optional, List, Dict, Any, Union
 
@@ -345,7 +346,23 @@ def _to_float(value) -> Optional[float]:
 
 
 def _is_ip(note: str) -> bool:
-    return bool(re.match(r"^(\d{1,3}\.){3}\d{1,3}$", note or "")) or (note or "") in ("::1", "localhost")
+    """True when the value is a bare IP literal rather than operator prose.
+
+    Uses `ipaddress` instead of a dotted-quad regex so IPv6 is recognised too:
+    an IPv6 client that adjusted stock without a reason would otherwise have
+    its own address rendered as the movement's `purpose` in the history feed
+    rather than falling back to "Manual adjustment".
+    """
+    candidate = (note or "").strip()
+    if not candidate:
+        return False
+    if candidate == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(candidate)
+        return True
+    except ValueError:
+        return False
 
 
 # re.DOTALL matters: without it `.` does not match a newline, so a multi-line

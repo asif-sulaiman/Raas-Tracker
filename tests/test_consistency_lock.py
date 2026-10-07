@@ -351,3 +351,57 @@ def test_update_sale_item_audit_logged(admin_client, db):
     assert old_val["unit_price"] == 3.25
     assert new_val["quantity"] == 300
     assert new_val["unit_price"] == 6.5
+
+
+
+def test_update_sale_full_persists_pi_file_path(admin_client, db):
+    """P1-15: the full-body path silently dropped pi_file_path.
+
+    The flat patch route (PUT with a header-only body) wrote it, so the two
+    routes disagreed: a field the API accepts and advertises was discarded with
+    no trace anywhere - and the audit snapshot excluded it, so nothing recorded
+    the loss either.
+    """
+    sale_id, item_ids = _create_sale_and_items(admin_client, pi_number="PI-PATH-1")
+    stored_path = "C:/srv/private/tenants/acme/2026/pi.pdf"
+    r = admin_client.put(f"/api/sales/{sale_id}", json={
+        "header": {"pi_number": "PI-PATH-1", "client_name": "Updated Client",
+                   "pi_file_path": stored_path},
+        "items": [
+            {"id": item_ids[0], "product_name": "ProdA", "quantity": 150,
+             "unit_price": 3.25, "unit": "KG"},
+            {"id": item_ids[1], "product_name": "ProdB", "quantity": 75,
+             "unit_price": 5.00, "unit": "DRUM"},
+        ],
+        "removedIds": [],
+    })
+    assert r.status_code == 200, r.get_json()
+    got = db.execute("SELECT pi_file_path FROM sales WHERE id = %s",
+                     (sale_id,)).fetchone()[0]
+    assert got == stored_path, "the full-body update discarded pi_file_path"
+
+
+def test_update_sale_full_keeps_pi_file_path_when_absent(admin_client, db):
+    """Absent optional fields keep their stored values - never NULL-wipe.
+
+    This is the existing rule at sales.py ("Absent optional fields keep their
+    stored values"), applied to the newly-persisted field.
+    """
+    sale_id, item_ids = _create_sale_and_items(admin_client, pi_number="PI-PATH-2")
+    kept = "C:/kept/pi.pdf"
+    db.execute("UPDATE sales SET pi_file_path = %s WHERE id = %s", (kept, sale_id))
+    db.commit()
+    r = admin_client.put(f"/api/sales/{sale_id}", json={
+        "header": {"pi_number": "PI-PATH-2"},
+        "items": [
+            {"id": item_ids[0], "product_name": "ProdA", "quantity": 150,
+             "unit_price": 3.25, "unit": "KG"},
+            {"id": item_ids[1], "product_name": "ProdB", "quantity": 75,
+             "unit_price": 5.00, "unit": "DRUM"},
+        ],
+        "removedIds": [],
+    })
+    assert r.status_code == 200, r.get_json()
+    got = db.execute("SELECT pi_file_path FROM sales WHERE id = %s",
+                     (sale_id,)).fetchone()[0]
+    assert got == kept, "an omitted field NULL-wiped the stored value"
