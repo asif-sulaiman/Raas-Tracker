@@ -288,7 +288,7 @@ def get_session_user(conn: psycopg.Connection, token: Optional[str]) -> Optional
                   u.must_change_password
            FROM sessions s JOIN users u ON u.id = s.user_id
            WHERE s.token_hash = %s
-           AND s.expires_at > to_char(clock_timestamp(), 'YYYY-MM-DD HH:MM:SS')""",
+           AND s.expires_at > to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS')""",
         (token_hash,)
     ).fetchone()
     if not row or row[5]:
@@ -407,7 +407,7 @@ def redeem_reset_token(conn: psycopg.Connection, raw_token: str, new_password: s
 def cleanup_expired_sessions(conn: psycopg.Connection) -> int:
     """Delete expired sessions. Returns rows removed."""
     cursor = conn.execute("DELETE FROM sessions WHERE expires_at <= "
-                          "to_char(NOW(), 'YYYY-MM-DD HH:MM:SS')")
+                          "to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS')")
     conn.commit()
     return cursor.rowcount
 
@@ -425,9 +425,13 @@ def create_api_key(conn: psycopg.Connection, name: str, created_by: Optional[int
         raise ValueError("key name must be 1-64 characters")
 
     # P1-12: `validate_api_key` compares expires_at lexicographically against
-    # to_char(clock_timestamp(), 'YYYY-MM-DD HH:MM:SS'), so a malformed value
+    # to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS'), so a malformed value
     # ("banana", or an impossible date) sorts after every real timestamp and the
     # key would silently never expire. Validate here, at the only write path.
+    # P1-18: that floor only became a real clock reading once to_char stopped
+    # being given the strftime pattern 'YYYY-MM-DD HH:MM:SS' (MM is MONTH, HH is
+    # 12-hour). The client-supplied format validated here is unchanged, and is
+    # the correct 24-hour spelling -- do not "harmonise" these two.
     expires_at = (expires_at or "").strip() or None
     if expires_at is not None:
         from datetime import datetime as _dt
@@ -511,14 +515,14 @@ def validate_api_key(conn: psycopg.Connection, raw_key: Optional[str],
     row = conn.execute(
         """SELECT id, name, expires_at, allowed_ips, revoked FROM api_keys
            WHERE key_hash = %s
-           AND (expires_at IS NULL OR expires_at > to_char(clock_timestamp(), 'YYYY-MM-DD HH:MM:SS'))""",
+           AND (expires_at IS NULL OR expires_at > to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS'))""",
         (_api_key_hash(raw_key),)
     ).fetchone()
     if not row or row[4]:
         return None
     if not _ip_allowed(row[3], ip):
         return None
-    conn.execute("UPDATE api_keys SET last_used_at = to_char(NOW(), 'YYYY-MM-DD HH:MM:SS'), last_used_ip = %s WHERE id = %s",
+    conn.execute("UPDATE api_keys SET last_used_at = to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS'), last_used_ip = %s WHERE id = %s",
                  (ip, row[0]))
     conn.commit()
     return {"id": row[0], "name": row[1], "type": "api-key"}
@@ -546,7 +550,7 @@ def record_login_attempt(conn: psycopg.Connection, username: Optional[str],
     # Periodic cleanup: remove entries older than 1 day (server clock —
     # the app host and the database host may disagree by seconds or more).
     conn.execute("DELETE FROM login_attempts WHERE attempted_at < "
-                 "to_char(NOW() - INTERVAL '1 day', 'YYYY-MM-DD HH:MM:SS')")
+                 "to_char(NOW() - INTERVAL '1 day', 'YYYY-MM-DD HH24:MI:SS')")
     conn.commit()
 
 
@@ -562,7 +566,7 @@ def is_login_blocked(conn: psycopg.Connection, username: Optional[str],
     row = conn.execute(
         """SELECT COUNT(*) FROM login_attempts
            WHERE success = 0
-           AND attempted_at >= to_char(clock_timestamp() - make_interval(mins => %s), 'YYYY-MM-DD HH:MM:SS')
+           AND attempted_at >= to_char(clock_timestamp() - make_interval(mins => %s), 'YYYY-MM-DD HH24:MI:SS')
            AND (username = %s OR ip_address = %s)""",
         (window_minutes, name, ip_address)
     ).fetchone()
@@ -575,7 +579,7 @@ def check_api_key_rate_limit(conn: psycopg.Connection, key_id: int,
     row = conn.execute(
         """SELECT COUNT(*) FROM api_key_rate_limits
            WHERE key_id = %s
-           AND hit_at >= to_char(clock_timestamp() - make_interval(secs => %s), 'YYYY-MM-DD HH:MM:SS')""",
+           AND hit_at >= to_char(clock_timestamp() - make_interval(secs => %s), 'YYYY-MM-DD HH24:MI:SS')""",
         (key_id, window_seconds)
     ).fetchone()
     return (row[0] if row else 0) >= max_hits
@@ -585,5 +589,5 @@ def record_api_key_hit(conn: psycopg.Connection, key_id: int) -> None:
     """Record an API key usage hit and clean old entries."""
     conn.execute("INSERT INTO api_key_rate_limits (key_id) VALUES (%s)", (key_id,))
     conn.execute("DELETE FROM api_key_rate_limits WHERE hit_at < "
-                 "to_char(NOW() - INTERVAL '1 day', 'YYYY-MM-DD HH:MM:SS')")
+                 "to_char(NOW() - INTERVAL '1 day', 'YYYY-MM-DD HH24:MI:SS')")
     conn.commit()

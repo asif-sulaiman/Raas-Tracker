@@ -14,7 +14,14 @@ from .notifications import notify_sale_stage, clear_dedupe, clear_maturity_dedup
 
 
 def _now_str() -> str:
-    """Current UTC time as 'YYYY-MM-DD HH:MM:SS' for TEXT datetime columns."""
+    """Current UTC time as 'YYYY-MM-DD HH:MM:SS' for TEXT datetime columns.
+
+    This is the *Python* spelling and it is correct: strftime uses %H for a
+    24-hour hour and %M for minutes. It must produce byte-identical output to
+    the SQL floor `to_char(..., 'YYYY-MM-DD HH24:MI:SS')`, which is what
+    compares against these values (P1-18). Never use the SQL pattern codes
+    here, and never use these Python codes inside a to_char() call.
+    """
     from datetime import datetime as _dt, timezone
     return _dt.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 

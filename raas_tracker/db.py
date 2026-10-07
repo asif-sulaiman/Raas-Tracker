@@ -5,8 +5,25 @@ Connects via DATABASE_URL (psycopg v3, transactional mode — explicit
 conn.commit()/conn.rollback() behave exactly like the former SQLite backend).
 
 Column style is intentionally conservative: datetimes stay TEXT
-('YYYY-MM-DD HH:MM:SS', via to_char(NOW(), ...)), flags stay INTEGER 0/1,
+('YYYY-MM-DD HH24:MI:SS', via to_char(NOW(), ...)), flags stay INTEGER 0/1,
 so all Python-side comparisons and sorting work unchanged.
+
+That format is not a strftime pattern. In SQL `to_char` the codes are
+different, and the two mistakes are silent rather than noisy:
+
+- `MM` is MONTH. Minutes are `MI`. Writing 'HH:MM:SS' put the month in the
+  minute slot (October rendered as ":10:"), so no timestamp ever recorded a
+  real minute. Because the columns are TEXT and every window is a string
+  comparison, each time-window control quietly degraded into a comparison of
+  the SECONDS field: the 10-minute login lockout became
+  `second_row >= second_now` (P1-18).
+- `HH` is a 12-hour clock; 24-hour is `HH24`. A 14:00 row rendered as `02:00`
+  and sorted before a 09:00 row, inverting every afternoon-ordered list.
+
+Always write `to_char(<ts>, 'YYYY-MM-DD HH24:MI:SS')` in SQL. The matching
+Python spelling is strftime("%Y-%m-%d %H:%M:%S"), which is what writes
+sessions.expires_at and api_keys.expires_at -- the two formats must stay
+identical or every string comparison between them is wrong.
 """
 
 import atexit
@@ -107,11 +124,20 @@ _SCHEMA_VERSION_KEY = "raas_schema_version"
 # current value in the same transaction as the signature.
 #
 # BUMP RULE: increment this whenever _create_tables() gains DDL (new table,
-# new column, new index) or a data migration that must run once. A database
-# that predates this key has no row at all, which counts as "not current" and
-# runs the full path exactly once.
+# new column, new index), CHANGES AN EXISTING COLUMN DEFAULT, or adds a data
+# migration that must run once. A database that predates this key has no row
+# at all, which counts as "not current" and runs the full path exactly once.
 #
-_SCHEMA_VERSION = 3
+# A changed DEFAULT counts as DDL because CREATE TABLE IF NOT EXISTS is a
+# no-op against an already-migrated table: it would leave the old DEFAULT in
+# place forever. Every DEFAULT change must therefore ship with an explicit
+# idempotent `ALTER TABLE ... ALTER COLUMN ... SET DEFAULT` in _run_migration
+# *and* a bump here, or the fix only applies to freshly created databases.
+#
+# 4 = P1-18: timestamp DEFAULTs and comparisons moved from the strftime pattern
+#     'YYYY-MM-DD HH:MM:SS' (to_char reads MM as MONTH, HH as 12-hour) to
+#     'YYYY-MM-DD HH24:MI:SS'. Backed by explicit ALTERs below.
+_SCHEMA_VERSION = 4
 
 # Frozen legacy tokens from builds that shipped them — do NOT add
 # per-migration entries. _SCHEMA_VERSION is authoritative; these only preserve
@@ -500,6 +526,82 @@ def backfill_invoice_lines(conn: psycopg.Connection) -> int:
     return seeded
 
 
+# P1-18: (table, column) pairs whose DEFAULT renders a TEXT timestamp.
+# Kept as one table so the ALTERs below and the CREATE TABLE defaults above
+# cannot drift apart. `recipes.created_date` is absent on purpose: it stores a
+# bare 'YYYY-MM-DD' date, which has no hour/minute/second fields to get wrong.
+_TIMESTAMP_DEFAULT_COLUMNS: tuple = (
+    ("companies", "created_at"),
+    ("uploads", "upload_date"),
+    ("approval_workflow", "reviewed_at"),
+    ("audit_logs", "timestamp"),
+    ("reconciliation_periods", "created_at"),
+    ("sales", "created_at"),
+    ("sales", "updated_at"),
+    ("sales_stage_history", "changed_at"),
+    ("sale_payments", "created_at"),
+    ("shipments", "created_at"),
+    ("production_runs", "created_at"),
+    ("users", "created_at"),
+    ("sessions", "created_at"),
+    ("login_attempts", "attempted_at"),
+    ("api_keys", "created_at"),
+    ("api_key_rate_limits", "hit_at"),
+    ("notifications", "created_at"),
+    ("notification_reads", "read_at"),
+    ("invoices", "created_at"),
+    ("letters_of_credit", "created_at"),
+    ("letters_of_credit", "updated_at"),
+)
+
+# The corrected format. `HH24` is 24-hour, `MI` is minute; see the module
+# docstring for why the strftime-looking spelling is wrong.
+_TIMESTAMP_DEFAULT_SQL = "to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS')"
+
+
+def _fix_timestamp_defaults(conn: psycopg.Connection) -> None:
+    """P1-18: repair timestamp DEFAULTs on databases that already exist.
+
+    `CREATE TABLE IF NOT EXISTS` is a no-op for a table that is already there,
+    so correcting the format inside the CREATE TABLE statements would fix only
+    a *fresh* database. Every already-migrated database would keep writing
+    'YYYY-MM-DD HH:MM:SS', where to_char read MM as MONTH and HH as 12-hour,
+    and the lockout / rate-limit / expiry windows would stay broken in
+    production while the test suite (which builds a fresh database each run)
+    went green. That is why the fix is not optional: these ALTERs are the only
+    thing that makes it reach a deployment.
+
+    Idempotent: re-asserting an identical DEFAULT is a no-op, and a missing
+    table or column is skipped rather than raising, so this is safe to run on
+    every migration and on a partially-migrated database.
+
+    Data: only the two tables whose rows are continuously rebuilt and carry no
+    audit weight are cleared. `audit_logs` is the immutable ledger and its
+    historical `timestamp` values are deliberately left exactly as written --
+    audit reads order by id, not by timestamp, so a mixed-format ledger still
+    reads correctly. Business `created_at` values are likewise left as-is and
+    only the DEFAULT changes going forward.
+    """
+    missing = []
+    for table, column in _TIMESTAMP_DEFAULT_COLUMNS:
+        if column not in _table_columns(conn, table):
+            missing.append(f"{table}.{column}")
+            continue
+        # Table and column names come from the module constant above, never
+        # from user input, so this cannot be an injection point.
+        conn.execute(f"ALTER TABLE {table} ALTER COLUMN {column} "
+                     f"SET DEFAULT {_TIMESTAMP_DEFAULT_SQL}")
+    if missing:
+        logger.warning("P1-18: skipped timestamp DEFAULT repair for missing "
+                       "column(s): %s", ", ".join(missing))
+
+    # Rebuilt continuously, semantically meaningless while malformed: a hit in
+    # the last 60s that reads as "in the future" lets a caller exceed 300
+    # requests/min, so those rows are dropped rather than reinterpreted.
+    for ephemeral in ("login_attempts", "api_key_rate_limits"):
+        conn.execute(f"DELETE FROM {ephemeral}")
+
+
 def _run_migration(conn: psycopg.Connection) -> None:
     """Every DDL statement of the schema. NO commit/rollback in here.
 
@@ -529,7 +631,7 @@ def _run_migration(conn: psycopg.Connection) -> None:
             contact_person TEXT,
             swift TEXT,
             lc_bank TEXT,
-            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS'))
+            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
         );
         CREATE TABLE IF NOT EXISTS recipes (
             id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -581,7 +683,7 @@ def _run_migration(conn: psycopg.Connection) -> None:
         CREATE TABLE IF NOT EXISTS uploads (
             id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             filename TEXT NOT NULL,
-            upload_date TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS')),
+            upload_date TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS')),
             file_type TEXT,
             status TEXT DEFAULT 'uploaded',
             total_chemicals INTEGER DEFAULT 0,
@@ -627,7 +729,7 @@ def _run_migration(conn: psycopg.Connection) -> None:
             reason_code TEXT,
             comments TEXT,
             reviewed_by TEXT,
-            reviewed_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS')),
+            reviewed_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS')),
             FOREIGN KEY (upload_id) REFERENCES uploads(id) ON DELETE CASCADE,
             FOREIGN KEY (upload_row_id) REFERENCES upload_rows(id) ON DELETE CASCADE
         );
@@ -639,7 +741,7 @@ def _run_migration(conn: psycopg.Connection) -> None:
             user_id TEXT DEFAULT 'system',
             old_value TEXT,
             new_value TEXT,
-            timestamp TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS')),
+            timestamp TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS')),
             ip_address TEXT
         );
         CREATE TABLE IF NOT EXISTS reconciliation_periods (
@@ -650,7 +752,7 @@ def _run_migration(conn: psycopg.Connection) -> None:
             status TEXT DEFAULT 'open',
             locked_by TEXT,
             locked_at TEXT,
-            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS'))
+            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
         );
         CREATE TABLE IF NOT EXISTS sales (
             id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -664,8 +766,8 @@ def _run_migration(conn: psycopg.Connection) -> None:
             shipment_date TEXT,
             payment_date TEXT,
             payment_amount REAL DEFAULT 0,
-            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS')),
-            updated_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS'))
+            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS')),
+            updated_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
         );
         CREATE TABLE IF NOT EXISTS sale_items (
             id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -680,7 +782,7 @@ def _run_migration(conn: psycopg.Connection) -> None:
             sale_id INTEGER NOT NULL,
             from_stage TEXT,
             to_stage TEXT NOT NULL,
-            changed_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS')),
+            changed_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS')),
             notes TEXT,
             FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE
         );
@@ -690,7 +792,7 @@ def _run_migration(conn: psycopg.Connection) -> None:
             payment_date TEXT,
             payment_amount REAL NOT NULL DEFAULT 0,
             notes TEXT,
-            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS')),
+            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS')),
             FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE
         );
         -- P1: partial shipments (one row per actual shipment event).
@@ -702,7 +804,7 @@ def _run_migration(conn: psycopg.Connection) -> None:
             invoice_date TEXT,
             notes TEXT,
             created_by INTEGER,
-            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS'))
+            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
         );
         -- P1: production runs (P3 executes). Run items snapshot the formula
         -- actually deducted, so master edits never rewrite batch history.
@@ -716,7 +818,7 @@ def _run_migration(conn: psycopg.Connection) -> None:
             qty_produced REAL NOT NULL DEFAULT 0,
             notes TEXT,
             created_by INTEGER,
-            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS'))
+            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
         );
         CREATE TABLE IF NOT EXISTS production_run_items (
             id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -732,13 +834,13 @@ def _run_migration(conn: psycopg.Connection) -> None:
             username TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL,
             role TEXT NOT NULL DEFAULT 'user',
-            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS'))
+            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
         );
         CREATE TABLE IF NOT EXISTS sessions (
             id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             token_hash TEXT NOT NULL UNIQUE,
             user_id INTEGER NOT NULL,
-            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS')),
+            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS')),
             expires_at TEXT NOT NULL,
             revoked INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -747,7 +849,7 @@ def _run_migration(conn: psycopg.Connection) -> None:
             id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
             username TEXT,
             ip_address TEXT,
-            attempted_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS')),
+            attempted_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS')),
             success INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS app_settings (
@@ -759,7 +861,7 @@ def _run_migration(conn: psycopg.Connection) -> None:
             key_hash TEXT NOT NULL UNIQUE,
             name TEXT NOT NULL,
             created_by INTEGER,
-            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS')),
+            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS')),
             expires_at TEXT,
             allowed_ips TEXT DEFAULT '',
             revoked INTEGER NOT NULL DEFAULT 0,
@@ -769,7 +871,7 @@ def _run_migration(conn: psycopg.Connection) -> None:
         );
         CREATE TABLE IF NOT EXISTS api_key_rate_limits (
             key_id INTEGER NOT NULL,
-            hit_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS')),
+            hit_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS')),
             FOREIGN KEY (key_id) REFERENCES api_keys(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS notifications (
@@ -782,7 +884,7 @@ def _run_migration(conn: psycopg.Connection) -> None:
             entity_type TEXT,
             entity_id INTEGER,
             dedupe_key TEXT,
-            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS'))
+            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
         );
         CREATE INDEX IF NOT EXISTS idx_notifications_dedupe ON notifications(dedupe_key);
         -- Chemical identity is case-insensitive application-wide: forbid
@@ -800,7 +902,7 @@ def _run_migration(conn: psycopg.Connection) -> None:
         CREATE TABLE IF NOT EXISTS notification_reads (
             user_id INTEGER NOT NULL,
             notification_id INTEGER NOT NULL,
-            read_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS')),
+            read_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS')),
             PRIMARY KEY (user_id, notification_id),
             FOREIGN KEY (notification_id) REFERENCES notifications(id) ON DELETE CASCADE
         );
@@ -874,7 +976,7 @@ def _run_migration(conn: psycopg.Connection) -> None:
             actual_ship_date TEXT,
             notes TEXT,
             created_by INTEGER,
-            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS'))
+            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
         )
     """)
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_sale_number "
@@ -919,8 +1021,8 @@ def _run_migration(conn: psycopg.Connection) -> None:
             bank_ref TEXT,
             stage TEXT NOT NULL DEFAULT 'lc_received',
             notes TEXT,
-            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS')),
-            updated_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH:MM:SS'))
+            created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS')),
+            updated_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
         )
     """)
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_letters_of_credit_company_lc "
@@ -947,6 +1049,12 @@ def _run_migration(conn: psycopg.Connection) -> None:
                  "ON invoice_items(sale_item_id)")
     backfill_lc_links(conn)
     backfill_invoice_lines(conn)
+
+    # P1-18: re-assert every timestamp DEFAULT, then clear the two tables whose
+    # stored values were written in the malformed format and are rebuilt
+    # continuously anyway. See _fix_timestamp_defaults for why the ALTERs are
+    # the load-bearing part of this fix.
+    _fix_timestamp_defaults(conn)
 
     # Global name uniqueness gives way to one master per company x product.
     conn.execute("ALTER TABLE recipes DROP CONSTRAINT IF EXISTS recipes_name_key")

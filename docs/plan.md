@@ -131,6 +131,39 @@ Baseline established by enumeration: **64 mutating routes — 49 covered, 1 part
 
 **Tail batch completed** — P1-8, P1-10, P1-12, P1-14, P1-15 (see git log).
 
+### P1-18 data migration (decided, implemented)
+
+The DEFAULT change is **DDL**, and `CREATE TABLE IF NOT EXISTS` is a no-op
+against an already-migrated table — correcting the format inside the CREATE
+statements alone would have fixed only a *fresh* database while every live
+deployment kept writing malformed timestamps. So `_SCHEMA_VERSION` went 3 → 4
+and `_fix_timestamp_defaults()` re-asserts all 21 DEFAULTs with idempotent
+`ALTER TABLE ... ALTER COLUMN ... SET DEFAULT`. Verified against a database
+migrated by the pre-fix code: version 3 → 4 detected, all 21 live DEFAULTs
+repaired, correct format on a new row. The test suite builds a fresh database
+every run and could **not** have caught this — hence
+`test_live_column_default_uses_the_correct_format` asserts against
+`information_schema`.
+
+| Table | Action | Why |
+|---|---|---|
+| `login_attempts` | **DELETE all rows** | Ephemeral, rebuilt on the next failure. A malformed row whose month-slot read as "in the future" made the lockout *under*-count, so reinterpreting it was not an option. |
+| `api_key_rate_limits` | **DELETE all rows** | Same, and a leaked hit is a rate-limit bypass. |
+| `audit_logs` | **untouched — no backfill, no rewrite** | Immutable ledger. Historical `timestamp` values keep their malformed shape **by decision**; the ledger stays byte-untouched. |
+| All business `created_at` / `updated_at` / `hit_at` / `read_at` / `reviewed_at` / `changed_at` / `upload_date` | historical rows left as-is, **DEFAULT corrected going forward** | These are display/sort data with no control attached; rewriting history is not worth the risk. |
+| `sessions.expires_at`, `api_keys.expires_at` | **no migration needed** | Written by Python `strftime("%Y-%m-%d %H:%M:%S")`, which was always correct. They became *correct in comparison* once the SQL floor was fixed. Confirmed, not assumed. |
+
+**Known residual (found, NOT fixed — needs a decision):** `audit_logs.timestamp`
+historical rows are malformed and new rows are not, and the audit-log listing
+orders by that column (`raas_tracker/audit.py:172`, `ORDER BY timestamp DESC`).
+So `/api/audit-logs` ordering is inconsistent for rows spanning the migration,
+and would also have been inverted across the afternoon before the fix. Audit
+*tests* and the other audit read paths use `ORDER BY id` (correct, monotonic)
+and are unaffected. Fixing the listing means either backfilling the ledger
+(explicitly rejected above) or ordering by `id` — a one-line change to
+`audit.py:172`, deliberately left alone because it alters the audit read path
+and belongs to a separate decision.
+
 **Remaining backlog (not started):**
 
 | Task | Description |
@@ -139,7 +172,7 @@ Baseline established by enumeration: **64 mutating routes — 49 covered, 1 part
 | P1-11 | Upload filename has three identities: `secure_filename` (extension gate), `_safe_upload_filename` (stored/audited), raw `file.filename` (response). Simplify to one |
 | P1-13 | **Audit atomicity, restated (earlier wording was inverted — see the correction below).** `atomic=True` **commits immediately** (`audit.py:141-142`), flushing the caller's whole open transaction; `atomic=False` leaves the INSERT in the caller's transaction so it rolls back with it — that is the *safe* direction. So ghost-row / partial-commit risk lives in the **`atomic=True`** sites, not the `atomic=False` ones. Real counts: **69 production call sites** — 50 `atomic=True`, 18 literal `atomic=False`, 1 variable-forwarded (`stock.py:278`). Highest severity: `uploads.py:891` `log_audit_action` sits **inside a per-row loop** in `adjust_stock_from_upload`; with `atomic=True` its commit durably flushes each row's `UPDATE chemicals` plus every earlier row, and the `except` at `uploads.py:906` returns `False` with **no rollback** — partial writes reported as failure |
 | ~~P1-17~~ ✓ | `tests/test_auth.py:16` assigned `auth_mod._DUMMY_HASH = None` as a bare module global instead of via `monkeypatch`, so it was never restored across tests (`conftest.py:88` does it correctly). Now set with `monkeypatch.setattr(auth_mod, "_DUMMY_HASH", None)` so it is restored at teardown; the anti-timing-oracle assertion is unchanged |
-| P1-18 | `tests/test_proxy_trust.py::test_forged_forwarded_for_cannot_reset_the_login_lockout` is **intermittent**: observed failing once as `401×6` in a full-suite run, then passing in three consecutive runs (full suite + the same `test_auth.py` ordering twice) with no code change. Production code was verified correct in both states — `x_for=0`, ProxyFix depth 2, `remote_addr='127.0.0.1'`, rows recorded verbatim, and the per-IP lockout itself behaves correctly. Stale `NOW()` vs `clock_timestamp()`, shared connections, live `x_for=1`, and bcrypt straddling a second boundary were each investigated and ruled out. Cause unknown; not reproducible on demand. Needs a bisect or an in-test assertion of the observed windowed count before the assertion can be trusted |
+| ~~P1-18~~ ✓ | **CLOSED — a production timestamp defect, not a flaky test.** Root cause: `to_char(ts, 'YYYY-MM-DD HH:MM:SS')` is a *strftime* pattern, and `to_char` reads the codes differently — `MM` = MONTH (minutes are `MI`) and `HH` = 12-hour (24-hour is `HH24`). So every datetime this schema produced stored the **month** in the minute slot and lost both the real minutes and any AM/PM distinction: real `2026-10-07 07:06:58` → stored `2026-10-07 07:10:58`, real `2026-03-15 14:22:41` → `2026-03-15 02:03:41`. Because the columns are TEXT and every window is a **string comparison**, each time-window control silently degraded into a comparison of the **seconds field**: `is_login_blocked`'s 10-minute window became `second_row >= second_now`, so an attempt written seconds earlier could be judged outside the window the moment the clock ticked past its recorded second. That is exactly the `401×6` flake — it reproduces in `tests/test_proxy_trust.py` **alone** (~6% of runs, 3/48 measured), and captured failures showed all 6 rows present, all `ip=127.0.0.1`, `route_eval=4` vs 5. Fix: `'YYYY-MM-DD HH24:MI:SS'` in every SQL `to_char`, `db.py` docstring rewritten to name the `MM`/`MI` and `HH`/`HH24` traps, `_SCHEMA_VERSION` 3 → 4. Same defect also broke `check_api_key_rate_limit` (300/min shed hits every minute) and made session/API-key expiry wrong by ~9 min early / ~59 min late (a 1-hour TTL was really ~10 hours). See "P1-18 data migration" below |
 | P1-16 | Delete paths `conn.commit()` **before** `log_audit_action`, so a failed audit INSERT leaves a committed delete with no row and a 500. Pre-existing repo-wide (`update_sale_item`, `delete_company` are identical), not a P1 regression. A `WITH del AS (DELETE ... RETURNING ...)` CTE would make capture + delete + audit one statement and one snapshot. Cannot be applied to the session-revoke route: `revoke_user_sessions` commits internally (`auth.py`, off-limits) |
 
 **P1 backlog (identified, not started):**

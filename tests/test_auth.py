@@ -80,7 +80,7 @@ def test_ip_level_throttle_cross_username(client, db):
 
 def test_login_attempts_pruned(db):
     db.execute("INSERT INTO login_attempts (username, success) VALUES ('old', 0)")
-    db.execute("UPDATE login_attempts SET attempted_at = to_char(NOW() - INTERVAL '2 days', 'YYYY-MM-DD HH:MM:SS')")
+    db.execute("UPDATE login_attempts SET attempted_at = to_char(NOW() - INTERVAL '2 days', 'YYYY-MM-DD HH24:MI:SS')")
     db.commit()
     record_login_attempt(db, "fresh", "127.0.0.1", False)
     assert db.execute("SELECT COUNT(*) FROM login_attempts WHERE username = 'old'").fetchone()[0] == 0
@@ -97,7 +97,7 @@ def test_api_key_rate_limit_db_backed(db):
     db.commit()
     assert check_api_key_rate_limit(db, key_id, max_hits=3, window_seconds=60) is True
     # Old hits are pruned on write.
-    db.execute("UPDATE api_key_rate_limits SET hit_at = to_char(NOW() - INTERVAL '2 days', 'YYYY-MM-DD HH:MM:SS')")
+    db.execute("UPDATE api_key_rate_limits SET hit_at = to_char(NOW() - INTERVAL '2 days', 'YYYY-MM-DD HH24:MI:SS')")
     db.commit()
     record_api_key_hit(db, key_id)
     assert db.execute("SELECT COUNT(*) FROM api_key_rate_limits").fetchone()[0] == 1

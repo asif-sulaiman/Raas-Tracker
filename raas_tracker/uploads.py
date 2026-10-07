@@ -13,7 +13,13 @@ from .stock import convert_quantity, get_unit_conversion
 
 
 def _now_str() -> str:
-    """Current UTC time as 'YYYY-MM-DD HH:MM:SS' for TEXT datetime columns."""
+    """Current UTC time as 'YYYY-MM-DD HH:MM:SS' for TEXT datetime columns.
+
+    The *Python* spelling, and correct: strftime uses %H for a 24-hour hour
+    and %M for minutes. It must produce byte-identical output to the SQL floor
+    `to_char(..., 'YYYY-MM-DD HH24:MI:SS')` that compares against these values
+    (P1-18). Never use the SQL pattern codes here.
+    """
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
