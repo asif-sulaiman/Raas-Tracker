@@ -223,6 +223,8 @@ describe('SaleDetailModal shipments', () => {
       </MemoryRouter>
     );
     expect(await screen.findByText('Cotton')).toBeTruthy();
-    expect(itemsCalls).toBeGreaterThanOrEqual(1);
+    // The sale detail can render before the invoice-items effect fires; wait
+    // for the refetch instead of sampling the counter at an arbitrary instant.
+    await waitFor(() => expect(itemsCalls).toBeGreaterThanOrEqual(1));
   });
 });
