@@ -1472,23 +1472,39 @@ def _invoice_money_already_on_sale(conn: psycopg.Connection,
     """
     row = conn.execute(
         """SELECT COALESCE((SELECT SUM(ii.line_total)
-                             FROM invoice_items ii
-                             JOIN invoices i ON i.id = ii.invoice_id
-                            WHERE i.sale_id = %s), 0)
+                              FROM invoice_items ii
+                              JOIN invoices i ON i.id = ii.invoice_id
+                             WHERE i.sale_id = %s), 0)
                 + COALESCE((SELECT SUM(i.amount)
                               FROM invoices i
                              WHERE i.sale_id = %s
                                AND i.amount IS NOT NULL
                                AND NOT EXISTS (SELECT 1 FROM invoice_items x
-                                                WHERE x.invoice_id = i.id)), 0)""",
+                                                 WHERE x.invoice_id = i.id)), 0)""",
         (sale_id, sale_id)).fetchone()
-    return _money(row[0] or 0)
+    raw = row[0] or 0
+    if isinstance(raw, Decimal) and not raw.is_finite():
+        raise ValueError(
+            "sale has non-finite invoiced lines (check invoice quantities)")
+    return _money(raw)
 
 
 def remaining_invoice_money(conn: psycopg.Connection, sale_id: int) -> Decimal:
-    """PI total minus everything already invoiced, floored at zero."""
-    total = _money(get_sale_invoice_total(conn, sale_id) or 0)
-    return max(total - _invoice_money_already_on_sale(conn, sale_id), Decimal("0"))
+    """PI total minus everything already invoiced, floored at zero.
+
+    A non-finite line total (NaN/Inf in a REAL quantity or unit_price)
+    poisons the SQL SUM and would otherwise raise ``InvalidOperation`` deep
+    in the money math, surfacing as a generic 500. It is bad input data, so
+    it raises ``ValueError`` (mapped to 400 by the routes) naming the cause.
+    """
+    raw_total = get_sale_invoice_total(conn, sale_id) or 0
+    if isinstance(raw_total, float) and not math.isfinite(raw_total):
+        raise ValueError(
+            "sale has a non-finite line total "
+            "(check quantities and unit prices)")
+    total = _money(raw_total)
+    already = _invoice_money_already_on_sale(conn, sale_id)
+    return max(total - already, Decimal("0"))
 
 
 def _seed_invoice_lines(conn: psycopg.Connection, invoice_id: int,

@@ -369,6 +369,17 @@ def _not_found(_e):
     return send_from_directory(REACT_BUILD_DIR, "index.html")
 
 
+@app.errorhandler(405)
+def _method_not_allowed(_e):
+    # Without this, a wrong-method /api request (e.g. POST where only GET
+    # matches) falls into the catch-all Exception handler and is reported
+    # as a 500, masking a client bug as a server failure. Generic message,
+    # detailed log server-side — same contract as the other handlers.
+    if request.path.startswith("/api"):
+        return jsonify({"error": "method not allowed"}), 405
+    return send_from_directory(REACT_BUILD_DIR, "index.html")
+
+
 # ==================== RATE LIMITS (tiers 2-3) ====================
 # Tier 1 (login throttle 5 fails/10 min, API-key 300/min) stays DB-backed.
 # These in-process limits are loop/DoS protection: approximate under
