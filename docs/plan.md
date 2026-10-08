@@ -252,6 +252,30 @@ Vertical slices linking production runs to sale invoices: schema, lifecycle back
 
 ---
 
+## 🧾 Phase INV-500: LC invoice-barrier 500 (Completed 2026-10-08)
+
+Creating an invoice from the `lc_received → shipment_ongoing` barrier modal
+failed with `500 {"error": "internal server error"}`.
+
+Root cause (reproduced locally with the test client): `Sales.jsx` always
+passed `saleId={null}` to the modal, so it POSTed to
+`/api/sales/null/invoices`. No POST route matches that shape, so Werkzeug
+raised 405 — and with no 405 handler the catch-all `Exception` handler
+masked it as a 500. Ruled out with evidence: no file writes on the invoice
+path (read-only-FS theory), zero `?` placeholders (SQLite-syntax theory),
+ProxyFix already correct (auth failures are 401/403, never this 500).
+
+| Task | Description | Files Touched | Acceptance |
+|---|---|---|---|
+| INV-1 ✅ | **405 handler** — `/api` wrong-method requests return 405 `{"error":"method not allowed"}` instead of falling into the catch-all 500 | `flask_app.py`, `tests/test_invoice_errors.py`, `docs/SPEC.md` | `POST /api/sales/null/invoices` → 405 JSON |
+| INV-2 ✅ | **Non-finite money guards** — `remaining_invoice_money` / `_invoice_money_already_on_sale` raise `ValueError` (400) on NaN/Inf PI or invoiced totals instead of `InvalidOperation` (500); nothing persisted on the 400 path | `raas_tracker/sales.py`, `tests/test_invoice_errors.py` | NaN qty / Inf price / NaN legacy line → 400 + zero invoice rows |
+| INV-3 ✅ | **Barrier modal takes the LC's PIs** — one invoice-number row per PI (single invoice or one per PI; same-PI splits stay in the PI detail line editor, since each create seeds the whole remainder), `apiFetch` instead of raw `fetch`, per-row errors, and auto-retry of the blocked `POST /api/lcs/<id>/move` on success | `InvoicesRequiredModal.jsx` (+ new `.test.jsx`, 5 tests), `Sales.jsx` (barrierPis/barrierMove, `handleBarrierInvoicesSuccess`) | Per-PI URLs asserted, never `null`; 299 frontend tests green, oxlint 0 errors, build OK |
+
+Business rule restated: one LC carries one **or many** invoices across its
+PIs (gate counts invoices across ALL of the LC's sales).
+
+---
+
 ## 🔮 Phase M8: Future Features (Backlog)
 
 Not yet sliced — awaiting prioritization.

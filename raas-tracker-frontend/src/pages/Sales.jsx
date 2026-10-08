@@ -55,6 +55,11 @@ export default function Sales() {
   const [showProductionRequired, setShowProductionRequired] = useState(false);
   const [barrierLcId, setBarrierLcId] = useState(null);
   const [barrierSaleId, setBarrierSaleId] = useState(null);
+  // PIs of the LC blocked on the invoice barrier (modal renders one row per
+  // PI so an LC can carry a single invoice or one per PI), plus the move to
+  // retry once the invoice(s) exist.
+  const [barrierPis, setBarrierPis] = useState([]);
+  const [barrierMove, setBarrierMove] = useState(null);
   const [barrierDetail, setBarrierDetail] = useState(null);
   const pageSize = 50;
 
@@ -211,9 +216,17 @@ export default function Sales() {
             : null;
       if (blocked) {
         if (blocked.barrier === 'invoices') {
+          const pis = (Array.isArray(lc.pis) ? lc.pis : [])
+            .filter((p) => p && typeof p.id === 'number')
+            .map((p) => ({ id: p.id, pi_number: p.pi_number }));
+          if (pis.length === 0) {
+            toast.error('No PIs are linked to this LC, so there is nothing to invoice.');
+            return;
+          }
           setBarrierLcId(lc.id);
           setBarrierSaleId(null);
-          setBarrierDetail(blocked.detail || {});
+          setBarrierPis(pis);
+          setBarrierMove({ lcId: lc.id, next });
           setShowInvoicesRequired(true);
         } else if (blocked.barrier === 'production') {
           setBarrierLcId(lc.id);
@@ -239,8 +252,39 @@ export default function Sales() {
     }
   };
 
-  const handleUnlink = async (lc, pi) => {
-    if (typeof lc?.id !== 'number' || !pi?.id) return;
+  // The invoice barrier modal calls back here: the blocking invoice(s) now
+  // exist, so retry the move the operator originally asked for instead of
+  // leaving them to click Move a second time.
+  const handleBarrierInvoicesSuccess = async () => {
+    const move = barrierMove;
+    setShowInvoicesRequired(false);
+    setBarrierMove(null);
+    setBarrierPis([]);
+    if (!move || typeof move.lcId !== 'number' || !move.next) {
+      fetchData();
+      return;
+    }
+    setMovingId(`lc-${move.lcId}`);
+    try {
+      const lc = lcs.find((l) => l.id === move.lcId);
+      await apiFetch(`/api/lcs/${move.lcId}/move`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ new_stage: move.next }),
+      });
+      toast.success(`LC "${lc?.lc_number || move.lcId}" moved`);
+    } catch (err) {
+      toast.error(err.message || 'Could not move LC');
+    } finally {
+      setMovingId(null);
+      setBarrierLcId(null);
+      setBarrierSaleId(null);
+      setBarrierDetail({});
+      fetchData();
+    }
+  };
+
+  const handleUnlink = async (lc, pi) => {    if (typeof lc?.id !== 'number' || !pi?.id) return;
     const ok = await confirm({
       title: `Unlink PI "${pi.pi_number || pi.id}"?`,
       message: 'The PI returns to the unlinked list — its data is kept.',
@@ -590,13 +634,12 @@ export default function Sales() {
           setShowInvoicesRequired(false);
           setBarrierLcId(null);
           setBarrierSaleId(null);
+          setBarrierPis([]);
+          setBarrierMove(null);
           setBarrierDetail({});
         }}
-        lcId={barrierLcId}
-        saleId={barrierSaleId}
-        onSuccess={() => {
-          fetchData();
-        }}
+        pis={barrierPis}
+        onSuccess={handleBarrierInvoicesSuccess}
       />
 
       <ProductionRequiredModal
