@@ -314,7 +314,12 @@ def _set_security_headers(resp):
     # Content Security Policy
     csp = (
         "default-src 'self'; "
-        "script-src 'self'; "
+        # 'self' alone blocks inline scripts, so the theme bootstrap in
+        # raas-tracker-frontend/index.html was silently dropped by browsers
+        # (dark mode never applied). Allowlist it by hash instead of
+        # 'unsafe-inline'; test_csp_allows_the_inline_theme_script recomputes
+        # the hash from index.html, so editing that script fails the gate.
+        "script-src 'self' 'sha256-i0ed3E9hYdck4GBiAzbjd2pnheK6j8fl472P8iayw1Q='; "
         "style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data:; "
         "font-src 'self'; "

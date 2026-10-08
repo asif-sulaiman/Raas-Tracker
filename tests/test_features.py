@@ -123,6 +123,45 @@ def test_csp_header_on_all_responses(admin_client, user_client):
         assert "default-src 'self'" in csp
 
 
+def _inline_script_hashes():
+    """sha256 CSP hashes of every inline <script> in the SPA index.html.
+
+    Computed from source rather than hardcoded: Vite copies the inline
+    theme bootstrap verbatim into dist/index.html, so if that script ever
+    changes, the CSP hash must change with it or browsers silently drop it
+    (which is exactly how dark mode was being blocked in production).
+    """
+    import base64
+    import hashlib
+    import re
+    from pathlib import Path
+
+    html_path = Path(__file__).resolve().parent.parent / "raas-tracker-frontend" / "index.html"
+    html = html_path.read_text(encoding="utf-8")
+    scripts = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, re.S)
+    assert scripts, f"expected an inline script in {html_path}"
+    return [
+        "sha256-" + base64.b64encode(hashlib.sha256(s.encode("utf-8")).digest()).decode()
+        for s in scripts
+    ]
+
+
+def test_csp_allows_the_inline_theme_script(client):
+    """Every inline script is hash-whitelisted, without weakening script-src.
+
+    script-src 'self' alone blocks inline scripts, so the theme bootstrap in
+    index.html never ran in production (no other code applies the theme).
+    Allowlisting by hash keeps the policy strict: no 'unsafe-inline'.
+    """
+    resp = client.get("/api/auth/status")
+    csp = resp.headers.get("Content-Security-Policy")
+    assert csp is not None
+    script_src = next(part for part in csp.split(";") if part.strip().startswith("script-src"))
+    assert "'unsafe-inline'" not in script_src
+    for digest in _inline_script_hashes():
+        assert f"'{digest}'" in script_src, f"missing {digest} in {script_src!r}"
+
+
 def test_security_headers_present(admin_client):
     """All security headers present."""
     resp = admin_client.get("/api/auth/status")
