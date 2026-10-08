@@ -22,7 +22,13 @@ export default function Setup() {
     fetch('/api/auth/status')
       .then((r) => r.json())
       .then((data) => {
-        if (!data.setup_needed) setAlreadyDone(true);
+        // Defensive check: ensure data is an object and has setup_needed property
+        if (data && typeof data === 'object' && 'setup_needed' in data) {
+          if (!data.setup_needed) setAlreadyDone(true);
+        } else {
+          // If we can't determine setup status, assume setup is needed to be safe
+          setAlreadyDone(false);
+        }
       })
       .catch(() => {});
   }, []);

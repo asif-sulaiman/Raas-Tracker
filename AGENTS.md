@@ -33,6 +33,8 @@ Flask 3 + psycopg3 backend, React 19/Vite/Tailwind 4 frontend, PostgreSQL (Supab
 8. **Keep docs current:** when a plan changes scope or architecture, update
    `docs/PRD.md`, `docs/SPEC.md`, and `docs/plan.md` in the same task.
 9. **Check `docs/plan.md` first** for pending work before proposing something new.
+10. **One agent per session** — `/clear` before switching build/plan/orchestrator;
+    a switched session keeps the old mode's history and keeps behaving like it.
 
 ## Code Standards
 

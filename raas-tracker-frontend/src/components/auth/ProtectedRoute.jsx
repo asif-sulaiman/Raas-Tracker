@@ -11,7 +11,14 @@ export default function ProtectedRoute() {
     if (!loading && !user) {
       fetch('/api/auth/status')
         .then((r) => r.json())
-        .then((data) => setSetupNeeded(!!data.setup_needed))
+        .then((data) => {
+          // Defensive check: ensure data is an object and has setup_needed property
+          if (data && typeof data === 'object' && 'setup_needed' in data) {
+            setSetupNeeded(!!data.setup_needed);
+          } else {
+            setSetupNeeded(false);
+          }
+        })
         .catch(() => setSetupNeeded(false));
     }
   }, [loading, user]);

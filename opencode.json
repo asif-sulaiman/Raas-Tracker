@@ -1,0 +1,16 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "opencode-notificator",
+    "opencode-vibeguard",
+    "oh-my-opencode-slim",
+    "@upstash/context7-opencode",
+    "envsitter-guard",
+    "opencode-mem",
+    "@honcho-ai/opencode-honcho"
+  ],
+  "lsp": {},
+  "permission": {
+    "lsp": "allow"
+  }
+}
