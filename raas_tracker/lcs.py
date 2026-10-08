@@ -148,6 +148,12 @@ def attach_pis(conn: psycopg.Connection, lc_id: int, sale_ids: list) -> dict:
     Every sale must share the LC's ``company_id`` or the whole call raises
     ``ValueError`` and links nothing. Mirrors the trimmed ``lc_number`` /
     ``lc_date`` onto each sale row (compat). Audits ``LC_ATTACH`` per sale.
+
+    Linking IS entering LC: every attached sale still at ``pi_issued`` is
+    advanced to ``lc_received`` (with ``sales_stage_history`` + ``SALE_MOVE``
+    rows) in this same transaction. Sales already past ``pi_issued`` are left
+    untouched — never downgraded, and a late attach to an advanced LC still
+    lands the newcomer on ``lc_received``, never past the invoice gate.
     """
     from .audit import log_audit_action
 
@@ -162,15 +168,17 @@ def attach_pis(conn: psycopg.Connection, lc_id: int, sale_ids: list) -> dict:
             raise ValueError("LC not found")
         _, raw_number, lc_company, lc_date = lc_row
         lc_number = (raw_number or "").strip()
+        prior_stages = {}
         for sale_id in sale_ids:
             sale = conn.execute(
-                "SELECT id, company_id FROM sales WHERE id = %s FOR UPDATE",
+                "SELECT id, company_id, stage FROM sales WHERE id = %s FOR UPDATE",
                 (sale_id,)).fetchone()
             if not sale:
                 raise ValueError(f"sale {sale_id} not found")
             if sale[1] != lc_company:
                 raise ValueError(
                     f"sale {sale_id} belongs to a different company")
+            prior_stages[sale_id] = sale[2]
         for sale_id in sale_ids:
             conn.execute(
                 "UPDATE sales SET lc_id = %s, lc_number = %s, lc_date = %s,"
@@ -178,6 +186,22 @@ def attach_pis(conn: psycopg.Connection, lc_id: int, sale_ids: list) -> dict:
                 (lc_id, lc_number, lc_date, _now_str(), sale_id))
             log_audit_action(conn, "LC_ATTACH", "lc", lc_id,
                              new_value=f"sale={sale_id}", atomic=False)
+            if prior_stages.get(sale_id) == "pi_issued":
+                # Entering LC: inline, no move_sale_to_stage (it commits
+                # mid-transaction, splitting this atomic unit and releasing
+                # the row locks early). Timestamp via the column DEFAULT,
+                # exactly as move_sale_to_stage does.
+                conn.execute(
+                    "UPDATE sales SET stage = %s, updated_at = %s WHERE id = %s",
+                    ("lc_received", _now_str(), sale_id))
+                conn.execute(
+                    "INSERT INTO sales_stage_history (sale_id, from_stage,"
+                    " to_stage, notes) VALUES (%s, %s, %s, %s)",
+                    (sale_id, "pi_issued", "lc_received",
+                     "auto-advanced on LC attach"))
+                log_audit_action(conn, "SALE_MOVE", "sale", sale_id,
+                                 old_value="pi_issued", new_value="lc_received",
+                                 atomic=False)
         conn.commit()
     except Exception:
         try:

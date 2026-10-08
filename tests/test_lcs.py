@@ -200,6 +200,82 @@ def test_detach_unlinked_returns_false(db):
 
 
 # --------------------------------------------------------------------------- #
+# attach advances pi_issued children to lc_received (INV-link Phase A)
+# --------------------------------------------------------------------------- #
+def test_attach_advances_pi_issued_children(db):
+    co = _company(db)
+    tag = _tag()
+    lc = lcsmod.create_lc(db, co, f"LC-AA-{tag}")
+    s1 = _sale(db, co, product="PAA1")
+    s2 = _sale(db, co, product="PAA2")
+    lcsmod.attach_pis(db, lc["id"], [s1, s2])
+    for sid in (s1, s2):
+        assert db.execute(
+            "SELECT stage FROM sales WHERE id = %s", (sid,)
+        ).fetchone()[0] == "lc_received"
+        hist = db.execute(
+            "SELECT from_stage, to_stage FROM sales_stage_history"
+            " WHERE sale_id = %s AND to_stage = %s",
+            (sid, "lc_received"),
+        ).fetchone()
+        assert hist is not None and hist[0] == "pi_issued"
+        audit = db.execute(
+            "SELECT COUNT(*) FROM audit_logs WHERE action = 'SALE_MOVE'"
+            " AND entity_type = 'sale' AND entity_id = %s",
+            (sid,),
+        ).fetchone()[0]
+        assert audit >= 1
+
+
+def test_attach_leaves_advanced_children_untouched(db):
+    co = _company(db)
+    tag = _tag()
+    lc = lcsmod.create_lc(db, co, f"LC-AU-{tag}")
+    s1 = _sale(db, co, product="PAU1")
+    s2 = _sale(db, co, product="PAU2")
+    assert salesmod.move_sale_to_stage(db, s2, "shipment_ongoing") is True
+    lcsmod.attach_pis(db, lc["id"], [s1, s2])
+    assert db.execute(
+        "SELECT stage FROM sales WHERE id = %s", (s1,)
+    ).fetchone()[0] == "lc_received"
+    assert db.execute(
+        "SELECT stage FROM sales WHERE id = %s", (s2,)
+    ).fetchone()[0] == "shipment_ongoing"
+    # no lc_received history row for the already-advanced child
+    assert db.execute(
+        "SELECT COUNT(*) FROM sales_stage_history WHERE sale_id = %s"
+        " AND to_stage = %s",
+        (s2, "lc_received"),
+    ).fetchone()[0] == 0
+
+
+def test_attach_to_advanced_lc_lands_lc_received(db):
+    co = _company(db)
+    tag = _tag()
+    lc = lcsmod.create_lc(db, co, f"LC-AL-{tag}")
+    db.execute("UPDATE letters_of_credit SET stage = %s WHERE id = %s",
+               ("shipment_ongoing", lc["id"]))
+    db.commit()
+    s1 = _sale(db, co, product="PAL1")
+    lcsmod.attach_pis(db, lc["id"], [s1])
+    # never jumps past the invoice gate with the LC
+    assert db.execute(
+        "SELECT stage FROM sales WHERE id = %s", (s1,)
+    ).fetchone()[0] == "lc_received"
+    assert db.execute(
+        "SELECT stage FROM letters_of_credit WHERE id = %s", (lc["id"],)
+    ).fetchone()[0] == "shipment_ongoing"
+
+
+def test_attach_empty_list_noop(db):
+    co = _company(db)
+    lc = lcsmod.create_lc(db, co, f"LC-AN-{_tag()}")
+    out = lcsmod.attach_pis(db, lc["id"], [])
+    assert out["id"] == lc["id"]
+    assert out["pis"] == []
+
+
+# --------------------------------------------------------------------------- #
 # move_lc_stage
 # --------------------------------------------------------------------------- #
 def test_move_lc_stage_propagates(db):
@@ -454,8 +530,11 @@ def test_linked_sale_direct_move_refused(db):
     lcsmod.attach_pis(db, lc["id"], [sid])
     assert salesmod.move_sale_to_stage(db, sid, "shipment_ongoing") is False
     db.rollback()
-    assert salesmod.advance_sale(db, sid) is not None  # pi_issued->lc_received ok
-    # now at lc_received, next advance would be shipment_ongoing -> refused
+    # INV-link: attach already advanced pi_issued -> lc_received, so the next
+    # direct advance IS the shipment hop — and it stays refused for linked PIs.
+    assert db.execute(
+        "SELECT stage FROM sales WHERE id = %s", (sid,)
+    ).fetchone()[0] == "lc_received"
     assert salesmod.advance_sale(db, sid) is None
     db.rollback()
 

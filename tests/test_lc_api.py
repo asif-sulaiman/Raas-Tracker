@@ -580,13 +580,10 @@ def test_linked_sale_advance_refused_via_api(admin_client, db):
     assert admin_client.post(
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
-    # pi_issued -> lc_received is fine
+    # INV-link: attach already advanced pi_issued -> lc_received, so the
+    # first direct move IS the shipment hop — refused for a linked sale.
     r1 = admin_client.post(f"/api/sales/{sid}/move", json={})
-    assert r1.status_code == 200, r1.get_json()
-    assert r1.get_json()["new_stage"] == "lc_received"
-    # lc_received -> shipment_ongoing must be refused for a linked sale
-    r2 = admin_client.post(f"/api/sales/{sid}/move", json={})
-    assert r2.status_code == 400, r2.get_json()
+    assert r1.status_code == 400, r1.get_json()
 
 
 # --------------------------------------------------------------------------- #
