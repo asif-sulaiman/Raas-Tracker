@@ -270,6 +270,13 @@ ProxyFix already correct (auth failures are 401/403, never this 500).
 | INV-1 ✅ | **405 handler** — `/api` wrong-method requests return 405 `{"error":"method not allowed"}` instead of falling into the catch-all 500 | `flask_app.py`, `tests/test_invoice_errors.py`, `docs/SPEC.md` | `POST /api/sales/null/invoices` → 405 JSON |
 | INV-2 ✅ | **Non-finite money guards** — `remaining_invoice_money` / `_invoice_money_already_on_sale` raise `ValueError` (400) on NaN/Inf PI or invoiced totals instead of `InvalidOperation` (500); nothing persisted on the 400 path | `raas_tracker/sales.py`, `tests/test_invoice_errors.py` | NaN qty / Inf price / NaN legacy line → 400 + zero invoice rows |
 | INV-3 ✅ | **Barrier modal takes the LC's PIs** — one invoice-number row per PI (single invoice or one per PI; same-PI splits stay in the PI detail line editor, since each create seeds the whole remainder), `apiFetch` instead of raw `fetch`, per-row errors, and auto-retry of the blocked `POST /api/lcs/<id>/move` on success | `InvoicesRequiredModal.jsx` (+ new `.test.jsx`, 5 tests), `Sales.jsx` (barrierPis/barrierMove, `handleBarrierInvoicesSuccess`) | Per-PI URLs asserted, never `null`; 299 frontend tests green, oxlint 0 errors, build OK |
+| INV-4 ✅ | **Link advances PIs to `lc_received`** — linking IS entering LC: `attach_pis` advances `pi_issued` children in the same transaction (UPDATE + history + `SALE_MOVE`, inline, single commit; never downgrades; late attach to an advanced LC still lands `lc_received`). 2 pre-existing assertions updated to the new contract | `raas_tracker/lcs.py`, `tests/test_lcs.py` (4 new), `tests/test_lc_api.py` (1 updated) | `test_lcs.py` + `test_lc_api.py` 69 green |
+| INV-5 ✅ | **Board buttons follow the LC's own stage** — `LcBoardCard` gets a move action only when its column matches `lc.stage`; early-column cards (split LC, lagging PI) show no move button, so the invoice modal is reachable only from a genuine 3rd-stage attempt | `Sales.jsx` (board render), new `Sales.test.jsx` (3 page tests) | 302 frontend tests green, oxlint 0 errors, build OK |
+
+Business rule restated: one LC carries one **or many** invoices across its
+PIs (gate counts invoices across ALL of the LC's sales). Linking a PI under
+an LC moves it to `lc_received` — the LC-create/link form is the LC-details
+demand for the 1st → 2nd stage hop.
 
 Business rule restated: one LC carries one **or many** invoices across its
 PIs (gate counts invoices across ALL of the LC's sales).

@@ -474,13 +474,20 @@ export default function Sales() {
                     continue;
                   }
                   const real = typeof group.lc.id === 'number';
+                  // Board honesty (INV-link): the card acts only from the
+                  // LC's own stage column. A card rendered early (split LC,
+                  // lagging PI) shows no move action — otherwise its button
+                  // promises one move (e.g. "Enter LC") while handleLcMove
+                  // attempts another (e.g. the shipment barrier + invoice
+                  // modal) from the wrong column.
+                  const atOwnStage = st.key === group.lc.stage;
                   nodes.push(
                     <LcBoardCard
                       key={`lc-${group.key}`}
                       lc={group.lc}
-                      actionLabel={movingId || !real ? null : st.actionLabel}
+                      actionLabel={movingId || !real || !atOwnStage ? null : st.actionLabel}
                       actionVariant={st.actionVariant}
-                      onAction={real ? handleLcMove : undefined}
+                      onAction={real && atOwnStage ? handleLcMove : undefined}
                       onOpen={handleLcOpen}
                       onViewPI={(pi) => setDetailSaleId(pi.id)}
                       onUnlink={isAdmin && real ? (pi) => handleUnlink(group.lc, pi) : undefined}
