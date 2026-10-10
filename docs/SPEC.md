@@ -641,7 +641,7 @@ future call sites are covered without opting in:
 | GET | `/api/lcs/<id>` | Session/Key | LC detail + `pis[]` (id, pi_number, stage, client_name, company_id) |
 | PUT | `/api/lcs/<id>` | Admin (15/min) | Update `lc_date`/`expiry_date`/`bank_ref`/`notes` only (number + company immutable); mirrors `lc_date` onto linked PIs |
 | DELETE | `/api/lcs/<id>` | Admin (15/min) | Delete — **409 while PIs are attached** (locked count + FK backstop) |
-| POST | `/api/lcs/<id>/pis` | Admin (15/min) | Attach `{sale_ids:[...]}` — every PI must share the LC's company (400 otherwise); mirrors `lc_number`/`lc_date` onto the PIs |
+| POST | `/api/lcs/<id>/pis` | Admin (15/min) | Attach `{sale_ids:[...]}` — every PI must share the LC's company (400 otherwise); mirrors `lc_number`/`lc_date` onto the PIs; every attached PI still at `pi_issued` advances to `lc_received` (history + `SALE_MOVE` audit, same transaction; later-stage PIs untouched, never downgraded) |
 | DELETE | `/api/lcs/<id>/pis/<sale_id>` | Admin (15/min) | Detach one PI (clears `lc_id` + mirrors) |
 | POST | `/api/lcs/<id>/move` | Admin (15/min) | Move the LC stage; **two barriers** — crossing into `shipment_ongoing` requires **≥1 invoice** (recipes no longer required here); crossing into `payment_due` requires **every invoiced product to have a company recipe AND an invoice-linked production run**. Both barriers enforced under row locks; stage propagated to all child PIs in one transaction |
 | GET | `/api/lcs/<id>/readiness` | Session/Key | Readiness snapshot — `invoices_ok`, `recipes_ok`, `produced_ok`, `detail` with per-PI remaining uninvoiced lines, `missing_recipes`, `missing_production` |
