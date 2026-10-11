@@ -77,6 +77,7 @@ def test_letters_of_credit_columns(lc_db):
     assert set(cols) == {
         "id", "lc_number", "company_id", "lc_date", "expiry_date",
         "bank_ref", "stage", "notes", "created_at", "updated_at",
+        "shipment_gate",
     }, f"unexpected letters_of_credit columns: {sorted(cols)}"
     assert cols["lc_number"]["nullable"] == "NO"
     assert cols["company_id"]["nullable"] == "NO"
@@ -85,6 +86,9 @@ def test_letters_of_credit_columns(lc_db):
         f"stage default should be 'lc_received': {cols['stage']['default']!r}"
     assert cols["lc_date"]["nullable"] == "YES"
     assert cols["expiry_date"]["nullable"] == "YES"
+    assert cols["shipment_gate"]["nullable"] == "YES"
+    assert "per_invoice" in (cols["shipment_gate"]["default"] or ""), \
+        f"shipment_gate default should be 'per_invoice': {cols['shipment_gate']['default']!r}"
     assert ("company_id", "companies", "id") in _fk_refs(lc_db, "letters_of_credit")
 
 
@@ -182,7 +186,7 @@ def test_invoice_items_columns(lc_db):
     cols = _columns(lc_db, "invoice_items")
     assert set(cols) == {
         "id", "invoice_id", "sale_item_id", "product_name",
-        "unit", "quantity", "unit_price", "line_total",
+        "unit", "quantity", "unit_price", "line_total", "source_type",
     }, f"unexpected invoice_items columns: {sorted(cols)}"
     assert cols["invoice_id"]["nullable"] == "NO"
     assert cols["sale_item_id"]["nullable"] == "YES"
@@ -190,6 +194,9 @@ def test_invoice_items_columns(lc_db):
     assert cols["unit"]["nullable"] == "NO"
     assert "KG" in (cols["unit"]["default"] or ""), \
         f"unit default should be 'KG': {cols['unit']['default']!r}"
+    assert cols["source_type"]["nullable"] == "YES"
+    assert "pi_line" in (cols["source_type"]["default"] or ""), \
+        f"source_type default should be 'pi_line': {cols['source_type']['default']!r}"
     fks = _fk_refs(lc_db, "invoice_items")
     assert ("invoice_id", "invoices", "id") in fks
     assert ("sale_item_id", "sale_items", "id") in fks

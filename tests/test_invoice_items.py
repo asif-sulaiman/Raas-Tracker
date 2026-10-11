@@ -84,20 +84,25 @@ def test_price_locked_to_sale_item(db):
     assert float(row[1]) == pytest.approx(2)
 
 
-def test_over_qty_rejected(db):
+def test_over_qty_allowed(db):
+    """Invoice quantities can exceed PI quantities (shipment advantage)."""
     co = _company(db)
     sid = _sale(db, co, qty=10, price=5)
     si_id, _, _ = _sale_item(db, sid)
     inv = _invoice(db, sid)
+    # First invoice with 6 (exceeds PI qty of 10? No, 6 < 10)
     salesmod.create_invoice_item(db, inv, si_id, 6)
-    with pytest.raises(ValueError):
-        salesmod.create_invoice_item(db, inv, si_id, 5)
-    db.rollback()
-    # only the first line persisted
-    assert len(salesmod.list_invoice_items(db, inv)) == 1
+    # Second invoice with 5 (total 11 > PI qty of 10) - NOW ALLOWED
+    salesmod.create_invoice_item(db, inv, si_id, 5)
+    db.commit()
+    items = salesmod.list_invoice_items(db, inv)
+    assert len(items) == 2
+    assert items[0]["quantity"] == 6
+    assert items[1]["quantity"] == 5
 
 
 def test_remaining_qty_math(db):
+    """Quantities can exceed PI remaining - no ceiling enforced."""
     co = _company(db)
     sid = _sale(db, co, qty=10, price=4)
     si_id, _, _ = _sale_item(db, sid)
@@ -106,11 +111,12 @@ def test_remaining_qty_math(db):
     salesmod.create_invoice_item(db, inv, si_id, 4)
     # 7 used, 3 remain: exact fill OK ...
     salesmod.create_invoice_item(db, inv, si_id, 3)
-    assert len(salesmod.list_invoice_items(db, inv)) == 3
-    # ... then anything more rejects
-    with pytest.raises(ValueError):
-        salesmod.create_invoice_item(db, inv, si_id, 1)
-    db.rollback()
+    # Now 10 used, 0 remain - but we can still add more (shipment advantage)
+    salesmod.create_invoice_item(db, inv, si_id, 5)
+    db.commit()
+    items = salesmod.list_invoice_items(db, inv)
+    assert len(items) == 4
+    assert items[3]["quantity"] == 5  # exceeded PI qty
 
 
 def test_quantity_must_be_finite_and_positive(db):
@@ -235,8 +241,8 @@ def test_shipment_ready_both(db):
 # --------------------------------------------------------------------------- #
 # Oracle gate 2 remediation: B7 / P1 / P2
 # --------------------------------------------------------------------------- #
-def test_sequential_double_create_boundary_second_rejected(db):
-    """B7: remaining exactly consumed, second INSERT rejected (locked txn)."""
+def test_sequential_double_create_boundary_allowed(db):
+    """B7: remaining exactly consumed, additional items still allowed (shipment advantage)."""
     co = _company(db)
     sid = _sale(db, co, qty=10, price=5)
     si_id, _, _ = _sale_item(db, sid)
@@ -244,10 +250,12 @@ def test_sequential_double_create_boundary_second_rejected(db):
     salesmod.create_invoice_item(db, inv, si_id, 6)
     salesmod.create_invoice_item(db, inv, si_id, 4)  # exactly consumed
     assert len(salesmod.list_invoice_items(db, inv)) == 2
-    with pytest.raises(ValueError):
-        salesmod.create_invoice_item(db, inv, si_id, 1)
-    db.rollback()
-    assert len(salesmod.list_invoice_items(db, inv)) == 2
+    # Now we can add more (shipment advantage - qty can exceed PI)
+    salesmod.create_invoice_item(db, inv, si_id, 1)
+    db.commit()
+    items = salesmod.list_invoice_items(db, inv)
+    assert len(items) == 3
+    assert items[2]["quantity"] == 1
 
 
 def test_invoice_amount_derived_cache(db):
@@ -360,4 +368,4 @@ def test_create_invoice_takes_no_stated_amount(db):
     params = inspect.signature(salesmod.create_invoice).parameters
     assert "amount" not in params, (
         "create_invoice must not accept a stated amount; the money is derived")
-    assert set(params) == {"conn", "sale_id", "invoice_number", "seed_lines"}
+    assert set(params) == {"conn", "sale_id", "invoice_number", "seed_lines", "lines"}

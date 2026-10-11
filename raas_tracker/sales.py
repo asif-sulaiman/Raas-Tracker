@@ -1507,6 +1507,77 @@ def remaining_invoice_money(conn: psycopg.Connection, sale_id: int) -> Decimal:
     return max(total - already, Decimal("0"))
 
 
+def pi_proposal_vs_invoiced(conn: psycopg.Connection, sale_id: int) -> Decimal:
+    """PI proposal total minus actual invoiced total (can be negative).
+
+    Used for variance reporting: shows how much invoiced amounts deviate
+    from the PI proposal. Positive = invoiced less than PI; negative = invoiced more.
+    """
+    raw_total = get_sale_invoice_total(conn, sale_id) or 0
+    if isinstance(raw_total, float) and not math.isfinite(raw_total):
+        raise ValueError(
+            "sale has a non-finite line total "
+            "(check quantities and unit prices)")
+    total = _money(raw_total)
+    already = _invoice_money_already_on_sale(conn, sale_id)
+    return _money(total - already)
+
+
+def validate_invoice_lines(conn: psycopg.Connection, sale_id: int,
+                           lines: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Validate and enrich invoice lines with server-enforced prices.
+
+    Args:
+        conn: Database connection
+        sale_id: The sale ID these lines belong to
+        lines: List of {"sale_item_id": int, "quantity": float}
+
+    Returns:
+        List of validated lines with added fields:
+        {"sale_item_id", "product_name", "unit", "quantity", "unit_price", "line_total"}
+
+    Raises:
+        ValueError: If line references invalid sale_item, qty <= 0, or non-finite qty.
+    """
+    if not lines:
+        raise ValueError("at least one invoice line required")
+
+    validated = []
+    for line in lines:
+        sale_item_id = line.get("sale_item_id")
+        quantity = line.get("quantity")
+
+        if sale_item_id is None:
+            raise ValueError("each line must have a sale_item_id")
+        try:
+            qty = float(quantity)
+        except (TypeError, ValueError):
+            raise ValueError("quantity must be a number")
+        if not math.isfinite(qty) or qty <= 0:
+            raise ValueError("quantity must be finite and > 0")
+
+        # Verify sale_item belongs to this sale and get authoritative price
+        si = conn.execute(
+            "SELECT id, product_name, unit, unit_price FROM sale_items "
+            "WHERE id = %s AND sale_id = %s FOR UPDATE",
+            (sale_item_id, sale_id)).fetchone()
+        if not si:
+            raise ValueError(f"sale item {sale_item_id} not found in this sale")
+
+        unit_price = float(si[3] or 0)
+        line_total = round(qty * unit_price, 2)
+
+        validated.append({
+            "sale_item_id": sale_item_id,
+            "product_name": si[1],
+            "unit": si[2] or "KG",
+            "quantity": qty,
+            "unit_price": unit_price,
+            "line_total": line_total,
+        })
+    return validated
+
+
 def _seed_invoice_lines(conn: psycopg.Connection, invoice_id: int,
                         sale_id: int, budget: Decimal) -> None:
     """Give a freshly created invoice one line per remaining uninvoiced PI line.
@@ -1587,29 +1658,20 @@ def _seed_invoice_lines(conn: psycopg.Connection, invoice_id: int,
 
 
 def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
-seed_lines: bool = True) -> Dict[str, Any]:
-    """Create a new invoice for a sale, deriving its money from the PI.
+                   lines: Optional[List[Dict[str, Any]]] = None,
+                   seed_lines: bool = True) -> Dict[str, Any]:
+    """Create a new invoice for a sale.
 
-    The caller states only WHICH invoice this is; the money is always derived as
-    the sale's remaining uninvoiced amount (PI total minus what the invoice lines
-    already carry), and the invoice is seeded with one line per remaining
-    uninvoiced PI line. The header is then restated from those lines in SQL, so
-    ``invoices.amount == SUM(invoice_items.line_total)`` holds by construction.
+    Two modes:
+    1. Explicit lines provided (lines=[{"sale_item_id": int, "quantity": float}, ...]):
+       - Quantities can exceed PI quantities (shipment advantage)
+       - Unit price always inherited from PI line (server-enforced)
+       - No quantity ceiling enforced
+    2. lines=None, seed_lines=True (default): legacy auto-seed from PI remainder
+    3. lines=None, seed_lines=False: header only (tests only, not exposed via API)
 
-    There is deliberately no way to state an amount. A header carrying money that
-    no line backs is invisible to the invoice-driven report: it reported a real
-    receivable as quantity 0 / total 0 / due 0 / "Paid" and dropped the money
-    from ``gross_sales``. One source of truth is the only way to keep the report,
-    the KPIs and the CSV honest. To invoice less than the remainder, create the
-    invoice and then adjust its lines (InvoiceLineEditor), or invoice part now
-    and the rest later.
-
-    An invoice whose derived amount is 0 is 'paid' at creation; legacy rows keep
-    amount NULL (= unknown) and are handled by _sync_invoice_paid_status.
-
-    ``seed_lines=False`` is an internal seam for the line-level unit tests, which
-    need an invoice with no lines so they can own the full remaining quantity.
-    It is never exposed by the API and must not become one.
+    Unit price is always inherited from the PI line (server-enforced).
+    Invoice amount is always Σ line totals (single source of truth).
     """
     if not invoice_number or not invoice_number.strip():
         raise ValueError("invoice_number is required")
@@ -1628,21 +1690,65 @@ seed_lines: bool = True) -> Dict[str, Any]:
     if not conn.execute("SELECT id FROM sales WHERE id = %s FOR UPDATE",
                         (sale_id,)).fetchone():
         raise ValueError("sale not found")
-    amount = remaining_invoice_money(conn, sale_id)
-    # paid_amount at creation is 0 -> covered when amount <= 0
-    status = "paid" if amount <= 0 else "planned"
 
-    try:
-        cursor = conn.execute(
-            """INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at)
-               VALUES (%s, %s, %s, ROUND(%s::numeric, 2), %s) RETURNING id""",
-            (sale_id, invoice_number, status, amount, _now_str())
-        )
-        invoice_id = cursor.fetchone()[0]
-    except psycopg.IntegrityError:
-        raise ValueError(f"Invoice number '{invoice_number}' already exists for this sale")
+    # Build invoice lines: explicit lines or legacy auto-seed
+    if lines is not None:
+        # Explicit lines mode: validate and use provided quantities (no ceiling)
+        validated_lines = validate_invoice_lines(conn, sale_id, lines)
+        amount = _money(sum(l["line_total"] for l in validated_lines))
+        status = "paid" if amount <= 0 else "planned"
 
-    if seed_lines:
+        try:
+            cursor = conn.execute(
+                """INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at)
+                   VALUES (%s, %s, %s, ROUND(%s::numeric, 2), %s) RETURNING id""",
+                (sale_id, invoice_number, status, amount, _now_str())
+            )
+            invoice_id = cursor.fetchone()[0]
+        except psycopg.IntegrityError:
+            raise ValueError(f"Invoice number '{invoice_number}' already exists for this sale")
+
+        # Insert validated lines
+        for vl in validated_lines:
+            row = conn.execute(
+                """INSERT INTO invoice_items
+                       (invoice_id, sale_item_id, product_name, unit,
+                        quantity, unit_price, line_total, source_type)
+                   VALUES (%s, %s, %s, %s, %s, %s,
+                           ROUND(%s::numeric * %s::numeric, 2), 'pi_line')
+                   RETURNING id, line_total""",
+                (invoice_id, vl["sale_item_id"], vl["product_name"], vl["unit"],
+                 vl["quantity"], vl["unit_price"], vl["quantity"], vl["unit_price"])
+            ).fetchone()
+            line_id, line_total = row
+            log_audit_action(conn, "INVOICE_ITEM_ADD", "invoice_item", line_id,
+                             new_value=(f"explicit line for sale_item {vl['sale_item_id']} "
+                                        f"qty={vl['quantity']} total={_money(line_total or 0)}"),
+                             atomic=False)
+
+        # Restate header from lines (single source of truth)
+        amount = _money(conn.execute(
+            """UPDATE invoices SET amount =
+                   (SELECT COALESCE(SUM(line_total), 0) FROM invoice_items
+                     WHERE invoice_id = %s)
+               WHERE id = %s RETURNING amount""",
+            (invoice_id, invoice_id)).fetchone()[0])
+
+    elif seed_lines:
+        # Legacy auto-seed from PI remainder (backward compatible)
+        amount = remaining_invoice_money(conn, sale_id)
+        status = "paid" if amount <= 0 else "planned"
+
+        try:
+            cursor = conn.execute(
+                """INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at)
+                   VALUES (%s, %s, %s, ROUND(%s::numeric, 2), %s) RETURNING id""",
+                (sale_id, invoice_number, status, amount, _now_str())
+            )
+            invoice_id = cursor.fetchone()[0]
+        except psycopg.IntegrityError:
+            raise ValueError(f"Invoice number '{invoice_number}' already exists for this sale")
+
         _seed_invoice_lines(conn, invoice_id, sale_id, amount)
         # Restate the header from the lines actually written, in ::numeric, so
         # the header is exactly the sum the report will compute.
@@ -1652,6 +1758,21 @@ seed_lines: bool = True) -> Dict[str, Any]:
                      WHERE invoice_id = %s)
                WHERE id = %s RETURNING amount""",
             (invoice_id, invoice_id)).fetchone()[0])
+
+    else:
+        # Header-only invoice (tests only) - still derive amount from PI total,
+        # but don't create invoice_items rows (internal test seam)
+        amount = remaining_invoice_money(conn, sale_id)
+        status = "paid" if amount <= 0 else "planned"
+        try:
+            cursor = conn.execute(
+                """INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at)
+                   VALUES (%s, %s, %s, ROUND(%s::numeric, 2), %s) RETURNING id""",
+                (sale_id, invoice_number, status, amount, _now_str())
+            )
+            invoice_id = cursor.fetchone()[0]
+        except psycopg.IntegrityError:
+            raise ValueError(f"Invoice number '{invoice_number}' already exists for this sale")
 
     # Entering production: only set production_running when no status yet
     # (COALESCE so a sale already at production_done/ship_booked never downgrades)
@@ -2176,9 +2297,8 @@ def create_invoice_item(conn: psycopg.Connection, invoice_id: int,
                         sale_item_id: int, quantity: float) -> Dict[str, Any]:
     """Add one invoice line. The unit price is resolved server-side from the
     sale item — the client can never set it. ``quantity`` must be finite and
-    > 0, and must not exceed the remaining uninvoiced quantity
-    (``sale_item.quantity`` minus already-invoiced). Audits
-    ``INVOICE_ITEM_ADD``.
+    > 0. Quantities may exceed the PI line quantity (shipment advantage).
+    Audits ``INVOICE_ITEM_ADD``.
     """
     from decimal import Decimal as _Dec
     try:
@@ -2205,27 +2325,14 @@ def create_invoice_item(conn: psycopg.Connection, invoice_id: int,
         if si[1] != sale_id:
             conn.rollback()
             raise ValueError("sale item does not belong to this invoice's sale")
-        # Exact remaining in SQL ::numeric (no float drift); the 1e-9 style
-        # epsilon survives only for repr noise in the error message.
-        rem_row = conn.execute(
-            "SELECT (quantity::numeric - COALESCE((SELECT SUM(quantity)::numeric"
-            " FROM invoice_items WHERE sale_item_id = %s), 0)) FROM sale_items"
-            " WHERE id = %s",
-            (sale_item_id, sale_item_id)).fetchone()
-        remaining = _Dec(str(rem_row[0])) if rem_row and rem_row[0] is not None else _Dec("0")
-        if _Dec(str(qty)) > remaining:
-            remaining_f = float(remaining)
-            conn.rollback()
-            raise ValueError(
-                f"quantity {qty:g} exceeds remaining {remaining_f:g}"
-                " for this sale item")
+        # Unit price inherited from PI line (server-enforced)
         unit_price = float(si[5] or 0)
         line_total = round(qty * unit_price, 2)
         try:
             row = conn.execute(
                 """INSERT INTO invoice_items (invoice_id, sale_item_id,
-                   product_name, unit, quantity, unit_price, line_total)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                       product_name, unit, quantity, unit_price, line_total, source_type)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, 'pi_line') RETURNING id""",
                 (invoice_id, sale_item_id, si[2], si[3] or "KG",
                  qty, unit_price, line_total),
             ).fetchone()
@@ -2249,6 +2356,10 @@ def create_invoice_item(conn: psycopg.Connection, invoice_id: int,
                                    f" qty={qty:g}",
                          atomic=False)
         conn.commit()
+        return {"id": line_id, "invoice_id": invoice_id,
+                "sale_item_id": sale_item_id, "product_name": si[2],
+                "unit": si[3] or "KG", "quantity": qty,
+                "unit_price": unit_price, "line_total": line_total}
     except Exception:
         try:
             conn.rollback()

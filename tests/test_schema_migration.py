@@ -119,6 +119,16 @@ def _setting(dsn, key):
         raw.close()
 
 
+def _table_columns(conn, table: str):
+    """Column names of a table in the public schema (empty set if missing)."""
+    cur = conn.execute(
+        """SELECT column_name FROM information_schema.columns
+           WHERE table_schema = 'public' AND table_name = %s""",
+        (table,),
+    )
+    return {row[0] for row in cur.fetchall()}
+
+
 # --------------------------------------------------------------------------- #
 # Task 1 — __exit__ must roll back on exception
 # --------------------------------------------------------------------------- #
@@ -258,6 +268,85 @@ def test_fast_path_is_a_noop_once_current(pg_dsn, monkeypatch):
 
     monkeypatch.setattr(dbmod, "_create_tables", _boom)
     dbmod.get_connection(pg_dsn).close()
+
+
+# --------------------------------------------------------------------------- #
+# Task 6 — INV-REVISION schema upgrade (v4 → v5)
+# --------------------------------------------------------------------------- #
+def test_inv_revision_columns_added_on_v4_to_v5_upgrade(pg_dsn):
+    """INV-REVISION v5 migration adds three new columns with correct defaults."""
+    # Start from a fully migrated v4 database
+    dbmod.get_connection(pg_dsn).close()
+
+    # Force version back to 4
+    conn = dbmod.get_connection(pg_dsn)
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES (%s, %s) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        (dbmod._SCHEMA_VERSION_KEY, "4"))
+    conn.commit()
+    conn.close()
+
+    # Now get a new connection - should trigger v4→v5 migration
+    conn = dbmod.get_connection(pg_dsn)
+    try:
+        # Check all three new columns exist
+        inv_cols = _table_columns(conn, "invoices")
+        assert "shipment_status" in inv_cols, "invoices.shipment_status missing"
+
+        lc_cols = _table_columns(conn, "letters_of_credit")
+        assert "shipment_gate" in lc_cols, "letters_of_credit.shipment_gate missing"
+
+        ii_cols = _table_columns(conn, "invoice_items")
+        assert "source_type" in ii_cols, "invoice_items.source_type missing"
+
+        # Check defaults by inserting test rows
+        # 1. invoices.shipment_status default 'pending'
+        sale_id = conn.execute(
+            "INSERT INTO sales (pi_number, client_name) VALUES ('PI-TEST', 'Test Co') RETURNING id"
+        ).fetchone()[0]
+        inv_id = conn.execute(
+            "INSERT INTO invoices (sale_id, invoice_number) VALUES (%s, 'TEST-SHIP') RETURNING id",
+            (sale_id,)
+        ).fetchone()[0]
+        status = conn.execute("SELECT shipment_status FROM invoices WHERE id = %s", (inv_id,)).fetchone()[0]
+        assert status == "pending", f"invoices.shipment_status default != 'pending', got {status}"
+
+        # 2. letters_of_credit.shipment_gate default 'per_invoice'
+        co_id = conn.execute(
+            "INSERT INTO companies (name) VALUES ('Test Co') RETURNING id"
+        ).fetchone()[0]
+        lc_id = conn.execute(
+            "INSERT INTO letters_of_credit (lc_number, company_id) VALUES ('LC-TEST', %s) RETURNING id",
+            (co_id,)
+        ).fetchone()[0]
+        gate = conn.execute("SELECT shipment_gate FROM letters_of_credit WHERE id = %s", (lc_id,)).fetchone()[0]
+        assert gate == "per_invoice", f"letters_of_credit.shipment_gate default != 'per_invoice', got {gate}"
+
+        # 3. invoice_items.source_type default 'pi_line'
+        inv_id2 = conn.execute(
+            "INSERT INTO invoices (sale_id, invoice_number) VALUES (%s, 'TEST-SRC') RETURNING id",
+            (sale_id,)
+        ).fetchone()[0]
+        si_id = conn.execute(
+            "INSERT INTO sale_items (sale_id, product_name, quantity, unit_price) VALUES (%s, 'Test', 10, 5) RETURNING id",
+            (sale_id,)
+        ).fetchone()[0]
+        ii_id = conn.execute(
+            "INSERT INTO invoice_items (invoice_id, sale_item_id, product_name, quantity, unit_price) "
+            "VALUES (%s, %s, 'Test', 5, 10) RETURNING id",
+            (inv_id2, si_id)
+        ).fetchone()[0]
+        src = conn.execute("SELECT source_type FROM invoice_items WHERE id = %s", (ii_id,)).fetchone()[0]
+        assert src == "pi_line", f"invoice_items.source_type default != 'pi_line', got {src}"
+
+        # Verify schema version was updated to 5
+        conn2 = dbmod.get_connection(pg_dsn)
+        conn2.close()
+        stored = _setting(pg_dsn, dbmod._SCHEMA_VERSION_KEY)
+        assert stored is not None and int(stored[0]) == 5, "schema version not updated to 5"
+    finally:
+        conn.close()
 
 
 # --------------------------------------------------------------------------- #

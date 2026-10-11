@@ -411,19 +411,21 @@ def test_invoice_item_create_server_price(admin_client, db):
     assert listed[0]["unit_price"] == 5.0
 
 
-def test_invoice_item_over_qty_409(admin_client, db):
+def test_invoice_item_over_qty_allowed(admin_client, db):
+    """Quantities can exceed PI quantities (shipment advantage)."""
     tag = _tag()
     inv_id, item_id = _invoiced_setup(db, tag, qty=10)
+    # Quantity 11 exceeds PI qty of 10 - NOW ALLOWED (shipment advantage)
     assert admin_client.post(
         f"/api/invoices/{inv_id}/items",
-        json={"sale_item_id": item_id, "quantity": 11}).status_code == 409
-    # partial accumulation also enforced: 6 ok, then 5 exceeds remaining 4
+        json={"sale_item_id": item_id, "quantity": 11}).status_code == 201
+    # Can accumulate beyond PI qty
     assert admin_client.post(
         f"/api/invoices/{inv_id}/items",
         json={"sale_item_id": item_id, "quantity": 6}).status_code == 201
     assert admin_client.post(
         f"/api/invoices/{inv_id}/items",
-        json={"sale_item_id": item_id, "quantity": 5}).status_code == 409
+        json={"sale_item_id": item_id, "quantity": 5}).status_code == 201
 
 
 def test_invoice_item_404_paths(admin_client, db):
