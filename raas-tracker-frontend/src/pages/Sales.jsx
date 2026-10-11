@@ -11,6 +11,7 @@ import UploadPI from '../components/sales/UploadPI';
 import ReviewModal from '../components/sales/ReviewModal';
 import PaymentModal from '../components/sales/PaymentModal';
 import SaleDetailModal from '../components/sales/SaleDetailModal';
+import InvoiceBuilderModal from '../components/sales/InvoiceBuilderModal';
 import InvoicesRequiredModal from '../components/sales/InvoicesRequiredModal';
 import ProductionRequiredModal from '../components/sales/ProductionRequiredModal';
 import { STAGES, groupSalesByLc, lcGroupKey, nextStageFor } from '../utils/sales';
@@ -645,6 +646,7 @@ export default function Sales() {
           setBarrierMove(null);
           setBarrierDetail({});
         }}
+        lcId={barrierLcId}
         pis={barrierPis}
         onSuccess={handleBarrierInvoicesSuccess}
       />
