@@ -9,6 +9,7 @@ import hashlib
 from flask import Flask, request, jsonify, send_from_directory, g, redirect
 from datetime import date, timedelta
 from functools import wraps
+from typing import Optional
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -2093,16 +2094,17 @@ def api_get_production_run(name, run_id):
             ]
         })
 
-
 # ==================== API: INVOICES ====================
-
-class InvoiceCreateIn(_StrippedModel):
-    invoice_number: str = Field(min_length=1)
 
 
 class InvoiceBatchLineIn(_StrippedModel):
     sale_item_id: int
     quantity: float
+
+
+class InvoiceCreateIn(_StrippedModel):
+    invoice_number: str = Field(min_length=1)
+    lines: Optional[list[InvoiceBatchLineIn]] = None
 
 
 class InvoiceBatchEntryIn(_StrippedModel):
@@ -2147,7 +2149,7 @@ def api_create_invoice(sale_id):
         conn.close()
         return jsonify({"error": "Sale not found"}), 404
     try:
-        result = create_invoice(conn, sale_id, payload.invoice_number)
+        result = create_invoice(conn, sale_id, payload.invoice_number, lines=payload.lines)
     except ValueError as e:
         _rollback_close(conn)
         return jsonify({"error": str(e)}), 400
@@ -3198,6 +3200,42 @@ def api_lc_readiness(lc_id):
                 for p in (lc.get("pis") or [])],
         "invoice_drafts": drafts,
     })
+
+
+@app.route("/api/invoices/<int:invoice_id>/readiness")
+def api_invoice_readiness(invoice_id):
+    """Per-invoice readiness for booking/shipping/payment."""
+    conn = get_db()
+    try:
+        inv = conn.execute(
+            "SELECT id, sale_id, status, shipment_status FROM invoices WHERE id = %s",
+            (invoice_id,)).fetchone()
+        if not inv:
+            return jsonify({"error": "Invoice not found"}), 404
+        invoice_id, sale_id, status, shipment_status = inv
+        # Booking: can book if status is planned
+        can_book = status == "planned"
+        # Shipping: can ship if status is booked
+        can_ship = status == "booked"
+        # Payment: can pay if status is shipped or booked (partial payment allowed)
+        can_pay = status in ("booked", "shipped")
+        # Production readiness: check if invoiced products have recipes + production
+        prod = production_readiness(conn, 
+            conn.execute("SELECT company_id FROM sales WHERE id = %s", (sale_id,)).fetchone()[0],
+            [sale_id])
+        return jsonify({
+            "invoice_id": invoice_id,
+            "status": status,
+            "shipment_status": shipment_status,
+            "can_book": can_book,
+            "can_ship": can_ship,
+            "can_pay": can_pay,
+            "recipes_ok": prod.get("recipes_ok"),
+            "produced_ok": prod.get("produced_ok"),
+            "detail": prod.get("detail"),
+        })
+    finally:
+        conn.close()
 
 
 @app.route("/api/lcs/<int:lc_id>", methods=["PUT"])
