@@ -3,7 +3,6 @@ import { Pencil, Trash2, Check, X, Plus, Loader2 } from 'lucide-react';
 import Modal from '../modals/Modal';
 import Badge from '../ui/Badge';
 import Button from '../ui/Button';
-import ShipmentModal from './ShipmentModal';
 import InvoicePanel from './InvoicePanel';
 import InvoiceLineEditor from './InvoiceLineEditor';
 import { formatNumber, formatDate, formatDateTime, sumLineTotals, lineTotal } from '../../utils/format';
@@ -150,7 +149,6 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
   // A refresh that failed after a successful mutation. The sale on screen is
   // then known to be out of date — never evidence that the sale is gone.
   const [refreshError, setRefreshError] = useState(null);
-  const [showShipmentModal, setShowShipmentModal] = useState(false);
   const [comments, setComments] = useState('');
   const [savingComments, setSavingComments] = useState(false);
 
@@ -582,11 +580,6 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
               <h4 className="text-sm font-semibold text-slate-800 dark:text-white">
                 Shipments ({(sale.shipments?.length ?? 0)})
               </h4>
-              {isAdmin && (
-                <Button variant="secondary" size="sm" icon={Plus} onClick={() => setShowShipmentModal(true)}>
-                  Record shipment
-                </Button>
-              )}
             </div>
             {(sale.shipments?.length ?? 0) === 0 ? (
               <p className="text-xs text-slate-400 dark:text-slate-500">No shipments recorded yet.</p>
@@ -676,12 +669,6 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
         </div>
       )}
     </Modal>
-    <ShipmentModal
-      isOpen={showShipmentModal}
-      saleId={saleId}
-      onClose={() => setShowShipmentModal(false)}
-      onSaved={() => { refresh(saleId); onSaved?.(); }}
-    />
     </>
   );
 }

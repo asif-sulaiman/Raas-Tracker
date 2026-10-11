@@ -81,11 +81,11 @@ function renderDetail(opts = {}) {
 }
 
 describe('SaleDetailModal shipments', () => {
-  it('lists shipments and offers recording to admins', async () => {
+  it('lists shipments without offering legacy recording', async () => {
     renderDetail({ role: 'admin' });
     expect(await screen.findByText('INV-9')).toBeTruthy();
     expect(screen.getByText('partial 1/2')).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Record shipment' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Record shipment' })).toBeNull();
   });
 
   it('hides shipment actions from non-admins', async () => {
