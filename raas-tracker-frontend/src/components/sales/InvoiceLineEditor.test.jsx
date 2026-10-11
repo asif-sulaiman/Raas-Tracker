@@ -14,17 +14,18 @@ const LINES = [
 ];
 
 describe('InvoiceLineEditor guards', () => {
-  it('blocks over-quantity before submit', () => {
+  it('allows quantity above remaining (INV-REVISION over-PI)', async () => {
     const onAdd = vi.fn(async () => {});
     render(<InvoiceLineEditor lines={LINES} onAdd={onAdd} />);
 
-    expect(screen.getByText(/40\.00 KG remaining/)).toBeTruthy();
+    expect(screen.getByText(/60\.00 of 100\.00 KG invoiced/)).toBeTruthy();
     fireEvent.change(screen.getByLabelText('Invoice quantity'), { target: { value: '50' } });
 
     const add = screen.getByRole('button', { name: 'Add line' });
-    expect(add.disabled).toBe(true);
+    expect(add.disabled).toBe(false);
     fireEvent.click(add);
-    expect(onAdd).not.toHaveBeenCalled();
+    await waitFor(() => expect(onAdd).toHaveBeenCalledTimes(1));
+    expect(onAdd.mock.calls[0][0]).toEqual({ sale_item_id: 1, quantity: 50 });
   });
 
   it('renders a server 409 in the alert slot', () => {

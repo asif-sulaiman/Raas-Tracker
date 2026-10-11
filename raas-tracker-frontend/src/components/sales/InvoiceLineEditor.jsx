@@ -8,14 +8,15 @@ const inputCls =
   'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
 
 /**
- * Phase 3 — partial-quantity invoice line editor.
+ * Phase 3 / INV-REVISION — partial-quantity invoice line editor.
  *
  * Lives inside the invoice flow (next to InvoicePanel): pick a PI line, enter
- * a quantity up to the remaining amount. Unit price is server-owned —
- * displayed read-only and never posted (POST /api/invoices/<id>/items takes
- * only {sale_item_id, quantity}). Over-quantity is blocked inline before
- * submit; a server 409 arrives via `serverError` and renders in the same
- * slot. Money display uses the app's exact integer-cents lineTotal.
+ * a quantity. Quantities may EXCEED the PI line remaining (shipment advantage
+ * per INV-REVISION) — the remaining figure is shown as a neutral FYI only.
+ * Unit price is server-owned — displayed read-only and never posted
+ * (POST /api/invoices/<id>/items takes only {sale_item_id, quantity}).
+ * Server errors arrive via `serverError` and render in the same slot.
+ * Money display uses the app's exact integer-cents lineTotal.
  *
  * Props (wiring lane owns the POST):
  *   lines: [{sale_item_id, product_name, unit, pi_quantity, invoiced_quantity, unit_price}]
@@ -28,11 +29,9 @@ export default function InvoiceLineEditor({
   saving = false,
   serverError = null,
 }) {
-  const firstAvailable = lines.find(
-    (l) => (l.pi_quantity || 0) - (l.invoiced_quantity || 0) > 0
-  );
+  const firstLine = lines[0];
   const [saleItemId, setSaleItemId] = useState(
-    firstAvailable ? String(firstAvailable.sale_item_id) : ''
+    firstLine ? String(firstLine.sale_item_id) : ''
   );
   const [quantity, setQuantity] = useState('');
   const [localError, setLocalError] = useState(null);
@@ -45,12 +44,13 @@ export default function InvoiceLineEditor({
 
   const piQty = selected ? Number(selected.pi_quantity) || 0 : 0;
   const invoiced = selected ? Number(selected.invoiced_quantity) || 0 : 0;
+  // Display-only reference — never used to block input (INV-REVISION allows
+  // invoice quantities to exceed PI remaining).
   const remaining = Math.max(0, piQty - invoiced);
   const unitPrice = selected ? Number(selected.unit_price) || 0 : 0;
   const qtyNum = quantity === '' ? 0 : Number(quantity);
-  const overQty = quantity !== '' && qtyNum > remaining;
-  const invalid = quantity === '' || !(qtyNum > 0) || overQty;
-  const liveTotal = lineTotal(qtyNum > 0 && !overQty ? qtyNum : 0, unitPrice);
+  const invalid = quantity === '' || !(qtyNum > 0);
+  const liveTotal = lineTotal(qtyNum > 0 ? qtyNum : 0, unitPrice);
   const busy = saving || adding;
 
   const pickLine = (value) => {
@@ -67,13 +67,6 @@ export default function InvoiceLineEditor({
     }
     if (!(qtyNum > 0)) {
       setLocalError('Enter a quantity greater than 0');
-      return;
-    }
-    if (qtyNum > remaining) {
-      // Blocked inline — the request never leaves the browser.
-      setLocalError(
-        `Quantity exceeds the remaining ${formatNumber(remaining)} ${selected.unit || ''} on this line`
-      );
       return;
     }
     setAdding(true);
@@ -95,8 +88,8 @@ export default function InvoiceLineEditor({
           Add invoice line
         </h4>
         {selected && (
-          <Badge variant={remaining > 0 ? 'info' : 'default'} size="xs">
-            {formatNumber(remaining)} {selected.unit || 'KG'} remaining
+          <Badge variant="default" size="xs">
+            {formatNumber(invoiced)} of {formatNumber(piQty)} {selected.unit || 'KG'} invoiced
           </Badge>
         )}
       </div>
@@ -121,9 +114,8 @@ export default function InvoiceLineEditor({
               {lines.map((l) => {
                 const rem = Math.max(0, (Number(l.pi_quantity) || 0) - (Number(l.invoiced_quantity) || 0));
                 return (
-                  <option key={l.sale_item_id} value={l.sale_item_id} disabled={rem <= 0}>
+                  <option key={l.sale_item_id} value={l.sale_item_id}>
                     {l.product_name} — remaining {formatNumber(rem)} {l.unit || 'KG'}
-                    {rem <= 0 ? ' (fully invoiced)' : ''}
                   </option>
                 );
               })}
@@ -162,7 +154,7 @@ export default function InvoiceLineEditor({
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div>
               <label className="text-xs font-medium text-slate-600 dark:text-slate-300">
-                Quantity * <span className="font-normal text-slate-400">— max {formatNumber(remaining)}</span>
+                Quantity * <span className="font-normal text-slate-400">— flexible over-PI quantity allowed</span>
               </label>
               <input
                 aria-label="Invoice quantity"
@@ -175,7 +167,7 @@ export default function InvoiceLineEditor({
                   setLocalError(null);
                 }}
                 placeholder="0.00"
-                className={`${inputCls} ${overQty ? '!border-rose-400 focus:!ring-rose-500/40 focus:!border-rose-500' : ''}`}
+                className={inputCls}
               />
             </div>
             <div>
