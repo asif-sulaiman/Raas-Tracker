@@ -201,22 +201,51 @@ def test_full_payment_flips_status_to_paid(admin_client, db):
     assert row["paid_amount"] == pytest.approx(100.0)
 
 
-# ---------- 4. derived amount 0 -> paid at creation ----------
+# ---------- 4. a zero amount is never born 'paid' ----------
 
-def test_zero_derived_amount_paid_at_creation(admin_client, db):
-    """A zero-priced PI line derives 0 -> born 'paid' (covered with no payment)."""
+def test_zero_derived_amount_is_planned_not_paid(admin_client, db):
+    """INV-REVISION: 'paid' must be backed by a real payment record.
+
+    A zero-derived amount used to birth the invoice 'paid' — an unfulfilled
+    receivable reported as settled with paid_amount 0. Status is now payment
+    driven only; a create (or any create-time arithmetic) can never do it.
+    """
     cid = _company(admin_client, db, name="AmtZero")
     sid = _sale(admin_client, cid, "PI-AMT-6", qty=10, unit_price=0)  # 10 x 0 = 0
 
     body = _create_invoice(admin_client, sid, "INV-AMT-6")
     assert body["amount"] == pytest.approx(0.0)
-    assert body["status"] == "paid"
-    assert _status(db, body["invoice_id"]) == "paid"
+    assert body["status"] == "planned"
+    assert _status(db, body["invoice_id"]) == "planned"
 
     row = _row(admin_client, sid, body["invoice_id"])
-    assert row["status"] == "paid"
+    assert row["status"] == "planned"
     assert row["amount"] == pytest.approx(0.0)
     assert row["paid_amount"] == pytest.approx(0.0)
+
+
+def test_zero_remainder_invoice_is_planned_not_paid(admin_client, db):
+    """The phantom-paid bug: invoice #2 on a fully-invoiced PI.
+
+    Invoice #1 consumes the whole remainder, so #2 derives 0. It must be born
+    'planned' and stay workable — never a terminal 'paid' row with no money
+    moved, which used to also report "1/2 invoices paid" on the panel.
+    """
+    cid = _company(admin_client, db, name="AmtRemainder")
+    sid = _sale(admin_client, cid, "PI-AMT-11", qty=20)  # 20 x 5 = 100
+
+    first = _invoice(admin_client, sid, "INV-AMT-11")   # seeds the full 100
+    second = _invoice(admin_client, sid, "INV-AMT-12")  # remainder is now 0
+
+    assert _status(db, first) == "planned"
+    assert _status(db, second) == "planned", (
+        "a zero remainder is not a payment — the invoice must stay workable")
+
+    # And it is not counted as settled by the sale-level completion summary.
+    body = admin_client.get(f"/api/sales/{sid}/completion").get_json()
+    assert body["total"] == 2
+    assert body["paid"] == 0
+    assert body["status"] == "none"
 
 
 # ---------- 5. legacy NULL amount: any payment marks it paid ----------
@@ -250,23 +279,16 @@ def test_legacy_null_amount_payment_marks_paid(admin_client, db):
 def test_paid_status_never_downgrades(admin_client, db):
     cid = _company(admin_client, db, name="AmtNoDown")
 
-    # (a) a 0-derived invoice is paid with zero payments -> rule still "met",
-    #     but the guarded UPDATE must not touch an already-'paid' row.
-    zero_sid = _sale(admin_client, cid, "PI-AMT-9", qty=10, unit_price=0)
-    zero_inv = _invoice(admin_client, zero_sid, "INV-AMT-9")
-    assert _status(db, zero_inv) == "paid"
-    assert _sync_invoice_paid_status(db, zero_inv) is False
-    assert _status(db, zero_inv) == "paid"
-
-    # (b) fully covered invoice: drop the payments, re-run the sync ->
-    #     rule no longer met, so no UPDATE may fire (never un-pays).
-    sid = _sale(admin_client, cid, "PI-AMT-10", qty=20)  # 20 x 5 = 100
-    inv = _invoice(admin_client, sid, "INV-AMT-10")
+    # (a) fully covered invoice -> the guarded UPDATE must not re-fire.
+    sid = _sale(admin_client, cid, "PI-AMT-9", qty=20)  # 20 x 5 = 100
+    inv = _invoice(admin_client, sid, "INV-AMT-9")
     _pay(admin_client, sid, inv, 100)
     assert _status(db, inv) == "paid"
     assert _sync_invoice_paid_status(db, inv) is False
     assert _status(db, inv) == "paid"
 
+    # (b) drop the payments, re-run the sync -> rule no longer met, so no
+    #     UPDATE may fire (never un-pays).
     db.execute("DELETE FROM sale_payments WHERE invoice_id = %s", (inv,))
     db.commit()
     assert _sync_invoice_paid_status(db, inv) is False

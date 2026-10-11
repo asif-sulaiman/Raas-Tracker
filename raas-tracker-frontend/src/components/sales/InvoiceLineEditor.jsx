@@ -1,67 +1,53 @@
-import { useState, useMemo } from 'react';
-import { Lock, AlertTriangle } from 'lucide-react';
+import { useState } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import Button from '../ui/Button';
-import Badge from '../ui/Badge';
-import { formatNumber, lineTotal } from '../../utils/format';
-
-const inputCls =
-  'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
+import InvoiceLineComposer from './InvoiceLineComposer';
 
 /**
- * Phase 3 / INV-REVISION — partial-quantity invoice line editor.
+ * Add a line to one already-open invoice.
  *
- * Lives inside the invoice flow (next to InvoicePanel): pick a PI line, enter
- * a quantity. Quantities may EXCEED the PI line remaining (shipment advantage
- * per INV-REVISION) — the remaining figure is shown as a neutral FYI only.
- * Unit price is server-owned — displayed read-only and never posted
- * (POST /api/invoices/<id>/items takes only {sale_item_id, quantity}).
- * Server errors arrive via `serverError` and render in the same slot.
- * Money display uses the app's exact integer-cents lineTotal.
+ * The invoice is chosen explicitly (`invoiceNumber`) instead of being inferred
+ * from the first non-paid row — with several invoices on a sale, silently
+ * picking one makes it impossible to know where a line landed.
+ *
+ * Quantities may EXCEED the PI proposal (INV-REVISION shipment advantage), so
+ * there is no ceiling here: the composer shows the proposal-vs-actual variance
+ * as reference only. Unit price stays server-owned and is never posted.
  *
  * Props (wiring lane owns the POST):
  *   lines: [{sale_item_id, product_name, unit, pi_quantity, invoiced_quantity, unit_price}]
+ *   invoiceNumber: the invoice this line is added to
  *   onAdd({sale_item_id, quantity}) — async, throws on failure
  *   saving, serverError
  */
 export default function InvoiceLineEditor({
   lines = [],
+  invoiceNumber,
   onAdd,
   saving = false,
   serverError = null,
 }) {
   const firstLine = lines[0];
-  const [saleItemId, setSaleItemId] = useState(
-    firstLine ? String(firstLine.sale_item_id) : ''
-  );
-  const [quantity, setQuantity] = useState('');
+  const [value, setValue] = useState({
+    sale_item_id: firstLine ? String(firstLine.sale_item_id) : '',
+    quantity: '',
+  });
   const [localError, setLocalError] = useState(null);
   const [adding, setAdding] = useState(false);
 
-  const selected = useMemo(
-    () => lines.find((l) => String(l.sale_item_id) === String(saleItemId)) || null,
-    [lines, saleItemId]
-  );
-
-  const piQty = selected ? Number(selected.pi_quantity) || 0 : 0;
-  const invoiced = selected ? Number(selected.invoiced_quantity) || 0 : 0;
-  // Display-only reference — never used to block input (INV-REVISION allows
-  // invoice quantities to exceed PI remaining).
-  const remaining = Math.max(0, piQty - invoiced);
-  const unitPrice = selected ? Number(selected.unit_price) || 0 : 0;
-  const qtyNum = quantity === '' ? 0 : Number(quantity);
-  const invalid = quantity === '' || !(qtyNum > 0);
-  const liveTotal = lineTotal(qtyNum > 0 ? qtyNum : 0, unitPrice);
+  const selectedId = value.sale_item_id;
+  const qtyNum = Number(value.quantity);
+  const invalid = !selectedId || !(qtyNum > 0);
   const busy = saving || adding;
 
-  const pickLine = (value) => {
-    setSaleItemId(value);
-    setQuantity('');
+  const pickLine = (next) => {
+    setValue(next);
     setLocalError(null);
   };
 
   const handleAdd = async () => {
     setLocalError(null);
-    if (!selected) {
+    if (!selectedId) {
       setLocalError('Pick a PI line first');
       return;
     }
@@ -71,11 +57,11 @@ export default function InvoiceLineEditor({
     }
     setAdding(true);
     try {
-      await onAdd?.({ sale_item_id: selected.sale_item_id, quantity: qtyNum });
-      setQuantity('');
+      await onAdd?.({ sale_item_id: Number(selectedId), quantity: qtyNum });
+      setValue((prev) => ({ ...prev, quantity: '' }));
     } catch {
-      // The wiring lane surfaces the failure through `serverError` (409
-      // over-qty included); keep the typed quantity so it can be trimmed.
+      // The wiring lane surfaces the failure through `serverError`; keep the
+      // typed quantity so it can be corrected.
     } finally {
       setAdding(false);
     }
@@ -87,10 +73,10 @@ export default function InvoiceLineEditor({
         <h4 className="text-sm font-semibold text-slate-800 dark:text-white">
           Add invoice line
         </h4>
-        {selected && (
-          <Badge variant="default" size="xs">
-            {formatNumber(invoiced)} of {formatNumber(piQty)} {selected.unit || 'KG'} invoiced
-          </Badge>
+        {invoiceNumber && (
+          <span className="font-mono text-xs font-medium text-slate-600 dark:text-slate-300">
+            to {invoiceNumber}
+          </span>
         )}
       </div>
 
@@ -100,113 +86,21 @@ export default function InvoiceLineEditor({
         </p>
       ) : (
         <>
-          <div>
-            <label className="text-xs font-medium text-slate-600 dark:text-slate-300">
-              PI line
-            </label>
-            <select
-              aria-label="PI line"
-              value={saleItemId}
-              onChange={(e) => pickLine(e.target.value)}
-              className={inputCls}
-            >
-              <option value="">Select a PI line…</option>
-              {lines.map((l) => {
-                const rem = Math.max(0, (Number(l.pi_quantity) || 0) - (Number(l.invoiced_quantity) || 0));
-                return (
-                  <option key={l.sale_item_id} value={l.sale_item_id}>
-                    {l.product_name} — remaining {formatNumber(rem)} {l.unit || 'KG'}
-                  </option>
-                );
-              })}
-            </select>
-          </div>
+          <InvoiceLineComposer lines={lines} value={value} onChange={pickLine} />
 
-          {selected && (
-            <dl className="grid grid-cols-3 gap-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-center">
-              <div>
-                <dt className="text-[11px] uppercase tracking-wider text-slate-400 dark:text-slate-500">
-                  PI qty
-                </dt>
-                <dd className="text-sm font-semibold text-slate-900 dark:text-white">
-                  {formatNumber(piQty)}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-[11px] uppercase tracking-wider text-slate-400 dark:text-slate-500">
-                  Invoiced
-                </dt>
-                <dd className="text-sm font-semibold text-slate-900 dark:text-white">
-                  {formatNumber(invoiced)}
-                </dd>
-              </div>
-              <div>
-                <dt className="text-[11px] uppercase tracking-wider text-slate-400 dark:text-slate-500">
-                  Remaining
-                </dt>
-                <dd className="text-sm font-bold text-indigo-600 dark:text-indigo-400">
-                  {formatNumber(remaining)}
-                </dd>
-              </div>
-            </dl>
-          )}
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label className="text-xs font-medium text-slate-600 dark:text-slate-300">
-                Quantity * <span className="font-normal text-slate-400">— flexible over-PI quantity allowed</span>
-              </label>
-              <input
-                aria-label="Invoice quantity"
-                type="number"
-                min="0"
-                step="any"
-                value={quantity}
-                onChange={(e) => {
-                  setQuantity(e.target.value);
-                  setLocalError(null);
-                }}
-                placeholder="0.00"
-                className={inputCls}
-              />
-            </div>
-            <div>
-              <label className="flex items-center gap-1 text-xs font-medium text-slate-600 dark:text-slate-300">
-                Unit price <Lock className="h-3 w-3 text-slate-400" />
-              </label>
-              <input
-                aria-label="Unit price"
-                value={selected ? `$${formatNumber(unitPrice)}` : '—'}
-                readOnly
-                tabIndex={-1}
-                title="Set by the PI line on the server — read-only"
-                className={`${inputCls} bg-slate-100 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400 cursor-not-allowed`}
-              />
-              <p className="mt-1 text-[11px] text-slate-400 dark:text-slate-500">
-                Server-owned — inherited from the PI line, never typed.
-              </p>
-            </div>
-          </div>
-
-          <div className="flex items-center justify-between gap-2">
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              Line total{' '}
-              <span className="text-sm font-bold text-emerald-600 dark:text-emerald-400">
-                ${formatNumber(liveTotal)}
-              </span>
-            </p>
+          <div className="flex items-center justify-end gap-2">
             <Button
               variant="primary"
               size="sm"
               onClick={handleAdd}
               loading={busy}
-              disabled={busy || !selected || invalid}
+              disabled={busy || invalid}
             >
               Add line
             </Button>
           </div>
 
-          {/* Inline validation + server 409 share one slot, same rose style */}
+          {/* Inline validation + server failure share one slot, same rose style */}
           {(localError || serverError) && (
             <p
               role="alert"

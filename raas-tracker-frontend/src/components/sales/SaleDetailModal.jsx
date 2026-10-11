@@ -5,6 +5,7 @@ import Badge from '../ui/Badge';
 import Button from '../ui/Button';
 import InvoicePanel from './InvoicePanel';
 import InvoiceLineEditor from './InvoiceLineEditor';
+import useSaleInvoiceLines from './useSaleInvoiceLines';
 import { formatNumber, formatDate, formatDateTime, sumLineTotals, lineTotal } from '../../utils/format';
 import { STAGE_LABELS, STAGE_BADGE } from '../../utils/sales';
 import { useAuth } from '../../context/AuthContext';
@@ -26,91 +27,35 @@ function Field({ label, value, mono }) {
 }
 
 /**
- * Invoice-line wiring for the shipment stage (non-visual parent of
- * InvoiceLineEditor). Builds per-PI-line remaining quantities from the sale's
- * items plus every invoice's posted lines (`GET /api/invoices/<id>/items`),
- * posts new lines to the open invoice (`POST .../items`, unit price stays
- * server-owned), and surfaces a 409 over-qty response through `serverError`
- * in the editor's shared alert slot.
+ * Invoice-line wiring for the shipment stage. Posts new lines to a CHOSEN
+ * open invoice (`POST /api/invoices/<id>/items`; unit price stays
+ * server-owned) and surfaces a server failure through `serverError` in the
+ * editor's shared alert slot.
+ *
+ * The target invoice is explicit (`targetId`) rather than "the first non-paid
+ * one": with several invoices on a sale, inferring it makes it impossible to
+ * know where a line landed.
  */
-function InvoiceLinesSection({ sale, onChanged }) {
+function InvoiceLinesSection({ sale, lines, reloadLines, onChanged }) {
   const { apiFetch } = useAuth();
-  const [itemsByInvoice, setItemsByInvoice] = useState({});
   const [serverError, setServerError] = useState(null);
   const [saving, setSaving] = useState(false);
 
   const invoices = Array.isArray(sale?.invoices) ? sale.invoices : [];
-  const target = invoices.find((i) => i.status !== 'paid') ?? invoices[0] ?? null;
-  const invoiceIdsKey = invoices.map((i) => i.invoice_id).join(',');
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const map = {};
-      let saw404 = false;
-      await Promise.all(
-        invoices.map(async (inv) => {
-          try {
-            const res = await apiFetch(`/api/invoices/${inv.invoice_id}/items`);
-            const data = await res.json();
-            if (!cancelled && Array.isArray(data)) map[inv.invoice_id] = data;
-          } catch (err) {
-            // A 404 means the invoice was voided elsewhere — drop its stale
-            // lines and refresh the sale so the invoice list updates. Other
-            // failures degrade to zero invoiced (server re-checks on write).
-            if (err?.status === 404) {
-              saw404 = true;
-            }
-          }
-        })
-      );
-      if (cancelled) return;
-      // Replace the whole map so entries for gone ids disappear.
-      setItemsByInvoice(map);
-      if (saw404) onChanged?.();
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // Refetch when the invoice set changes (add/void), not just on sale id.
-    // `apiFetch`/`onChanged` identities shift; the ids key is the real input.
-    // oxlint-disable-next-line react-hooks/exhaustive-deps
-  }, [sale?.id, invoiceIdsKey]);
-
-  const invoicedBySaleItem = {};
-  for (const items of Object.values(itemsByInvoice)) {
-    for (const it of items || []) {
-      invoicedBySaleItem[it.sale_item_id] =
-        (invoicedBySaleItem[it.sale_item_id] || 0) + (Number(it.quantity) || 0);
-    }
-  }
-  const lines = (sale?.items || []).map((si) => ({
-    sale_item_id: si.id,
-    product_name: si.product_name,
-    unit: si.unit || 'KG',
-    pi_quantity: Number(si.quantity) || 0,
-    invoiced_quantity: invoicedBySaleItem[si.id] || 0,
-    unit_price: Number(si.unit_price) || 0,
-  }));
+  // Only invoices that can still take lines: a paid one is settled.
+  const openInvoices = invoices.filter((i) => i.status !== 'paid');
+  const [targetId, setTargetId] = useState(() => String(openInvoices[0]?.invoice_id ?? ''));
 
   const handleAdd = async ({ sale_item_id, quantity }) => {
     setSaving(true);
     setServerError(null);
     try {
-      await apiFetch(`/api/invoices/${target.invoice_id}/items`, {
+      await apiFetch(`/api/invoices/${targetId}/items`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sale_item_id, quantity }),
       });
-      try {
-        const res = await apiFetch(`/api/invoices/${target.invoice_id}/items`);
-        const data = await res.json();
-        if (Array.isArray(data)) {
-          setItemsByInvoice((prev) => ({ ...prev, [target.invoice_id]: data }));
-        }
-      } catch {
-        // The line landed; a failed refresh keeps the typed totals.
-      }
+      await reloadLines?.();
       onChanged?.();
     } catch (err) {
       setServerError(err?.message || 'Could not add invoice line');
@@ -120,14 +65,36 @@ function InvoiceLinesSection({ sale, onChanged }) {
     }
   };
 
-  if (!target || lines.length === 0) return null;
+  const target = openInvoices.find((i) => String(i.invoice_id) === String(targetId));
+
+  if (openInvoices.length === 0 || lines.length === 0) return null;
   return (
-    <InvoiceLineEditor
-      lines={lines}
-      onAdd={handleAdd}
-      saving={saving}
-      serverError={serverError}
-    />
+    <div className="space-y-2">
+      <div>
+        <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
+          Add lines to invoice
+        </label>
+        <select
+          aria-label="Target invoice"
+          value={targetId}
+          onChange={(e) => setTargetId(e.target.value)}
+          className={inputCls}
+        >
+          {openInvoices.map((inv) => (
+            <option key={inv.invoice_id} value={inv.invoice_id}>
+              {inv.invoice_number} — {inv.status}
+            </option>
+          ))}
+        </select>
+      </div>
+      <InvoiceLineEditor
+        lines={lines}
+        invoiceNumber={target?.invoice_number}
+        onAdd={handleAdd}
+        saving={saving}
+        serverError={serverError}
+      />
+    </div>
   );
 }
 
@@ -190,6 +157,13 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
     // `refresh` is a plain per-render function — adding it would refetch on every render.
     // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [saleId]);
+
+  // Per-PI-line invoiced totals, computed once and shared by the invoice
+  // creation form and the standalone line editor (both need the same figures).
+  const { lines: piLines, reload: reloadPiLines } = useSaleInvoiceLines(sale, () => {
+    refresh(saleId);
+    onSaved?.();
+  });
 
   const startEditing = () => {
     if (!sale) return;
@@ -615,13 +589,17 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
                 key={sale.id}
                 saleId={sale.id}
                 isAdmin={isAdmin}
+                lines={piLines}
                 onChanged={() => {
                   refresh(saleId);
+                  reloadPiLines?.();
                   onSaved?.();
                 }}
               />
               <InvoiceLinesSection
                 sale={sale}
+                lines={piLines}
+                reloadLines={reloadPiLines}
                 onChanged={() => {
                   refresh(saleId);
                   onSaved?.();

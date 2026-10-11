@@ -203,8 +203,8 @@ def test_completion_reflects_invoice_counts(admin_client, db):
                             "invoices": []}
 
     # Two invoices, neither paid. The first derives the whole 50 remainder, so it
-    # is trimmed to 30 to leave a real remainder for the second; otherwise the
-    # second would derive 0 and be born 'paid' (amount 0 = nothing owed).
+    # is trimmed to 30 to leave a real remainder for the second, keeping each
+    # invoice's money non-zero and the assertion below about real coverage.
     first = _invoice(admin_client, sid, "INV-CMP-1")
     unit_price, qty = db.execute(
         "SELECT unit_price, quantity FROM sale_items WHERE sale_id = %s "

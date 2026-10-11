@@ -1672,6 +1672,9 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
 
     Unit price is always inherited from the PI line (server-enforced).
     Invoice amount is always Σ line totals (single source of truth).
+    Every invoice is born ``planned``: ``paid`` asserts money was received, so
+    only a payment record may set it (``_sync_invoice_paid_status``). Create-time
+    arithmetic must never derive it.
     """
     if not invoice_number or not invoice_number.strip():
         raise ValueError("invoice_number is required")
@@ -1696,7 +1699,11 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
         # Explicit lines mode: validate and use provided quantities (no ceiling)
         validated_lines = validate_invoice_lines(conn, sale_id, lines)
         amount = _money(sum(l["line_total"] for l in validated_lines))
-        status = "paid" if amount <= 0 else "planned"
+        # INV-REVISION: a create NEVER births 'paid'. 'paid' asserts money was
+        # received, so only a payment record can set it (_sync_invoice_paid_status).
+        # Deriving status from create-time arithmetic made a zero-amount invoice
+        # a terminal, unfulfilled row reported as settled.
+        status = "planned"
 
         try:
             cursor = conn.execute(
@@ -1737,7 +1744,8 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
     elif seed_lines:
         # Legacy auto-seed from PI remainder (backward compatible)
         amount = remaining_invoice_money(conn, sale_id)
-        status = "paid" if amount <= 0 else "planned"
+        # See the explicit-lines branch: create-time arithmetic never sets 'paid'.
+        status = "planned"
 
         try:
             cursor = conn.execute(
@@ -1763,7 +1771,7 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
         # Header-only invoice (tests only) - still derive amount from PI total,
         # but don't create invoice_items rows (internal test seam)
         amount = remaining_invoice_money(conn, sale_id)
-        status = "paid" if amount <= 0 else "planned"
+        status = "planned"
         try:
             cursor = conn.execute(
                 """INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at)
