@@ -28,6 +28,8 @@ const STATUS_LABELS = {
 };
 
 // The next thing a user can do with an invoice, per status.
+// 'planned' still offers 'book', but BLOCKED below: production is mandatory
+// before a ship can be booked for an invoice.
 const NEXT_STEP = {
   planned: 'book',
   produced: 'book',
@@ -41,6 +43,11 @@ const STEP_LABEL = {
   ship: 'Ship',
   pay: 'Record payment',
 };
+
+// Booking commits to a real shipment, so it is gated on the invoice having
+// been produced from the recipe page. The action stays visible but disabled so
+// the prerequisite is discoverable rather than silently absent.
+const NEEDS_PRODUCTION = 'Produce this invoice from the recipe page before booking a shipment.';
 
 function today() {
   return new Date().toISOString().slice(0, 10);
@@ -422,6 +429,9 @@ export default function InvoicePanel({ saleId, isAdmin = false, lines = [], onCh
           {invoices.map((inv) => {
             const kind = NEXT_STEP[inv.status];
             const active = step?.invoiceId === inv.invoice_id;
+            // Booking is gated on production. 'planned' is not bookable yet;
+            // 'produced' and later are.
+            const blocked = kind === 'book' && inv.status === 'planned';
             return (
               <div key={inv.invoice_id} className="px-2.5 py-2">
                 <div className="flex flex-wrap items-center gap-2">
@@ -454,9 +464,20 @@ export default function InvoicePanel({ saleId, isAdmin = false, lines = [], onCh
                   )}
                   <span className="flex-1" />
                   {isAdmin && kind && !active && !adding && (
-                    <Button variant="secondary" size="sm" onClick={() => openStep(inv.invoice_id, kind)}>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      disabled={blocked}
+                      title={blocked ? NEEDS_PRODUCTION : undefined}
+                      onClick={() => !blocked && openStep(inv.invoice_id, kind)}
+                    >
                       {STEP_LABEL[kind]}
                     </Button>
+                  )}
+                  {blocked && (
+                    <span className="text-[11px] text-amber-600 dark:text-amber-400">
+                      {NEEDS_PRODUCTION}
+                    </span>
                   )}
                   {isAdmin && !active && !adding && (
                     <button

@@ -135,6 +135,35 @@ def user_client(pg_dsn, db, monkeypatch):
 
 
 @pytest.fixture()
+def produce_for(admin_client):
+    """Register recipe+chemical and run production linked to one invoice.
+
+    Booking an invoice requires every invoiced product to be produced from the
+    recipe page, so any test that books must satisfy that first. Call as
+    ``produce_for(company_id, sale_id, invoice_id, tag, product)``.
+    """
+    def _produce(company_id, sale_id, invoice_id, tag, product):
+        chem = f"GateChem-{tag}"
+        recipe = f"GateRecipe-{tag}"
+        r = admin_client.post("/api/chemicals",
+                              json={"name": chem, "qty": 500, "unit": "KG"})
+        assert r.status_code == 200, r.get_json()
+        r = admin_client.post("/api/recipes", json={
+            "name": recipe, "yield": 100, "company_id": company_id,
+            "product_name": product})
+        assert r.status_code == 201, r.get_json()
+        r = admin_client.post(f"/api/recipes/{recipe}/items", json={
+            "chemical": chem, "percentage": 40, "company_id": company_id})
+        assert r.status_code == 200, r.get_json()
+        r = admin_client.post(f"/api/recipes/{recipe}/produce", json={
+            "production_qty": 5, "company_id": company_id,
+            "sale_ids": [sale_id], "invoice_ids": [invoice_id]})
+        assert r.status_code == 201, r.get_json()
+        return r.get_json()
+    return _produce
+
+
+@pytest.fixture()
 def proxy_trust(monkeypatch):
     """Re-evaluate ProxyFix's `x_for` for this test's env, then restore it.
 

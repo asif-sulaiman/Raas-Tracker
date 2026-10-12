@@ -1982,10 +1982,39 @@ def update_invoice_status(conn: psycopg.Connection, invoice_id: int, status: str
 
 
 def book_invoice(conn: psycopg.Connection, invoice_id: int, approx_ship_date: str) -> bool:
-    """Book an invoice with approximate ship date."""
+    """Book an invoice with approximate ship date.
+
+    Production is mandatory first: booking commits to a real shipment, so an
+    invoice whose products have not all been produced from the recipe page is
+    refused. Fail-closed — the check re-reads production content rather than
+    trusting ``invoices.status``, which a partial run already flips to
+    'produced'.
+    """
     if not approx_ship_date or not approx_ship_date.strip():
         raise ValueError("approx_ship_date is required for booking")
     approx = approx_ship_date.strip()
+
+    inv = conn.execute(
+        "SELECT i.sale_id, s.company_id, i.status FROM invoices i "
+        "JOIN sales s ON s.id = i.sale_id WHERE i.id = %s FOR UPDATE",
+        (invoice_id,)).fetchone()
+    if not inv:
+        return False
+    _, company_id, current = inv
+
+    # Re-check content at both pre-booking states ('planned' and 'produced').
+    # Checking only 'planned' would be the hole: record_production flips status
+    # to 'produced' on the FIRST linked run, so a multi-product invoice would
+    # sail through with later products never built.
+    if _INVOICE_STATUS_ORDER.index(current) <= _INVOICE_STATUS_ORDER.index("produced"):
+        ready = invoice_production_readiness(conn, company_id, invoice_id)
+        if not ready["ok"]:
+            missing = ready["missing_recipes"] or ready["missing_production"]
+            raise ValueError(
+                "invoice not produced yet — run production from the recipe page "
+                f"for: {', '.join(missing)}"
+            )
+
     if not update_invoice_status(conn, invoice_id, "booked", approx_ship_date=approx):
         return False
     log_audit_action(conn, "INVOICE_BOOK", "invoice", invoice_id,
@@ -2480,6 +2509,61 @@ def production_readiness(conn: psycopg.Connection, company_id: int,
             "missing_recipes": sorted(missing_recipes),
             "missing_production": sorted(missing_production),
         },
+    }
+
+
+def invoice_production_readiness(conn: psycopg.Connection, company_id: int,
+                                 invoice_id: int) -> Dict[str, Any]:
+    """Gate core for booking ONE invoice: has it actually been produced?
+
+    Strict, fail-closed, and deliberately scoped to this invoice alone rather
+    than to its sale. Invoices on one sale proceed independently — booking a
+    ship for one must not wait on, or be unlocked by, a sibling's production.
+
+    Requires, for every distinct product on THIS invoice's own lines: a recipe
+    for the company, and a production run for that recipe linked to THIS
+    invoice. ``invoices.status`` is not consulted — ``record_production`` marks
+    an invoice 'produced' on the FIRST linked run, so on a multi-product invoice
+    that flag reads satisfied while later products are still unbuilt. Booking
+    commits to a real shipment, so it re-checks the content instead.
+
+    Returns ``{"ok": bool, "missing_recipes": [...], "missing_production": [...]}``.
+    """
+    products = [
+        r[0] for r in conn.execute(
+            """SELECT DISTINCT ii.product_name
+                 FROM invoice_items ii
+                WHERE ii.invoice_id = %s AND ii.product_name IS NOT NULL""",
+            (invoice_id,)).fetchall()
+    ]
+    missing_recipes: List[str] = []
+    missing_production: List[str] = []
+    for product in sorted(products):
+        recipe = conn.execute(
+            """SELECT id FROM recipes
+                WHERE company_id = %s
+                  AND lower(product_name) = lower(%s)""",
+            (company_id, product)).fetchone()
+        if not recipe:
+            missing_recipes.append(product)
+            # No recipe means it cannot have been produced for one either.
+            missing_production.append(product)
+            continue
+        run = conn.execute(
+            """SELECT pr.id
+                 FROM production_runs pr
+                 JOIN production_run_links prl ON prl.run_id = pr.id
+                WHERE pr.recipe_id = %s
+                  AND prl.invoice_id = %s
+                LIMIT 1""",
+            (recipe[0], invoice_id)).fetchone()
+        if not run:
+            missing_production.append(product)
+    return {
+        "ok": not missing_recipes and not missing_production,
+        "products": sorted(products),
+        "missing_recipes": sorted(missing_recipes),
+        "missing_production": sorted(missing_production),
     }
 
 

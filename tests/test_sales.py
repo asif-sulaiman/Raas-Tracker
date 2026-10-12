@@ -259,14 +259,20 @@ def test_header_patch_updates_are_audited(admin_client, db):
     assert "New Co" in (row[1] or "")
 
 
-def test_book_invoice_writes_audit(admin_client, db):
+def test_book_invoice_writes_audit(admin_client, db, produce_for):
+    cid = admin_client.post("/api/companies", json={"name": "BookAudit Co"}).status_code
+    assert cid == 201
+    company_id = db.execute(
+        "SELECT id FROM companies WHERE name = %s", ("BookAudit Co",)).fetchone()[0]
     r = admin_client.post("/api/sales", json={
-        "sale": {"pi_number": "PI-BOOK-A", "client_name": "B Co"},
+        "sale": {"pi_number": "PI-BOOK-A", "client_name": "B Co",
+                 "company_id": company_id},
         "items": [{"product_name": "W", "quantity": 1, "unit_price": 10}]})
     sid = r.get_json().get("id") or r.get_json()["sale"]["id"]
     inv = admin_client.post(
         f"/api/sales/{sid}/invoices",
         json={"invoice_number": "INV-AUD-BOOK"}).get_json()["invoice_id"]
+    produce_for(company_id, sid, inv, "AUD", "W")
     r = admin_client.post(
         f"/api/sales/{sid}/invoices/{inv}/book",
         json={"approx_ship_date": "2026-11-01"})
@@ -279,14 +285,20 @@ def test_book_invoice_writes_audit(admin_client, db):
     assert "2026-11-01" in (row[0] or "")
 
 
-def test_refused_book_writes_no_audit(admin_client, db):
+def test_refused_book_writes_no_audit(admin_client, db, produce_for):
+    r = admin_client.post("/api/companies", json={"name": "BookRefuse Co"})
+    assert r.status_code == 201
+    company_id = db.execute(
+        "SELECT id FROM companies WHERE name = %s", ("BookRefuse Co",)).fetchone()[0]
     r = admin_client.post("/api/sales", json={
-        "sale": {"pi_number": "PI-BOOK-B", "client_name": "B Co"},
+        "sale": {"pi_number": "PI-BOOK-B", "client_name": "B Co",
+                 "company_id": company_id},
         "items": [{"product_name": "W", "quantity": 1, "unit_price": 10}]})
     sid = r.get_json().get("id") or r.get_json()["sale"]["id"]
     inv = admin_client.post(
         f"/api/sales/{sid}/invoices",
         json={"invoice_number": "INV-AUD-BOOK2"}).get_json()["invoice_id"]
+    produce_for(company_id, sid, inv, "REF", "W")
     ok = admin_client.post(
         f"/api/sales/{sid}/invoices/{inv}/book",
         json={"approx_ship_date": "2026-11-01"})

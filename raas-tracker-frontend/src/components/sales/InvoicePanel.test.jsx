@@ -24,7 +24,10 @@ afterEach(() => {
 
 const INVOICES = [
   {
-    invoice_id: 7, invoice_number: 'INV-1', status: 'planned',
+    // 'produced' so the Book action is live: booking is gated on production,
+    // and these cases exercise the booking form itself. The blocked case has
+    // its own 'planned' invoice.
+    invoice_id: 7, invoice_number: 'INV-1', status: 'produced',
     approx_ship_date: null, actual_ship_date: null, notes: null,
     created_at: '2026-09-01 10:00:00',
     amount: null, paid_amount: 0, // legacy row — no amount to show
@@ -134,7 +137,7 @@ describe('InvoicePanel', () => {
     renderPanel();
     expect(await screen.findByText('INV-1')).toBeTruthy();
     expect(screen.getByText('INV-2')).toBeTruthy();
-    expect(screen.getByText('Planned')).toBeTruthy();
+    expect(screen.getByText('Produced')).toBeTruthy();
     expect(screen.getByText('Booked')).toBeTruthy();
     expect(screen.getByText('Paid')).toBeTruthy();
     expect(screen.getByText('1/3 invoices paid')).toBeTruthy();
@@ -269,6 +272,35 @@ describe('InvoicePanel', () => {
 
     // A "remaining" figure is never shown: a PI is a quote, not a ledger.
     expect(screen.queryByText(/remaining/i)).toBeNull();
+  });
+
+  it('keeps Book visible but disabled, with a reason, until produced', async () => {
+    // Production is mandatory before a ship is booked. The action stays on
+    // screen so the prerequisite is discoverable instead of silently vanishing.
+    const invoices = [{
+      invoice_id: 21, invoice_number: 'INV-P', status: 'planned',
+      approx_ship_date: null, actual_ship_date: null, notes: null,
+      created_at: '2026-09-01 10:00:00', amount: 500, paid_amount: 0,
+    }];
+    renderPanel({ invoices });
+
+    const book = await screen.findByRole('button', { name: 'Book shipment' });
+    expect(book.disabled).toBe(true);
+    expect(book.getAttribute('title')).toMatch(/recipe/i);
+    expect(screen.getByText(/produce this invoice from the recipe page/i)).toBeTruthy();
+  });
+
+  it('enables Book once the invoice is produced', async () => {
+    const invoices = [{
+      invoice_id: 22, invoice_number: 'INV-PR', status: 'produced',
+      approx_ship_date: null, actual_ship_date: null, notes: null,
+      created_at: '2026-09-01 10:00:00', amount: 500, paid_amount: 0,
+    }];
+    renderPanel({ invoices });
+
+    const book = await screen.findByRole('button', { name: 'Book shipment' });
+    expect(book.disabled).toBe(false);
+    expect(screen.queryByText(/produce this invoice from the recipe page/i)).toBeNull();
   });
 
   it('shows amount and paid progress on each invoice row', async () => {

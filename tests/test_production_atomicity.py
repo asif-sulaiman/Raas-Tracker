@@ -205,10 +205,11 @@ def test_produce_multi_recipe_all_valid_commits_once(admin_client, db):
 # ---------- 3. booking is one transaction (invoice + sale together) ----------
 
 
-def test_book_invoice_moves_invoice_and_sale_together(admin_client, db):
+def test_book_invoice_moves_invoice_and_sale_together(admin_client, db, produce_for):
     cid = _company(admin_client, db, "BookCo")
     sid = _sale(admin_client, cid, "PI-BOOK-AT-1", "BookProd")
     inv = _invoice(admin_client, sid, "INV-BOOK-AT-1")
+    produce_for(cid, sid, inv, "BookAT", "BookProd")
 
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
                           json={"approx_ship_date": "2026-10-15"})
@@ -345,6 +346,11 @@ def test_produce_never_downgrades_shipped_invoice_or_ship_booked_sale(admin_clie
     # (b) a booked sale (shipment_status='ship_booked') is never pushed back
     sid_book = _sale(admin_client, cid, "PI-FWD-2", "FwdProd")
     inv_book = _invoice(admin_client, sid_book, "INV-FWD-BOOKED")
+    # Booking requires production first.
+    r = admin_client.post("/api/recipes/FwdRecipe/produce", json={
+        "production_qty": 10, "company_id": cid,
+        "sale_ids": [sid_book], "invoice_ids": [inv_book]})
+    assert r.status_code == 201, r.get_json()
     r = admin_client.post(f"/api/sales/{sid_book}/invoices/{inv_book}/book",
                           json={"approx_ship_date": "2026-11-01"})
     assert r.status_code == 200, r.get_json()
@@ -373,6 +379,11 @@ def test_produce_keeps_booked_invoice_booked(admin_client, db):
     _recipe_with_items(admin_client, cid, "BkdProd", "BkdRecipe",
                        [("BkdChem-1", 10)])
     inv = _invoice(admin_client, sid, "INV-BKD-1")
+    # Booking requires production first.
+    r = admin_client.post("/api/recipes/BkdRecipe/produce", json={
+        "production_qty": 10, "company_id": cid,
+        "sale_ids": [sid], "invoice_ids": [inv]})
+    assert r.status_code == 201, r.get_json()
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
                           json={"approx_ship_date": "2026-11-01"})
     assert r.status_code == 200, r.get_json()
@@ -390,7 +401,7 @@ def test_produce_keeps_booked_invoice_booked(admin_client, db):
         "SELECT sale_id, invoice_id FROM production_run_links WHERE run_id = %s",
         (run_id,)).fetchall()}
     assert (sid, inv) in links
-    assert _stock(db, ["BkdChem-1"]) == [("BkdChem-1", 99.0)]
+    assert _stock(db, ["BkdChem-1"]) == [("BkdChem-1", 98.0)]
 
     # The invoice lifecycle position did not regress...
     assert _invoice_status(db, inv) == "booked"
@@ -410,6 +421,11 @@ def test_produce_on_booked_invoice_is_idempotent_on_re_run(admin_client, db):
     _recipe_with_items(admin_client, cid, "ReRunProd", "ReRunRecipe",
                        [("ReRunChem-1", 10)])
     inv = _invoice(admin_client, sid, "INV-RERUN-1")
+    # Booking requires production first.
+    pre = admin_client.post("/api/recipes/ReRunRecipe/produce", json={
+        "production_qty": 10, "company_id": cid,
+        "sale_ids": [sid], "invoice_ids": [inv]})
+    assert pre.status_code == 201, pre.get_json()
     assert admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
                              json={"approx_ship_date": "2026-11-01"}
                              ).status_code == 200
@@ -422,9 +438,9 @@ def test_produce_on_booked_invoice_is_idempotent_on_re_run(admin_client, db):
 
     assert _invoice_status(db, inv) == "booked"
     assert _shipment_status(db, sid) == "ship_booked"
-    # Two runs, two deductions — atomicity intact across the re-run.
-    assert _stock(db, ["ReRunChem-1"]) == [("ReRunChem-1", 98.0)]
-    assert _state(db, sid, inv)["runs"] == 2
+    # Three runs (the pre-book one plus two), three deductions.
+    assert _stock(db, ["ReRunChem-1"]) == [("ReRunChem-1", 97.0)]
+    assert _state(db, sid, inv)["runs"] == 3
 
 
 # ---------- 6. @admin_required on the five mutating routes ----------

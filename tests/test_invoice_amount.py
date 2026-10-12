@@ -443,7 +443,7 @@ def test_book_ship_pay_reject_missing_invoice(admin_client, db):
     assert r.status_code == 404, r.get_json()
 
 
-def test_partial_pay_returns_actual_status(admin_client, db):
+def test_partial_pay_returns_actual_status(admin_client, db, produce_for):
     cid = _company(admin_client, db, name="IntHonest")
     sid = _sale(admin_client, cid, "PI-INT-H", qty=40)  # 40 x 5 = 200
     inv = _invoice(admin_client, sid, "INV-INT-H")
@@ -462,6 +462,8 @@ def test_partial_pay_returns_actual_status(admin_client, db):
     assert r.get_json()["status"] == "produced"
     assert _status(db, inv) == "produced"
 
+# Booking requires real production, not just the status flag flipped above.
+    produce_for(cid, sid, inv, "Int", "ProdAmt")
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
                           json={"approx_ship_date": "2026-11-10"})
     assert r.status_code == 200, r.get_json()

@@ -115,10 +115,10 @@ def test_first_invoice_sets_production_running_and_never_downgrades(
 # ---------- 3. book ----------
 
 def test_book_requires_approx_date_and_sets_ship_booked(admin_client, db):
-    cid = _company(admin_client, db, name="BookCo")
-    sid = _sale(admin_client, cid, "PI-BK-1")
-    inv = _invoice(admin_client, sid, "INV-BK-1")
+    cid, sid, inv = _production_setup(admin_client, db, "Book")
 
+    # The date is validated BEFORE the production gate, so a bad payload still
+    # reports the missing date rather than the missing production.
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book", json={})
     assert r.status_code == 400
     assert "error" in r.get_json()
@@ -126,6 +126,8 @@ def test_book_requires_approx_date_and_sets_ship_booked(admin_client, db):
                           json={"approx_ship_date": "   "})
     assert r.status_code == 400
     assert "error" in r.get_json()
+
+    _produce(admin_client, cid, "Recipe-Book", sid, inv)
 
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
                           json={"approx_ship_date": "2026-10-15"})
@@ -233,7 +235,133 @@ def test_completion_reflects_invoice_counts(admin_client, db):
     assert body["status"] == "partial"
 
 
-# ---------- 7. produce ----------
+# ---------- 8. booking requires production of every invoiced product ----------
+
+def _produce(admin_client, company_id, recipe_name, sale_id, invoice_id):
+    r = admin_client.post(f"/api/recipes/{recipe_name}/produce", json={
+        "production_qty": 5, "company_id": company_id,
+        "sale_ids": [sale_id], "invoice_ids": [invoice_id]})
+    assert r.status_code == 201, r.get_json()
+    return r.get_json()
+
+
+def test_book_is_refused_until_the_invoice_has_been_produced(admin_client, db):
+    """Production is mandatory before a ship can be booked for an invoice.
+
+    The recipe exists but nothing has been produced yet, so the invoice must
+    not be bookable: booking is the step that commits to a real shipment.
+    """
+    cid, sid, inv = _production_setup(admin_client, db, "Gate")
+
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
+                          json={"approx_ship_date": "2026-11-01"})
+    assert r.status_code == 409, r.get_json()
+    assert "produced" in r.get_json()["error"].lower()
+    assert _invoice_status(db, inv) == "planned"
+    # Booking must not have advanced the sale's shipment sub-step either.
+    assert _detail(admin_client, sid)["shipment_status"] != "ship_booked"
+
+    _produce(admin_client, cid, "Recipe-Gate", sid, inv)
+
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
+                          json={"approx_ship_date": "2026-11-01"})
+    assert r.status_code == 200, r.get_json()
+    assert _invoice_status(db, inv) == "booked"
+
+
+def test_book_is_refused_when_only_some_invoiced_products_are_produced(
+        admin_client, db):
+    """A 'produced' status alone is not enough — every product must be.
+
+    ``record_production`` marks an invoice 'produced' on the FIRST linked run.
+    On a two-product invoice that leaves the gate looking satisfied while the
+    second product was never produced, so booking must re-check the content.
+    """
+    cid = _company(admin_client, db, name="PartCo")
+    r = admin_client.post("/api/sales", json={
+        "sale": {"pi_number": "PI-PART-1", "client_name": "x", "company_id": cid},
+        "items": [
+            {"product_name": "ProdA", "quantity": 10, "unit_price": 5, "unit": "KG"},
+            {"product_name": "ProdB", "quantity": 10, "unit_price": 5, "unit": "KG"},
+        ]})
+    assert r.status_code == 201, r.get_json()
+    sid = r.get_json()["id"]
+
+    admin_client.post("/api/chemicals", json={"name": "ChemA", "qty": 500, "unit": "KG"})
+    admin_client.post("/api/chemicals", json={"name": "ChemB", "qty": 500, "unit": "KG"})
+    for name, product in (("RecipeA", "ProdA"), ("RecipeB", "ProdB")):
+        r = admin_client.post("/api/recipes", json={
+            "name": name, "yield": 100, "company_id": cid, "product_name": product})
+        assert r.status_code == 201, r.get_json()
+        r = admin_client.post(f"/api/recipes/{name}/items", json={
+            "chemical": name.replace("Recipe", "Chem"), "percentage": 40,
+            "company_id": cid})
+        assert r.status_code == 200, r.get_json()
+
+    inv = _invoice(admin_client, sid, "INV-PART-1")
+    assert len(_detail(admin_client, sid)["invoices"]) == 1
+
+    # Produce ProdA only. This does flip the invoice to 'produced'...
+    _produce(admin_client, cid, "RecipeA", sid, inv)
+    assert _invoice_status(db, inv) == "produced"
+
+    # ...but booking must still refuse: ProdB was never produced.
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
+                          json={"approx_ship_date": "2026-11-01"})
+    assert r.status_code == 409, r.get_json()
+    assert "prodb" in r.get_json()["error"].lower()
+
+    # Produce ProdB too — now the whole invoice is covered.
+    _produce(admin_client, cid, "RecipeB", sid, inv)
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
+                          json={"approx_ship_date": "2026-11-01"})
+    assert r.status_code == 200, r.get_json()
+
+
+def test_producing_a_sibling_invoice_does_not_unlock_this_one(admin_client, db):
+    """Invoices proceed independently; coverage is not shared between them."""
+    cid = _company(admin_client, db, name="SibCo")
+    r = admin_client.post("/api/sales", json={
+        "sale": {"pi_number": "PI-SIB-1", "client_name": "x", "company_id": cid},
+        "items": [
+            {"product_name": "SibProdA", "quantity": 5, "unit_price": 5, "unit": "KG"},
+            {"product_name": "SibProdB", "quantity": 5, "unit_price": 5, "unit": "KG"},
+        ]})
+    sid = r.get_json()["id"]
+
+    for chem, prod in (("SibChemA", "SibProdA"), ("SibChemB", "SibProdB")):
+        admin_client.post("/api/chemicals", json={"name": chem, "qty": 500, "unit": "KG"})
+        name = "SibRecipe" + prod[-1]
+        r = admin_client.post("/api/recipes", json={
+            "name": name, "yield": 100, "company_id": cid, "product_name": prod})
+        assert r.status_code == 201, r.get_json()
+        r = admin_client.post(f"/api/recipes/{name}/items", json={
+            "chemical": chem, "percentage": 40, "company_id": cid})
+        assert r.status_code == 200, r.get_json()
+
+    # Two invoices, one product each (explicit lines: the legacy auto-seed
+    # would hand every remaining PI line to the first invoice).
+    item_a, item_b = [r[0] for r in db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id", (sid,)).fetchall()]
+    r = admin_client.post(f"/api/sales/{sid}/invoices", json={
+        "invoice_number": "INV-SIB-A", "lines": [{"sale_item_id": item_a, "quantity": 5}]})
+    assert r.status_code == 201, r.get_json()
+    inv_a = r.get_json()["invoice_id"]
+    r = admin_client.post(f"/api/sales/{sid}/invoices", json={
+        "invoice_number": "INV-SIB-B", "lines": [{"sale_item_id": item_b, "quantity": 5}]})
+    assert r.status_code == 201, r.get_json()
+    inv_b = r.get_json()["invoice_id"]
+
+    _produce(admin_client, cid, "SibRecipeA", sid, inv_a)
+
+    # A is covered and bookable...
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv_a}/book",
+                          json={"approx_ship_date": "2026-11-01"})
+    assert r.status_code == 200, r.get_json()
+    # ...while B, whose product has never been produced, is still refused.
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv_b}/book",
+                          json={"approx_ship_date": "2026-11-01"})
+    assert r.status_code == 409, r.get_json()
 
 def _production_setup(admin_client, db, tag):
     """Company + sale + chemical + registered recipe + one invoice."""
@@ -299,6 +427,8 @@ def test_produce_never_downgrades_ship_booked_sale_or_booked_invoice(
     """
     cid, sid, inv = _production_setup(admin_client, db, "B")
 
+    # Booking requires production first, so produce before booking.
+    _produce(admin_client, cid, "Recipe-B", sid, inv)
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
                           json={"approx_ship_date": "2026-11-01"})
     assert r.status_code == 200
@@ -321,8 +451,9 @@ def test_produce_never_downgrades_ship_booked_sale_or_booked_invoice(
         "SELECT sale_id, invoice_id FROM production_run_links "
         "WHERE run_id = %s", (run_id,)).fetchall()}
     assert (sid, inv) in pairs
-    # 40% of 5 = 2.0 KG deducted from the seeded 500 KG.
-    assert _stock(db, ["Chem-B"]) == [("Chem-B", 498.0)]
+    # Two runs happened (the one that unlocked booking, plus this one):
+    # 40% of 5 = 2.0 KG each, so 500 -> 496.
+    assert _stock(db, ["Chem-B"]) == [("Chem-B", 496.0)]
 
 
 def test_produce_cross_sale_invoice_uses_invoices_own_sale(admin_client, db):

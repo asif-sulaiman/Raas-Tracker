@@ -119,6 +119,9 @@ from raas_tracker.sales import (
     mark_invoice_paid, void_invoice, get_sale_completion, _now_str,
     check_lc_shipment_ready, create_invoice_item, list_invoice_items,
     InvoicedLineConflict, create_invoices_batch,
+    # Used by GET /api/invoices/<id>/readiness; previously never imported, so
+    # that route raised NameError on every call.
+    production_readiness,
 )
 from raas_tracker.stock import sync_reorder_notifications
 
@@ -1963,6 +1966,10 @@ def _state_error_status(message):
     msg = (message or "").strip()
     if msg.startswith("invoice already"):
         return 409
+    # A lifecycle step blocked by a precondition that is not malformed input:
+    # the request is well-formed, the invoice is simply not ready yet.
+    if msg.startswith("invoice not produced"):
+        return 409
     if msg == "Invoice not found" or msg.startswith("linked sale ") \
             or msg.startswith("linked invoice "):
         return 404
@@ -2149,7 +2156,14 @@ def api_create_invoice(sale_id):
         conn.close()
         return jsonify({"error": "Sale not found"}), 404
     try:
-        result = create_invoice(conn, sale_id, payload.invoice_number, lines=payload.lines)
+        # model_dump(), like the batch route below: validate_invoice_lines reads
+        # plain dicts, and a raw Pydantic model has no .get(), so passing
+        # payload.lines straight through raised AttributeError -> 500 on every
+        # explicit-lines create.
+        result = create_invoice(
+            conn, sale_id, payload.invoice_number,
+            lines=([ln.model_dump() for ln in payload.lines] if payload.lines else None),
+        )
     except ValueError as e:
         _rollback_close(conn)
         return jsonify({"error": str(e)}), 400
