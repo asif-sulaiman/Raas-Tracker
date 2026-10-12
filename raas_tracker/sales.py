@@ -2009,11 +2009,8 @@ def book_invoice(conn: psycopg.Connection, invoice_id: int, approx_ship_date: st
     if _INVOICE_STATUS_ORDER.index(current) <= _INVOICE_STATUS_ORDER.index("produced"):
         ready = invoice_production_readiness(conn, company_id, invoice_id)
         if not ready["ok"]:
-            missing = ready["missing_recipes"] or ready["missing_production"]
-            raise ValueError(
-                "invoice not produced yet — run production from the recipe page "
-                f"for: {', '.join(missing)}"
-            )
+            raise ValueError(_production_blocked_message(
+                ready["missing_recipes"] or ready["missing_production"]))
 
     if not update_invoice_status(conn, invoice_id, "booked", approx_ship_date=approx):
         return False
@@ -2247,9 +2244,42 @@ def void_invoice(conn: psycopg.Connection, sale_id: int, invoice_id: int) -> boo
     return True
 
 
-def list_invoices(conn: psycopg.Connection, sale_id: int) -> List[Dict[str, Any]]:
-    """List all invoices for a sale, with amount + paid-to-date per invoice."""
-    return [
+def _production_blocked_message(missing: List[str]) -> str:
+    """Single source for the "not produced yet" wording.
+
+    Shared by ``book_invoice``'s 409 body and the ``book_blocked_reason`` the
+    list payload carries, so the button's hint and the server's refusal can
+    never drift apart.
+    """
+    return ("invoice not produced yet — run production from the recipe page "
+            f"for: {', '.join(missing)}")
+
+
+# Statuses from which booking is still a legal next step. Anything past these
+# is closed: not bookable, and no production check is worth running.
+_BOOKABLE_STATUSES = ("planned", "produced")
+
+
+def list_invoices(conn: psycopg.Connection, sale_id: int,
+                  with_readiness: bool = False) -> List[Dict[str, Any]]:
+    """List all invoices for a sale, with amount + paid-to-date per invoice.
+
+    ``with_readiness`` adds ``can_book`` + ``book_blocked_reason`` so the
+    invoice panel can disable its Book action from server truth instead of
+    inferring it from ``status``.
+
+    Off by default on purpose: ``get_sale_by_id`` (the whole PI detail modal)
+    and ``get_sale_completion`` both embed this list but read none of these
+    flags, and readiness costs extra queries per open invoice. Only
+    ``GET /api/sales/<id>/invoices`` asks for them.
+
+    ``can_book`` mirrors ``book_invoice`` exactly — open status AND every
+    product produced — so the panel and the gate cannot disagree.
+    ``book_blocked_reason`` is ``null`` when bookable, and for closed invoices
+    too (a booked invoice is not "blocked", it is simply past booking);
+    ``can_book`` carries that distinction on its own.
+    """
+    rows = [
         {"invoice_id": r[0], "invoice_number": r[1], "status": r[2],
          "approx_ship_date": r[3], "actual_ship_date": r[4], "notes": r[5],
          "created_at": r[6],
@@ -2264,6 +2294,24 @@ def list_invoices(conn: psycopg.Connection, sale_id: int) -> List[Dict[str, Any]
             (sale_id,)
         ).fetchall()
     ]
+    if not with_readiness:
+        return rows
+
+    company_row = conn.execute(
+        "SELECT company_id FROM sales WHERE id = %s", (sale_id,)).fetchone()
+    company_id = company_row[0] if company_row else None
+    for row in rows:
+        if row["status"] not in _BOOKABLE_STATUSES:
+            row["can_book"] = False
+            row["book_blocked_reason"] = None
+            continue
+        ready = invoice_production_readiness(conn, company_id, row["invoice_id"])
+        row["can_book"] = bool(ready["ok"])
+        row["book_blocked_reason"] = (
+            None if ready["ok"] else _production_blocked_message(
+                ready["missing_recipes"] or ready["missing_production"])
+        )
+    return rows
 
 
 def get_sale_completion(conn: psycopg.Connection, sale_id: int) -> Dict[str, Any]:

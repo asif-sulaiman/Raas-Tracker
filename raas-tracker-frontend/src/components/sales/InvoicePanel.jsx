@@ -429,9 +429,17 @@ export default function InvoicePanel({ saleId, isAdmin = false, lines = [], onCh
           {invoices.map((inv) => {
             const kind = NEXT_STEP[inv.status];
             const active = step?.invoiceId === inv.invoice_id;
-            // Booking is gated on production. 'planned' is not bookable yet;
-            // 'produced' and later are.
-            const blocked = kind === 'book' && inv.status === 'planned';
+            // Booking is gated on production CONTENT, which the status alone
+            // cannot express: record_production flips an invoice to 'produced'
+            // on the first linked run, so a multi-product invoice can read
+            // 'produced' while a sibling product is unbuilt. Trust the
+            // server's can_book; fall back fail-closed (only 'produced' may
+            // be assumed bookable) when an older payload omits the flag.
+            const canBook = typeof inv.can_book === 'boolean'
+              ? inv.can_book
+              : inv.status === 'produced';
+            const blocked = kind === 'book' && !canBook;
+            const blockedReason = inv.book_blocked_reason || NEEDS_PRODUCTION;
             return (
               <div key={inv.invoice_id} className="px-2.5 py-2">
                 <div className="flex flex-wrap items-center gap-2">
@@ -468,7 +476,7 @@ export default function InvoicePanel({ saleId, isAdmin = false, lines = [], onCh
                       variant="secondary"
                       size="sm"
                       disabled={blocked}
-                      title={blocked ? NEEDS_PRODUCTION : undefined}
+                      title={blocked ? blockedReason : undefined}
                       onClick={() => !blocked && openStep(inv.invoice_id, kind)}
                     >
                       {STEP_LABEL[kind]}
@@ -476,7 +484,7 @@ export default function InvoicePanel({ saleId, isAdmin = false, lines = [], onCh
                   )}
                   {blocked && (
                     <span className="text-[11px] text-amber-600 dark:text-amber-400">
-                      {NEEDS_PRODUCTION}
+                      {blockedReason}
                     </span>
                   )}
                   {isAdmin && !active && !adding && (

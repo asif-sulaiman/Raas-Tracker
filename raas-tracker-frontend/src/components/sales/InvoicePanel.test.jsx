@@ -281,26 +281,72 @@ describe('InvoicePanel', () => {
       invoice_id: 21, invoice_number: 'INV-P', status: 'planned',
       approx_ship_date: null, actual_ship_date: null, notes: null,
       created_at: '2026-09-01 10:00:00', amount: 500, paid_amount: 0,
+      can_book: false,
+      book_blocked_reason: 'invoice not produced yet — run production from the recipe page for: Cotton',
     }];
     renderPanel({ invoices });
 
     const book = await screen.findByRole('button', { name: 'Book shipment' });
     expect(book.disabled).toBe(true);
     expect(book.getAttribute('title')).toMatch(/recipe/i);
-    expect(screen.getByText(/produce this invoice from the recipe page/i)).toBeTruthy();
+    // The server's reason is shown verbatim, so it names the product.
+    expect(screen.getByText(/run production from the recipe page for: Cotton/i)).toBeTruthy();
   });
 
-  it('enables Book once the invoice is produced', async () => {
+  it('disables Book on a produced invoice the server still refuses', async () => {
+    // The desync this closes: status says 'produced' (record_production flips
+    // it on the FIRST linked run) but a sibling product is unbuilt. A
+    // status-driven button offered an action that always 409'd.
+    const invoices = [{
+      invoice_id: 23, invoice_number: 'INV-PARTIAL', status: 'produced',
+      approx_ship_date: null, actual_ship_date: null, notes: null,
+      created_at: '2026-09-01 10:00:00', amount: 500, paid_amount: 0,
+      can_book: false,
+      book_blocked_reason: 'invoice not produced yet — run production from the recipe page for: Androma LO2',
+    }];
+    renderPanel({ invoices });
+
+    const book = await screen.findByRole('button', { name: 'Book shipment' });
+    expect(book.disabled).toBe(true);
+    // The server's own reason is what the operator is told.
+    expect(screen.getByText(/Androma LO2/)).toBeTruthy();
+  });
+
+  it('enables Book once the server reports it ready', async () => {
     const invoices = [{
       invoice_id: 22, invoice_number: 'INV-PR', status: 'produced',
       approx_ship_date: null, actual_ship_date: null, notes: null,
       created_at: '2026-09-01 10:00:00', amount: 500, paid_amount: 0,
+      can_book: true, book_blocked_reason: null,
     }];
     renderPanel({ invoices });
 
     const book = await screen.findByRole('button', { name: 'Book shipment' });
     expect(book.disabled).toBe(false);
-    expect(screen.queryByText(/produce this invoice from the recipe page/i)).toBeNull();
+    expect(screen.queryByText(/recipe page/i)).toBeNull();
+  });
+
+  it('falls back to fail-closed when the payload has no can_book field', async () => {
+    // Version skew: an older backend omits the flag. Only 'produced' may be
+    // assumed bookable, matching the server gate.
+    const invoices = [
+      {
+        invoice_id: 31, invoice_number: 'INV-SKEW-P', status: 'planned',
+        approx_ship_date: null, actual_ship_date: null, notes: null,
+        created_at: '2026-09-01 10:00:00', amount: 100, paid_amount: 0,
+      },
+      {
+        invoice_id: 32, invoice_number: 'INV-SKEW-R', status: 'produced',
+        approx_ship_date: null, actual_ship_date: null, notes: null,
+        created_at: '2026-09-01 10:00:00', amount: 100, paid_amount: 0,
+      },
+    ];
+    renderPanel({ invoices });
+
+    const buttons = await screen.findAllByRole('button', { name: 'Book shipment' });
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0].disabled).toBe(true);
+    expect(buttons[1].disabled).toBe(false);
   });
 
   it('shows amount and paid progress on each invoice row', async () => {

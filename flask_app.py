@@ -119,9 +119,9 @@ from raas_tracker.sales import (
     mark_invoice_paid, void_invoice, get_sale_completion, _now_str,
     check_lc_shipment_ready, create_invoice_item, list_invoice_items,
     InvoicedLineConflict, create_invoices_batch,
-    # Used by GET /api/invoices/<id>/readiness; previously never imported, so
-    # that route raised NameError on every call.
-    production_readiness,
+    # Per-invoice production gate for GET /api/invoices/<id>/readiness, plus the
+    # shared blocked-message so the readiness hint and book_invoice's 409 agree.
+    invoice_production_readiness, _production_blocked_message,
 )
 from raas_tracker.stock import sync_reorder_notifications
 
@@ -2204,7 +2204,9 @@ def api_create_invoices_batch(sale_id):
 @app.route("/api/sales/<int:sale_id>/invoices")
 def api_list_invoices(sale_id):
     conn = get_db()
-    invoices = list_invoices(conn, sale_id)
+    # with_readiness: the panel needs can_book / book_blocked_reason to render
+    # the Book action honestly. Only this route asks for them.
+    invoices = list_invoices(conn, sale_id, with_readiness=True)
     conn.close()
     return jsonify(invoices)
 
@@ -3227,16 +3229,20 @@ def api_invoice_readiness(invoice_id):
         if not inv:
             return jsonify({"error": "Invoice not found"}), 404
         invoice_id, sale_id, status, shipment_status = inv
-        # Booking: can book if status is planned
-        can_book = status == "planned"
+        # Production readiness is per INVOICE, not per sale: producing a
+        # sibling invoice's product must not make this one look ready.
+        # (It used to call the sale-scoped production_readiness.)
+        company_row = conn.execute(
+            "SELECT company_id FROM sales WHERE id = %s", (sale_id,)).fetchone()
+        company_id = company_row[0] if company_row else None
+        ready = invoice_production_readiness(conn, company_id, invoice_id)
+        # Booking is only a live option from an open status, and only once
+        # every invoiced product has been produced. Mirrors book_invoice.
+        can_book = status in ("planned", "produced") and ready["ok"]
         # Shipping: can ship if status is booked
         can_ship = status == "booked"
         # Payment: can pay if status is shipped or booked (partial payment allowed)
         can_pay = status in ("booked", "shipped")
-        # Production readiness: check if invoiced products have recipes + production
-        prod = production_readiness(conn, 
-            conn.execute("SELECT company_id FROM sales WHERE id = %s", (sale_id,)).fetchone()[0],
-            [sale_id])
         return jsonify({
             "invoice_id": invoice_id,
             "status": status,
@@ -3244,9 +3250,18 @@ def api_invoice_readiness(invoice_id):
             "can_book": can_book,
             "can_ship": can_ship,
             "can_pay": can_pay,
-            "recipes_ok": prod.get("recipes_ok"),
-            "produced_ok": prod.get("produced_ok"),
-            "detail": prod.get("detail"),
+            "recipes_ok": not ready["missing_recipes"],
+            "produced_ok": ready["ok"],
+            "book_blocked_reason": (
+                None if can_book or status not in ("planned", "produced")
+                else _production_blocked_message(
+                    ready["missing_recipes"] or ready["missing_production"])
+            ),
+            "detail": {
+                "products": ready["products"],
+                "missing_recipes": ready["missing_recipes"],
+                "missing_production": ready["missing_production"],
+            },
         })
     finally:
         conn.close()

@@ -56,6 +56,19 @@ def _stock(db, names):
     return [(r[0], r[1]) for r in rows]
 
 
+def _produce(admin_client, company_id, recipe_name, sale_id, invoice_id):
+    """One production run for a recipe, linked to this invoice.
+
+    Booking is gated on production, so any test that books must satisfy this
+    first (conftest's ``produce_for`` fixture does the same in one call).
+    """
+    r = admin_client.post(f"/api/recipes/{recipe_name}/produce", json={
+        "production_qty": 5, "company_id": company_id,
+        "sale_ids": [sale_id], "invoice_ids": [invoice_id]})
+    assert r.status_code == 201, r.get_json()
+    return r.get_json()
+
+
 # ---------- 1. invoice create + duplicate rules ----------
 
 def test_invoice_create_list_duplicate_and_cross_sale_reuse(admin_client, db):
@@ -235,14 +248,159 @@ def test_completion_reflects_invoice_counts(admin_client, db):
     assert body["status"] == "partial"
 
 
-# ---------- 8. booking requires production of every invoiced product ----------
+# ---------- 11. booking availability is reported per invoice ----------
 
-def _produce(admin_client, company_id, recipe_name, sale_id, invoice_id):
-    r = admin_client.post(f"/api/recipes/{recipe_name}/produce", json={
-        "production_qty": 5, "company_id": company_id,
-        "sale_ids": [sale_id], "invoice_ids": [invoice_id]})
-    assert r.status_code == 201, r.get_json()
+def _rows_for(admin_client, sale_id):
+    return {r["invoice_id"]: r for r in
+            admin_client.get(f"/api/sales/{sale_id}/invoices").get_json()}
+
+
+def _readiness(admin_client, invoice_id):
+    r = admin_client.get(f"/api/invoices/{invoice_id}/readiness")
+    assert r.status_code == 200, r.get_json()
     return r.get_json()
+
+
+def test_invoice_list_reports_cannot_book_before_production(admin_client, db):
+    """The panel must be able to disable Book without guessing from status."""
+    cid, sid, inv = _production_setup(admin_client, db, "ListGate")
+
+    row = _rows_for(admin_client, sid)[inv]
+    assert row["can_book"] is False
+    assert row["book_blocked_reason"]
+    assert "recipe" in row["book_blocked_reason"].lower()
+
+    _produce(admin_client, cid, "Recipe-ListGate", sid, inv)
+
+    row = _rows_for(admin_client, sid)[inv]
+    assert row["can_book"] is True
+    # null means exactly one thing: bookable.
+    assert row["book_blocked_reason"] is None
+
+
+def test_partial_production_reports_cannot_book_despite_produced_status(
+        admin_client, db):
+    """The status flag alone says 'produced'; the content does not agree.
+
+    This is the UI/server desync the list payload exists to close: a
+    status-driven button would be enabled and then refused with a 409.
+    """
+    cid = _company(admin_client, db, name="ListPartCo")
+    r = admin_client.post("/api/sales", json={
+        "sale": {"pi_number": "PI-LISTP-1", "client_name": "x", "company_id": cid},
+        "items": [
+            {"product_name": "ListProdA", "quantity": 10, "unit_price": 5, "unit": "KG"},
+            {"product_name": "ListProdB", "quantity": 10, "unit_price": 5, "unit": "KG"},
+        ]})
+    assert r.status_code == 201, r.get_json()
+    sid = r.get_json()["id"]
+
+    for chem, prod in (("ListChemA", "ListProdA"), ("ListChemB", "ListProdB")):
+        admin_client.post("/api/chemicals", json={"name": chem, "qty": 500, "unit": "KG"})
+        name = "ListRecipe" + prod[-1]
+        r = admin_client.post("/api/recipes", json={
+            "name": name, "yield": 100, "company_id": cid, "product_name": prod})
+        assert r.status_code == 201, r.get_json()
+        r = admin_client.post(f"/api/recipes/{name}/items", json={
+            "chemical": chem, "percentage": 40, "company_id": cid})
+        assert r.status_code == 200, r.get_json()
+
+    item_a, item_b = [r[0] for r in db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id", (sid,)).fetchall()]
+    r = admin_client.post(f"/api/sales/{sid}/invoices", json={
+        "invoice_number": "INV-LISTP-1",
+        "lines": [{"sale_item_id": item_a, "quantity": 10},
+                  {"sale_item_id": item_b, "quantity": 10}]})
+    assert r.status_code == 201, r.get_json()
+    inv = r.get_json()["invoice_id"]
+
+    _produce(admin_client, cid, "ListRecipeA", sid, inv)
+    assert _invoice_status(db, inv) == "produced", "the flag really is 'produced'"
+
+    row = _rows_for(admin_client, sid)[inv]
+    assert row["can_book"] is False
+    # The reason must name the product that is still unbuilt.
+    assert "ListProdB" in row["book_blocked_reason"]
+
+    # And the endpoint agrees with the list payload.
+    body = _readiness(admin_client, inv)
+    assert body["produced_ok"] is False
+    assert body["can_book"] is False
+
+
+def test_invoice_readiness_ignores_a_produced_sibling(admin_client, db):
+    """Readiness is per invoice, not per sale.
+
+    Used to be sale-scoped, so producing one invoice's product made a sibling
+    look produced too.
+    """
+    cid = _company(admin_client, db, name="ListSibCo")
+    r = admin_client.post("/api/sales", json={
+        "sale": {"pi_number": "PI-LISTS-1", "client_name": "x", "company_id": cid},
+        "items": [
+            {"product_name": "ListSibA", "quantity": 5, "unit_price": 5, "unit": "KG"},
+            {"product_name": "ListSibB", "quantity": 5, "unit_price": 5, "unit": "KG"},
+        ]})
+    assert r.status_code == 201, r.get_json()
+    sid = r.get_json()["id"]
+
+    for chem, prod in (("ListSibChemA", "ListSibA"), ("ListSibChemB", "ListSibB")):
+        admin_client.post("/api/chemicals", json={"name": chem, "qty": 500, "unit": "KG"})
+        name = "ListSibRecipe" + prod[-1]
+        r = admin_client.post("/api/recipes", json={
+            "name": name, "yield": 100, "company_id": cid, "product_name": prod})
+        assert r.status_code == 201, r.get_json()
+        r = admin_client.post(f"/api/recipes/{name}/items", json={
+            "chemical": chem, "percentage": 40, "company_id": cid})
+        assert r.status_code == 200, r.get_json()
+
+    item_a, item_b = [r[0] for r in db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id", (sid,)).fetchall()]
+    r = admin_client.post(f"/api/sales/{sid}/invoices", json={
+        "invoice_number": "INV-LISTS-A",
+        "lines": [{"sale_item_id": item_a, "quantity": 5}]})
+    inv_a = r.get_json()["invoice_id"]
+    r = admin_client.post(f"/api/sales/{sid}/invoices", json={
+        "invoice_number": "INV-LISTS-B",
+        "lines": [{"sale_item_id": item_b, "quantity": 5}]})
+    inv_b = r.get_json()["invoice_id"]
+
+    _produce(admin_client, cid, "ListSibRecipeA", sid, inv_a)
+
+    assert _readiness(admin_client, inv_a)["produced_ok"] is True
+    # B's own product was never produced, even though its sibling's was.
+    b = _readiness(admin_client, inv_b)
+    assert b["produced_ok"] is False
+    assert b["can_book"] is False
+
+
+def test_booked_invoice_reports_cannot_book_without_a_blocked_reason(
+        admin_client, db):
+    """A closed invoice is simply not bookable — that is not a 'blockage'."""
+    cid, sid, inv = _production_setup(admin_client, db, "ListClosed")
+    _produce(admin_client, cid, "Recipe-ListClosed", sid, inv)
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
+                          json={"approx_ship_date": "2026-11-01"})
+    assert r.status_code == 200, r.get_json()
+
+    row = _rows_for(admin_client, sid)[inv]
+    assert row["can_book"] is False
+    assert row["book_blocked_reason"] is None
+
+    assert _readiness(admin_client, inv)["can_book"] is False
+
+
+def test_invoice_detail_does_not_pay_for_readiness(admin_client, db):
+    """The heaviest endpoints must not compute readiness nobody reads.
+
+    ``get_sale_by_id`` and ``get_sale_completion`` embed the invoice list but
+    not its booking flags.
+    """
+    cid, sid, inv = _production_setup(admin_client, db, "ListCost")
+    detail = _detail(admin_client, sid)
+    assert detail["invoices"][0].get("can_book") is None
+    comp = admin_client.get(f"/api/sales/{sid}/completion").get_json()
+    assert comp["invoices"][0].get("can_book") is None
 
 
 def test_book_is_refused_until_the_invoice_has_been_produced(admin_client, db):
