@@ -318,6 +318,18 @@ while later products are still unbuilt.
   product on it has a company recipe and an invoice-linked production run.
 - Production is mandatory **from the recipe page** when the goods are ready —
   there is no booking shortcut.
+- The panel renders `Book` from the server's `can_book` / `book_blocked_reason`
+  rather than from `status`, so a disabled button and a 409 always agree.
+
+---
+
+## ⚠️ Known limitations (deliberate, tracked)
+
+| # | Limitation | Why it stands | What closing it needs |
+|---|---|---|---|
+| 1 | **The gate matches products by name**, not by a stable id: `lower(recipes.product_name) = lower(invoice_items.product_name)`, and `invoice_items.product_name` is a denormalised copy taken at line-creation time. Rename a product after invoicing and the gate looks for a recipe under the old name, refusing booking indefinitely. | `production_runs.sale_item_id` exists but is **always NULL** — the only INSERT (`recipes.py:637`) never sets it and its `NOT NULL` was dropped at `db.py:950`. There is no other stable link. | Populate `production_runs.sale_item_id` in `create_production_run`, then join on it in `invoice_production_readiness` with a name fallback for historical rows. |
+| 2 | **The gate asserts production *presence*, not *quantity*.** Producing 1 KG against a 3,000 KG invoice line unblocks booking. | Decided deliberately: booking is a commercial act, and the production department owns whether a batch was sufficient. | Compare `SUM(qty_produced)` per invoice line against `invoice_items.quantity`. Blocked on a unit: neither `recipes` nor `production_runs` stores the product unit, so the two numbers cannot be compared soundly without one. |
+| 3 | **The batch endpoint still caps quantity at the PI remainder**, while the single-invoice path allows over-PI quantities. Invoices needing more than the remainder must be created one at a time. | Left as-is to avoid widening the blast radius of the booking-gate change. | Drop the `remaining` ceiling in `create_invoices_batch` (`sales.py:1864-1868`) to match the single-invoice contract. |
 
 ---
 
