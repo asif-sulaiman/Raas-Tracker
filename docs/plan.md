@@ -278,8 +278,46 @@ PIs (gate counts invoices across ALL of the LC's sales). Linking a PI under
 an LC moves it to `lc_received` — the LC-create/link form is the LC-details
 demand for the 1st → 2nd stage hop.
 
-Business rule restated: one LC carries one **or many** invoices across its
-PIs (gate counts invoices across ALL of the LC's sales).
+---
+
+## 🧾 Phase INV-REVISION: Flexible Invoices (Completed 2026-10-12)
+
+The commercial model restated: **the invoice is the reference point of the
+sale, the PI is a proposal.** An invoice line may carry a quantity **greater**
+than its PI line (shipment advantage), one product may appear on several
+invoices, and only PI products may be invoiced. A create **never** births
+`paid` — only a payment record may, because `paid` asserts money was received.
+
+| Task | Description | Files Touched | Acceptance |
+|---|---|---|---|
+| INV-R1 ✅ | **Schema v5 + flexible quantities** — `_SCHEMA_VERSION` 4 → 5; new `invoice_items.source_type`, `invoices.shipment_status`, `letters_of_credit.shipment_gate`; `create_invoice` gains an explicit-lines mode (no quantity ceiling) alongside the legacy PI-remainder auto-seed; header always restated as `SUM(invoice_items.line_total)` | `raas_tracker/db.py`, `raas_tracker/sales.py`, `tests/test_invoice_items.py`, `tests/test_schema_migration.py` | Migrates existing DBs; gate green |
+| INV-R2 ✅ | **Flexible-invoice API** — `POST /api/sales/<id>/invoices` accepts optional `lines:[{sale_item_id, quantity}]`; `POST /api/sales/<id>/invoices/batch` creates N invoices atomically; `GET /api/invoices/<id>/items`; add-line recomputes `invoices.amount` in the same transaction | `flask_app.py` | gate green |
+| INV-R3 ✅ | **InvoiceBuilderModal** — flexible invoice-creation UI (multi-line, per-line quantities) | `InvoiceBuilderModal.jsx`, `Sales.jsx` | build OK |
+| INV-R4 ✅ | **Line-composer consolidation + no-born-paid** — shared `InvoiceLineComposer`, `useSaleInvoiceLines` hook, `varianceLabel`; lines required at creation; a zero-amount invoice is no longer born `paid`; the legacy **Record Shipment** button + `ShipmentModal` were deleted (shipment is now invoice-driven) | `InvoiceLineComposer.jsx`, `InvoiceLineEditor.jsx`, `InvoicePanel.jsx`, `SaleDetailModal.jsx`, `useSaleInvoiceLines.js`, `varianceLabel.js`, `ShipmentModal.jsx` (deleted), `raas_tracker/sales.py` | 305 frontend tests green; gate green |
+
+---
+
+## 🏭 Phase PBB: Production-Before-Booking Gate (Completed 2026-10-12)
+
+Booking commits to a real shipment, so it is refused until the invoice's
+products have actually been produced — a recipe run created from the **recipe
+page** and linked to **that** invoice. The check is **fail-closed** and
+**per-invoice**: it re-reads production content rather than trusting
+`invoices.status`, because `record_production` flips a multi-product invoice to
+`produced` on the **first** linked run, so on its own that flag reads satisfied
+while later products are still unbuilt.
+
+| Task | Description | Files Touched | Acceptance |
+|---|---|---|---|
+| PBB-1 ✅ | **Booking requires production** — `book_invoice` re-checks production readiness for every distinct product on the invoice, at both pre-booking states (`planned` and `produced`); a short invoice raises `ValueError("invoice not produced yet — run production from the recipe page for: …")`, mapped to **409** by `_state_error_status` | `raas_tracker/sales.py`, `flask_app.py`, `tests/test_invoices_production.py` | unauthorised booking 409; produced flow books; gate green |
+| PBB-2 ✅ | **`invoice_production_readiness()`** — per-invoice gate core; requires, for each product on **this** invoice, a company recipe **and** a production run linked to this invoice (`production_run_links.invoice_id`); scoped to the invoice alone (siblings proceed independently) | `raas_tracker/sales.py` | gate green |
+| PBB-3 ✅ | **Latent fixes surfaced by the gate** — import `production_readiness` in `flask_app.py` (a `NameError` crashed every `GET /api/invoices/<id>/readiness`); pass `model_dump()`ed lines in `api_create_invoice` (a raw Pydantic model has no `.get()`, so explicit-lines creates raised `AttributeError` → 500) | `flask_app.py`, `tests/test_production_atomicity.py`, `tests/test_invoice_amount.py`, `tests/test_sales.py` | both routes stabilised; gate green |
+
+**Business rule now in force**
+- `planned → booked` is **gated**: an invoice cannot be booked until every
+  product on it has a company recipe and an invoice-linked production run.
+- Production is mandatory **from the recipe page** when the goods are ready —
+  there is no booking shortcut.
 
 ---
 
@@ -320,7 +358,7 @@ When starting any task above:
 
 ## 📌 Notes for Agent
 
-- **Current branch:** `main` (commit `998b841`)
+- **Current branch:** `main` (commit `c3400c6` + working-tree PBB gate)
 - **Local DB:** `DATABASE_URL` set via `setx` (Supabase pooler, encoded pw)
 - **Vercel Preview:** `https://chemcalc-omega.vercel.app/` — auto-deploys on push
 - **Test DB:** `pgserver` embedded (offline) or `TEST_DATABASE_URL`

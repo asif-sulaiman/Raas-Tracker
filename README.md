@@ -2,8 +2,9 @@
 
 Warehouse chemical inventory with monthly reconciliation, recipe management,
 file upload comparison (PDF/Excel), a sales pipeline (PI → LC → shipment →
-payment → completed) with PDF/`.docx` PI parsing, and session + API-key
-authentication. Flask backend serves a React 19 + Vite frontend.
+payment → completed) with PDF/`.docx` PI parsing, per-invoice production/shipment
+tracking (production is required before an invoice can be booked), and session +
+API-key authentication. Flask backend serves a React 19 + Vite frontend.
 PostgreSQL (Supabase) is the database in every environment.
 
 ## Quick start (local)
@@ -49,6 +50,13 @@ username and per IP), per-key rate limits, audited auth events.
 | `DISABLE_SETUP` | unset | `true` disables the one-time setup endpoint |
 | `FLASK_DEBUG` | `0` | Never enable in production |
 | `RAAS_LOG_LEVEL` | `INFO` | Python log level for the `raas` logger |
+| `TRUSTED_PROXY` | unset → header ignored | `1` trusts one `X-Forwarded-For` hop (ProxyFix). **Required** behind any proxy; leave unset when anything can reach the app directly |
+| `MAX_CONTENT_LENGTH_MB` | `50` | Upload body cap in MB (float allowed, e.g. `4.5` on Vercel) |
+| `REDIS_URL` | unset → in-memory | Shared rate-limit storage; **required** on serverless/multi-process so limits are global |
+| `CORS_ALLOWED_ORIGINS` | `""` | Comma-separated origins (empty = same-origin only) |
+| `RAAS_RATE_LIMITS` | `on` | `off` disables Flask-Limiter (tests) |
+| `RAAS_DATA_DIR` | repo root | Writable data dir (uploads, reports) |
+| `DB_POOL_MAX` | `10` | Per-process connection-pool ceiling |
 
 See `.env.example` for a template.
 
@@ -124,7 +132,7 @@ use; the current path is online hosting against Supabase (no DB container).
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/ -q        # backend: 90+ tests, isolated PG DBs
+python -m pytest tests/ -q        # backend: 740+ tests, isolated PG DBs
 cd raas-tracker-frontend
 npm install && npx vitest run     # frontend unit tests
 npx oxlint && npx vite build      # lint + production build
@@ -149,8 +157,10 @@ raas_tracker/          Data layer (PostgreSQL via psycopg)
   auth.py             Users, sessions, API keys, throttle, setup tokens
   stock.py            Chemicals, units, reorder levels
   uploads.py          Uploads, comparison, approvals, reconciliation
-  recipes.py          Recipes + production reports
-  sales.py            Pipeline, items, payments, summaries
+  recipes.py          Recipes + production runs
+  sales.py            Pipeline, items, payments, invoices, production gate, summaries
+  companies.py        Customer master
+  lcs.py              Letters of credit (LC owns the pipeline journey)
   cli.py              python chem_stock.py <command> entry
 chem_stock.py         Compatibility shim (re-exports raas_tracker.*)
 scripts/              One-off ops scripts (e.g. SQLite -> Postgres migration)

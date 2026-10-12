@@ -90,13 +90,14 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 3. Audit logs (`/api/audit-logs`) trace all actions
 
 ### Flow 6: Go for Production & Invoice Tracking
-1. An invoice is created against a PI (existing or new number). Its **lines** carry the product, the invoiced quantity, the unit price and the line total. Quantity is **free relative to the PI**: it may be the full PI quantity, less than it, or split across several invoices. Unit price is inherited from the PI line and enforced server-side — the client cannot set it
+1. An invoice is created against a PI (existing or new number). Its **lines** carry the product, the invoiced quantity, the unit price and the line total. Quantity is **free relative to the PI**: it may be the full PI quantity, less than it, **more than it** (a shipment advantage), or split across several invoices. Unit price is inherited from the PI line and enforced server-side — the client cannot set it
 2. Because quantity may differ per invoice, a product can be partly shipped and the remainder abandoned. Nothing records "abandoned": a quantity that was never invoiced simply never becomes due
 3. The invoice's money is **always derived**, never typed: `amount` = the PI total minus what the invoice lines already carry, and the invoice is seeded with one line per remaining uninvoiced PI line before its header is restated as the sum of those lines. So `invoices.amount` always equals the sum of its lines, and every invoice reads correctly on the commercial report. A typed amount is not accepted — a header carrying money no line backs is invisible to the report, which showed a real receivable as "Paid" and dropped it from gross sales. To invoice less than the remainder, create the invoice and then adjust its lines
 4. **Multi-invoice creation:** Use `POST /api/sales/<id>/invoices/batch` to create N invoices in one atomic transaction. Body: `{invoices:[{invoice_number, lines:[{sale_item_id, quantity}]}]}`. Each invoice gets ≥1 line; per `sale_item` the sum of quantities across the batch must not exceed the remaining uninvoiced quantity; headers are restated as `SUM(invoice_items.line_total)`; atomic (one commit or full rollback)
 5. Recipes → detail → **Go for Production** → company → sale/PI → invoice → material number (auto-filled from item no.), packing, batch, date, quantity, optional multi-recipe rows → production run created and linked
 6. Linked invoices advance `planned → produced`; pipeline card shows the shipment sub-step badge (Production running → Production done → Ship booked)
 7. Per invoice: **Book** (approx. ship date) → `booked`; **Ship** (actual date) → `shipped` + shipment record; **Pay** → `paid` once payments cover the amount — `paid` never reverts
+   - **Production before booking:** `Book` is refused (409) until every product on the invoice has a company recipe **and** a production run made from the **recipe page** and linked to **that** invoice. Booking commits to a real shipment, so an unproduced invoice cannot be booked.
 
 ### Flow 7: Commercial Report (invoice-driven)
 - One row per **PI line** (unchanged grain), same columns as before
@@ -204,4 +205,4 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 
 ---
 
-*Last updated: September 2026 — based on actual codebase state (commit 998b841)*
+*Last updated: October 2026 — INV-REVISION (flexible invoices, schema v5) + production-before-booking gate*
