@@ -273,3 +273,442 @@ def test_every_operator_route_is_actually_reachable_by_an_operator():
     assert declared == stamped, (
         "OPERATOR_ROUTES list drifted from the stamped decorators: "
         f"{sorted(declared ^ stamped)}")
+
+
+# ============================ P1-B: volume control ============================
+#
+# P1-A gave operators the write surface. That is a trust change, and trust
+# without a volume bound is not a control: `POST /api/sales` took inline items
+# on the same 300/min default that guarded a GET, so an operator session (or a
+# leaked operator API key) could amplify one request into thousands of rows.
+#
+# AGENTS.md already required 15/min on mutating routes. Before P1-B, only
+# `sales/batch`, `sales/parse`, `upload` and the two report routes carried it,
+# while the six operator writes created by P1-A — and the whole invoice
+# lifecycle — silently ran on the default.
+#
+# The limit is read from a stamp rather than parsed from source, for the same
+# reason P1-A does: Flask-Limiter keeps no per-route metadata on the view, so
+# the only non-brittle assertion is over what the app itself declares.
+
+def _stamps(view):
+    """Collect ``_raas_*`` stamps from a view and everything it wraps.
+
+    Today the walk is a **no-op**: ``functools.wraps`` copies the inner wrapper's
+    ``__dict__`` upward, so both ``_raas_role`` (from the role decorator) and
+    ``_raas_limit`` (from ``limited()``) already sit on the registered view.
+    An earlier version of this docstring claimed the limit lived "one
+    ``__wrapped__`` hop down", which is wrong.
+
+    Keep the walk, but not for the reason an earlier draft of this docstring
+    gave. Two false claims were removed after review:
+
+    * It is **not** true that ``_raas_limit`` "lives one ``__wrapped__`` hop
+      down" — ``functools.wraps`` copies the inner ``__dict__`` upward, so both
+      stamps are already on the registered view and the walk is a **no-op for
+      every route in the app today**.
+    * It is **not** true that the walk rescues a wrapper that omits
+      ``functools.wraps``: such a wrapper sets no ``__wrapped__`` either, so
+      there is no chain to walk. (This docstring previously claimed the
+      opposite, which was wrong.)
+
+    What the walk genuinely buys is the partial-``wraps`` case —
+    ``@wraps(inner, updated=())`` creates the chain link while copying none of
+    the custom attributes — plus either decorator order. Hence the ``None``
+    check rather than ``setdefault``: ``setdefault`` writes on the outermost
+    frame even when that frame has no stamp, latching ``None`` so the inner
+    value can never surface. Pinned by
+    ``test_stamps_survive_a_partial_functools_wraps``.
+    """
+    out = {}
+    while view is not None:
+        for key in ("_raas_role", "_raas_limit"):
+            if out.get(key) is None:
+                out[key] = getattr(view, key, None)
+        view = getattr(view, "__wrapped__", None)
+    return out
+
+
+def _stamps_for(method, path):
+    for rule in flask_app.app.url_map.iter_rules():
+        if rule.rule == path and method in (rule.methods or set()):
+            return _stamps(flask_app.app.view_functions.get(rule.endpoint))
+    return {}
+
+
+def test_stamps_survive_a_partial_functools_wraps():
+    """MED-1: `setdefault` would latch `None` here and hide the inner stamps.
+
+    No route in the app does this today — Flask-Limiter and both role decorators
+    use a full `functools.wraps`, so every stamp is copied onto the registered
+    view and the walk is a no-op in production. This pins the one case the walk
+    actually rescues: a wrapper built with `wraps(..., updated=())` sets
+    `__wrapped__` (the chain link exists) while copying none of the custom
+    attributes, so the outer frame has `_raas_limit = None` and only the inner
+    frame carries 15.
+    """
+    import functools
+
+    def inner():
+        pass
+    inner._raas_role = "operator"
+    inner._raas_limit = 15
+
+    # Full wraps: stamps copied upward, so the outer frame answers.
+    @functools.wraps(inner)
+    def full():
+        return inner()
+
+    # Partial wraps: __wrapped__ present, custom attributes NOT copied.
+    @functools.wraps(inner, updated=())
+    def partial():
+        return inner()
+
+    assert _stamps(full)["_raas_limit"] == 15
+
+    # Precondition: this is the case the `None`-check exists for. `setdefault`
+    # writes `None` from this frame and never lets the inner 15 surface.
+    assert getattr(partial, "_raas_limit", None) is None
+    assert partial.__wrapped__ is inner
+    assert _stamps(partial)["_raas_limit"] == 15
+    assert _stamps(partial)["_raas_role"] == "operator"
+
+
+def _stamped_limited(method_filter):
+    """Every route carrying a `_raas_limit` stamp, under a method filter."""
+    return {(m, r.rule) for r in flask_app.app.url_map.iter_rules()
+            for m in (r.methods or set()) & method_filter
+            if _stamps(flask_app.app.view_functions.get(r.endpoint))
+            .get("_raas_limit") is not None}
+
+
+# Invoice lifecycle + the two N-in-one routes. `invoices/batch` and the single
+# `invoices/<id>/items` write are included because they are the same class of
+# action as `sales/batch`, which was already limited — the inconsistency is
+# exactly what made the old state hard to reason about.
+VOLUME_BOUNDED_ROUTES = OPERATOR_ROUTES + [
+    ("POST", "/api/sales/<int:sale_id>/invoices"),
+    ("POST", "/api/sales/<int:sale_id>/invoices/batch"),
+    ("POST", "/api/invoices/<int:invoice_id>/items"),
+    ("POST", "/api/sales/<int:sale_id>/invoices/<int:invoice_id>/book"),
+    ("POST", "/api/sales/<int:sale_id>/invoices/<int:invoice_id>/ship"),
+    ("POST", "/api/sales/<int:sale_id>/invoices/<int:invoice_id>/pay"),
+    ("DELETE", "/api/sales/<int:sale_id>/invoices/<int:invoice_id>"),
+    # Admin writes with row fan-out. Oracle (P1-B gate) flagged all three as
+    # *unthrottled* while carrying an unbounded list — the higher-amplification
+    # half of the surface, which the first draft of P1-B had left at 300/min.
+    ("POST", "/api/recipes/<path:name>/produce"),
+    ("PUT", "/api/sales/<int:sale_id>"),
+    # Upload/LC/report writes already limited in practice, converted to the
+    # stamping form so the policy test can actually see them.
+    ("POST", "/api/uploads/<int:upload_id>/approve"),
+    ("POST", "/api/uploads/<int:upload_id>/apply"),
+    ("POST", "/api/reports/live/export"),
+    ("POST", "/api/lcs"),
+    ("PUT", "/api/lcs/<int:lc_id>"),
+    ("DELETE", "/api/lcs/<int:lc_id>"),
+    ("POST", "/api/lcs/<int:lc_id>/pis"),
+    ("DELETE", "/api/lcs/<int:lc_id>/pis/<int:sale_id>"),
+    ("POST", "/api/lcs/<int:lc_id>/move"),
+]
+
+
+@pytest.mark.parametrize("method,path", VOLUME_BOUNDED_ROUTES)
+def test_volume_bounded_write_declares_its_limit(method, path):
+    """15/min, stated at the route — not inherited from the 300/min default."""
+    assert (method, path) in _mutating_rules(), f"{method} {path} is not a route"
+    limit = _stamps_for(method, path).get("_raas_limit")
+    assert limit == flask_app.WRITE_LIMIT_PER_MINUTE == 15, (
+        f"{method} {path} declares no volume limit (falls back to the "
+        f"300/min default): got {limit!r}")
+
+
+def test_volume_bounded_list_matches_the_stamped_routes():
+    """The declared list and the stamped reality must not drift.
+
+    This is a **one-sided** guard: it catches a route that carries ``@limited()``
+    but is missing from the list. It cannot catch an admin write that carries no
+    limit at all - ~27 such routes still sit on the 300/min default, which
+    ``test_no_operator_write_silently_relies_on_the_default`` deliberately does
+    not police (it is operator-scoped). Extending the volume policy to the whole
+    admin surface is a tracked gap in ``docs/plan.md``, not closed here.
+    """
+    declared = {(m, p) for m, p in VOLUME_BOUNDED_ROUTES}
+    stamped = _stamped_limited(MUTATING)
+    assert declared == stamped, (
+        "VOLUME_BOUNDED_ROUTES drifted from the stamped @limited() decorators: "
+        f"{sorted(declared ^ stamped)}")
+
+
+def test_the_read_default_is_above_the_write_budget():
+    """The 15/min write cap must not drift at or above the read default.
+
+    Asserted against our own named constants rather than Flask-Limiter's
+    ``_default_limits``: that attribute is private and version-specific, so a
+    test on it would fail on an upgrade while telling us nothing about policy.
+    """
+    assert flask_app.WRITE_LIMIT_PER_MINUTE == 15
+    assert flask_app.READ_LIMIT_PER_MINUTE == 300
+    assert flask_app.WRITE_LIMIT_PER_MINUTE < flask_app.READ_LIMIT_PER_MINUTE
+
+
+def _one_sale():
+    """A minimal valid `SaleCreateIn` payload."""
+    return {
+        "sale": {
+            "pi_number": "PI-1",
+            "company_id": 1,
+        },
+        "items": [{
+            "product_name": "P",
+            "quantity": 1.0,
+            "unit_price": 1.0,
+            "unit": "kg",
+        }],
+    }
+
+
+def test_sale_batch_rejects_more_than_the_declared_max():
+    """One POST /api/sales/batch writes N sales x M items in one transaction."""
+    from flask_app import SaleBatchIn
+    max_len = _cap_of(SaleBatchIn, "sales")
+    assert max_len is not None, "SaleBatchIn.sales is still unbounded"
+
+    SaleBatchIn(sales=[_one_sale() for _ in range(max_len)])  # at the cap: fine
+    with pytest.raises(Exception):
+        SaleBatchIn(sales=[_one_sale() for _ in range(max_len + 1)])
+
+
+def test_no_operator_write_silently_relies_on_the_default():
+    """Catch-all: any operator route added without ``@limited()`` fails here.
+
+    The parametrised test above pins a known list; this one fails on an
+    unlisted route, so a new operator write cannot join the surface with no
+    volume bound just by being forgotten in the list.
+    """
+    undeclared = [(m, r.rule) for r in flask_app.app.url_map.iter_rules()
+                  for m in (r.methods or set()) & MUTATING
+                  if _stamps(flask_app.app.view_functions.get(r.endpoint))
+                  .get("_raas_role") == "operator"
+                  and _stamps(flask_app.app.view_functions.get(r.endpoint))
+                  .get("_raas_limit") is None]
+    assert not undeclared, (
+        f"operator routes without a declared limit: {sorted(undeclared)}")
+
+
+# ---------- one request may not be an unbounded number of rows ----------
+
+# ---------- the caps must bound the PRODUCT, not just each factor ----------
+
+def test_sale_batch_rejects_a_batch_over_the_total_row_budget():
+    """HIGH-2: per-factor caps leave the product unbounded.
+
+    `SaleCreateIn` nests inside `SaleBatchIn`, so 50 sales x 200 items is still
+    ~10 000 sequential inserts in ONE transaction (one commit at the end) from
+    ~700 KB of body — inside the 4.5 MB Vercel limit. An operator API key can fire
+    15 such requests a minute against a 15-session pooler.
+    """
+    from flask_app import MAX_BATCH_ROWS, SaleBatchIn
+
+    per_sale = 200
+    n_sales = MAX_BATCH_ROWS // per_sale + 1
+    payload = {"sales": [_one_sale() for _ in range(n_sales)]}
+    for s in payload["sales"]:
+        s["items"] = [{"product_name": "P", "quantity": 1.0,
+                       "unit_price": 1.0, "unit": "kg"}] * per_sale
+
+    # Each factor is individually legal — this is exactly why a product cap is needed.
+    assert n_sales <= 50, "precondition: the sale count is within its own cap"
+    assert per_sale <= 200, "precondition: items-per-sale is within its own cap"
+
+    with pytest.raises(Exception) as err:
+        SaleBatchIn(**payload)
+    assert "total items per batch" in str(err.value)
+
+
+def test_sale_batch_accepts_a_batch_at_the_total_row_budget():
+    """The budget is a ceiling, not a quota: a realistic batch still passes."""
+    from flask_app import MAX_BATCH_ROWS, SaleBatchIn
+    per_sale, n_sales = 50, 20          # 1000 total items, well under the budget
+    payload = {"sales": [_one_sale() for _ in range(n_sales)]}
+    for s in payload["sales"]:
+        s["items"] = [{"product_name": "P", "quantity": 1.0,
+                       "unit_price": 1.0, "unit": "kg"}] * per_sale
+    assert per_sale * n_sales <= MAX_BATCH_ROWS
+    SaleBatchIn(**payload)
+
+
+def test_invoice_batch_rejects_a_batch_over_the_total_row_budget():
+    """Same product problem on the financial path: 50 invoices x 200 lines."""
+    from flask_app import MAX_BATCH_ROWS, InvoiceBatchCreateIn
+
+    per_invoice = 200
+    n_invoices = MAX_BATCH_ROWS // per_invoice + 1
+    payload = {"invoices": [
+        {"invoice_number": f"INV-{i}",
+         "lines": [{"sale_item_id": 1, "quantity": 1.0}] * per_invoice}
+        for i in range(n_invoices)]}
+    assert n_invoices <= 50, "precondition: invoice count within its own cap"
+
+    with pytest.raises(Exception) as err:
+        InvoiceBatchCreateIn(**payload)
+    assert "total lines per batch" in str(err.value)
+
+
+def test_total_row_budget_is_exposed_and_sane():
+    """One named constant, and it must be below the worst-case product."""
+    from flask_app import MAX_BATCH_ROWS
+    assert MAX_BATCH_ROWS == 2000
+    worst_case = 50 * 200      # SaleBatchIn.sales x SaleCreateIn.items
+    assert MAX_BATCH_ROWS < worst_case, "the budget cannot bind if it is above the cap"
+
+
+def test_total_row_budget_surfaces_as_a_400_with_the_error_contract(user_client):
+    """AGENTS.md: validation errors are 400 `{error, details:[{field, message}]}`."""
+    from flask_app import MAX_BATCH_ROWS
+    per_sale = 200
+    n_sales = MAX_BATCH_ROWS // per_sale + 1
+    sales = [_one_sale() for _ in range(n_sales)]
+    for s in sales:
+        s["items"] = [{"product_name": "P", "quantity": 1.0,
+                       "unit_price": 1.0, "unit": "kg"}] * per_sale
+
+    res = user_client.post("/api/sales/batch", json={"sales": sales})
+    assert res.status_code == 400
+    body = res.get_json()
+    assert body["error"] == "Invalid payload"
+    assert any("total items per batch" in d["message"] for d in body["details"])
+    assert any(d["field"].startswith("sales") for d in body["details"]), body
+
+
+def test_sale_batch_rejects_an_empty_list_as_before():
+    """The pre-existing lower bound must survive the max_length change."""
+    from flask_app import SaleBatchIn
+    with pytest.raises(Exception):
+        SaleBatchIn(sales=[])
+
+
+def _cap_of(model, field):
+    """The declared ``max_length`` for a Pydantic list field, or None.
+
+    ``metadata`` holds typed constraint objects: only ``MaxLen`` carries
+    ``max_length``, so use getattr rather than assuming the attribute exists.
+    """
+    meta = model.model_fields[field].metadata
+    return next((getattr(m, "max_length", None) for m in meta
+                 if getattr(m, "max_length", None) is not None), None)
+
+
+# One row-fanning case per field Oracle listed as uncapped. Each is `(model,
+# field, builder)` where the builder produces a payload exactly one over the cap.
+ROW_FANNING_CAPS = [
+    # HIGH-3 — the route P1-A opened to operators, and the operator backstop
+    # admits API keys, so this is reachable by a leaked low-trust credential.
+    ("SaleCreateIn", "items", lambda n: [{"product_name": "P", "quantity": 1.0,
+                                          "unit_price": 1.0, "unit": "kg"}] * n),
+    # HIGH-2 — full replace + one delete per removedId on the money-bearing rows.
+    ("SaleFullUpdateIn", "items", lambda n: [{"product_name": "P", "quantity": 1.0,
+                                              "unit_price": 1.0, "unit": "kg"}] * n),
+    ("SaleFullUpdateIn", "removedIds", lambda n: list(range(n))),
+    # MED-1 — N invoices x M lines, the financial write path.
+    ("InvoiceBatchCreateIn", "invoices", lambda n: [
+        {"invoice_number": f"INV-{i}", "lines": [
+            {"sale_item_id": 1, "quantity": 1.0}]} for i in range(n)]),
+    ("InvoiceBatchEntryIn", "lines", lambda n: [
+        {"sale_item_id": 1, "quantity": 1.0}] * n),
+    # Round 2 HIGH-1: the single-invoice twin of the capped batch line list.
+    ("InvoiceCreateIn", "lines", lambda n: [
+        {"sale_item_id": 1, "quantity": 1.0}] * n),
+    # Round 2 MED-3: ~5 round trips per id, and it advances sale stage.
+    ("LcAttachIn", "sale_ids", lambda n: list(range(n))),
+]
+
+# Sibling fields the model still requires when the capped field is exercised on
+# its own. Without these the model fails validation for a *missing* field and the
+# test would pass for the wrong reason.
+_ROW_FAN_REQUIRED_SIBLINGS = {
+    ("SaleCreateIn", "items"): {"sale": {"pi_number": "PI-1", "company_id": 1}},
+    ("SaleFullUpdateIn", "items"): {
+        "header": {"pi_number": "PI-1", "company_id": 1}},
+    ("SaleFullUpdateIn", "removedIds"): {
+        "header": {"pi_number": "PI-1", "company_id": 1},
+        "items": [{"product_name": "P", "quantity": 1.0,
+                   "unit_price": 1.0, "unit": "kg"}]},
+    ("InvoiceBatchCreateIn", "invoices"): {},
+    ("InvoiceBatchEntryIn", "lines"): {"invoice_number": "INV-1"},
+    ("InvoiceCreateIn", "lines"): {"invoice_number": "INV-1"},
+    ("LcAttachIn", "sale_ids"): {},
+}
+
+
+@pytest.mark.parametrize("model_name,field,build", ROW_FANNING_CAPS)
+def test_row_fanning_list_field_is_capped(model_name, field, build):
+    """A single request must not be an unbounded number of rows."""
+    import flask_app as fa
+    model = getattr(fa, model_name)
+    cap = _cap_of(model, field)
+    assert cap is not None, f"{model_name}.{field} is still unbounded"
+
+    # Exactly at the cap validates; one over is refused.
+    at_cap = dict(_ROW_FAN_REQUIRED_SIBLINGS[(model_name, field)])
+    at_cap[field] = build(cap)
+    model(**at_cap)
+
+    over = dict(at_cap)
+    over[field] = build(cap + 1)
+    with pytest.raises(Exception):
+        model(**over)
+
+
+@pytest.mark.parametrize("field", ["sale_ids", "invoice_ids", "recipes"])
+def test_production_run_id_lists_are_capped(field):
+    """HIGH-1: these were the largest fan-out on /produce and shipped uncapped.
+
+    Each id drives a sequential per-element round trip inside a transaction
+    holding a pool slot (`recipes.py` `_owned_sale_ids`, and the per-invoice
+    SELECT/INSERT/FOR UPDATE).
+    """
+    from flask_app import ProductionRunCreateIn
+    cap = _cap_of(ProductionRunCreateIn, field)
+    assert cap is not None, f"ProductionRunCreateIn.{field} is still unbounded"
+
+    # `recipes` holds ProductionRecipeIn rows (no required fields); the other
+    # two hold plain ints.
+    fill = (lambda: {}) if field == "recipes" else (lambda: 1)
+
+    at_cap = {"production_qty": 1.0, field: [fill() for _ in range(cap)]}
+    ProductionRunCreateIn(**at_cap)  # at the cap: fine
+
+    over = dict(at_cap)
+    over[field] = [fill() for _ in range(cap + 1)]
+    with pytest.raises(Exception):
+        ProductionRunCreateIn(**over)
+
+
+def test_production_run_recipes_cap_has_a_regression_test():
+    """MED-4: this cap shipped with no test; assert it explicitly, by name."""
+    from flask_app import ProductionRunCreateIn
+    assert _cap_of(ProductionRunCreateIn, "recipes") == 50
+
+
+@pytest.mark.parametrize("path", ["/api/reports/generate", "/api/reports/export"])
+def test_report_rejects_more_than_the_declared_recipe_cap(user_client, path):
+    """The report routes read the body directly, so the cap is enforced there."""
+    one = [{"company_id": 1, "recipe_name": "R"}]
+    over = one * (flask_app.MAX_REPORT_RECIPES + 1)
+
+    res = user_client.post(path, json={"recipes": over, "qty": 1})
+    assert res.status_code == 400, f"{path} accepted an oversized report"
+    body = res.get_json()
+    assert "at most" in body["details"][0]["message"].lower()
+    assert body["details"][0]["field"] == "recipes"
+
+
+@pytest.mark.parametrize("path", ["/api/reports/generate", "/api/reports/export"])
+def test_report_rejects_a_non_list_recipes_body(user_client, path):
+    """LOW-4: `len()` on a str counts characters and the shape loop then
+    indexes a `str`, which is a 500. The cap is the natural place to reject it.
+    """
+    res = user_client.post(path, json={"recipes": "not-a-list", "qty": 1})
+    assert res.status_code == 400, f"{path} accepted a string recipes body"
+    assert res.get_json()["details"][0]["message"] == "must be a list"

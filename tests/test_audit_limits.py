@@ -1,10 +1,11 @@
 """P1-3: every audit value column is bounded and free of control characters.
 
 `audit_logs.entity_type` / `old_value` / `new_value` are bare `TEXT`
-(`raas_tracker/db.py`) and no Pydantic model in the app sets `max_length`, so
-nothing stopped an attacker-influenced or simply enormous string from landing
-in the audit trail. The bound is enforced once, centrally, in
-`log_audit_action`, so current and future call sites are covered.
+(`raas_tracker/db.py`) and P1-B has since added `max_length` to several request
+*list* fields, but no model bounds these audit *string* columns, so nothing
+stopped an attacker-influenced or simply enormous string from landing in the
+audit trail. The bound is enforced once, centrally, in `log_audit_action`, so
+current and future call sites are covered.
 
 Two call sites also had to be corrected at the source, because the value they
 wrote was wrong in kind rather than merely too long:

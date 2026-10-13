@@ -18,6 +18,80 @@ This plan captures future work aligned with the Vibe Coding guidebook. The core 
 
 ---
 
+## 🔒 Security hardening — Phase 1: authorization (in progress)
+
+A read-only audit produced a 5-phase plan. **Phase 1 only is authorised**;
+Phases 2–5 are deferred. Each sub-phase is gated by the full backend suite plus
+an Oracle review, and the working state lives in `.slim/deepwork/phase1-authorization.md`.
+
+| Sub-phase | Scope | Gate |
+|---|---|---|
+| 0 | Pre-flight: scan all 20 PostgreSQL `REAL`/`double precision` columns for non-finite values before the Phase 2 numeric work | ✅ 0 non-finite rows |
+| P1-A | Explicit role classification — `operator_or_admin_required` stamping `_raas_role`; every mutating route declares its class; `_ADMIN_PATHS` demoted to non-load-bearing defence in depth; `POST /api/sales/batch` demoted admin → operator to match `POST /api/sales` | Oracle ✅ PASS (commit `9e3d713`) |
+| P1-B | Volume control — `limited()` stamps `_raas_limit` at 15/min on every mutating operator route, the invoice lifecycle, and the admin writes with row fan-out; `max_length` on 7 row-fanning list fields; report `recipes` capped inline with `{error, details[]}` | Oracle 🔴 blocked first pass → all blockers remediated → re-review pending |
+
+**P1-B blockers found by the first Oracle pass, and what closed them**
+
+| Finding | Problem | Resolution |
+|---|---|---|
+| HIGH-1 | `POST /api/recipes/<name>/produce` unthrottled (300/min) and `sale_ids`/`invoice_ids` uncapped — the route had the *largest* fan-out (one round trip per id) while the `recipes` field beside it got the cap | `@limited()` + `max_length=200` on both id lists |
+| HIGH-2 | `PUT /api/sales/<id>` was the only mutating route with an unbounded rate **and** two uncapped row-fanning fields, on the money-bearing tables | `@limited()` + `max_length=200` on `items` and `removedIds` |
+| HIGH-3 | `POST /api/sales` — the route P1-A opened to operators — got a rate bound but no row bound; the operator backstop admits API keys | `items` capped at 200 |
+| MED-1 | `POST .../invoices/batch` is N×M per request with both factors uncapped — the financial write path | `invoices` 50 / `lines` 200 |
+| MED-2 | The admin half of `VOLUME_BOUNDED_ROUTES` had no drift guard, so the list could silently diverge from reality | `test_volume_bounded_list_matches_the_stamped_routes` mirrors P1-A's role guard |
+| MED-3 | **21** routes used a bare `@limiter.limit("15 per minute")` — genuinely limited, but invisible to the stamp, while SPEC claimed they were declared | All converted to `@limited()`; SPEC is now true |
+| MED-4 | `ProductionRunCreateIn.recipes` shipped with zero tests | Dedicated regression test |
+| LOW-1 | `WRITE_LIMIT_PER_MINUTE` was defined twice; editing one copy would change nothing and be caught by nothing | Merged to a single definition |
+| LOW-2 | The `_stamps()` docstring claimed `_raas_limit` lived "one `__wrapped__` hop down". Oracle proved `functools.wraps` copies both stamps onto the registered view, so the walk is currently a no-op — and a maintainer reading the wrong reason would delete it | Corrected; the walk is kept for either decorator order and non-`wraps` outer wrappers |
+| LOW-3/4 | Report cap returned a bare `{error}` (AGENTS.md mandates `details[]`), and `len()` on a non-list body counted characters and then 500'd | Both fixed; cap still precedes the per-item shape loop so rejection is O(1) |
+| LOW-6 | Only SPEC was updated; AGENTS.md rule 8 requires `plan.md` in the same task | This section |
+
+**P1-B blockers found by the second Oracle pass, and what closed them**
+
+| Finding | Problem | Resolution |
+|---|---|---|
+| HIGH-1 | `InvoiceCreateIn.lines` uncapped—the single-invoice twin of the capped `InvoiceBatchEntryIn.lines`, on a route this change newly stamped | `max_length=200`, added to `ROW_FANNING_CAPS` and the SPEC table |
+| MED-1 | `_stamps()` used `out.setdefault(...)`, which writes on the outermost frame even when it has no stamp—latching `None` so the inner value could never surface | Changed to an explicit `None` check, and pinned by `test_stamps_survive_a_partial_functools_wraps`. Both false claims in the docstring were also corrected |
+| MED-2 | `test_every_route_using_a_15_per_minute_limit_is_stamped` was a tautology (`sm—sg` by construction, and the drift guard already asserts `sm == declared`) | Deleted |
+| MED-3 | `LcAttachIn.sale_ids` uncapped: ~5 round trips per id inside the LC lock, and each `pi_issued` sale advances to `lc_received` | `max_length=200` |
+| MED-4 | The drift guard's docstring overclaimed—it is one-sided and cannot catch an admin write with no limit at all | Docstring now states the one-sidedness; the ~27 unthrottled admin routes are recorded as a tracked gap below |
+| LOW-2 | `plan.md` said 14 conversions; the diff has 21 converted + 14 net-new | Corrected |
+
+**Scope decisions taken (user-ratified)**
+
+| Decision | Choice |
+|---|---|
+| Product cap on nested batch payloads | **Added `MAX_BATCH_ROWS = 2000`**—a `field_validator` on `SaleBatchIn.sales` and `InvoiceBatchCreateIn.invoices` capping total rows, rather than shrinking the per-factor caps (which would penalise single-sale entry). Raises through the existing `{error, details:[{field, message}]}` path |
+| Extending the volume policy to all ~27 unthrottled admin routes | **Left for a later phase**—P1-B stays the operator + invoice-lifecycle policy. Recorded below as a tracked gap, not silently dropped |
+| Client-side cap on `MultiPICreateModal` | **Added**—`MAX_DOCS = 50` disables "Add PI document" at the cap, and `validate()` rejects an over-cap set before the request, so the UI cannot build a request the server will refuse **on document count**. The per-PI item cap (200) and the total-row budget are NOT mirrored — an over-long PI still surfaces as a server 400 in the banner |
+
+**Open scope decisions (not silently decided)**
+
+1. ~~**Product cap on nested batch payloads.**~~ **CLOSED** — `MAX_BATCH_ROWS = 2000`
+   added (see the ratified table above).
+2. **~27 admin mutating routes remain on the 300/min default**, including the
+   money-bearing ones (`PUT/DELETE /api/sales/<id>/items`, `PUT .../payment`,
+   `PUT .../payments/<id>`, `POST .../shipments`, `PUT .../move`). SPEC is accurate— it claims only "every mutating operator route and the whole invoice lifecycle"— but P1-A's thesis was that opt-in-by-omission is the bug, so this is the same shape.
+3. **`POST /api/uploads/<id>/approve|apply`** processes every parsed row of an uploaded
+   file with no row cap (`chem_stock.py` has no `MAX_ROWS`). 15/min bounds the request
+   rate, not the row set.
+
+**Known gaps carried forward (tracked, not closed):**
+- ~27 admin mutating routes remain on the 300/min default—see the scope table below.
+- `POST /api/recipes/<name>/produce` — `recipes` is capped at 50 rows, but each row
+  expands to a run **plus its whole BOM** (`update_stock` + insert per ingredient).
+  ~1 000 ingredients in one transaction, and `MAX_BATCH_ROWS` deliberately does not
+  cover this route.
+- `MultiPICreateModal` mirrors only the 50-document cap; the per-PI item cap (200) and
+  the total-row budget are not mirrored, so an over-long PI surfaces as a server 400.
+- `DELETE /api/sales/<id>` — a money-bearing cascade delete — remains on the 300/min
+  default.
+- `POST /api/uploads/<id>/approve|apply` processes every parsed row of an uploaded file
+  with no row cap (`chem_stock.py` has no `MAX_ROWS`); 15/min bounds the request rate,
+  not the row set.
+
+---
+
 ## ✅ Multi-PI under a single LC (2026-10)
 
 Delivered in four phases, each gated by a full test run + an Oracle review.
@@ -262,7 +336,7 @@ passed `saleId={null}` to the modal, so it POSTed to
 `/api/sales/null/invoices`. No POST route matches that shape, so Werkzeug
 raised 405 — and with no 405 handler the catch-all `Exception` handler
 masked it as a 500. Ruled out with evidence: no file writes on the invoice
-path (read-only-FS theory), zero `?` placeholders (SQLite-syntax theory),
+path (read-only-FS theory), zero `—` placeholders (SQLite-syntax theory),
 ProxyFix already correct (auth failures are 401/403, never this 500).
 
 | Task | Description | Files Touched | Acceptance |

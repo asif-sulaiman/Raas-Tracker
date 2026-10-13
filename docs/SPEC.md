@@ -784,6 +784,10 @@ removing the tuple must change nothing.
 reformat, a new module, `add_url_rule`, or a Blueprint cannot make the check drift
 from what Flask actually routes.
 
+The same argument applies to **rate limits**, which is why P1-B added `@limited()`:
+Flask-Limiter holds no per-route metadata on the view, so `_raas_limit` is stamped
+and read the same way. See [Rate Limiting](#rate-limiting-flask-limiter).
+
 #### Operator routes (11)
 
 | Method | Path |
@@ -815,10 +819,68 @@ commercial report is invoice-driven so an uninvoiced PI contributes 0 to gross s
 
 ### Rate Limiting (Flask-Limiter)
 - Default: 300/min per identity (user/key/IP) — applies to **every** route, so
-  `POST /api/sales` is bounded at 300/min, not unlimited. P1-B tightens the
-  mutating operator routes to 15/min.
-- Tier 2 (15/min): `/api/upload`, `/api/uploads/*/approve|apply`, `/api/reports/generate|export`,
-  `/api/reports/live/export`, `/api/sales/parse`, `/api/sales/batch`
+  reads and low-risk writes share `READ_LIMIT_PER_MINUTE = 300`.
+- **P1-B — write budget: `WRITE_LIMIT_PER_MINUTE = 15`.** P1-A gave `user` the
+  PI/recipe/report write surface, and a trust change without a volume bound is
+  not a control: those writes ran on the 300/min read default, so one operator
+  request could amplify into thousands of rows. Every mutating operator route
+  and the whole invoice lifecycle now declare 15/min explicitly.
+- Declared via `@limited()`, never `@limiter.limit("15 per minute")`. Flask-Limiter
+  keys limits by `module.__qualname__` in an internal manager and keeps **no
+  per-route metadata on the view**, so a test asserting the limit by reading source
+  would be fail-open exactly as P1-A's role test was. `limited()` applies the limit
+  *and* stamps `_raas_limit`, so the policy test walks `app.url_map` →
+  `view_functions` → the `__wrapped__` chain. `functools.wraps` copies both stamps onto
+  the registered view, so for every route today the walk is a **no-op**; it is kept because
+  it also covers either decorator order and a partial `@wraps(inner, updated=())` (which
+  creates the chain link but copies no custom attributes).
+- `test_volume_bounded_list_matches_the_stamped_routes` mirrors P1-A's role drift
+  guard, but it is **one-sided**: it catches a route that carries `@limited()` while
+  missing from the list. It cannot catch a write that carries no limit at all — ~27
+  admin mutating routes (including `DELETE /api/sales/<id>`) are still on the 300/min
+  default. That gap is tracked in `docs/plan.md`, not closed here.
+- Tier 2 (15/min): `/api/upload`, `/api/uploads/*/approve|apply|export`,
+  `/api/reports/generate|export`, `/api/reports/live{,/filtered,/summary,/export}`,
+  `/api/sales`, `/api/sales/parse`, `/api/sales/batch`, `/api/sales/export`,
+  `/api/recipes`(+`/<name>`, `/items`, `/items/<chem>`, `/produce`),
+  `/api/unit-conversions`, `/api/notifications/read`, `/api/lcs`(+`/<id>`, `/pis`,
+  `/pis/<sale_id>`, `/move`), `PUT /api/sales/<id>`, and the invoice
+  lifecycle (`.../invoices`, `.../invoices/batch`, `/api/invoices/<id>/items`,
+  `.../book`, `.../ship`, `.../pay`, `.../` DELETE). `invoices/batch` already had
+  15/min; the lifecycle around it did not, and the inconsistency was the finding.
+- `POST /api/notifications/read` is included: the `NotificationContext` poll is
+  `POLL_MS = 30_000` (2/min) and drives a **GET**; read-marking is user-initiated
+  from the bell, so 15/min has ample headroom.
+- Enforcement lives in the view wrapper (inside the role decorator), so an
+  unauthenticated flood gets 401 without consuming budget. Consequence: 429 is
+  only observable with valid credentials on these routes. Login keeps its own
+  DB-backed throttle.
+- **Rate limit bounds requests, not rows.** A 15/min budget still permits 15
+  arbitrarily large bodies, so the list fields that fan out into per-row inserts
+  are bounded too (P1-B):
+  | Field | Cap | Why |
+  |---|---|---|
+  | `SaleCreateIn.items` | 200 | `POST /api/sales` — the route P1-A opened to operators, and the operator backstop deliberately admits **API keys**, so a leaked low-trust credential reaches this |
+  | `SaleFullUpdateIn.items` / `.removedIds` | 200 / 200 | `PUT /api/sales/<id>` replaces the item set and deletes one row per `removedIds`, inside a transaction holding the money-bearing `sales`/`sale_items` locks |
+  | `SaleBatchIn.sales` | 50 | N sales × M items in one transaction; `min_length=1` kept. `POST /api/sales` is the path for anything larger |
+  | `InvoiceBatchCreateIn.invoices` / `InvoiceBatchEntryIn.lines` | 50 / 200 | the financial write path; amplification is quadratic, so **both** factors are capped |
+| `InvoiceCreateIn.lines` | 200 | single-invoice twin of the batch line list — one `SELECT … FOR UPDATE` per line inside the sale-row lock; capped in the same commit so the batch route is not bounded while its sibling is not |
+| `LcAttachIn.sale_ids` | 200 | `/api/lcs/<id>/pis`: ~5 sequential round trips per id inside the LC lock, and each `pi_issued` sale is advanced to `lc_received` — a pipeline mutation, not just a link. `sorted(set(...))` de-duplicates but bounds nothing |
+  | `ProductionRunCreateIn.sale_ids` / `.invoice_ids` | 200 / 200 | `/produce`: one sequential round trip per id inside a transaction holding a pool slot (`recipes.py` `_owned_sale_ids`, per-invoice SELECT/INSERT/`FOR UPDATE`) |
+  | `ProductionRunCreateIn.recipes` | 50 | each row is a production run **plus its whole BOM** — `create_production_run` iterates `list_recipe_items` and does an `update_stock` + `production_run_items` insert per ingredient. 50 recipes x a 20-chemical BOM is ~1 000 ingredients in one transaction, and **`MAX_BATCH_ROWS` does not cover this route** (only `SaleBatchIn`/`InvoiceBatchCreateIn`) — tracked in `docs/plan.md` |
+  | `/api/reports/{generate,export}` `recipes` | `MAX_REPORT_RECIPES = 200` | read from the raw body (no Pydantic model), so enforced inline → 400 `{error, details:[{field, message}]}`; each entry becomes a stock query, and `export` writes a file. Also rejects a non-list body before `len()` |
+- **Product caps.** Per-factor caps bound the factors, not their product, and
+  `SaleCreateIn` nests inside `SaleBatchIn` — so 50 sales × 200 items is still ~10 000
+  sequential inserts in one transaction, from ~700 KB of body, well inside the Vercel
+  limit. `MAX_BATCH_ROWS = 2000` caps the total instead of shrinking the factors, via a
+  `field_validator` on the list field so the error still carries a named field in
+  `{error, details:[{field, message}]}`:
+  | Model | Counts | Error |
+  |---|---|---|
+  | `SaleBatchIn.sales` | `sum(len(sale.items))` | `at most 2000 total items per batch (got N); send fewer, larger PIs or use POST /api/sales` |
+  | `InvoiceBatchCreateIn.invoices` | `sum(len(invoice.lines))` | `at most 2000 total lines per batch (got N)` |
+  A realistic batch (20 PIs × 50 items = 1000) is unaffected.
+  `MAX_CONTENT_LENGTH` (50MB local / 4.5MB on Vercel) remains the outer body bound.
 - Tier 1: Login throttle (5 fails/**10 min** per username+IP, DB-backed).
   The window is a real 10-minute window since P1-18. Before it, `login_attempts.
   attempted_at` was written by `to_char(NOW(), 'YYYY-MM-DD HH:MM:SS')` — `MM`
@@ -871,12 +933,12 @@ commercial report is invoice-driven so an uninvoiced PI contributes 0 to gross s
 - **Fixtures**: `db` (clean conn), `client` (Flask test client), `admin_client`, `user_client`
 - **Bcrypt**: Rounds=4 in tests (vs 13 prod) for speed
 - **Rate Limits**: `RAAS_RATE_LIMITS=off` globally; targeted tests re-enable
-- **Coverage**: 740 passed / 8 skipped (auth, stock, upload, sales, invoices, production, LC, rate limits, PI parse, notifications, schema migration, upload-limit config) — includes `tests/test_invoices_production.py`, `tests/test_invoice_items.py`, `tests/test_schema_migration.py`
+- **Coverage**: 834 passed / 8 skipped (auth, stock, upload, sales, invoices, production, LC, rate limits, PI parse, notifications, schema migration, upload-limit config) — includes `tests/test_invoices_production.py`, `tests/test_invoice_items.py`, `tests/test_schema_migration.py`, `tests/test_authorization_roles.py` (89 tests: P1-A role classification + P1-B volume limits and payload caps).
 
 ### Frontend (Vitest)
 - **Environment**: jsdom
-- **Coverage**: 40 test files, 305 tests (utils, components, contexts, pages) — includes `InvoicePanel.test.jsx`, `InvoiceBuilderModal` coverage and the consolidated line composer
-- **Lint**: oxlint (0 errors, 0 warnings)
+- **Coverage**: 40 test files, 312 tests (utils, components, contexts, pages) — includes `InvoicePanel.test.jsx`, `InvoiceBuilderModal` coverage and the consolidated line composer
+- **Lint**: oxlint (0 errors, 16 pre-existing warnings)
 
 ### CI (`.github/workflows/ci.yml`)
 - **Runtime**: Python **3.12** pinned to the Vercel deploy runtime (Vercel defaults to 3.12; no `.python-version`/`pyproject.toml` overrides it) · Node 22 · postgres:16

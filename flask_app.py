@@ -402,13 +402,61 @@ def _limit_key():
 # Redis-backed limiter fallback: uses REDIS_URL if set, else in-memory
 _limiter_storage_uri = os.getenv("REDIS_URL", "memory://")
 
+# P1-B: the volume budget for a mutating write. AGENTS.md requires 15/min on
+# mutating/heavy routes; the read default below is the ceiling for reads, not a
+# licence for bulk writes. Operators sit at a lower trust boundary than admins,
+# so volume control is what carries that risk now that they can enter PIs.
+# Single definition: `limited()` binds this at def-time, so a second copy would
+# change nothing while appearing authoritative.
+WRITE_LIMIT_PER_MINUTE = 15
+
+# The read ceiling, kept as a named constant so the P1-B policy test can assert
+# the ordering without touching Flask-Limiter's private ``_default_limits``.
+READ_LIMIT_PER_MINUTE = 300
+
 limiter = Limiter(
     _limit_key,
     app=app,
-    default_limits=["300 per minute"],
+    default_limits=[f"{READ_LIMIT_PER_MINUTE} per minute"],
     storage_uri=_limiter_storage_uri,
     headers_enabled=True,
 )
+
+
+# P1-B: how many recipes one report request may name. These routes read the body
+# directly (no Pydantic model), so the bound is explicit here. Each entry becomes
+# a stock query, and `export` writes a file per request on top.
+MAX_REPORT_RECIPES = 200
+
+# P1-B: the per-factor caps above bound each list, not their product. Because
+# `SaleCreateIn` nests inside `SaleBatchIn`, 50 sales x 200 items is still ~10 000
+# sequential inserts in ONE transaction (one commit at the end) from ~700 KB of
+# body — well inside the 4.5 MB Vercel limit. A leaked *operator* API key, which
+# the operator backstop deliberately admits, could fire 15 such requests a minute
+# against a 15-session pooler. This budget caps the product instead of shrinking
+# the factors, so single-sale entry is unaffected.
+MAX_BATCH_ROWS = 2000
+
+
+def limited(n_per_minute: int = WRITE_LIMIT_PER_MINUTE):
+    """Rate-limit a view AND stamp the number for the policy test.
+
+    Flask-Limiter exposes nothing introspectable per route (it keys limits by
+    ``module.__qualname__`` in an internal manager, never on the view), so the
+    P1-B policy test would otherwise have to parse source — the brittle,
+    fail-open approach already rejected for the role model. Stamping keeps the
+    assertion reading ``app.url_map`` like everything else, immune to
+    reformatting, a second module, ``add_url_rule``, or a Blueprint.
+
+    The stamp is applied *after* ``limiter.limit`` returns, so if two limits are
+    ever stacked the outer (stricter-agnostic) stamp wins and cannot be
+    inverted by ``functools.wraps`` copying an inner one upward.
+    """
+    def deco(f):
+        wrapped = limiter.limit(f"{n_per_minute} per minute")(f)
+        setattr(wrapped, "_raas_limit", n_per_minute)
+        return wrapped
+    return deco
 
 
 @limiter.request_filter
@@ -900,7 +948,8 @@ def _req_float(data, field, default=0):
     return value
 
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    BaseModel, ConfigDict, Field, ValidationError, field_validator)
 
 
 class _StrippedModel(BaseModel):
@@ -1204,6 +1253,7 @@ def api_recipe_detail(name):
 
 @app.route("/api/recipes", methods=["POST"])
 @operator_or_admin_required
+@limited()
 def api_create_recipe():
     data = request.get_json() or {}
     try:
@@ -1241,6 +1291,7 @@ class RecipeCreateIn(_StrippedModel):
 
 @app.route("/api/recipes/<path:name>/items", methods=["POST"])
 @operator_or_admin_required
+@limited()
 def api_add_recipe_item(name):
     data = request.get_json() or {}
     try:
@@ -1297,6 +1348,7 @@ def api_delete_recipe(name):
 
 @app.route("/api/recipes/<path:name>", methods=["PUT"])
 @operator_or_admin_required
+@limited()
 def api_update_recipe(name):
     data = request.get_json() or {}
     total_qty = data.get("total_quantity")
@@ -1322,6 +1374,7 @@ def api_update_recipe(name):
 
 @app.route("/api/recipes/<path:name>/items/<chem>", methods=["PUT"])
 @operator_or_admin_required
+@limited()
 def api_update_recipe_item(name, chem):
     data = request.get_json() or {}
     try:
@@ -1350,7 +1403,7 @@ def api_update_recipe_item(name, chem):
 # ==================== API: UPLOAD & COMPARISON ====================
 @app.route("/api/upload", methods=["POST"])
 @operator_or_admin_required
-@limiter.limit("15 per minute")
+@limited()
 def api_upload():
     if "file" not in request.files:
         return jsonify({"error": "No file selected"}), 400
@@ -1466,7 +1519,7 @@ def api_delete_upload(upload_id):
 
 @app.route("/api/uploads/<int:upload_id>/approve", methods=["POST"])
 @admin_required
-@limiter.limit("15 per minute")
+@limited()
 def api_approve_upload(upload_id):
     from chem_stock import approve_upload, get_unmapped_rows
     conn = get_db()
@@ -1486,7 +1539,7 @@ def api_approve_upload(upload_id):
 
 @app.route("/api/uploads/<int:upload_id>/apply", methods=["POST"])
 @admin_required
-@limiter.limit("15 per minute")
+@limited()
 def api_apply_upload(upload_id):
     from chem_stock import adjust_stock_from_upload
     conn = get_db()
@@ -1532,7 +1585,7 @@ def api_upload_download(upload_id):
 
 
 @app.route("/api/uploads/<int:upload_id>/export")
-@limiter.limit("15 per minute")
+@limited()
 def api_upload_export(upload_id):
     conn = get_db()
     upload = conn.execute("SELECT * FROM uploads WHERE id = %s", (upload_id,)).fetchone()
@@ -1570,7 +1623,7 @@ def api_upload_export(upload_id):
 # ==================== API: REPORTS ====================
 @app.route("/api/reports/generate", methods=["POST"])
 @operator_or_admin_required
-@limiter.limit("15 per minute")
+@limited()
 def api_report_generate():
     data = request.get_json() or {}
     # recipes is now a list of {"company_id": int, "recipe_name": str}
@@ -1580,6 +1633,20 @@ def api_report_generate():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
+    # P1-B: cap BEFORE the per-item shape loop, so an oversized body is rejected
+    # without iterating it. `details` matches the shape Pydantic caps emit via
+    # `_validation_error_response` (AGENTS.md error contract).
+    if not isinstance(recipe_selections, list):
+        return jsonify({
+            "error": "Invalid payload",
+            "details": [{"field": "recipes",
+                         "message": "must be a list"}]}), 400
+    if len(recipe_selections) > MAX_REPORT_RECIPES:
+        return jsonify({
+            "error": "Invalid payload",
+            "details": [{
+                "field": "recipes",
+                "message": f"at most {MAX_REPORT_RECIPES} recipes per report"}]}), 400
     if not recipe_selections:
         return jsonify({"error": "No recipes selected"}), 400
 
@@ -1611,7 +1678,7 @@ def api_report_generate():
 
 @app.route("/api/reports/export", methods=["POST"])
 @operator_or_admin_required
-@limiter.limit("15 per minute")
+@limited()
 def api_report_export():
     data = request.get_json() or {}
     # recipes is now a list of {"company_id": int, "recipe_name": str}
@@ -1621,6 +1688,20 @@ def api_report_export():
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
 
+    # P1-B: cap BEFORE the per-item shape loop, so an oversized body is rejected
+    # without iterating it. `details` matches the shape Pydantic caps emit via
+    # `_validation_error_response` (AGENTS.md error contract).
+    if not isinstance(recipe_selections, list):
+        return jsonify({
+            "error": "Invalid payload",
+            "details": [{"field": "recipes",
+                         "message": "must be a list"}]}), 400
+    if len(recipe_selections) > MAX_REPORT_RECIPES:
+        return jsonify({
+            "error": "Invalid payload",
+            "details": [{
+                "field": "recipes",
+                "message": f"at most {MAX_REPORT_RECIPES} recipes per report"}]}), 400
     if not recipe_selections:
         return jsonify({"error": "No recipes selected"}), 400
 
@@ -1689,7 +1770,7 @@ def _bad_int_query_param(names):
 
 
 @app.route("/api/reports/live")
-@limiter.limit("15 per minute")
+@limited()
 @admin_required
 def api_commercial_report():
     conn = get_db()
@@ -1701,7 +1782,7 @@ def api_commercial_report():
 
 
 @app.route("/api/reports/live/filtered")
-@limiter.limit("15 per minute")
+@limited()
 @admin_required
 def api_commercial_report_filtered():
     """Filtered commercial report with pagination."""
@@ -1737,7 +1818,7 @@ def api_commercial_report_filtered():
 
 
 @app.route("/api/reports/live/summary")
-@limiter.limit("15 per minute")
+@limited()
 @admin_required
 def api_commercial_report_summary():
     """Period-aggregated commercial report summary."""
@@ -1769,7 +1850,7 @@ def api_commercial_report_summary():
 
 @app.route("/api/reports/live/export", methods=["GET", "POST"])
 @admin_required
-@limiter.limit("15 per minute")
+@limited()
 def api_commercial_report_export():
     if request.method == "POST":
         filters = request.get_json() or {}
@@ -1892,6 +1973,7 @@ def api_notifications():
 
 @app.route("/api/notifications/read", methods=["POST"])
 @operator_or_admin_required
+@limited()
 def api_notifications_read():
     ident = _human_identity()
     if not ident:
@@ -1935,6 +2017,7 @@ def api_unit_conversions():
 
 @app.route("/api/unit-conversions", methods=["POST"])
 @operator_or_admin_required
+@limited()
 def api_create_conversion():
     data = request.get_json() or {}
     from_unit = str(data.get("from_unit", "")).strip()
@@ -1973,10 +2056,15 @@ class ProductionRunCreateIn(_StrippedModel):
     material_number: str | None = None
     packing: str | None = None
     invoice_number: str | None = None
-    sale_ids: list[int] | None = None
-    invoice_ids: list[int] | None = None
+    # P1-B: bounded. Both id lists fan out to one sequential round trip per
+    # element inside a transaction holding a pool slot (recipes.py `_owned_sale_ids`,
+    # and the per-invoice SELECT/INSERT/lock). They were the larger fan-out on
+    # this route and shipped uncapped while the `recipes` rows below were capped.
+    sale_ids: list[int] | None = Field(default=None, max_length=200)
+    invoice_ids: list[int] | None = Field(default=None, max_length=200)
     # Multiple recipe rows for multi-recipe production
-    recipes: list[ProductionRecipeIn] | None = None
+    # P1-B: bounded. Each row becomes its own production-run insert.
+    recipes: list[ProductionRecipeIn] | None = Field(default=None, max_length=50)
 
 
 def _rollback(conn):
@@ -2019,6 +2107,7 @@ def _state_error_status(message):
 
 @app.route("/api/recipes/<path:name>/produce", methods=["POST"])
 @admin_required
+@limited()
 def api_produce_recipe(name):
     try:
         payload = ProductionRunCreateIn.model_validate(request.get_json() or {})
@@ -2152,16 +2241,33 @@ class InvoiceBatchLineIn(_StrippedModel):
 
 class InvoiceCreateIn(_StrippedModel):
     invoice_number: str = Field(min_length=1)
-    lines: Optional[list[InvoiceBatchLineIn]] = None
+    # P1-B: bounded. This is the single-invoice twin of `InvoiceBatchEntryIn.lines`
+    # (capped at 200); without the cap here the batch route is bounded and its
+    # sibling is not. One SELECT ... FOR UPDATE per line in
+    # `validate_invoice_lines`, held inside the sale-row lock.
+    lines: Optional[list[InvoiceBatchLineIn]] = Field(default=None, min_length=1, max_length=200)
 
 
 class InvoiceBatchEntryIn(_StrippedModel):
     invoice_number: str = Field(min_length=1)
-    lines: list[InvoiceBatchLineIn] = Field(min_length=1)
+    # P1-B: bounded. This is the financial write path and amplification is
+    # N invoices x M lines in one transaction, so both factors are capped.
+    lines: list[InvoiceBatchLineIn] = Field(min_length=1, max_length=200)
 
 
 class InvoiceBatchCreateIn(_StrippedModel):
-    invoices: list[InvoiceBatchEntryIn] = Field(min_length=1)
+    invoices: list[InvoiceBatchEntryIn] = Field(min_length=1, max_length=50)
+
+    @field_validator("invoices")
+    @classmethod
+    def _bound_total_rows(cls, invoices):
+        # Caps the *product*: 50 invoices x 200 lines is ~10 000 locked round trips
+        # in one transaction holding every `sale_items` row. See MAX_BATCH_ROWS.
+        total = sum(len(i.lines) for i in invoices)
+        if total > MAX_BATCH_ROWS:
+            raise ValueError(
+                f"at most {MAX_BATCH_ROWS} total lines per batch (got {total})")
+        return invoices
 
 
 class InvoiceBookIn(_StrippedModel):
@@ -2182,6 +2288,7 @@ class InvoicePayIn(_StrippedModel):
 
 @app.route("/api/sales/<int:sale_id>/invoices", methods=["POST"])
 @admin_required
+@limited()
 def api_create_invoice(sale_id):
     """Create a new invoice for a sale."""
     try:
@@ -2218,7 +2325,7 @@ def api_create_invoice(sale_id):
 
 @app.route("/api/sales/<int:sale_id>/invoices/batch", methods=["POST"])
 @admin_required
-@limiter.limit("15 per minute")
+@limited()
 def api_create_invoices_batch(sale_id):
     """Create N invoices in ONE transaction: any failure rolls back all."""
     try:
@@ -2276,6 +2383,7 @@ def _invoice_transition_error(conn, e):
 
 @app.route("/api/sales/<int:sale_id>/invoices/<int:invoice_id>/book", methods=["POST"])
 @admin_required
+@limited()
 def api_book_invoice(sale_id, invoice_id):
     try:
         payload = InvoiceBookIn.model_validate(request.get_json() or {})
@@ -2315,6 +2423,7 @@ def api_book_invoice(sale_id, invoice_id):
 
 @app.route("/api/sales/<int:sale_id>/invoices/<int:invoice_id>/ship", methods=["POST"])
 @admin_required
+@limited()
 def api_ship_invoice(sale_id, invoice_id):
     try:
         payload = InvoiceShipIn.model_validate(request.get_json() or {})
@@ -2343,6 +2452,7 @@ def api_ship_invoice(sale_id, invoice_id):
 
 @app.route("/api/sales/<int:sale_id>/invoices/<int:invoice_id>/pay", methods=["POST"])
 @admin_required
+@limited()
 def api_pay_invoice(sale_id, invoice_id):
     try:
         payload = InvoicePayIn.model_validate(request.get_json() or {})
@@ -2369,6 +2479,7 @@ def api_pay_invoice(sale_id, invoice_id):
 
 @app.route("/api/sales/<int:sale_id>/invoices/<int:invoice_id>", methods=["DELETE"])
 @admin_required
+@limited()
 def api_void_invoice(sale_id, invoice_id):
     """Void an invoice row (even paid/shipped — the remediation path).
 
@@ -2480,7 +2591,11 @@ class SaleHeaderIn(_StrippedModel):
 
 class SaleCreateIn(BaseModel):
     sale: SaleHeaderIn
-    items: list[SaleItemIn] = Field(min_length=1)
+    # P1-B: bounded. This is the route P1-A opened to operators, and the operator
+    # backstop deliberately admits API keys — so an unbounded item list is
+    # reachable by a leaked low-trust credential. A rate limit alone does not
+    # help: 15/min x unbounded rows is still tens of thousands of inserts.
+    items: list[SaleItemIn] = Field(min_length=1, max_length=200)
 
 
 def _validation_error_response(e: ValidationError):
@@ -2499,7 +2614,7 @@ def _duplicate_pi_warning(conn, pi_number: str):
 
 @app.route("/api/sales/parse", methods=["POST"])
 @operator_or_admin_required
-@limiter.limit("15 per minute")
+@limited()
 def api_parse_pi():
     """Parse an uploaded PI document (.pdf or .docx) in-memory and return extracted data."""
     if "file" not in request.files:
@@ -2535,7 +2650,7 @@ def api_list_sales():
 
 
 @app.route("/api/sales/export")
-@limiter.limit("15 per minute")
+@limited()
 def api_sales_export():
     import csv
     import io
@@ -2582,6 +2697,7 @@ def api_get_sale(sale_id):
 
 @app.route("/api/sales", methods=["POST"])
 @operator_or_admin_required
+@limited()
 def api_create_sale():
     try:
         payload = SaleCreateIn(**(request.get_json() or {}))
@@ -2623,12 +2739,16 @@ class SaleFullItemIn(_StrippedModel):
 
 class SaleFullUpdateIn(BaseModel):
     header: SaleHeaderIn
-    items: list[SaleFullItemIn] = Field(min_length=1)
-    removedIds: list[int] = Field(default_factory=list)
+    # P1-B: bounded. `update_sale_full` snapshots the old items for audit, then
+    # replaces this list and deletes one row per `removedIds` entry — all inside
+    # a transaction holding the money-bearing `sales`/`sale_items` locks.
+    items: list[SaleFullItemIn] = Field(min_length=1, max_length=200)
+    removedIds: list[int] = Field(default_factory=list, max_length=200)
 
 
 @app.route("/api/sales/<int:sale_id>", methods=["PUT"])
 @admin_required
+@limited()
 def api_update_sale(sale_id):
     raw = request.get_json() or {}
     if "items" in raw:
@@ -3133,7 +3253,11 @@ class LcUpdateIn(BaseModel):
 
 
 class LcAttachIn(_StrippedModel):
-    sale_ids: list[int] = Field(min_length=1)
+    # P1-B: bounded, matching `ProductionRunCreateIn.sale_ids`. `attach_pis`
+    # costs ~5 sequential round trips per id (SELECT FOR UPDATE, UPDATE, audit,
+    # and a stage-history + SALE_MOVE pair for `pi_issued` sales) inside the LC's
+    # own lock. `sorted(set(...))` de-duplicates but bounds nothing.
+    sale_ids: list[int] = Field(min_length=1, max_length=200)
 
 
 class LcMoveIn(_StrippedModel):
@@ -3142,7 +3266,22 @@ class LcMoveIn(_StrippedModel):
 
 
 class SaleBatchIn(BaseModel):
-    sales: list[SaleCreateIn] = Field(min_length=1)
+    # P1-B: bounded. Operator-reachable since the class split, and one request
+    # writes N sales x M items in a single long transaction — against a Supabase
+    # pooler that caps out at 15 sessions, an unbounded body is a row amplifier.
+    # POST /api/sales (1 sale) stays the path for anything larger.
+    sales: list[SaleCreateIn] = Field(min_length=1, max_length=50)
+
+    @field_validator("sales")
+    @classmethod
+    def _bound_total_rows(cls, sales):
+        # Caps the *product*, not just each factor — see MAX_BATCH_ROWS.
+        total = sum(len(s.items) for s in sales)
+        if total > MAX_BATCH_ROWS:
+            raise ValueError(
+                f"at most {MAX_BATCH_ROWS} total items per batch (got {total}); "
+                f"send fewer, larger PIs or use POST /api/sales")
+        return sales
 
 
 class InvoiceItemCreateIn(_StrippedModel):
@@ -3167,7 +3306,7 @@ def api_list_lcs():
 
 @app.route("/api/lcs", methods=["POST"])
 @admin_required
-@limiter.limit("15 per minute")
+@limited()
 def api_create_lc():
     try:
         payload = LcCreateIn.model_validate(request.get_json() or {})
@@ -3312,7 +3451,7 @@ def api_invoice_readiness(invoice_id):
 
 @app.route("/api/lcs/<int:lc_id>", methods=["PUT"])
 @admin_required
-@limiter.limit("15 per minute")
+@limited()
 def api_update_lc_record(lc_id):
     try:
         payload = LcUpdateIn.model_validate(request.get_json() or {})
@@ -3340,7 +3479,7 @@ def api_update_lc_record(lc_id):
 
 @app.route("/api/lcs/<int:lc_id>", methods=["DELETE"])
 @admin_required
-@limiter.limit("15 per minute")
+@limited()
 def api_delete_lc_record(lc_id):
     import psycopg as _psycopg
     conn = get_db()
@@ -3388,7 +3527,7 @@ def api_delete_lc_record(lc_id):
 
 @app.route("/api/lcs/<int:lc_id>/pis", methods=["POST"])
 @admin_required
-@limiter.limit("15 per minute")
+@limited()
 def api_attach_pis(lc_id):
     try:
         payload = LcAttachIn.model_validate(request.get_json() or {})
@@ -3414,7 +3553,7 @@ def api_attach_pis(lc_id):
 
 @app.route("/api/lcs/<int:lc_id>/pis/<int:sale_id>", methods=["DELETE"])
 @admin_required
-@limiter.limit("15 per minute")
+@limited()
 def api_detach_pi(lc_id, sale_id):
     conn = get_db()
     try:
@@ -3431,7 +3570,7 @@ def api_detach_pi(lc_id, sale_id):
 
 @app.route("/api/lcs/<int:lc_id>/move", methods=["POST"])
 @admin_required
-@limiter.limit("15 per minute")
+@limited()
 def api_move_lc(lc_id):
     try:
         payload = LcMoveIn.model_validate(request.get_json() or {})
@@ -3525,7 +3664,7 @@ def api_move_lc(lc_id):
 
 @app.route("/api/sales/batch", methods=["POST"])
 @operator_or_admin_required
-@limiter.limit("15 per minute")
+@limited()
 def api_create_sales_batch():
     """Create N PIs in ONE transaction: any failure rolls back everything.
 
@@ -3604,7 +3743,7 @@ def api_create_sales_batch():
 
 @app.route("/api/invoices/<int:invoice_id>/items", methods=["POST"])
 @admin_required
-@limiter.limit("15 per minute")
+@limited()
 def api_create_invoice_item(invoice_id):
     """Add an invoice line. unit_price is inherited server-side from the PI
     line; quantities beyond the PI remainder are refused with 409."""

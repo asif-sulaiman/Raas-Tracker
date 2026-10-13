@@ -4,7 +4,7 @@ import React from 'react';
 import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { AuthProvider } from '../../context/AuthContext';
-import MultiPICreateModal from './MultiPICreateModal';
+import MultiPICreateModal, { MAX_DOCS } from './MultiPICreateModal';
 
 vi.mock('sonner', () => {
   const toastFn = Object.assign(vi.fn(), {
@@ -144,5 +144,58 @@ describe('MultiPICreateModal batch wiring', () => {
     expect(await screen.findByText(/Nothing was saved/)).toBeTruthy();
     await waitFor(() => expect(posts).toHaveLength(1));
     expect(onSaved).not.toHaveBeenCalled();
+  });
+  // P1-B: the server caps a batch at 50 sales. Mirror the ceiling client-side so
+  // the user cannot assemble a request that will hard-400 on save.
+  describe('batch document cap', () => {
+    async function addDocs(n) {
+      const add = screen.getByRole('button', { name: 'Add PI document' });
+      for (let i = 0; i < n; i += 1) {
+        fireEvent.click(add);
+      }
+    }
+
+    it('disables "Add PI document" once the cap is reached', async () => {
+      renderModal();
+      await screen.findByLabelText('Company');
+
+      // One document exists on open, so MAX_DOCS-1 further clicks reach the cap.
+      await addDocs(MAX_DOCS - 1);
+
+      const add = screen.getByRole('button', { name: 'Add PI document' });
+      expect(add).toBeTruthy();
+      expect(add.disabled).toBe(true);
+      expect(add.getAttribute('title')).toContain(String(MAX_DOCS));
+      // Rendering 50 full document cards is legitimately slow; the default 5s is
+      // not enough once the suite runs many files in parallel.
+    }, 30000);
+
+    it('keeps the button enabled below the cap', async () => {
+      renderModal();
+      await screen.findByLabelText('Company');
+
+      await addDocs(2);
+
+      const add = screen.getByRole('button', { name: 'Add PI document' });
+      expect(add.disabled).toBe(false);
+      expect(add.getAttribute('title')).toBeNull();
+    });
+
+    it('never assembles more documents than the cap allows', async () => {
+      const posts = [];
+      renderModal({ postsOpts: { posts } });
+      await screen.findByLabelText('Company');
+
+      // Click well past the cap, including while the button is already disabled.
+      await addDocs(MAX_DOCS + 10);
+
+      // The save button counts the documents; it must never exceed the cap, and
+      // no document past the cap may exist in the DOM at all.
+      const save = screen.getByRole('button', { name: /Save \d+ PIs to PI Issued/ });
+      expect(save.textContent).toMatch(new RegExp(`Save ${MAX_DOCS} PIs`));
+      expect(screen.getByLabelText(`PI number document ${MAX_DOCS}`)).toBeTruthy();
+      expect(screen.queryByLabelText(`PI number document ${MAX_DOCS + 1}`)).toBeNull();
+      expect(posts).toHaveLength(0);
+    }, 30000);
   });
 });

@@ -15,6 +15,17 @@ const rowInputCls =
   'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1 text-xs text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
 
 let seq = 0;
+// P1-B: POST /api/sales/batch caps a batch at 50 sales (and at MAX_BATCH_ROWS
+// total items server-side). Mirror the DOCUMENT ceiling here so the user cannot
+// build a request the server will reject on document count.
+//
+// Only the document count is mirrored. The per-PI item cap (200) and the
+// total-row budget are not, so an over-long PI still surfaces as a server 400 in
+// the error banner. Tracked as scope, not closed.
+export const MAX_DOCS = 50;
+const BATCH_CAP_MESSAGE =
+  `A batch is capped at ${MAX_DOCS} PI documents (server limit). Split larger runs into separate batches.`;
+
 const nextKey = (prefix) => `${prefix}-${Date.now()}-${seq++}`;
 
 function blankItem() {
@@ -118,6 +129,10 @@ export default function MultiPICreateModal({ isOpen, initialDocs, onClose, onSav
   };
 
   const addDoc = () => {
+    if (docs.length >= MAX_DOCS) {
+      setBatchError({ message: BATCH_CAP_MESSAGE });
+      return;
+    }
     setDocs((prev) => [...prev, blankDoc()]);
   };
 
@@ -152,6 +167,11 @@ export default function MultiPICreateModal({ isOpen, initialDocs, onClose, onSav
     const errors = {};
     if (companies.length > 0 && companyId === '') {
       setBatchError({ message: 'Select a company (register it on the Companies page first)' });
+      return null;
+    }
+    // Fail before the request rather than hard-400ing on the server's cap.
+    if (docs.length > MAX_DOCS) {
+      setBatchError({ message: BATCH_CAP_MESSAGE });
       return null;
     }
     docs.forEach((d, idx) => {
@@ -484,7 +504,15 @@ export default function MultiPICreateModal({ isOpen, initialDocs, onClose, onSav
           ))}
         </div>
 
-        <Button variant="secondary" size="sm" icon={Plus} onClick={addDoc} className="w-full justify-center">
+        <Button
+          variant="secondary"
+          size="sm"
+          icon={Plus}
+          onClick={addDoc}
+          disabled={docs.length >= MAX_DOCS}
+          title={docs.length >= MAX_DOCS ? `Batch capped at ${MAX_DOCS} PI documents` : undefined}
+          className="w-full justify-center"
+        >
           Add PI document
         </Button>
 
