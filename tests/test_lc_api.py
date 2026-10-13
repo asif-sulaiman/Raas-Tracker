@@ -589,9 +589,17 @@ def test_linked_sale_advance_refused_via_api(admin_client, db):
 
 
 # --------------------------------------------------------------------------- #
-# auth: mutating routes are admin-only
+# auth: financial routes are admin-only; PI entry is operator-class
 # --------------------------------------------------------------------------- #
 def test_mutating_routes_require_admin(user_client, db):
+    """LCs stay admin-only; bulk PI creation is now operator-class (P1-A).
+
+    ``POST /api/sales/batch`` used to be asserted 403 here. It was demoted to
+    the operator class because it is identical to ``POST /api/sales`` in intent
+    and blast radius: both create a PI at ``pi_issued``, and neither can reach
+    money without an admin action later (attach PI -> LC -> create invoice ->
+    book -> pay).
+    """
     tag = _tag()
     co = db.execute(
         "INSERT INTO companies (name) VALUES (%s) RETURNING id",
@@ -600,7 +608,14 @@ def test_mutating_routes_require_admin(user_client, db):
     assert user_client.post(
         "/api/lcs",
         json={"company_id": co, "lc_number": f"LC-AU-{tag}"}).status_code == 403
+    # Operator: a non-admin may enter PIs in bulk, as it may one at a time.
+    assert user_client.post("/api/sales",
+                            json={"sale": {"pi_number": f"PI-SGL-{tag}",
+                                           "company_id": co},
+                                  "items": [{"product_name": f"SProd-{tag}",
+                                             "quantity": 5, "unit_price": 10}]}
+                            ).status_code == 201
     assert user_client.post("/api/sales/batch",
-                            json=_batch_payload(tag, co)).status_code == 403
+                            json=_batch_payload(tag, co)).status_code == 201
     # reads stay open to authenticated non-admins
     assert user_client.get("/api/lcs").status_code == 200

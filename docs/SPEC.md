@@ -754,9 +754,71 @@ future call sites are covered without opting in:
 - API keys → per-key rate limit (300/min, DB-backed)
 - `must_change_password==1` human sessions → 403 `password change required` on all `/api/*` except `PUT /api/auth/password`, `GET /api/auth/me`, `POST /api/auth/logout` (API keys exempt)
 
+### Write Role Model (P1-A)
+
+`_gate_api` enforces the **admin role only** for `/api/users` and `/api/keys`. Every
+other route's privilege comes from its own decorator, so write authorization used to be
+**opt-in**: a mutating route with no decorator was reachable by any signed-in `user`.
+
+Every mutating route now **declares** one of two classes:
+
+| Class | Decorator | Who may call |
+|---|---|---|
+| **admin** | `@admin_required` | human admin only. **API keys never pass** (`type` must be `human`). |
+| **operator** | `@operator_or_admin_required` | any authenticated identity — human admin, human `user`, **or API key** |
+
+The operator decorator is **declarative, not restrictive**. It exists so a route's class
+is stated rather than implied by an omission, and so a future tightening has one place
+to land. It deliberately does *not* exclude API keys:
+`tests/test_stock_audit.py::test_unit_conversion_audit_records_the_api_key_actor`
+asserts an `X-API-Key` caller reaches `POST /api/unit-conversions` and is audited as
+`api-key:<name>`. Anonymous callers are still refused — `_gate_api` returns 401 first,
+and the decorator's own `None`-identity guard is a backstop.
+
+`_ADMIN_PATHS` is retained as **defence in depth** — deliberately *not* load-bearing.
+Every mutating route carries its own role decorator, and so do the two reads that
+previously depended on the prefix alone (`GET /api/users`, `GET /api/keys`), so
+removing the tuple must change nothing.
+`tests/test_authorization_roles.py` reads the declared class from `app.url_map`
+(each decorator stamps `_raas_role` on its wrapper) rather than parsing source, so a
+reformat, a new module, `add_url_rule`, or a Blueprint cannot make the check drift
+from what Flask actually routes.
+
+#### Operator routes (11)
+
+| Method | Path |
+|---|---|
+| POST | `/api/sales` |
+| POST | `/api/sales/batch` |
+| POST | `/api/sales/parse` |
+| POST | `/api/recipes` |
+| POST | `/api/recipes/<path:name>/items` |
+| PUT | `/api/recipes/<path:name>` |
+| PUT | `/api/recipes/<path:name>/items/<chem>` |
+| POST | `/api/upload` |
+| POST | `/api/unit-conversions` |
+| POST | `/api/reports/generate` |
+| POST | `/api/reports/export` |
+| POST | `/api/notifications/read` |
+
+`POST /api/sales/batch` was demoted from admin to operator: identical intent and blast
+radius to `POST /api/sales` (both create a PI at `pi_issued`; neither can reach money
+without an admin action later — attach PI → LC → create invoice → book → pay), and the
+commercial report is invoice-driven so an uninvoiced PI contributes 0 to gross sales.
+
+#### Open decisions (deliberately unchanged, not yet ratified)
+
+| Asymmetry | Current | Status |
+|---|---|---|
+| Recipe delete vs edit | operator may `PUT` yield/water %, may **not** `DELETE` (cascades into `production_run_items`) | kept admin; needs a decision |
+| Appending sale items | `POST /api/sales` (operator) inserts `sale_items` inline, but `POST /api/sales/<id>/items` is admin | kept admin; `tests/test_consistency_lock.py:94` pins the 403 |
+
 ### Rate Limiting (Flask-Limiter)
-- Default: 300/min per identity (user/key/IP)
-- Tier 2: `/api/upload`, `/api/uploads/*/approve|apply|export`, `/api/reports/*`, `/api/sales/parse`, `/api/sales/export` → 15/min
+- Default: 300/min per identity (user/key/IP) — applies to **every** route, so
+  `POST /api/sales` is bounded at 300/min, not unlimited. P1-B tightens the
+  mutating operator routes to 15/min.
+- Tier 2 (15/min): `/api/upload`, `/api/uploads/*/approve|apply`, `/api/reports/generate|export`,
+  `/api/reports/live/export`, `/api/sales/parse`, `/api/sales/batch`
 - Tier 1: Login throttle (5 fails/**10 min** per username+IP, DB-backed).
   The window is a real 10-minute window since P1-18. Before it, `login_attempts.
   attempted_at` was written by `to_char(NOW(), 'YYYY-MM-DD HH:MM:SS')` — `MM`

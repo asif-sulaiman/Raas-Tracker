@@ -161,15 +161,13 @@ _PUBLIC_API = {
 }
 
 # Human-admin-only paths. API keys never pass these (scripts can't manage users).
+#
+# This prefix list is defence in depth, NOT the primary gate. Every mutating
+# route now carries its own @admin_required / operator decorator, and so do the
+# two reads that used to depend on this prefix alone (GET /api/users,
+# GET /api/keys). Removing the tuple must therefore change nothing — if it ever
+# does, a route lost its own gate.
 _ADMIN_PATHS = ("/api/users", "/api/keys")
-
-
-def _require_admin():
-    """403 unless the caller is a human admin. Returns None when allowed."""
-    ident = getattr(g, "current_identity", None) or {}
-    if ident.get("type") != "human" or ident.get("role") != "admin":
-        return jsonify({"error": "admin required"}), 403
-    return None
 
 
 def _key_rate_ok(key_id: int) -> bool:
@@ -457,6 +455,40 @@ def admin_required(f):
         if ident.get("type") != "human" or ident.get("role") != "admin":
             return jsonify({"error": "admin required"}), 403
         return f(*args, **kwargs)
+    # Machine-readable role stamp. tests/test_authorization_roles.py reads this
+    # via app.url_map rather than parsing source, so the check survives a
+    # reformat, a new module, add_url_rule, or a Blueprint.
+    setattr(decorated, "_raas_role", "admin")
+    return decorated
+
+
+def operator_or_admin_required(f):
+    """Decorator: operational data entry — any authenticated identity.
+
+    Marks a route as the operator class so its privilege is *declared* at the
+    route instead of implied by the absence of a decorator. Write
+    authorization used to be opt-in: ``_gate_api`` enforces the admin role only
+    for ``_ADMIN_PATHS``, so a mutating route with no decorator was reachable by
+    any signed-in ``user`` by default.
+
+    This deliberately does NOT exclude API keys.
+    ``tests/test_stock_audit.py::test_unit_conversion_audit_records_the_api_key_actor``
+    asserts an ``X-API-Key`` caller reaches ``/api/unit-conversions`` and is
+    audited as ``api-key:<name>``. Narrowing this would silently revoke a
+    documented capability, so the decorator asserts presence of a *known*
+    identity type and leaves the operator/admin split to ``@admin_required``.
+
+    The type list is explicit rather than "any truthy dict" so a future identity
+    kind (OAuth, a service account, a cron identity) fails CLOSED here instead
+    of being waved through by default.
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        ident = getattr(g, "current_identity", None)
+        if not ident or ident.get("type") not in ("human", "api-key"):
+            return jsonify({"error": "authentication required"}), 401
+        return f(*args, **kwargs)
+    setattr(decorated, "_raas_role", "operator")
     return decorated
 
 
@@ -695,6 +727,7 @@ def api_reset_password():
 
 # ==================== API: USERS (human-admin only) ====================
 @app.route("/api/users")
+@admin_required
 def api_list_users():
     conn = get_db()
     users = list_users(conn)
@@ -703,6 +736,7 @@ def api_list_users():
 
 
 @app.route("/api/users", methods=["POST"])
+@admin_required
 def api_create_user():
     data = request.get_json() or {}
     conn = get_db()
@@ -717,6 +751,7 @@ def api_create_user():
 
 
 @app.route("/api/users/<int:user_id>", methods=["DELETE"])
+@admin_required
 def api_delete_user(user_id):
     conn = get_db()
     try:
@@ -810,6 +845,7 @@ def api_admin_reset_token(user_id):
 
 # ==================== API: KEYS (human-admin only) ====================
 @app.route("/api/keys")
+@admin_required
 def api_list_keys():
     conn = get_db()
     keys = list_api_keys(conn)
@@ -818,6 +854,7 @@ def api_list_keys():
 
 
 @app.route("/api/keys", methods=["POST"])
+@admin_required
 def api_create_key():
     data = request.get_json() or {}
     ident = getattr(g, "current_identity", None) or {}
@@ -834,6 +871,7 @@ def api_create_key():
 
 
 @app.route("/api/keys/<int:key_id>", methods=["DELETE"])
+@admin_required
 def api_revoke_key(key_id):
     conn = get_db()
     ok = revoke_api_key(conn, key_id)
@@ -1050,10 +1088,8 @@ class ChemicalCreateIn(_StrippedModel):
 
 
 @app.route("/api/chemicals", methods=["POST"])
+@admin_required
 def api_add_chemical():
-    denied = _require_admin()
-    if denied:
-        return denied
     try:
         payload = ChemicalCreateIn.model_validate(request.get_json() or {})
     except ValidationError as e:
@@ -1085,10 +1121,8 @@ def api_add_chemical():
 
 
 @app.route("/api/chemicals/update", methods=["POST"])
+@admin_required
 def api_update_chemical():
-    denied = _require_admin()
-    if denied:
-        return denied
     data = request.get_json() or {}
     try:
         delta = _req_float(data, "delta", 0)
@@ -1109,10 +1143,8 @@ def api_update_chemical():
 
 
 @app.route("/api/chemicals/reorder", methods=["PUT"])
+@admin_required
 def api_set_reorder_level():
-    denied = _require_admin()
-    if denied:
-        return denied
     data = request.get_json() or {}
     name = str(data.get("name", "")).strip()
     if not name:
@@ -1171,6 +1203,7 @@ def api_recipe_detail(name):
 
 
 @app.route("/api/recipes", methods=["POST"])
+@operator_or_admin_required
 def api_create_recipe():
     data = request.get_json() or {}
     try:
@@ -1207,6 +1240,7 @@ class RecipeCreateIn(_StrippedModel):
 
 
 @app.route("/api/recipes/<path:name>/items", methods=["POST"])
+@operator_or_admin_required
 def api_add_recipe_item(name):
     data = request.get_json() or {}
     try:
@@ -1262,6 +1296,7 @@ def api_delete_recipe(name):
 
 
 @app.route("/api/recipes/<path:name>", methods=["PUT"])
+@operator_or_admin_required
 def api_update_recipe(name):
     data = request.get_json() or {}
     total_qty = data.get("total_quantity")
@@ -1286,6 +1321,7 @@ def api_update_recipe(name):
 
 
 @app.route("/api/recipes/<path:name>/items/<chem>", methods=["PUT"])
+@operator_or_admin_required
 def api_update_recipe_item(name, chem):
     data = request.get_json() or {}
     try:
@@ -1313,6 +1349,7 @@ def api_update_recipe_item(name, chem):
 
 # ==================== API: UPLOAD & COMPARISON ====================
 @app.route("/api/upload", methods=["POST"])
+@operator_or_admin_required
 @limiter.limit("15 per minute")
 def api_upload():
     if "file" not in request.files:
@@ -1532,6 +1569,7 @@ def api_upload_export(upload_id):
 
 # ==================== API: REPORTS ====================
 @app.route("/api/reports/generate", methods=["POST"])
+@operator_or_admin_required
 @limiter.limit("15 per minute")
 def api_report_generate():
     data = request.get_json() or {}
@@ -1572,6 +1610,7 @@ def api_report_generate():
 
 
 @app.route("/api/reports/export", methods=["POST"])
+@operator_or_admin_required
 @limiter.limit("15 per minute")
 def api_report_export():
     data = request.get_json() or {}
@@ -1852,6 +1891,7 @@ def api_notifications():
 
 
 @app.route("/api/notifications/read", methods=["POST"])
+@operator_or_admin_required
 def api_notifications_read():
     ident = _human_identity()
     if not ident:
@@ -1894,6 +1934,7 @@ def api_unit_conversions():
 
 
 @app.route("/api/unit-conversions", methods=["POST"])
+@operator_or_admin_required
 def api_create_conversion():
     data = request.get_json() or {}
     from_unit = str(data.get("from_unit", "")).strip()
@@ -2457,6 +2498,7 @@ def _duplicate_pi_warning(conn, pi_number: str):
 
 
 @app.route("/api/sales/parse", methods=["POST"])
+@operator_or_admin_required
 @limiter.limit("15 per minute")
 def api_parse_pi():
     """Parse an uploaded PI document (.pdf or .docx) in-memory and return extracted data."""
@@ -2539,6 +2581,7 @@ def api_get_sale(sale_id):
 
 
 @app.route("/api/sales", methods=["POST"])
+@operator_or_admin_required
 def api_create_sale():
     try:
         payload = SaleCreateIn(**(request.get_json() or {}))
@@ -3481,10 +3524,15 @@ def api_move_lc(lc_id):
 
 
 @app.route("/api/sales/batch", methods=["POST"])
-@admin_required
+@operator_or_admin_required
 @limiter.limit("15 per minute")
 def api_create_sales_batch():
-    """Create N PIs in ONE transaction: any failure rolls back everything."""
+    """Create N PIs in ONE transaction: any failure rolls back everything.
+
+    Operator-class: identical to ``POST /api/sales`` in intent and blast radius
+    (both create a PI at ``pi_issued``; neither can reach money without an admin
+    action later), so it is not admin-gated.
+    """
     try:
         payload = SaleBatchIn.model_validate(request.get_json() or {})
     except ValidationError as e:
