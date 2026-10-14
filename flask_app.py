@@ -2678,8 +2678,17 @@ def api_production_source():
 
 class SaleItemIn(_StrippedModel):
     product_name: str = Field(min_length=1)
-    quantity: float = Field(ge=0, allow_inf_nan=False)
-    unit_price: float = Field(ge=0, allow_inf_nan=False)
+    # Phase 2-B: `gt=0`, not `ge=0`. A sale line is money owed; a zero or
+    # negative quantity/price is not a line, it is a rounding accident, and it
+    # is what the PI parser emits when it cannot find the price column. The
+    # service layer enforces the same rule (sales._positive_values) — this
+    # bound is what turns the rejection into AGENTS.md's error contract,
+    # 400 {error, details:[{field, message}]}, instead of an unhandled
+    # ValueError escaping api_create_sale as a 500. It is the ONLY wall on
+    # /api/sales/batch, which has its own inline INSERT and never calls
+    # add_sale.
+    quantity: float = Field(gt=0, allow_inf_nan=False)
+    unit_price: float = Field(gt=0, allow_inf_nan=False)
     unit: str = Field(default="KG", min_length=1)
     item_no: str | None = None
 
@@ -2837,8 +2846,13 @@ class SaleHeaderPatchIn(_StrippedModel):
 class SaleFullItemIn(_FiniteModel):
     id: int | None = None
     product_name: str = Field(min_length=1)
-    quantity: float = Field(ge=0)
-    unit_price: float = Field(ge=0)
+    # Phase 2-B: `gt=0`, matching SaleItemIn and the service layer's rule —
+    # see SaleItemIn for why. `allow_inf_nan=False` is inherited from
+    # `_FiniteModel`; Pydantic runs that check first and short-circuits, so a
+    # non-finite value still produces exactly one `finite_number` error rather
+    # than also tripping `greater_than`.
+    quantity: float = Field(gt=0)
+    unit_price: float = Field(gt=0)
     unit: str = Field(default="KG", min_length=1)
 
 
@@ -3094,9 +3108,15 @@ class SaleItemPatchIn(_FiniteModel):
     # finite guard. It also picks up `str_strip_whitespace`, which this model
     # alone never had — every sibling item model already strips, and
     # `min_length=1` on an unstripped `"  "` is a blank product name.
+    #
+    # Phase 2-B: `gt=0` for the same reason as SaleItemIn. Without it this
+    # model would let a 0 through and the service's ValueError would surface
+    # as a bare `{"error": ...}` 400 from api_update_item, while every other
+    # sale-line route answers with a `details` array — the same rejection,
+    # two different error shapes, depending on the route the client picked.
     product_name: str | None = Field(default=None, min_length=1)
-    quantity: float | None = Field(default=None, ge=0)
-    unit_price: float | None = Field(default=None, ge=0)
+    quantity: float | None = Field(default=None, gt=0)
+    unit_price: float | None = Field(default=None, gt=0)
     unit: str | None = Field(default=None, min_length=1)
 
 

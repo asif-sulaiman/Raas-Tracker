@@ -11,6 +11,7 @@ from typing import Optional, List, Dict, Any, Union
 
 from .db import get_connection, logger
 from .stock import get_all_chemicals, update_stock
+from ._numeric import finite_values
 from .uploads import csv_safe
 
 def add_recipe(conn: psycopg.Connection, name: str, total_quantity: float = 1, water_percentage: float = 0,
@@ -28,6 +29,11 @@ def add_recipe(conn: psycopg.Connection, name: str, total_quantity: float = 1, w
     Returns:
         True if created, False if recipe already exists
     """
+    # Phase 2-B: `water_percentage < 0 or > 100` is False for nan, and
+    # total_quantity has no check at all. `cli.py` reaches both with
+    # `float(sys.argv[...])`, and a poisoned yield_qty / percentage becomes a
+    # frozen formula snapshot every later production run multiplies by.
+    finite_values(total_quantity, water_percentage)
     if water_percentage < 0 or water_percentage > 100:
         raise ValueError("water_percentage must be between 0 and 100")
     name = (name or "").strip()
@@ -155,6 +161,9 @@ def add_recipe_item(conn: psycopg.Connection, company_id: int, recipe_name: str,
         return False
     
     required_qty_per_unit = percentage / 100.0
+    # Phase 2-B: `percentage < 0` is False for both nan and inf, and the
+    # percentage becomes `recipe_items.required_qty_per_unit`.
+    finite_values(percentage)
     if percentage < 0:
         raise ValueError("percentage must be 0 or greater")
     _check_percentage_total(conn, recipe["id"], recipe.get("water_percentage") or 0,
@@ -253,6 +262,8 @@ def update_recipe_item(conn: psycopg.Connection, company_id: int, recipe_name: s
         return False
 
     new_qty_per_unit = new_percentage / 100.0
+    # Phase 2-B, same columns as add_recipe_item.
+    finite_values(new_percentage)
     if new_percentage < 0:
         raise ValueError("percentage must be 0 or greater")
     current_total = _items_percentage_total(conn, recipe["id"])
@@ -354,6 +365,9 @@ def update_recipe(conn: psycopg.Connection, company_id: int, name: str,
     
     updates = []
     params = []
+    # Phase 2-B: total_quantity had no check at all, and the water range check
+    # below is False for nan.
+    finite_values(total_quantity, water_percentage)
     if total_quantity is not None:
         updates.append("total_quantity = %s")
         params.append(total_quantity)

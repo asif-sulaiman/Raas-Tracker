@@ -435,7 +435,7 @@ export default function MultiPICreateModal({ isOpen, initialDocs, onClose, onSav
                               <input
                                 aria-label={`Quantity document ${docIdx + 1} row ${rowIdx + 1}`}
                                 type="number"
-                                min="0"
+                                min="0.001"
                                 step="any"
                                 value={item.quantity}
                                 onChange={(e) =>
@@ -464,7 +464,7 @@ export default function MultiPICreateModal({ isOpen, initialDocs, onClose, onSav
                               <input
                                 aria-label={`Unit price document ${docIdx + 1} row ${rowIdx + 1}`}
                                 type="number"
-                                min="0"
+                                min="0.001"
                                 step="any"
                                 value={item.unit_price}
                                 onChange={(e) =>

@@ -11,6 +11,7 @@ from typing import Optional, List, Dict, Any, Union
 
 from .audit import log_audit_action
 from .notifications import notify_sale_stage, clear_dedupe, clear_maturity_dedupe
+from ._numeric import finite_values as _finite
 
 
 def _now_str() -> str:
@@ -38,6 +39,42 @@ class InvoicedLineConflict(ValueError):
     """
 
 
+def _positive_values(pairs: List[tuple]) -> None:
+    """Raise ValueError unless every (field, value) pair is strictly positive.
+
+    Phase 2-B, the **sign** rule on the sale-line money columns. Deliberate
+    reversal of the first pass, which kept ``0`` and negatives legal here on the
+    reasoning that a zero-priced quotation line ("price TBD") is legitimate.
+    That reasoning was put to the user with its cost stated explicitly, and the
+    strict rule was chosen over it. See ``tests/test_sale_item_sign_rule.py``.
+
+    Applied to ``quantity`` AND ``unit_price`` on all four writers of
+    ``sale_items.quantity`` / ``sale_items.unit_price`` — ``add_sale_item``,
+    ``update_sale_item``, ``add_sale`` and ``update_sale_full``. They write the
+    same two columns, so a rule on any subset of them is a rule that can be
+    bypassed by using one of the others; ``add_sale`` is the only sale-create
+    path over HTTP.
+
+    A helper rather than four inline ``if``s so the four writers cannot drift
+    apart, and so the field name in the message points at the column. ``_finite``
+    runs FIRST at every call site: ``nan <= 0`` is False, so a sign check on its
+    own would wave NaN through.
+    """
+    for field, value in pairs:
+        if value is None:
+            # "not supplied", not "not a number". `update_sale_item` is a
+            # PATCH: the route passes every keyword through, so a body carrying
+            # only `unit_price` arrives here with `quantity=None`. Validating it
+            # would reject a perfectly good single-field edit.
+            continue
+        try:
+            ok = float(value) > 0
+        except (TypeError, ValueError):
+            raise ValueError(f"{field} must be a number")
+        if not ok:
+            raise ValueError(f"{field} must be greater than 0")
+
+
 def _next_stage(current: str) -> Optional[str]:
     """Return the next stage in the pipeline, or None if at end."""
     try:
@@ -49,7 +86,16 @@ def _next_stage(current: str) -> Optional[str]:
 
 def add_sale(conn: psycopg.Connection, sale_data: Dict[str, Any],
              items: List[Dict[str, Any]], initial_stage: str = "pi_issued") -> int:
-    """Insert a new sale with line items. Returns the new sale ID."""
+    """Insert a new sale with line items. Returns the new sale ID.
+
+    Phase 2-B: every item's quantity/unit_price must be finite and > 0.
+    Validated before the INSERT INTO sales, not inside the item loop, so a
+    rejected line cannot leave an uncommitted header behind on a failed call.
+    """
+    for item in items or []:
+        qty, price = item.get("quantity", 0), item.get("unit_price", 0)
+        _finite(qty, price)
+        _positive_values([("quantity", qty), ("unit_price", price)])
     cursor = conn.execute(
         """INSERT INTO sales (stage, pi_number, pi_date, client_name, pi_file_path, company_id, maturity_date, comments)
            VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
@@ -397,6 +443,9 @@ def record_sale_payment(conn: psycopg.Connection, sale_id: int, payment_date: st
     when it is NULL or different from the provided value.
     Clears maturity notification dedupe keys when the sale becomes fully paid.
     """
+    # Phase 2-B. Must precede the maturity_date UPDATE below: a rejection that
+    # lands after it would leave the header mutated on a call that failed.
+    _finite(payment_amount)
     if payment_amount is None or payment_amount <= 0:
         raise ValueError("payment_amount must be positive")
     
@@ -475,6 +524,9 @@ def update_sale_payment_record(conn: psycopg.Connection, payment_id: int,
         fields.append("payment_date = %s")
         vals.append(payment_date)
     if payment_amount is not None:
+        # Phase 2-B, same column as record_sale_payment. Placed inside the
+        # `is not None` branch: only a supplied amount can be non-finite.
+        _finite(payment_amount)
         if payment_amount <= 0:
             raise ValueError("payment_amount must be positive")
         fields.append("payment_amount = %s")
@@ -539,7 +591,14 @@ def _revert_if_unpaid(conn: psycopg.Connection, sale_id: int) -> None:
 
 def add_sale_item(conn: psycopg.Connection, sale_id: int, product_name: str,
                   quantity: float, unit_price: float, unit: str = "KG") -> int:
-    """Add a line item to an existing sale. Returns the new item ID."""
+    """Add a line item to an existing sale. Returns the new item ID.
+
+    Phase 2-B: quantity and unit_price must be finite and strictly > 0.
+    Reversal of the first pass, which allowed zero here — see
+    ``_positive_values`` and ``tests/test_sale_item_sign_rule.py``.
+    """
+    _finite(quantity, unit_price)
+    _positive_values([("quantity", quantity), ("unit_price", unit_price)])
     unit = (unit or "KG").strip().upper() or "KG"
     cursor = conn.execute(
         """INSERT INTO sale_items (sale_id, product_name, quantity, unit_price, unit)
@@ -571,6 +630,16 @@ def update_sale_item(conn: psycopg.Connection, item_id: int,
     next invoice off a total that no longer matches what was billed, and
     invoice_items.line_total would keep the old money. product_name and unit are
     descriptive only, so they stay editable.
+
+    Phase 2-B: a supplied quantity/unit_price must be finite and strictly > 0.
+    Two placement decisions, both load-bearing:
+
+    * AFTER the invoiced-line conflict gate — that 409 is the more specific
+      answer and the frontend already handles it, so a non-positive value must
+      not change an invoiced line's error shape to a 400.
+    * INSIDE the `is not None` branch — a patch that does not touch the money
+      columns must not be validated against them, or a descriptive-only rename
+      of an invoiced line would start failing.
     """
     # Fetch old item for audit
     old_row = conn.execute(
@@ -584,6 +653,10 @@ def update_sale_item(conn: psycopg.Connection, item_id: int,
             raise InvoicedLineConflict(
                 "cannot change quantity or price of a sale item that has invoice"
                 " lines (adjust the invoice lines instead)")
+        # Phase 2-B, after the 409 gate above and before any write.
+        _finite(quantity, unit_price)
+        _positive_values(
+            [("quantity", quantity), ("unit_price", unit_price)])
     old_item = {"product_name": old_row[0], "quantity": old_row[1],
                 "unit_price": old_row[2], "unit": old_row[3]}
     
@@ -676,6 +749,18 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
     transactions are implicit (replacing BEGIN IMMEDIATE). Raises ValueError
     on business-rule violations. Returns the updated sale dict, or None when
     the sale does not exist.
+
+    Phase 2-B: item quantity/unit_price must be finite and strictly > 0. The whole
+    item list is validated before the first write, so a poisoned line late in
+    the batch cannot leave earlier lines applied.
+
+    The sign rule here is a TIGHTENING of the pre-existing `qty < 0 or
+    price < 0`, not a new rule: zero was previously accepted. That matters
+    more here than anywhere else, because this function REPLACES the sale's
+    entire line set — a sale that already held a zero-priced line becomes
+    unsaveable through this route until the operator gives that line a positive
+    price. Verified against production: 0 non-positive rows in `sale_items`, so
+    nothing to migrate today.
     """
     removed_ids = [int(r) for r in (removed_ids or [])]
     try:
@@ -743,8 +828,13 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
                 price = float(it.get("unit_price", 0))
             except (TypeError, ValueError):
                 raise ValueError(f"items[{pos}] quantity/unit_price must be numbers")
-            if qty < 0 or price < 0:
-                raise ValueError("Quantity and price cannot be negative")
+            # Phase 2-B: `qty < 0` is False for both inf and nan, so
+            # finiteness is a separate check, not a reordering of this one.
+            _finite(qty, price)
+            # Was `if qty < 0 or price < 0: "Quantity and price cannot be
+            # negative"`, which let 0 through. Now the same strict rule as
+            # every other writer of these columns, with the field named.
+            _positive_values([("quantity", qty), ("unit_price", price)])
             unit = (it.get("unit") or "KG").strip().upper() or "KG"
             item_id = it.get("id")
             if item_id is not None:
@@ -2192,6 +2282,8 @@ def mark_invoice_paid(conn: psycopg.Connection, invoice_id: int,
     recorded and the invoice flips to 'paid' (money received is truth; no
     amount cap here by design).
     """
+    # Phase 2-B. Before the SELECT ... FOR UPDATE, so a rejection takes no lock.
+    _finite(payment_amount)
     if payment_amount is None or payment_amount <= 0:
         raise ValueError("payment_amount must be positive")
 

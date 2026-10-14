@@ -10,6 +10,7 @@ from typing import Optional, List, Dict, Any, Union
 from .audit import log_audit_action
 from .db import logger
 from .stock import convert_quantity, get_unit_conversion
+from ._numeric import finite_values
 
 
 def _now_str() -> str:
@@ -95,6 +96,12 @@ def compare_stock_upload(conn: psycopg.Connection, upload_data: List[Dict[str, A
         name = item.get("name", "").strip()
         upload_last = float(item.get("balance_last_month", 0) or 0)
         upload_this = float(item.get("balance_this_month", 0) or 0)
+        # Phase 2-B. A spreadsheet cell is not a JSON body, so neither of
+        # Phase 2-A's walls applies. `inf or 0` is `inf` — the `or 0` fallback
+        # only catches None/0/empty — and these two numbers are what
+        # `save_upload` persists into `upload_rows.balance_last_month` /
+        # `balance_this_month` (REAL).
+        finite_values(upload_last, upload_this)
         batch_number = item.get("batch_number", "")
         expiry_date = item.get("expiry_date", "")
         upload_unit = item.get("upload_unit", "").upper().strip()
@@ -932,7 +939,17 @@ def adjust_stock_from_upload(conn: psycopg.Connection, upload_id: int,
             chemical_name = row[0]
             new_qty = row[1]
             upload_unit = row[2]
-            
+
+            # Phase 2-B, the second end of the upload write path. This value is
+            # RE-READ out of `upload_rows`, so the guard in
+            # `compare_stock_upload` that keeps it out of the table is not by
+            # itself enough to keep it out of stock. Phase 0 found 0 poisoned
+            # rows today, but the column is durable nullable REAL: a legacy row
+            # or any future writer lands here, and the unit conversion below
+            # (`inf * factor`) is just as non-finite as the value it started
+            # from.
+            finite_values(new_qty)
+
             # Get current stock (case-insensitive: chemical identity is
             # guarded unique on lower(name), uploads may differ in case).
             chemical = conn.execute(

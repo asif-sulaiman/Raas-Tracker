@@ -209,11 +209,27 @@ def test_zero_derived_amount_is_planned_not_paid(admin_client, db):
     A zero-derived amount used to birth the invoice 'paid' — an unfulfilled
     receivable reported as settled with paid_amount 0. Status is now payment
     driven only; a create (or any create-time arithmetic) can never do it.
+
+    FIXTURE CHANGE, Phase 2-B. This built the zero amount with a
+    ``unit_price: 0`` PI line (10 x 0 = 0). ``sale_items.quantity`` and
+    ``unit_price`` are now strictly positive on every writer, so that line can
+    no longer be created and this route to a zero is closed. Every ASSERTION
+    below is unchanged — the claim under test is still that a create-time
+    derivation landing on 0 yields `planned`. It is reached through the other
+    real route to zero, sub-cent rounding on an explicit invoice line:
+    0.0001 x 5 = 0.00. (The auto-seed route to the same zero — a fully
+    invoiced PI with nothing left over — is covered by
+    ``test_zero_remainder_invoice_is_planned_not_paid`` below.)
     """
     cid = _company(admin_client, db, name="AmtZero")
-    sid = _sale(admin_client, cid, "PI-AMT-6", qty=10, unit_price=0)  # 10 x 0 = 0
+    sid = _sale(admin_client, cid, "PI-AMT-6", qty=1, unit_price=5)
+    sale_item_id = _sale_item_ids(db, sid)[0]
 
-    body = _create_invoice(admin_client, sid, "INV-AMT-6")
+    r = admin_client.post(f"/api/sales/{sid}/invoices", json={
+        "invoice_number": "INV-AMT-6",
+        "lines": [{"sale_item_id": sale_item_id, "quantity": 0.0001}]})
+    assert r.status_code == 201, r.get_json()
+    body = r.get_json()
     assert body["amount"] == pytest.approx(0.0)
     assert body["status"] == "planned"
     assert _status(db, body["invoice_id"]) == "planned"

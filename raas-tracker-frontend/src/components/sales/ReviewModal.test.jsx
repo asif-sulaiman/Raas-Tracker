@@ -5,6 +5,7 @@ import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/re
 import { MemoryRouter } from 'react-router-dom';
 import { AuthProvider } from '../../context/AuthContext';
 import ReviewModal from './ReviewModal';
+import { ApiError } from '../../utils/api';
 import { toast } from 'sonner';
 
 vi.mock('sonner', () => {
@@ -93,6 +94,30 @@ describe('ReviewModal capture fields', () => {
       sale: { pi_number: 'PI-9', company_id: 7 },
       items: [{ product_name: 'Cotton', unit: 'DRUM' }],
     });
+  });
+});
+
+describe('ReviewModal server error surfacing', () => {
+  it('shows the server message and field-level details on a 400', async () => {
+    // Phase 2-B: sale_items.quantity/unit_price are strictly positive, so a
+    // parsed PI whose price column was missing (unit_price 0) now comes back as
+    // a 400 + details. The operator must see WHICH line the server rejected.
+    const failing = vi.fn(async () => {
+      throw new ApiError(400, 'Validation failed', [
+        { field: 'items.0.unit_price', message: 'Input should be greater than 0' },
+        { field: 'items.0.quantity', message: 'Input should be greater than 0' },
+      ]);
+    });
+    renderReview(failing);
+    const select = await screen.findByLabelText('Company');
+    await waitFor(() => expect(select.value).toBe('7'));
+    fireEvent.click(screen.getByRole('button', { name: 'Save to PI Issued' }));
+
+    expect(await screen.findByText('Validation failed')).toBeTruthy();
+    expect(screen.getByText('items.0.unit_price: Input should be greater than 0')).toBeTruthy();
+    expect(screen.getByText('items.0.quantity: Input should be greater than 0')).toBeTruthy();
+    // The generic string hid the reason and must not come back.
+    expect(screen.queryByText('Failed to save sale')).toBeNull();
   });
 });
 

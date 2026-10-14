@@ -207,9 +207,13 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
       setSaleError('At least one product item is required');
       return;
     }
+    // The server enforces gt=0 on sale_items.quantity / unit_price, so a zero
+    // (parse_sales.py emits unit_price 0.0 when the PI has no price column) is
+    // just as invalid as a negative. NaN/blank fails the same test for the same
+    // reason — it would serialise to null and be rejected downstream.
     for (const i of clean) {
-      if ((parseFloat(i.quantity) || 0) < 0 || (parseFloat(i.unit_price) || 0) < 0) {
-        setSaleError('Quantity and price cannot be negative');
+      if (!(parseFloat(i.quantity) > 0) || !(parseFloat(i.unit_price) > 0)) {
+        setSaleError('Quantity and price must be greater than zero');
         return;
       }
     }
@@ -448,13 +452,13 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
                           <input value={i.product_name} onChange={(e) => updateEditItem(i.key, 'product_name', e.target.value)} className={inputCls} />
                         </td>
                         <td className="px-2.5 py-1.5">
-                          <input type="number" min="0" step="any" value={i.quantity} onChange={(e) => updateEditItem(i.key, 'quantity', e.target.value)} className={inputCls} />
+                          <input type="number" min="0.001" step="any" value={i.quantity} onChange={(e) => updateEditItem(i.key, 'quantity', e.target.value)} className={inputCls} />
                         </td>
                         <td className="px-2.5 py-1.5">
                           <input value={i.unit || 'KG'} onChange={(e) => updateEditItem(i.key, 'unit', e.target.value.toUpperCase())} className={inputCls} aria-label="Unit" />
                         </td>
                         <td className="px-2.5 py-1.5">
-                          <input type="number" min="0" step="any" value={i.unit_price} onChange={(e) => updateEditItem(i.key, 'unit_price', e.target.value)} className={inputCls} />
+                          <input type="number" min="0.001" step="any" value={i.unit_price} onChange={(e) => updateEditItem(i.key, 'unit_price', e.target.value)} className={inputCls} />
                         </td>
                         <td className="px-2.5 py-1.5 text-right font-semibold">
                           ${formatNumber(lineTotal(i.quantity, i.unit_price))}

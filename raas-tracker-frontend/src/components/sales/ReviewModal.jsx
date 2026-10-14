@@ -133,11 +133,11 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
   const handleSave = async () => {
     setError(null);
     if (!piNumber.trim()) {
-      setError('PI number is required');
+      setError({ message: 'PI number is required' });
       return;
     }
     if (companies.length > 0 && companyId === '') {
-      setError('Select a company (register it on the Companies page first)');
+      setError({ message: 'Select a company (register it on the Companies page first)' });
       return;
     }
     const cleanItems = items
@@ -149,7 +149,7 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
         unit: (i.unit || 'KG').toUpperCase(),
       }));
     if (cleanItems.length === 0) {
-      setError('At least one product item is required');
+      setError({ message: 'At least one product item is required' });
       return;
     }
     setSaving(true);
@@ -158,8 +158,19 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
         sale: { pi_number: piNumber.trim(), pi_date: piDate || null, client_name: clientName.trim() || null, company_id: companyId === '' ? null : Number(companyId) },
         items: cleanItems,
       });
-    } catch {
-      setError('Failed to save sale');
+    } catch (err) {
+      // Same contract as MultiPICreateModal: surface the server's message and,
+      // when a 400 carries details, name each offending field. A PI parsed
+      // without a price column arrives with unit_price 0 and is rejected by the
+      // strictly-positive rule — a bare "Failed to save sale" gives the operator
+      // no line to go and fix.
+      const details = Array.isArray(err?.fields)
+        ? err.fields.map((f) => `${f.field}: ${f.message}`)
+        : [];
+      setError({
+        message: err?.message || 'Failed to save sale',
+        details,
+      });
       setSaving(false);
     }
   };
@@ -291,7 +302,7 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
                       <td className="px-2.5 py-1.5">
                         <input
                           type="number"
-                          min="0"
+                          min="0.001"
                           step="any"
                           value={item.quantity}
                           onChange={(e) => updateItem(item.key, 'quantity', e.target.value)}
@@ -313,7 +324,7 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
                       <td className="px-2.5 py-1.5">
                         <input
                           type="number"
-                          min="0"
+                          min="0.001"
                           step="any"
                           value={item.unit_price}
                           onChange={(e) => updateItem(item.key, 'unit_price', e.target.value)}
@@ -354,7 +365,16 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
         </div>
 
         {error && (
-          <p className="text-xs font-medium text-rose-600 dark:text-rose-400">{error}</p>
+          <div role="alert">
+            <p className="text-xs font-medium text-rose-600 dark:text-rose-400">{error.message}</p>
+            {Array.isArray(error.details) && error.details.length > 0 && (
+              <ul className="mt-1.5 space-y-0.5 text-xs text-rose-600 dark:text-rose-400 list-disc list-inside">
+                {error.details.map((d, i) => (
+                  <li key={i}>{d}</li>
+                ))}
+              </ul>
+            )}
+          </div>
         )}
       </div>
     </Modal>

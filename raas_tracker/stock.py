@@ -12,6 +12,12 @@ from .db import JSON_PATH, get_connection, logger
 from .audit import log_audit_action
 from .notifications import notify_reorder_status
 
+# Phase 2-B: the shared output-boundary guard lives in its own module so this
+# one does not have to be imported for it. It is still used below, in this
+# module's own writers.
+from ._numeric import finite_values
+
+
 def import_from_json(json_path: str = JSON_PATH) -> Dict[str, int]:
     """Import chemical stock from parsed JSON data.
     
@@ -44,7 +50,12 @@ def import_from_json(json_path: str = JSON_PATH) -> Dict[str, int]:
         if not name:
             skipped += 1
             continue
-        
+
+        # Phase 2-B: this is a FILE ingress — `json.load` on disk, then
+        # `float()` on whatever is in it. Neither Phase 2-A wall can see it.
+        # Checked before the UPDATE/INSERT so a rejected row is never written.
+        finite_values(float(qty), float(last_qty))
+
         try:
             existing = conn.execute(
                 "SELECT id FROM chemicals WHERE UPPER(name) = %s", (name.upper(),)
@@ -160,6 +171,10 @@ def add_unit_conversion(conn: psycopg.Connection, from_unit: str, to_unit: str, 
     change here silently alters every derived quantity in the product.
     """
     fu, tu = from_unit.upper().strip(), to_unit.upper().strip()
+    # Phase 2-B: the factor governs every quantity conversion in the product,
+    # so a non-finite one makes `convert_quantity` return inf for every
+    # movement derived from it.
+    finite_values(factor)
     try:
         prev = conn.execute(
             "SELECT factor FROM unit_conversions WHERE from_unit = %s AND to_unit = %s",
@@ -247,7 +262,12 @@ def update_stock(conn: psycopg.Connection, name: str, delta: float, unit: str = 
     if not chemical:
         logger.warning("Chemical '%s' not found in database", name)
         return False
-    
+
+    # Phase 2-B: `new_qty = current_qty + delta` and `inf < 0` is False, so the
+    # shortage guard below never trips. `cli.py` reaches this with
+    # `float(sys.argv[3])`.
+    finite_values(delta)
+
     chem_id, chem_name, current_qty, chem_unit, reorder_level = chemical
     
     # Normalize unit - if user provides unit, validate it matches or is KG
@@ -294,6 +314,9 @@ def set_reorder_level(conn: psycopg.Connection, name: str, level: float) -> bool
     """
     if level is None or level < 0:
         raise ValueError("reorder_level must be 0 or greater")
+    # Phase 2-B: `inf < 0` is False, and the HTTP route's `_req_float` (2-A
+    # MEDIUM-1) is only one of the callers.
+    finite_values(level)
     row = conn.execute(
         "SELECT id, name, current_qty, reorder_level FROM chemicals WHERE name = %s",
         (name,),
@@ -313,6 +336,8 @@ def set_reorder_level(conn: psycopg.Connection, name: str, level: float) -> bool
 
 def add_chemical(conn: psycopg.Connection, name: str, qty: float, unit: str = "KG") -> bool:
     """Add a new chemical to the database."""
+    # Phase 2-B, before the existence lookup so nothing is read or written.
+    finite_values(qty)
     existing = conn.execute(
         "SELECT id FROM chemicals WHERE UPPER(name) = %s",
         ((name or "").strip().upper(),)

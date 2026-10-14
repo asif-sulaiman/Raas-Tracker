@@ -228,3 +228,87 @@ describe('SaleDetailModal shipments', () => {
     await waitFor(() => expect(itemsCalls).toBeGreaterThanOrEqual(1));
   });
 });
+
+// The server enforces gt=0 on sale_items.quantity / unit_price. parse_sales.py
+// emits unit_price 0.0 when the PI has no recognisable price column, so a zero
+// is a realistic operator-facing value here — it must be stopped in the browser
+// with a clear reason instead of being POSTed and coming back as a bare 400.
+describe('SaleDetailModal item sign guard', () => {
+  // Self-contained fetch: the shared installFetch answers PUT /api/sales/5 with a
+  // body that has no `items`, which is fine for the comment-save tests but makes
+  // a successful item save render `sale.items.length` on undefined.
+  let puts = [];
+  function installEditorFetch() {
+    puts = [];
+    vi.stubGlobal('fetch', vi.fn(async (url, options) => {
+      const u = String(url);
+      const method = options?.method || 'GET';
+      if (u.includes('/api/auth/me')) return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
+      if (u.match(/\/api\/sales\/5$/) && method === 'PUT') {
+        puts.push(JSON.parse(options.body));
+        return jsonResponse(DETAIL);
+      }
+      if (u.match(/\/api\/sales\/5$/)) return jsonResponse(DETAIL);
+      if (u.includes('/api/sales/5')) return jsonResponse(DETAIL);
+      return jsonResponse({});
+    }));
+  }
+
+  async function openEditor(onSaved) {
+    installEditorFetch();
+    render(
+      <MemoryRouter>
+        <AuthProvider>
+          <ConfirmProvider>
+            <SaleDetailModal saleId={5} onClose={vi.fn()} onSaved={onSaved} />
+          </ConfirmProvider>
+        </AuthProvider>
+      </MemoryRouter>
+    );
+    expect(await screen.findByText('Cotton')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Sale' }));
+    // In edit mode each row renders qty and unit price as number inputs
+    // (role=spinbutton), in that DOM order.
+    const spinbuttons = await screen.findAllByRole('spinbutton');
+    return { quantity: spinbuttons[0], unitPrice: spinbuttons[1] };
+  }
+
+  it('blocks a zero quantity client-side instead of posting it', async () => {
+    const onSaved = vi.fn();
+    const { quantity } = await openEditor(onSaved);
+    fireEvent.change(quantity, { target: { value: '0' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+    expect(await screen.findByText(/must be greater than zero/i)).toBeTruthy();
+    // No PUT may be attempted, and no success callback may fire.
+    expect(puts).toHaveLength(0);
+    expect(onSaved).not.toHaveBeenCalled();
+  });
+
+  it('blocks a zero unit price client-side instead of posting it', async () => {
+    const onSaved = vi.fn();
+    const { unitPrice } = await openEditor(onSaved);
+    fireEvent.change(unitPrice, { target: { value: '0' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+    expect(await screen.findByText(/must be greater than zero/i)).toBeTruthy();
+    expect(puts).toHaveLength(0);
+    expect(onSaved).not.toHaveBeenCalled();
+  });
+
+  it('still blocks negatives, and still saves a valid line', async () => {
+    const onSaved = vi.fn();
+    const { quantity } = await openEditor(onSaved);
+    fireEvent.change(quantity, { target: { value: '-5' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+    expect(await screen.findByText(/must be greater than zero/i)).toBeTruthy();
+    expect(puts).toHaveLength(0);
+    expect(onSaved).not.toHaveBeenCalled();
+
+    fireEvent.change(quantity, { target: { value: '100' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+    await waitFor(() => expect(puts).toHaveLength(1));
+    expect(puts[0].items[0]).toMatchObject({ product_name: 'Cotton', quantity: 100, unit_price: 3.25 });
+    expect(onSaved).toHaveBeenCalledTimes(1);
+  });
+});
