@@ -18,17 +18,31 @@ This plan captures future work aligned with the Vibe Coding guidebook. The core 
 
 ---
 
-## 🔒 Security hardening — Phase 1: authorization (in progress)
+## 🔒 Security hardening — Phase 1: authorization ✅ · Phase 2: numeric integrity 🔄
 
-A read-only audit produced a 5-phase plan. **Phase 1 only is authorised**;
-Phases 2–5 are deferred. Each sub-phase is gated by the full backend suite plus
-an Oracle review, and the working state lives in `.slim/deepwork/phase1-authorization.md`.
+A read-only audit produced a 5-phase plan. **Phase 1 is complete**; Phase 2 is
+authorised and in progress. Phases 3–5 are deferred. Each sub-phase is gated by the
+full backend suite plus an Oracle review, and the working state lives in
+`.slim/deepwork/phase1-authorization.md` and `.slim/deepwork/phase2-numeric-integrity.md`.
 
 | Sub-phase | Scope | Gate |
 |---|---|---|
 | 0 | Pre-flight: scan all 20 PostgreSQL `REAL`/`double precision` columns for non-finite values before the Phase 2 numeric work | ✅ 0 non-finite rows |
 | P1-A | Explicit role classification — `operator_or_admin_required` stamping `_raas_role`; every mutating route declares its class; `_ADMIN_PATHS` demoted to non-load-bearing defence in depth; `POST /api/sales/batch` demoted admin → operator to match `POST /api/sales` | Oracle ✅ PASS (commit `9e3d713`) |
-| P1-B | Volume control — `limited()` stamps `_raas_limit` at 15/min on every mutating operator route, the invoice lifecycle, and the admin writes with row fan-out; `max_length` on 7 row-fanning list fields; report `recipes` capped inline with `{error, details[]}` | Oracle 🔴 blocked first pass → all blockers remediated → re-review pending |
+| P1-B | Volume control — `limited()` stamps `_raas_limit` at 15/min on every mutating operator route, the invoice lifecycle, and the admin writes with row fan-out; `max_length` on 7 row-fanning list fields; report `recipes` capped inline with `{error, details[]}` | Oracle 🔴 blocked twice → all blockers remediated → ✅ PASS (commit `5afd27b`) |
+| P2-A | Input boundary — app-wide `_FiniteJSONProvider` (`app.json`) rejecting the bare `NaN`/`Infinity`/`-Infinity` literals; shared `_FiniteModel` base (`allow_inf_nan=False`) across the 8 money/quantity write models; `@app.errorhandler(400)` so an undecodable body is a 400 and not a 500; `_req_float` on the two raw-dict numeric routes | Oracle ✅ APPROVED, no HIGH findings (2026-10-14) |
+| P2-B | Output boundary — `math.isfinite()` in `record_sale_payment`, `mark_invoice_paid`, `add_sale_item`, `update_sale_item`; the layer that holds when the parser is bypassed | ⬜ planned |
+
+**P2-A gate findings, and what closed them**
+
+| Finding | Problem | Resolution |
+|---|---|---|
+| MEDIUM-1 | `PUT /api/chemicals/reorder` has no Pydantic model, so neither wall applied: `float(data.get("reorder_level", 0) or 0)` accepted a quoted `"Infinity"`, and `stock.py:295` only rejects `level < 0` — `inf < 0` is False. It committed `inf` into a `REAL NOT NULL` column permanently, after which every `GET /api/chemicals` serialised invalid JSON | Routed through `_req_float`, which carries `math.isfinite`. Sweeping for the same shape found `PUT /api/recipes/<name>` (`total_quantity` had **no** guard; `water_percentage` had `0 ≤ v ≤ 100`, which `inf` trips but `nan` walks straight through) — same fix |
+| MEDIUM-1b | Same sweep, found while fixing the above: all four recipe routes coerce a raw-dict `company_id` with `int(...)` under `except (TypeError, ValueError)`. `int(float('inf'))` raises **`OverflowError`**, which that tuple does not catch — so `{"company_id": 1e309}` reached the catch-all `Exception` handler as a 500, the exact shape the new 400 handler exists to prevent. No data was written (the route aborts before the UPDATE), so this is an error-shape defect, not a poisoning one | `OverflowError` added to all four `except` tuples |
+| MEDIUM-2 | SPEC.md omitted the new 400 handler, the parser rejection and the `_FiniteModel` contract from its error-handler set; `plan.md` still said "Phase 1 only is authorised" | SPEC §6 gained the 400 handler and a new §6.1 "Numeric integrity"; this table |
+| LOW-1 | `_bad_request`'s comment claimed it covered "a body whose content type is not JSON" — it does not (that is a 415 with no handler, pre-existing and out of scope) | Clause removed; the gap is now stated in the comment so it is not mistaken for coverage |
+| LOW-2 | A test docstring cited `app.json_provider`, an attribute that does not exist in Flask 3.x | Corrected to `app.json` |
+| Hygiene | `_FiniteFlask` subclass existed only to set `json_provider_class`; `app.json` is a plain attribute | Subclass dropped — `app.json = _FiniteJSONProvider(app)`, so `type(app) is Flask` is True again. The `loads()` override that installs `parse_constant` is load-bearing and now says so |
 
 **P1-B blockers found by the first Oracle pass, and what closed them**
 

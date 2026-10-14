@@ -7,6 +7,7 @@ import json
 import math
 import hashlib
 from flask import Flask, request, jsonify, send_from_directory, g, redirect
+from flask.json.provider import DefaultJSONProvider
 from datetime import date, timedelta
 from functools import wraps
 from typing import Optional
@@ -42,7 +43,51 @@ def _max_content_length_bytes(raw, default_mb=50.0):
     return int(mb * 1024 * 1024)
 
 
+class _FiniteJSONProvider(DefaultJSONProvider):
+    """Reject the non-finite JSON literals, app-wide, at the parse boundary.
+
+    `NaN`, `Infinity` and `-Infinity` are not valid JSON, but Python's `json`
+    module accepts them anyway and hands back a `float('inf')` that then rides
+    through every downstream comparison untouched — `inf > 0` is True and
+    `inf >= invoice_total` is True, so a payment written as `Infinity`
+    completes the sale and pays the invoice without a cent arriving. Once such
+    a value reaches a `REAL` column it is unrecoverable.
+
+    `json.loads` exposes exactly one hook for these, `parse_constant`, and it
+    fires only for the bare (unquoted) tokens. That is the right scope here: a
+    *quoted* `"Infinity"` stays an ordinary string and is refused downstream by
+    float coercion and by `allow_inf_nan=False`, with a better error message
+    than anything raised at parse time.
+
+    `request.get_json()` turns the ValueError raised here into a `BadRequest`,
+    which the 400 handler reports in the same `{error}` shape as every other
+    rejection — a clean 400 before any route body runs.
+    """
+
+    @staticmethod
+    def parse_constant(name):
+        raise ValueError(
+            f"non-finite JSON constant {name} is not accepted; "
+            "all numbers in a request body must be finite")
+
+    def loads(self, s, **kwargs):
+        # LOAD-BEARING — do not "simplify" this away. `DefaultJSONProvider.loads`
+        # calls `json.loads(s, **kwargs)` and never installs `parse_constant`
+        # itself, so overriding `parse_constant` alone silently does nothing and
+        # the guard above would appear to hold while every body still parsed.
+        # The unit tests in `test_numeric_integrity.py` fail if this line goes.
+        kwargs.setdefault("parse_constant", self.parse_constant)
+        return super().loads(s, **kwargs)
+
+
 app = Flask(__name__)
+# Phase 2-A: make the finite provider the app-wide choke point. Flask 3 builds
+# `app.json` from `json_provider_class` in `__init__` and no longer exposes the
+# old `app.json_provider` setter, but `app.json` is a plain attribute, so
+# assigning over it is equivalent — and it keeps `type(app) is Flask`, rather
+# than swapping in a `Flask` subclass for a two-line change. One choke point,
+# every route — see `tests/test_numeric_integrity.py`.
+app.json = _FiniteJSONProvider(app)
 app.secret_key = _secret
 # Hard cap on request bodies (client-side 50MB check is bypassable)
 app.config["MAX_CONTENT_LENGTH"] = _max_content_length_bytes(
@@ -380,6 +425,28 @@ def _method_not_allowed(_e):
     if request.path.startswith("/api"):
         return jsonify({"error": "method not allowed"}), 405
     return send_from_directory(REACT_BUILD_DIR, "index.html")
+
+
+@app.errorhandler(400)
+def _bad_request(_e):
+    # Raised by Werkzeug when the request body cannot be decoded as JSON:
+    # bad syntax, or a non-finite literal refused by `_FiniteJSONProvider`
+    # (Phase 2-A).
+    #
+    # It does NOT cover a missing or non-JSON Content-Type: that raises
+    # `UnsupportedMediaType` (415), which has no handler and still falls
+    # through to the catch-all below as a 500. Pre-existing and out of scope —
+    # recorded here so the gap is not mistaken for coverage.
+    #
+    # Without this handler those land in the catch-all `Exception` handler
+    # below and are reported as 500 — "server fault, retry" for what is
+    # permanently a client fault, which sends the caller into a pointless
+    # retry loop and hides the real cause. Routes that reject a payload by
+    # returning a `(jsonify(...), 400)` tuple never reach an error handler,
+    # so this only affects body-level decode failures. Same contract as the
+    # other handlers: generic message here, detail in the log.
+    app.logger.warning("rejected undecodable request body: %s", _e)
+    return jsonify({"error": "Invalid request body"}), 400
 
 
 # ==================== RATE LIMITS (tiers 2-3) ====================
@@ -956,6 +1023,31 @@ class _StrippedModel(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
 
+class _FiniteModel(_StrippedModel):
+    """Phase 2-A: a model on the money/quantity surface.
+
+    `allow_inf_nan=False` makes Pydantic reject `NaN`, `Infinity` and
+    `-Infinity` for *every* float field in the model, so no single field can
+    drift out of the guard as the models are edited.
+
+    A child of `_StrippedModel`, not a sibling or a parent, on purpose. Making
+    it the parent would switch finiteness on for all ~30 current
+    `_StrippedModel` subclasses — many of them carrying fields that are
+    deliberately permissive today and are *not* part of this phase. Adopting
+    the finite base is then a one-word, per-model, auditable opt-in.
+
+    This is the second wall, not the only one: `_FiniteJSONProvider` refuses the
+    bare literals before a request body is parsed. A non-finite float that does
+    not come from a bare literal — a quoted `"Infinity"`, which `float()`
+    accepts, or a `1e309` that overflows on the way in — reaches this model
+    intact, so this wall is load-bearing, not defence-in-depth. (A third,
+    `math.isfinite()` in the service layer, is Phase 2-B: it is what covers
+    callers that never arrive as an HTTP JSON body at all.)
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True, allow_inf_nan=False)
+
+
 class PasswordChangeIn(_StrippedModel):
     current_password: str = Field(min_length=1)
     new_password: str = Field(min_length=1)
@@ -1129,7 +1221,7 @@ def api_chemicals():
     return jsonify(chemicals)
 
 
-class ChemicalCreateIn(_StrippedModel):
+class ChemicalCreateIn(_FiniteModel):
     name: str = Field(min_length=1)
     qty: float = Field(default=0, ge=0)
     unit: str = Field(default="KG", min_length=1)
@@ -1199,9 +1291,9 @@ def api_set_reorder_level():
     if not name:
         return jsonify({"error": "name is required"}), 400
     try:
-        level = float(data.get("reorder_level", 0) or 0)
-    except (TypeError, ValueError):
-        return jsonify({"error": "reorder_level must be a number"}), 400
+        level = _req_float(data, "reorder_level", 0)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     conn = get_db()
     try:
         success = set_reorder_level(conn, name, level)
@@ -1281,7 +1373,7 @@ def api_create_recipe():
     return jsonify({"success": True, "name": payload.name}), 201
 
 
-class RecipeCreateIn(_StrippedModel):
+class RecipeCreateIn(_FiniteModel):
     name: str = Field(min_length=1)
     yield_qty: float = Field(default=1, gt=0)
     water_percentage: float = Field(default=0, ge=0, le=100)
@@ -1304,7 +1396,7 @@ def api_add_recipe_item(name):
         return jsonify({"error": "company_id is required"}), 400
     try:
         company_id = int(company_id)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # inf/nan reach here as float
         return jsonify({"error": "company_id must be an integer"}), 400
     conn = get_db()
     try:
@@ -1351,14 +1443,25 @@ def api_delete_recipe(name):
 @limited()
 def api_update_recipe(name):
     data = request.get_json() or {}
-    total_qty = data.get("total_quantity")
-    water_pct = data.get("water_percentage")
+    # Phase 2-A: these two are read straight out of the raw dict — no Pydantic
+    # model, so `allow_inf_nan=False` never sees them and the provider cannot
+    # help either (a quoted "Infinity" is an ordinary string to it, and a bare
+    # 1e309 is valid JSON that overflows to inf). `_req_float` is the guard.
+    # `None` still means "keep the current value": the frontend omits a field
+    # the user did not edit, so only a supplied value is coerced.
+    try:
+        total_qty = (None if data.get("total_quantity") is None
+                     else _req_float(data, "total_quantity", 0))
+        water_pct = (None if data.get("water_percentage") is None
+                     else _req_float(data, "water_percentage", 0))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     company_id = data.get("company_id")
     if company_id is None:
         return jsonify({"error": "company_id is required"}), 400
     try:
         company_id = int(company_id)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # inf/nan reach here as float
         return jsonify({"error": "company_id must be an integer"}), 400
     conn = get_db()
     try:
@@ -1386,7 +1489,7 @@ def api_update_recipe_item(name, chem):
         return jsonify({"error": "company_id is required"}), 400
     try:
         company_id = int(company_id)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # inf/nan reach here as float
         return jsonify({"error": "company_id must be an integer"}), 400
     conn = get_db()
     try:
@@ -2119,7 +2222,7 @@ def api_produce_recipe(name):
         return jsonify({"error": "company_id is required"}), 400
     try:
         company_id = int(company_id)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # inf/nan reach here as float
         return jsonify({"error": "company_id must be an integer"}), 400
 
     # Handle multi-recipe production. ALL recipes in one request share ONE
@@ -2234,8 +2337,10 @@ def api_get_production_run(name, run_id):
 # ==================== API: INVOICES ====================
 
 
-class InvoiceBatchLineIn(_StrippedModel):
+class InvoiceBatchLineIn(_FiniteModel):
     sale_item_id: int
+    # No bound, deliberately: what `quantity` is allowed to *be* is Phase 3's
+    # question. Phase 2-A only stops it being non-finite.
     quantity: float
 
 
@@ -2280,7 +2385,7 @@ class InvoiceShipIn(_StrippedModel):
     notes: str | None = None
 
 
-class InvoicePayIn(_StrippedModel):
+class InvoicePayIn(_FiniteModel):
     payment_amount: float = Field(gt=0)
     payment_date: str = Field(min_length=1)
     notes: str | None = None
@@ -2729,7 +2834,7 @@ class SaleHeaderPatchIn(_StrippedModel):
     comments: str | None = None
 
 
-class SaleFullItemIn(_StrippedModel):
+class SaleFullItemIn(_FiniteModel):
     id: int | None = None
     product_name: str = Field(min_length=1)
     quantity: float = Field(ge=0)
@@ -2871,14 +2976,14 @@ def api_update_lc(sale_id):
         _rollback_close(conn)
 
 
-class PaymentIn(_StrippedModel):
+class PaymentIn(_FiniteModel):
     payment_date: str | None = None
     payment_amount: float = Field(gt=0)
     notes: str | None = None
     maturity_date: str | None = None
 
 
-class PaymentPatchIn(_StrippedModel):
+class PaymentPatchIn(_FiniteModel):
     payment_date: str | None = None
     payment_amount: float | None = Field(default=None, gt=0)
     notes: str | None = None
@@ -2984,7 +3089,11 @@ def api_add_item(sale_id):
     return jsonify({"id": item_id, "message": "Item added"}), 201
 
 
-class SaleItemPatchIn(BaseModel):
+class SaleItemPatchIn(_FiniteModel):
+    # Phase 2-A: moved off `BaseModel` so `quantity`/`unit_price` inherit the
+    # finite guard. It also picks up `str_strip_whitespace`, which this model
+    # alone never had — every sibling item model already strips, and
+    # `min_length=1` on an unstripped `"  "` is a blank product name.
     product_name: str | None = Field(default=None, min_length=1)
     quantity: float | None = Field(default=None, ge=0)
     unit_price: float | None = Field(default=None, ge=0)

@@ -560,7 +560,15 @@ def test_batch_preserves_maturity_date(admin_client, db):
 
 
 def test_batch_inf_qty_400(admin_client, db):
-    """P3: inf quantity in batch items -> 400 validation shape."""
+    """P3: inf quantity in batch items -> 400 validation shape.
+
+    Phase 2-A: `_FiniteJSONProvider` now rejects the bare `Infinity` while the
+    body is being decoded, so this no longer reaches `SaleItemIn`'s
+    `allow_inf_nan=False` and the response carries the parser's `{error}` rather
+    than the model's `{error, details}`. Both are 400s and both write nothing;
+    the model layer's rejection is pinned directly in
+    `tests/test_qty_validation.py::test_money_model_rejects_non_finite`.
+    """
     tag = _tag()
     co = _company(db, f"LC INF {tag}")
     payload = {"sales": [
@@ -570,7 +578,9 @@ def test_batch_inf_qty_400(admin_client, db):
     ]}
     r = admin_client.post("/api/sales/batch", json=payload)
     assert r.status_code == 400, r.get_json()
-    assert isinstance(r.get_json().get("details"), list)
+    assert r.get_json().get("error")
+    assert db.execute("SELECT count(*) FROM sales WHERE pi_number = %s",
+                      (f"PI-INF-{tag}",)).fetchone()[0] == 0
 
 
 def test_linked_sale_advance_refused_via_api(admin_client, db):

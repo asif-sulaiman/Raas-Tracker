@@ -922,8 +922,35 @@ commercial report is invoice-driven so an uninvoiced PI contributes 0 to gross s
 | **Rate Limit** | 429 + `Retry-After` header; JSON `{error: "rate limit exceeded, slow down"}` |
 | **File Upload** | Max 50MB by default (`MAX_CONTENT_LENGTH`, override with `MAX_CONTENT_LENGTH_MB`); allowed ext {.pdf,.xlsx,.xls}; **one canonical filename**, computed once per request by `_safe_upload_filename` (`raas_tracker/uploads.py`) and reused for the extension gate, the stored `uploads.filename`, the `UPLOAD_CREATE` audit row and the JSON response — it strips control chars, path traversal, bidi controls (U+202E/U+200E/U+200F), leading dots and Windows reserved device names, and **preserves non-ASCII** (werkzeug's `secure_filename` is deliberately not used: it flattened a legitimate Arabic name to a bare `xlsx`, so the gate rejected a real file). The on-disk name is separate and stays `uuid4().hex + ext`; parse failure → 400 + file cleanup |
 | **PI Parse** | Only `.pdf`/`.docx` accepted; legacy `.doc` rejected with guidance |
-| **Global** | `@app.errorhandler(404)` → 404 `{"error":"not found"}`; `@app.errorhandler(405)` → 405 `{"error":"method not allowed"}` (a wrong-method /api request must never fall into the catch-all and masquerade as a 500); `@app.errorhandler(500)` + `@app.errorhandler(Exception)` → 500 `{"error":"internal server error"}` (log full trace) |
+| **Global** | `@app.errorhandler(404)` → 404 `{"error":"not found"}`; `@app.errorhandler(405)` → 405 `{"error":"method not allowed"}` (a wrong-method /api request must never fall into the catch-all and masquerade as a 500); `@app.errorhandler(400)` → 400 `{"error":"Invalid request body"}` (Werkzeug `BadRequest` — a body that will not decode; see §6.1); `@app.errorhandler(500)` + `@app.errorhandler(Exception)` → 500 `{"error":"internal server error"}` (log full trace). Registered **by status code, not by exception class**, so it cannot shadow 404/405/413/429 |
 | **413** | File too large → 413 `{"error":"file too large (max N MB)"}` where N = `MAX_CONTENT_LENGTH_MB` (default 50). On Vercel the platform 4.5MB body limit fires at the edge first, so >4.5MB gets Vercel's own 413 page, not this JSON — set `MAX_CONTENT_LENGTH_MB=4.5` to align the app cap with the platform |
+
+### 6.1 Numeric integrity (P2-A) — non-finite values cannot enter
+
+`NaN` and `Infinity` are not display bugs: `inf >= invoice_total` is True, so a
+payment written as `Infinity` completes a sale and marks an invoice paid without a
+cent arriving, and the value is unrecoverable once it lands in a `REAL` column.
+Two independent walls, both app-wide:
+
+| Wall | Where | What it rejects |
+|---|---|---|
+| **JSON parser** | `flask_app.py:_FiniteJSONProvider`, installed as `app.json` | The **bare** literals `NaN`, `Infinity`, `-Infinity`, which Python's `json` accepts by default. Wired as an attribute assignment on a plain `Flask` app (not a `json_provider` setter, which Flask 3.x removed). A body-parse failure raises `ValueError` → `BadRequest` → the 400 handler above, before any route body runs |
+| **Schema** | `flask_app.py:_FiniteModel` (`allow_inf_nan=False` in `model_config`), inherited by every money/quantity write model | Every float field of those models. A **quoted** `"Infinity"` is an ordinary string to the parser and Pydantic v2 lax mode coerces `str → float` via `float()`, which succeeds — so this wall is load-bearing, not defence-in-depth |
+
+**Neither wall is complete on its own, and that is deliberate:**
+
+- `1e309` is *valid JSON* that overflows to `inf`. `parse_constant` correctly never
+  fires on it; only the schema (or a route guard) refuses it.
+- Routes with **no Pydantic model** behind them get neither. `PUT /api/chemicals/reorder`
+  and `PUT /api/recipes/<name>` read numbers straight from the raw dict, so they
+  coerce through `_req_float` (`flask_app.py:_req_float`), which carries its own
+  `math.isfinite` check. Any new raw-dict numeric field must do the same.
+- The serializer still emits `Infinity` on the way **out** — only the parse boundary
+  is hardened. Unreachable through guarded surfaces today; a column poisoned by a
+  future path would render as invalid JSON to clients.
+
+Phase 2-B adds the third wall (`math.isfinite` in the service layer), which is what
+covers non-HTTP callers that bypass the parser entirely.
 
 ## 7. Testing Strategy
 
@@ -933,7 +960,7 @@ commercial report is invoice-driven so an uninvoiced PI contributes 0 to gross s
 - **Fixtures**: `db` (clean conn), `client` (Flask test client), `admin_client`, `user_client`
 - **Bcrypt**: Rounds=4 in tests (vs 13 prod) for speed
 - **Rate Limits**: `RAAS_RATE_LIMITS=off` globally; targeted tests re-enable
-- **Coverage**: 834 passed / 8 skipped (auth, stock, upload, sales, invoices, production, LC, rate limits, PI parse, notifications, schema migration, upload-limit config) — includes `tests/test_invoices_production.py`, `tests/test_invoice_items.py`, `tests/test_schema_migration.py`, `tests/test_authorization_roles.py` (89 tests: P1-A role classification + P1-B volume limits and payload caps).
+- **Coverage**: 929 passed / 8 skipped (auth, stock, upload, sales, invoices, production, LC, rate limits, PI parse, notifications, schema migration, upload-limit config) — includes `tests/test_invoices_production.py`, `tests/test_invoice_items.py`, `tests/test_schema_migration.py, `tests/test_numeric_integrity.py`, `tests/test_qty_validation.py``, `tests/test_authorization_roles.py` (89 tests: P1-A role classification + P1-B volume limits and payload caps).
 
 ### Frontend (Vitest)
 - **Environment**: jsdom
