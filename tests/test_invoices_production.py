@@ -648,6 +648,9 @@ def test_move_to_shipment_ongoing_sets_production_running(admin_client, db):
     assert r.get_json()["new_stage"] == "lc_received"
     assert _detail(admin_client, sid)["shipment_status"] is None
 
+    # Phase 3-A: need an invoice to advance to shipment_ongoing
+    _invoice(admin_client, sid, "INV-MOVE-1")
+
     r = admin_client.post(f"/api/sales/{sid}/move", json={"notes": "to ship"})
     assert r.status_code == 200
     assert r.get_json()["new_stage"] == "shipment_ongoing"

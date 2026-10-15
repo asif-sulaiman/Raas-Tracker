@@ -411,21 +411,31 @@ def test_invoice_item_create_server_price(admin_client, db):
     assert listed[0]["unit_price"] == 5.0
 
 
-def test_invoice_item_over_qty_allowed(admin_client, db):
-    """Quantities can exceed PI quantities (shipment advantage)."""
+def test_invoice_item_over_qty_rejected_above_tolerance(admin_client, db):
+    """Quantities can exceed PI quantities up to 5% tolerance (shipment advantage), but not beyond."""
     tag = _tag()
     inv_id, item_id = _invoiced_setup(db, tag, qty=10)
-    # Quantity 11 exceeds PI qty of 10 - NOW ALLOWED (shipment advantage)
+    # 10 * 1.05 = 10.5 ceiling
+    # At ceiling (10.5) -> accepted
     assert admin_client.post(
         f"/api/invoices/{inv_id}/items",
-        json={"sale_item_id": item_id, "quantity": 11}).status_code == 201
-    # Can accumulate beyond PI qty
+        json={"sale_item_id": item_id, "quantity": 10.5}).status_code == 201
+    # Over ceiling (cumulative 11.0 > 10.5) -> rejected
     assert admin_client.post(
         f"/api/invoices/{inv_id}/items",
-        json={"sale_item_id": item_id, "quantity": 6}).status_code == 201
+        json={"sale_item_id": item_id, "quantity": 0.5}).status_code == 409
+    # Over ceiling (11 > 10.5) -> rejected
     assert admin_client.post(
         f"/api/invoices/{inv_id}/items",
-        json={"sale_item_id": item_id, "quantity": 5}).status_code == 201
+        json={"sale_item_id": item_id, "quantity": 11}).status_code == 409
+    # Another over ceiling (cumulative 17 > 10.5) -> rejected
+    assert admin_client.post(
+        f"/api/invoices/{inv_id}/items",
+        json={"sale_item_id": item_id, "quantity": 6}).status_code == 409
+    # Another over ceiling (cumulative 22 > 10.5) -> rejected
+    assert admin_client.post(
+        f"/api/invoices/{inv_id}/items",
+        json={"sale_item_id": item_id, "quantity": 5}).status_code == 409
 
 
 def test_invoice_item_404_paths(admin_client, db):

@@ -2339,9 +2339,8 @@ def api_get_production_run(name, run_id):
 
 class InvoiceBatchLineIn(_FiniteModel):
     sale_item_id: int
-    # No bound, deliberately: what `quantity` is allowed to *be* is Phase 3's
-    # question. Phase 2-A only stops it being non-finite.
-    quantity: float
+    # Phase 3-C: gt=0 enforced at model boundary (complements service-layer tolerance)
+    quantity: float = Field(gt=0, allow_inf_nan=False)
 
 
 class InvoiceCreateIn(_StrippedModel):

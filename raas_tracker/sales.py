@@ -14,6 +14,10 @@ from .notifications import notify_sale_stage, clear_dedupe, clear_maturity_dedup
 from ._numeric import finite_values as _finite
 
 
+# Phase 3-C: 5% over-invoice tolerance (global constant, multiplier)
+OVER_INVOICE_TOLERANCE = Decimal("1.05")
+
+
 def _now_str() -> str:
     """Current UTC time as 'YYYY-MM-DD HH:MM:SS' for TEXT datetime columns.
 
@@ -258,15 +262,35 @@ def move_sale_to_stage(conn: psycopg.Connection, sale_id: int, new_stage: str,
     into ``shipment_ongoing`` is refused (returns False) — linked PIs only
     travel via the LC endpoints. ``payment_due -> completed`` (incl.
     ``_complete_if_paid``) stays allowed.
+
+    Phase 3-A barriers:
+    - lc_received -> shipment_ongoing: requires at least one non-void invoice
+    - shipment_ongoing -> payment_due: requires every invoiced product has
+      a company recipe AND an invoice-linked production run
     """
-    row = conn.execute("SELECT stage, client_name, lc_id FROM sales WHERE id = %s", (sale_id,)).fetchone()
+    row = conn.execute("SELECT stage, client_name, lc_id, company_id FROM sales WHERE id = %s", (sale_id,)).fetchone()
     if not row:
         return False
-    current, client_name, lc_id = row[0], row[1] or f"#{sale_id}", row[2]
+    current, client_name, lc_id, company_id = row[0], row[1] or f"#{sale_id}", row[2], row[3]
     if new_stage not in SALE_STAGE_ORDER:
         return False
     if new_stage == "shipment_ongoing" and not via_lc and lc_id is not None:
         return False
+
+    # Phase 3-A: Barrier 1 - lc_received -> shipment_ongoing requires at least one non-void invoice
+    if new_stage == "shipment_ongoing" and current == "lc_received":
+        ready = invoice_readiness(conn, [sale_id])
+        if not ready["invoices_ok"]:
+            return False
+
+    # Phase 3-A: Barrier 2 - shipment_ongoing -> payment_due requires recipe + production for every invoiced product
+    if new_stage == "payment_due" and current == "shipment_ongoing":
+        if company_id is None:
+            return False
+        ready = production_readiness(conn, company_id, [sale_id])
+        if not ready["produced_ok"]:
+            return False
+
     if new_stage == "shipment_ongoing":
         # Entering production/shipment: mark the sale as running unless it
         # already reached a later shipment_status (never downgrade).
@@ -1668,6 +1692,62 @@ def validate_invoice_lines(conn: psycopg.Connection, sale_id: int,
     return validated
 
 
+def check_invoice_tolerance(conn: psycopg.Connection, sale_id: int,
+                            lines: List[Dict[str, Any]]) -> None:
+    """Enforce 5% over-invoice ceiling per PI line.
+
+    Args:
+        conn: DB connection
+        sale_id: Sale ID
+        lines: List of {"sale_item_id": int, "quantity": float}
+               These are the NEW lines being added.
+
+    Raises:
+        ValueError: If any PI line's total invoiced qty (existing + new) > PI_qty * 1.05
+    """
+    from collections import defaultdict
+
+    # Aggregate new quantities by sale_item_id
+    qty_by_item = defaultdict(Decimal)
+    for line in lines:
+        qty_by_item[line["sale_item_id"]] += Decimal(str(line["quantity"]))
+
+    # Fetch PI line quantities AND existing invoiced quantities
+    placeholders = ",".join(["%s"] * len(qty_by_item))
+    rows = conn.execute(
+        f"""SELECT si.id, si.quantity,
+                  COALESCE(SUM(ii.quantity)::numeric, 0) AS already_invoiced
+           FROM sale_items si
+           LEFT JOIN invoice_items ii ON ii.sale_item_id = si.id
+           LEFT JOIN invoices i ON i.id = ii.invoice_id
+           WHERE si.id IN ({placeholders})
+           GROUP BY si.id, si.quantity""",
+        tuple(qty_by_item.keys())
+    ).fetchall()
+
+    for item_id, pi_qty, already_invoiced in rows:
+        invoiced = qty_by_item[item_id] + Decimal(str(already_invoiced or 0))
+        pi_qty_dec = Decimal(str(pi_qty))
+        ceiling = (pi_qty_dec * OVER_INVOICE_TOLERANCE).quantize(Decimal("0.000001"))
+        if invoiced > ceiling:
+            raise ValueError(
+                f"PI line {item_id}: invoiced {invoiced:g} "
+                f"exceeds {ceiling:g} (PI qty {pi_qty_dec:g} + 5%)"
+            )
+
+
+def _assert_invoice_mutable(conn: psycopg.Connection, invoice_id: int) -> None:
+    """Raise ValueError if invoice is not mutable (booked/paid/shipped/void)."""
+    row = conn.execute(
+        "SELECT status FROM invoices WHERE id = %s FOR UPDATE", (invoice_id,)
+    ).fetchone()
+    if not row:
+        raise ValueError("invoice not found")
+    status = row[0]
+    if status in ("booked", "paid", "shipped", "void"):
+        raise ValueError(f"cannot modify a {status} invoice")
+
+
 def _seed_invoice_lines(conn: psycopg.Connection, invoice_id: int,
                         sale_id: int, budget: Decimal) -> None:
     """Give a freshly created invoice one line per remaining uninvoiced PI line.
@@ -1786,8 +1866,10 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
 
     # Build invoice lines: explicit lines or legacy auto-seed
     if lines is not None:
-        # Explicit lines mode: validate and use provided quantities (no ceiling)
+        # Explicit lines mode: validate and use provided quantities
         validated_lines = validate_invoice_lines(conn, sale_id, lines)
+        # Phase 3-C: Enforce 5% over-invoice tolerance (aggregate with existing lines)
+        check_invoice_tolerance(conn, sale_id, validated_lines)
         amount = _money(sum(l["line_total"] for l in validated_lines))
         # INV-REVISION: a create NEVER births 'paid'. 'paid' asserts money was
         # received, so only a payment record can set it (_sync_invoice_paid_status).
@@ -1804,6 +1886,10 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
             invoice_id = cursor.fetchone()[0]
         except psycopg.IntegrityError:
             raise ValueError(f"Invoice number '{invoice_number}' already exists for this sale")
+
+        # Phase 3-B: Freeze invoice lines once booked/paid/shipped/void
+        # (New invoices are 'planned' so this passes, but provides defense in depth)
+        _assert_invoice_mutable(conn, invoice_id)
 
         # Insert validated lines
         for vl in validated_lines:
@@ -1846,6 +1932,9 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
             invoice_id = cursor.fetchone()[0]
         except psycopg.IntegrityError:
             raise ValueError(f"Invoice number '{invoice_number}' already exists for this sale")
+
+        # Phase 3-B: Freeze invoice lines once booked/paid/shipped/void
+        _assert_invoice_mutable(conn, invoice_id)
 
         _seed_invoice_lines(conn, invoice_id, sale_id, amount)
         # Restate the header from the lines actually written, in ::numeric, so
@@ -1918,17 +2007,8 @@ def create_invoices_batch(conn: psycopg.Connection, sale_id: int,
     conn.execute(
         "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id FOR UPDATE",
         (sale_id,)).fetchall()
-    remaining: Dict[int, Decimal] = {}
-    for r in conn.execute(
-        """SELECT si.id,
-                  (si.quantity::numeric
-                   - COALESCE((SELECT SUM(ii.quantity)::numeric
-                                FROM invoice_items ii
-                               WHERE ii.sale_item_id = si.id), 0)) AS rem
-             FROM sale_items si WHERE si.sale_id = %s ORDER BY si.id""",
-        (sale_id,)).fetchall():
-        remaining[r[0]] = _to_decimal(r[1]) if r[1] is not None else Decimal("0")
-    sale_item_ids = set(remaining.keys())
+    sale_item_ids = {r[0] for r in conn.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id", (sale_id,)).fetchall()}
 
     # Validate the whole batch BEFORE any write.
     batch_qty: Dict[int, Decimal] = {}
@@ -1951,11 +2031,9 @@ def create_invoices_batch(conn: psycopg.Connection, sale_id: int,
             if not qty.is_finite() or qty <= 0:
                 raise ValueError("quantity must be finite and > 0")
             batch_qty[sid_i] = batch_qty.get(sid_i, Decimal("0")) + qty
-    for sid_i, q in batch_qty.items():
-        if q > remaining[sid_i]:
-            raise ValueError(
-                f"quantity {float(q):g} exceeds remaining"
-                f" {float(remaining[sid_i]):g} for sale item {sid_i}")
+    # Phase 3-C: The 5% tolerance check (check_invoice_tolerance) replaces the old
+    # "remaining" check. It accounts for existing invoiced quantities and allows
+    # up to PI_qty * 1.05 total, instead of strictly PI_qty.
     seen_nums: set = set()
     for inv in invoices:
         num = inv["invoice_number"].strip()
@@ -1967,6 +2045,14 @@ def create_invoices_batch(conn: psycopg.Connection, sale_id: int,
             (sale_id, num)).fetchone():
             raise ValueError(
                 f"Invoice number '{num}' already exists for this sale")
+
+    # Phase 3-C: Enforce 5% over-invoice tolerance across the entire batch
+    # Aggregate all lines from all invoices in the batch
+    all_lines = []
+    for inv in invoices:
+        for ln in inv["lines"]:
+            all_lines.append({"sale_item_id": ln["sale_item_id"], "quantity": float(ln["quantity"])})
+    check_invoice_tolerance(conn, sale_id, all_lines)
 
     results = []
     for inv in invoices:
@@ -1981,6 +2067,9 @@ def create_invoices_batch(conn: psycopg.Connection, sale_id: int,
             raise ValueError(
                 f"Invoice number '{num}' already exists for this sale")
         amount = Decimal("0")
+        # Phase 3-B: Freeze invoice lines once booked/paid/shipped/void
+        # (New invoices are 'planned' so this passes, but provides defense in depth)
+        _assert_invoice_mutable(conn, invoice_id)
         for ln in inv["lines"]:
             sid_i = ln["sale_item_id"]
             qty = _to_decimal(ln["quantity"])
@@ -2492,6 +2581,8 @@ def create_invoice_item(conn: psycopg.Connection, invoice_id: int,
             conn.rollback()
             raise ValueError("invoice not found")
         sale_id = inv[1]
+        # Phase 3-B: Freeze invoice lines once booked/paid/shipped/void
+        _assert_invoice_mutable(conn, invoice_id)
         si = conn.execute(
             "SELECT id, sale_id, product_name, unit, quantity, unit_price"
             " FROM sale_items WHERE id = %s FOR UPDATE",
@@ -2502,6 +2593,8 @@ def create_invoice_item(conn: psycopg.Connection, invoice_id: int,
         if si[1] != sale_id:
             conn.rollback()
             raise ValueError("sale item does not belong to this invoice's sale")
+        # Phase 3-C: Enforce 5% over-invoice tolerance (aggregate with existing lines)
+        check_invoice_tolerance(conn, sale_id, [{"sale_item_id": sale_item_id, "quantity": qty}])
         # Unit price inherited from PI line (server-enforced)
         unit_price = float(si[5] or 0)
         line_total = round(qty * unit_price, 2)
@@ -2579,14 +2672,14 @@ def invoice_readiness(conn: psycopg.Connection,
                       sale_ids: List[int]) -> Dict[str, Any]:
     """Gate core for ``lc_received -> shipment_ongoing``.
 
-    Requires at least one invoice. ``sale_count`` and ``invoice_count`` are kept
+    Requires at least one invoice (status != 'void'). ``sale_count`` and ``invoice_count`` are kept
     identical to the previous `_lc_shipment_readiness` shape so the route and
     readiness endpoints can keep using ``invoices_ok``/``detail`` unchanged.
     """
     invoice_count = 0
     if sale_ids:
         invoice_count = conn.execute(
-            "SELECT COUNT(*) FROM invoices WHERE sale_id = ANY(%s)",
+            "SELECT COUNT(*) FROM invoices WHERE sale_id = ANY(%s) AND status != 'void'",
             (sale_ids,)).fetchone()[0]
     return {
         "invoices_ok": invoice_count >= 1,
