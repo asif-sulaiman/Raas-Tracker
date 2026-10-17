@@ -12,6 +12,14 @@ from typing import Optional, List, Dict, Any, Union
 from .audit import log_audit_action
 from .notifications import notify_sale_stage, clear_dedupe, clear_maturity_dedupe
 from ._numeric import finite_values as _finite
+from ._exceptions import (
+    InvoiceAlreadyAdvanced,
+    InvoiceNotFound,
+    InvoiceNotProduced,
+    LifecycleConflict,
+    SaleItemNotFound,
+    ToleranceExceeded,
+)
 
 
 # Phase 3-C: 5% over-invoice tolerance (global constant, multiplier)
@@ -33,13 +41,17 @@ def _now_str() -> str:
 SALE_STAGE_ORDER = ["pi_issued", "lc_received", "shipment_ongoing", "payment_due", "completed"]
 
 
-class InvoicedLineConflict(ValueError):
+class InvoicedLineConflict(LifecycleConflict):
     """A PI line that invoice_items already point at cannot be re-based.
 
     Removing it, or changing its quantity/price, would desynchronise the
     commercial report: its grain is the PI line while its money comes from
-    invoice_items, and the next invoice is sized from the PI total. Routes map
-    this to 409 (a conflict with existing money), never 400.
+    invoice_items, and the next invoice is sized from the PI total.
+
+    A `LifecycleConflict`, so ``_exceptions.status_for`` reports the 409 it
+    always meant. It used to be a bare ``ValueError`` that three routes each
+    caught to hardcode a 409 — the docstring claimed "never 400" and nothing
+    but those three copies enforced it.
     """
 
 
@@ -1730,19 +1742,19 @@ def check_invoice_tolerance(conn: psycopg.Connection, sale_id: int,
         pi_qty_dec = Decimal(str(pi_qty))
         ceiling = (pi_qty_dec * OVER_INVOICE_TOLERANCE).quantize(Decimal("0.000001"))
         if invoiced > ceiling:
-            raise ValueError(
+            raise ToleranceExceeded(
                 f"PI line {item_id}: invoiced {invoiced:g} "
                 f"exceeds {ceiling:g} (PI qty {pi_qty_dec:g} + 5%)"
             )
 
 
 def _assert_invoice_mutable(conn: psycopg.Connection, invoice_id: int) -> None:
-    """Raise ValueError if invoice is not mutable (booked/paid/shipped/void)."""
+    """Raise InvoiceNotFound if the invoice is gone, ValueError if frozen."""
     row = conn.execute(
         "SELECT status FROM invoices WHERE id = %s FOR UPDATE", (invoice_id,)
     ).fetchone()
     if not row:
-        raise ValueError("invoice not found")
+        raise InvoiceNotFound("invoice not found")
     status = row[0]
     if status in ("booked", "paid", "shipped", "void"):
         raise ValueError(f"cannot modify a {status} invoice")
@@ -2138,7 +2150,7 @@ def update_invoice_status(conn: psycopg.Connection, invoice_id: int, status: str
         return False
     current = row[0]
     if _INVOICE_STATUS_ORDER.index(status) <= _INVOICE_STATUS_ORDER.index(current):
-        raise ValueError(f"invoice already {current}")
+        raise InvoiceAlreadyAdvanced(f"invoice already {current}")
 
     fields = ["status = %s"]
     params = [status]
@@ -2188,7 +2200,7 @@ def book_invoice(conn: psycopg.Connection, invoice_id: int, approx_ship_date: st
     if _INVOICE_STATUS_ORDER.index(current) <= _INVOICE_STATUS_ORDER.index("produced"):
         ready = invoice_production_readiness(conn, company_id, invoice_id)
         if not ready["ok"]:
-            raise ValueError(_production_blocked_message(
+            raise InvoiceNotProduced(_production_blocked_message(
                 ready["missing_recipes"] or ready["missing_production"]))
 
     if not update_invoice_status(conn, invoice_id, "booked", approx_ship_date=approx):
@@ -2217,11 +2229,11 @@ def ship_invoice(conn: psycopg.Connection, invoice_id: int, actual_ship_date: st
         (invoice_id,)
     ).fetchone()
     if not invoice:
-        raise ValueError("Invoice not found")
+        raise InvoiceNotFound("Invoice not found")
     _, sale_id, db_number, current = invoice
     if current in ("shipped", "paid"):
         conn.rollback()
-        raise ValueError(f"invoice already {current}")
+        raise InvoiceAlreadyAdvanced(f"invoice already {current}")
 
     # Shipment insert is inlined (not via add_shipment, which COMMITs) so the
     # lock is held until the guarded status flip below commits atomically.
@@ -2244,7 +2256,7 @@ def ship_invoice(conn: psycopg.Connection, invoice_id: int, actual_ship_date: st
         lost = conn.execute(
             "SELECT status FROM invoices WHERE id = %s", (invoice_id,)
         ).fetchone()
-        raise ValueError(f"invoice already {(lost[0] if lost else 'shipped')}")
+        raise InvoiceAlreadyAdvanced(f"invoice already {(lost[0] if lost else 'shipped')}")
 
     # atomic=False on both, single commit below: the shipment row, the guarded
     # status flip and their two audit rows are one transaction. The commit
@@ -2380,7 +2392,7 @@ def mark_invoice_paid(conn: psycopg.Connection, invoice_id: int,
         "SELECT sale_id FROM invoices WHERE id = %s FOR UPDATE", (invoice_id,)
     ).fetchone()
     if not invoice:
-        raise ValueError("Invoice not found")
+        raise InvoiceNotFound("Invoice not found")
     sale_id = invoice[0]
 
     cursor = conn.execute(
@@ -2579,7 +2591,7 @@ def create_invoice_item(conn: psycopg.Connection, invoice_id: int,
             (invoice_id,)).fetchone()
         if not inv:
             conn.rollback()
-            raise ValueError("invoice not found")
+            raise InvoiceNotFound("invoice not found")
         sale_id = inv[1]
         # Phase 3-B: Freeze invoice lines once booked/paid/shipped/void
         _assert_invoice_mutable(conn, invoice_id)
@@ -2589,7 +2601,7 @@ def create_invoice_item(conn: psycopg.Connection, invoice_id: int,
             (sale_item_id,)).fetchone()
         if not si:
             conn.rollback()
-            raise ValueError("sale item not found")
+            raise SaleItemNotFound("sale item not found")
         if si[1] != sale_id:
             conn.rollback()
             raise ValueError("sale item does not belong to this invoice's sale")
@@ -2611,7 +2623,7 @@ def create_invoice_item(conn: psycopg.Connection, invoice_id: int,
                 conn.rollback()
             except Exception:
                 pass
-            raise ValueError("invoice not found")
+            raise InvoiceNotFound("invoice not found")
         line_id = row[0]
         # Contract: invoices.amount is a DERIVED cache of
         # SUM(invoice_items.line_total). Recomputed on every write in the

@@ -163,12 +163,14 @@ from raas_tracker.sales import (
     create_invoice, list_invoices, book_invoice, ship_invoice,
     mark_invoice_paid, void_invoice, get_sale_completion, _now_str,
     check_lc_shipment_ready, create_invoice_item, list_invoice_items,
-    InvoicedLineConflict, create_invoices_batch,
+    create_invoices_batch,
     # Per-invoice production gate for GET /api/invoices/<id>/readiness, plus the
     # shared blocked-message so the readiness hint and book_invoice's 409 agree.
     invoice_production_readiness, _production_blocked_message,
 )
 from raas_tracker.stock import sync_reorder_notifications
+# Phase 4-A: the HTTP status of a service refusal comes from its TYPE.
+from raas_tracker._exceptions import LifecycleConflict, status_for
 
 # ---- AuthN/Z: sessions (humans) OR api_keys (scripts) ----
 # The legacy RAAS_TOKEN env gate is retired: per-key api_keys provide
@@ -2190,24 +2192,6 @@ def _rollback_close(conn):
     conn.close()
 
 
-# Service ValueError message -> HTTP status for the invoice/production routes.
-# 409 = the request conflicts with the resource's current state (terminal
-# lifecycle state), 404 = the referenced resource is missing or invisible to
-# this tenant, everything else stays a 400 validation-style rejection.
-def _state_error_status(message):
-    msg = (message or "").strip()
-    if msg.startswith("invoice already"):
-        return 409
-    # A lifecycle step blocked by a precondition that is not malformed input:
-    # the request is well-formed, the invoice is simply not ready yet.
-    if msg.startswith("invoice not produced"):
-        return 409
-    if msg == "Invoice not found" or msg.startswith("linked sale ") \
-            or msg.startswith("linked invoice "):
-        return 404
-    return 400
-
-
 @app.route("/api/recipes/<path:name>/produce", methods=["POST"])
 @admin_required
 @limited()
@@ -2260,7 +2244,7 @@ def api_produce_recipe(name):
         conn.commit()
     except ValueError as e:
         _rollback_close(conn)
-        return jsonify({"error": str(e)}), _state_error_status(str(e))
+        return jsonify({"error": str(e)}), status_for(e)
     except Exception:
         _rollback_close(conn)
         app.logger.exception("Production run failed")
@@ -2418,7 +2402,12 @@ def api_create_invoice(sale_id):
         )
     except ValueError as e:
         _rollback_close(conn)
-        return jsonify({"error": str(e)}), 400
+        # Phase 4-A contract change: a 5%-tolerance breach is a 409 (it
+        # conflicts with what this sale has already been invoiced for), not a
+        # 400. `POST /api/invoices/<id>/items` already answered 409 for the
+        # same refusal; this route used to hardcode 400. One condition, one
+        # status. See docs/SPEC.md "Sales Invoices".
+        return jsonify({"error": str(e)}), status_for(e)
     except Exception:
         _rollback_close(conn)
         app.logger.exception("Invoice creation failed")
@@ -2444,7 +2433,9 @@ def api_create_invoices_batch(sale_id):
         result = create_invoices_batch(conn, sale_id, [i.model_dump() for i in payload.invoices])
     except ValueError as e:
         _rollback_close(conn)
-        return jsonify({"error": str(e)}), 400
+        # Same Phase 4-A contract change as the single-invoice route above: a
+        # 5%-tolerance breach is a 409 on the batch route too.
+        return jsonify({"error": str(e)}), status_for(e)
     except Exception:
         _rollback_close(conn)
         app.logger.exception("Invoices batch failed")
@@ -2478,11 +2469,14 @@ def _invoice_transition_error(conn, e):
     """Map invoice service ValueErrors to a status and release the connection.
 
     The rollback is mandatory here: the caller may already hold uncommitted
-    writes in this transaction, and close() would otherwise commit them.
+    writes in this transaction, and a plain ``close()`` would discard them
+    without an explicit decision. It never *commits* — psycopg's ``close()``
+    discards the transaction — so this is about making the discard explicit and
+    uniform with the other error paths, not about preventing a commit.
     """
     msg = str(e)
     _rollback_close(conn)
-    return jsonify({"error": msg}), _state_error_status(msg)
+    return jsonify({"error": msg}), status_for(e)
 
 
 @app.route("/api/sales/<int:sale_id>/invoices/<int:invoice_id>/book", methods=["POST"])
@@ -2880,14 +2874,14 @@ def api_update_sale(sale_id):
             sale = update_sale_full(conn, sale_id, full.header.model_dump(exclude_unset=True),
                                     [i.model_dump() for i in full.items],
                                     full.removedIds)
-        except InvoicedLineConflict as e:
-            # 409, not 400: the same rule as the single-item delete/update guards,
-            # so a client can tell a money conflict from a validation error.
-            _rollback_close(conn)
-            return jsonify({"error": str(e)}), 409
         except ValueError as e:
-            conn.close()
-            return jsonify({"error": str(e)}), 400
+            # Status from the exception TYPE, never a literal: re-basing an
+            # invoiced PI line is `InvoicedLineConflict`, a `LifecycleConflict`
+            # -> 409, so a client can tell a money conflict from a validation
+            # error. `update_sale_full` has already rolled its own transaction
+            # back, so this rollback only releases the connection.
+            _rollback_close(conn)
+            return jsonify({"error": str(e)}), status_for(e)
         except Exception:
             conn.close()
             app.logger.exception("sale full update failed")
@@ -3136,14 +3130,12 @@ def api_update_item(sale_id, item_id):
     conn = get_db()
     try:
         update_sale_item(conn, item_id, patch.product_name, patch.quantity, patch.unit_price, patch.unit)
-    except InvoicedLineConflict as e:
-        # Same rule as the delete guard: money already invoiced against this PI
-        # line must not be silently re-based by editing quantity/price.
-        _rollback_close(conn)
-        return jsonify({"error": str(e)}), 409
     except ValueError as e:
+        # Money already invoiced against this PI line must not be silently
+        # re-based by editing quantity/price: `InvoicedLineConflict` carries the
+        # 409 itself, so the status needs no literal here.
         _rollback_close(conn)
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": str(e)}), status_for(e)
     conn.close()
     return jsonify({"message": "Item updated"})
 
@@ -3159,15 +3151,13 @@ def api_delete_item(sale_id, item_id):
         return jsonify({"error": "A sale must keep at least one product item"}), 400
     try:
         deleted = delete_sale_item(conn, sale_id, item_id)
-    except InvoicedLineConflict as e:
+    except ValueError as e:
         # A PI line that invoice_items point at cannot be deleted: the report's
         # grain is the PI line but its money is the invoice line, so removing it
         # would leave the rows not summing to the sale's receivable.
+        # `InvoicedLineConflict` carries the 409.
         _rollback_close(conn)
-        return jsonify({"error": str(e)}), 409
-    except ValueError as e:
-        _rollback_close(conn)
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"error": str(e)}), status_for(e)
     conn.close()
     if not deleted:
         # The line did not belong to this sale, or is already gone. Answering
@@ -3321,27 +3311,6 @@ def _lc_delete_guarded(conn, lc_id):
     return True
 
 
-def _lc_attach_error(message):
-    """Map attach/detach service errors: missing resources -> 404."""
-    msg = str(message)
-    low = msg.lower()
-    if low == "lc not found" or (
-            low.startswith("sale ") and low.endswith("not found")):
-        return jsonify({"error": msg}), 404
-    return jsonify({"error": msg}), 400
-
-
-def _invoice_item_error(message):
-    """Map invoice-item service errors: over-qty -> 409, missing -> 404."""
-    msg = str(message)
-    low = msg.lower()
-    if "remain" in low or "exceed" in low:
-        return jsonify({"error": msg}), 409
-    if low in ("invoice not found", "sale item not found"):
-        return jsonify({"error": msg}), 404
-    return jsonify({"error": msg}), 400
-
-
 def _shipment_missing_names(readiness):
     """Named missing preconditions from the readiness payload (permanent
     route-level helper supporting both the top-level missing list and
@@ -3451,10 +3420,10 @@ def api_create_lc():
                        bank_ref=payload.bank_ref, notes=payload.notes)
     except ValueError as e:
         _rollback_close(conn)
-        msg = str(e)
-        if "already exists" in msg.lower():
-            return jsonify({"error": msg}), 409
-        return jsonify({"error": msg}), 400
+        # Status comes from the exception TYPE (raas_tracker._exceptions):
+        # a duplicate LC number -> 409, blank number / unknown company -> 400.
+        # Never from `"already exists" in msg.lower()`.
+        return jsonify({"error": str(e)}), status_for(e)
     except LookupError as e:
         _rollback_close(conn)
         return jsonify({"error": str(e)}), 404
@@ -3669,8 +3638,12 @@ def api_attach_pis(lc_id):
         return jsonify({"error": str(e)}), 404
     except ValueError as e:
         _rollback_close(conn)
-        # Real lane-A service raises ValueError for missing LC/sale too.
-        return _lc_attach_error(str(e))
+        # Status comes from the exception TYPE (raas_tracker._exceptions):
+        # LcNotFound / LcSaleNotFound -> 404, anything still plain -> 400.
+        # `_lc_attach_error` used to read the wording instead, and answered
+        # 400 for a cross-tenant sale against 404 for a missing one — an
+        # oracle that told a caller which sale_ids exist.
+        return jsonify({"error": str(e)}), status_for(e)
     except Exception:
         _rollback_close(conn)
         app.logger.exception("LC attach failed")
@@ -3747,38 +3720,44 @@ def api_move_lc(lc_id):
         try:
             ok = move_lc_stage(conn, lc_id, payload.new_stage,
                                notes=payload.notes)
-        except ValueError as e:
-            msg = str(e)
-            low = msg.lower()
-            if "not ready for shipment" in low or "recipes:" in low \
-                    or "invoices:" in low or "not ready to go past shipment" in low \
-                    or "production:" in low:
-                _rollback_close(conn)
-                # Recompute readiness for the structured 409 shape.
-                rconn = get_db()
-                try:
-                    try:
-                        readiness = check_lc_shipment_ready(rconn, lc_id)
-                        missing = _shipment_missing_names(readiness)
-                        recipes_ok = readiness.get("recipes_ok")
-                        invoices_ok = readiness.get("invoices_ok")
-                        produced_ok = readiness.get("produced_ok")
-                    except Exception:
-                        missing = [msg]
-                        recipes_ok = False
-                        invoices_ok = False
-                        produced_ok = False
-                finally:
-                    rconn.close()
-                return jsonify({
-                    "error": msg,
-                    "missing": missing,
-                    "recipes_ok": recipes_ok,
-                    "invoices_ok": invoices_ok,
-                    "produced_ok": produced_ok,
-                }), 409
+        except LifecycleConflict as e:
             _rollback_close(conn)
-            return jsonify({"error": msg}), 400
+            # The readiness gates raise their own conflict type at the point
+            # the message is built (lcs.LcNotReadyForShipment /
+            # LcNotReadyPastShipment). This used to sniff the text for
+            # "not ready for shipment" / "recipes:" / "invoices:" /
+            # "production:" — three of which are vocabulary shared with the
+            # readiness payload the message is itself assembled from, so the
+            # status moved whenever the wording did.
+            msg = str(e)
+            # Recompute readiness for the structured 409 shape.
+            rconn = get_db()
+            try:
+                try:
+                    readiness = check_lc_shipment_ready(rconn, lc_id)
+                    missing = _shipment_missing_names(readiness)
+                    recipes_ok = readiness.get("recipes_ok")
+                    invoices_ok = readiness.get("invoices_ok")
+                    produced_ok = readiness.get("produced_ok")
+                except Exception:
+                    missing = [msg]
+                    recipes_ok = False
+                    invoices_ok = False
+                    produced_ok = False
+            finally:
+                rconn.close()
+            return jsonify({
+                "error": msg,
+                "missing": missing,
+                "recipes_ok": recipes_ok,
+                "invoices_ok": invoices_ok,
+                "produced_ok": produced_ok,
+            }), 409
+        except ValueError as e:
+            # Plain refusal (e.g. "invalid stage: x") — status from the type,
+            # which for an un-typed ValueError is 400.
+            _rollback_close(conn)
+            return jsonify({"error": str(e)}), status_for(e)
         if not ok:
             _rollback_close(conn)
             return jsonify({"error": "LC not found"}), 404
@@ -3892,9 +3871,10 @@ def api_create_invoice_item(invoice_id):
         return jsonify({"error": str(e)}), 404
     except ValueError as e:
         _rollback_close(conn)
-        # Real lane-A service raises ValueError for missing invoice/sale
-        # item too — map those to 404, over-qty to 409.
-        return _invoice_item_error(str(e))
+        # Status comes from the exception TYPE (raas_tracker._exceptions):
+        # over-tolerance -> 409, missing invoice/sale item -> 404, and any
+        # remaining validation refusal -> 400. Never from the message text.
+        return jsonify({"error": str(e)}), status_for(e)
     except Exception:
         _rollback_close(conn)
         app.logger.exception("invoice item creation failed")

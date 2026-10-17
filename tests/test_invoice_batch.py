@@ -73,6 +73,14 @@ def test_batch_two_invoices_split_by_line_allocation(admin_client, db):
 
 
 def test_batch_over_allocation_rejected_and_atomic(admin_client, db):
+    """8 + 5 against a PI of 10 breaches the 5% ceiling -> refused, atomically.
+
+    The status changed 400 -> 409 in Phase 4-A: a breach conflicts with what
+    the sale has already been invoiced for, so retrying the identical body can
+    never succeed (RFC 9110 §15.5.10), and `POST /api/invoices/<id>/items`
+    already answered 409 for the same refusal. Only the status assertion moved;
+    the atomicity assertion below is unchanged and is what this test is for.
+    """
     cid = _company(admin_client, db, name="BatchCo2")
     sid = _sale_two_items(admin_client, cid, "PI-BATCH-2")
     a, b = _item_ids(db, sid)
@@ -83,7 +91,9 @@ def test_batch_over_allocation_rejected_and_atomic(admin_client, db):
          "lines": [{"sale_item_id": a, "quantity": 5}]},  # 8+5 > 10
     ]}
     r = admin_client.post(f"/api/sales/{sid}/invoices/batch", json=payload)
-    assert r.status_code == 400, r.get_json()
+    assert r.status_code == 409, r.get_json()
+    assert r.get_json()["error"] == (
+        f"PI line {a}: invoiced 13.0 exceeds 10.500000 (PI qty 10.0 + 5%)")
     assert _invoice_rows(db, sid) == []
 
 

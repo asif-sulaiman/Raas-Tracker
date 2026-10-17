@@ -397,7 +397,7 @@ while later products are still unbuilt.
 
 | Task | Description | Files Touched | Acceptance |
 |---|---|---|---|
-| PBB-1 ✅ | **Booking requires production** — `book_invoice` re-checks production readiness for every distinct product on the invoice, at both pre-booking states (`planned` and `produced`); a short invoice raises `ValueError("invoice not produced yet — run production from the recipe page for: …")`, mapped to **409** by `_state_error_status` | `raas_tracker/sales.py`, `flask_app.py`, `tests/test_invoices_production.py` | unauthorised booking 409; produced flow books; gate green |
+| PBB-1 ✅ | **Booking requires production** — `book_invoice` re-checks production readiness for every distinct product on the invoice, at both pre-booking states (`planned` and `produced`); a short invoice raises `InvoiceNotProduced(_production_blocked_message(...))` (`raas_tracker/_exceptions.py`, raised at `sales.py:2203`), reported as **409** by `status_for(e)` inside `_invoice_transition_error` (`flask_app.py:2469`). *(Corrected 2026-10-15: this row previously said it raised a `ValueError` literal mapped by `_state_error_status` — both halves were false after Phase 4-A deleted that mapper and typed the refusal.)* | `raas_tracker/sales.py`, `raas_tracker/_exceptions.py`, `flask_app.py`, `tests/test_invoices_production.py` | unauthorised booking 409; produced flow books; gate green |
 | PBB-2 ✅ | **`invoice_production_readiness()`** — per-invoice gate core; requires, for each product on **this** invoice, a company recipe **and** a production run linked to this invoice (`production_run_links.invoice_id`); scoped to the invoice alone (siblings proceed independently) | `raas_tracker/sales.py` | gate green |
 | PBB-3 ✅ | **Latent fixes surfaced by the gate** — import `production_readiness` in `flask_app.py` (a `NameError` crashed every `GET /api/invoices/<id>/readiness`); pass `model_dump()`ed lines in `api_create_invoice` (a raw Pydantic model has no `.get()`, so explicit-lines creates raised `AttributeError` → 500) | `flask_app.py`, `tests/test_production_atomicity.py`, `tests/test_invoice_amount.py`, `tests/test_sales.py` | both routes stabilised; gate green |
 
@@ -408,6 +408,20 @@ while later products are still unbuilt.
   there is no booking shortcut.
 - The panel renders `Book` from the server's `can_book` / `book_blocked_reason`
   rather than from `status`, so a disabled button and a 409 always agree.
+
+---
+
+## 📜 Public contract changes
+
+Every entry here is an **intentional** change to a response a client can
+observe. If you are debugging a status that "used to be 400 and is now 409",
+this is where to look.
+
+| Date | Change | Routes affected | Rationale |
+|---|---|---|---|
+| 2026-10-15 | **A 5% over-invoice tolerance breach answers `409`, not `400`.** `ToleranceExceeded` (`raas_tracker/_exceptions.py`) is a conflict with what the sale has already been invoiced for — retrying the identical body will never succeed — so it is RFC 9110 §15.5.10. `POST /api/invoices/<id>/items` already returned 409; `POST /api/sales/<id>/invoices` and `POST /api/sales/<id>/invoices/batch` **hardcoded 400** for the same refusal, so the status depended on which door the request came in by. Both now go through `status_for(e)`. **Not a bug** — `tests/test_typed_errors.py::test_tolerance_breach_is_409_on_every_invoice_write_route` pins all three at once | `POST /api/sales/<id>/invoices`, `POST /api/sales/<id>/invoices/batch` (400 → 409) | One condition must yield one status; the phase's whole purpose. `POST /api/invoices/<id>/items` is unchanged |
+
+Also documented in `docs/SPEC.md` §4 ("Sales Invoices", "Invoice Items") and §6.
 
 ---
 

@@ -12,6 +12,11 @@ from typing import Optional, List, Dict, Any, Union
 from .db import get_connection, logger
 from .stock import get_all_chemicals, update_stock
 from ._numeric import finite_values
+from ._exceptions import (
+    InvoiceAlreadyAdvanced,
+    LinkedInvoiceNotFound,
+    LinkedSaleNotFound,
+)
 from .uploads import csv_safe
 
 def add_recipe(conn: psycopg.Connection, name: str, total_quantity: float = 1, water_percentage: float = 0,
@@ -527,7 +532,8 @@ def _owned_sale_ids(conn: psycopg.Connection, company_id: int,
             (sale_id, company_id)
         ).fetchone()
         if not row:
-            raise ValueError(f"linked sale {sale_id} not found for this company")
+            raise LinkedSaleNotFound(
+                f"linked sale {sale_id} not found for this company")
         owned.append(row[0])
     return owned
 
@@ -544,7 +550,8 @@ def _owned_invoice_ids(conn: psycopg.Connection, company_id: int,
             (invoice_id, company_id)
         ).fetchone()
         if not row:
-            raise ValueError(f"linked invoice {invoice_id} not found for this company")
+            raise LinkedInvoiceNotFound(
+                f"linked invoice {invoice_id} not found for this company")
         owned.append(row[0])
     return owned
 
@@ -700,7 +707,7 @@ def create_production_run(
             ).fetchone()
             current = inv_row[0] if inv_row else None
             if current in ("shipped", "paid"):
-                raise ValueError(f"invoice already {current}")
+                raise InvoiceAlreadyAdvanced(f"invoice already {current}")
             if current in _INVOICE_STATUS_ORDER and \
                     _INVOICE_STATUS_ORDER.index(current) < _INVOICE_STATUS_ORDER.index("produced"):
                 conn.execute(

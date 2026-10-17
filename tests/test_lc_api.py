@@ -198,15 +198,34 @@ def test_attach_400_empty(admin_client, db):
     assert isinstance(r2.get_json().get("details"), list)
 
 
-def test_attach_400_company_mismatch(admin_client, db):
+def test_attach_404_company_mismatch_indistinguishable_from_missing(
+        admin_client, db):
+    """Phase 4-A: cross-tenant attach is now a 404, byte-identical to missing.
+
+    CHANGED ASSERTION (disclosed): this used to assert 400. The old
+    "sale N belongs to a different company" -> 400 pairing against a missing
+    sale's 404 was a cross-tenant enumeration oracle — walking `sale_id`
+    revealed which ids exist and belong to somebody else. Both answers are now
+    the same 404 with the same body. The missing-sale case below is the
+    control.
+    """
     tag = _tag()
     co_a = _company(db, f"LC MA {tag}")
     co_b = _company(db, f"LC MB {tag}")
     lc = _mk_lc(admin_client, co_a, f"LC-MM-{tag}")
-    other = _sale(db, f"PI-MM-{tag}", company_id=co_b)
+    foreign = _sale(db, f"PI-MM-{tag}", company_id=co_b)
+    absent = 987654321
+
     r = admin_client.post(f"/api/lcs/{lc['id']}/pis",
-                          json={"sale_ids": [other]})
-    assert r.status_code == 400
+                          json={"sale_ids": [foreign]})
+    missing = admin_client.post(f"/api/lcs/{lc['id']}/pis",
+                                json={"sale_ids": [absent]})
+
+    assert r.status_code == missing.status_code == 404
+    assert (r.get_json()["error"].replace(str(foreign), "{id}")
+            == missing.get_json()["error"].replace(str(absent), "{id}")
+            == "sale {id} not found")
+    assert "different company" not in r.get_json()["error"]
 
 
 def test_attach_unknown_sale_404(admin_client, db):

@@ -682,15 +682,15 @@ future call sites are covered without opting in:
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/api/invoices/<id>/items` | Session/Key | Invoice lines (product, quantity, unit_price, line_total) |
-| POST | `/api/invoices/<id>/items` | Admin (15/min) | Add a line `{sale_item_id, quantity}` — **unit_price is resolved server-side from the PI line**, never accepted from the client; quantity must be finite and > 0, and **may exceed the PI line quantity** (shipment advantage, INV-REVISION — no ceiling). Recomputes `invoices.amount` from its lines in the same transaction |
+| POST | `/api/invoices/<id>/items` | Admin (15/min) | Add a line `{sale_item_id, quantity}` — **unit_price is resolved server-side from the PI line**, never accepted from the client; quantity must be finite and > 0, and **may exceed the PI line quantity** (shipment advantage, INV-REVISION — no ceiling). Recomputes `invoices.amount` from its lines in the same transaction. Exceeding the 5% over-invoice ceiling (`check_invoice_tolerance`) is **409** `ToleranceExceeded` |
 | GET | `/api/invoices/<id>/readiness` | Session/Key | Per-invoice readiness — `status`, `can_book`/`can_ship`/`can_pay`, `book_blocked_reason`, `recipes_ok`, `produced_ok`, `detail` (products needing a recipe or an invoice-linked production run). Production is evaluated for **this invoice only** (a sibling's production neither blocks nor unlocks it) |
 
 ### Sales Invoices
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/api/sales/<id>/invoices` | Session/Key | List invoices with `amount` + `paid_amount` each, plus `can_book` + `book_blocked_reason` (PBB) so the panel renders Book from server truth. `book_blocked_reason` is `null` whenever the invoice is not bookable, including for closed (`booked`/`shipped`/`paid`) rows — `can_book` alone carries "past booking" |
-| POST | `/api/sales/<id>/invoices` | Admin | Create (`invoice_number` required; optional `lines:[{sale_item_id, quantity}]`). **No `amount` is accepted** — money is always derived. With `lines`, quantities are validated (may exceed the PI line; unit price resolved from the PI) and the header is restated as `SUM(invoice_items.line_total)`; without `lines`, one line is seeded per remaining uninvoiced PI line from the derived remainder. A create is born `planned`, never `paid` (INV-REVISION). 400 on duplicate number; sets sale `shipment_status='production_running'` (COALESCE, never downgrades) |
-| POST | `/api/sales/<id>/invoices/batch` | Admin (15/min) | Create N invoices in ONE transaction: body `{invoices:[{invoice_number, lines:[{sale_item_id, quantity}]}]}` — each invoice gets ≥1 line; per `sale_item` the sum of quantities across the batch must not exceed the remaining uninvoiced quantity; headers restated as `SUM(line_total)`; atomic (one commit or full rollback) |
+| POST | `/api/sales/<id>/invoices` | Admin | Create (`invoice_number` required; optional `lines:[{sale_item_id, quantity}]`). **No `amount` is accepted** — money is always derived. With `lines`, quantities are validated (may exceed the PI line; unit price resolved from the PI) and the header is restated as `SUM(invoice_items.line_total)`; without `lines`, one line is seeded per remaining uninvoiced PI line from the derived remainder. A create is born `planned`, never `paid` (INV-REVISION). 400 on duplicate number; **409** on a 5% tolerance breach (Phase 4-A change, was 400 — see below); sets sale `shipment_status='production_running'` (COALESCE, never downgrades) |
+| POST | `/api/sales/<id>/invoices/batch` | Admin (15/min) | Create N invoices in ONE transaction: body `{invoices:[{invoice_number, lines:[{sale_item_id, quantity}]}]}` — each invoice gets ≥1 line; per `sale_item` the sum of quantities across the batch must not exceed the remaining uninvoiced quantity; headers restated as `SUM(line_total)`; atomic (one commit or full rollback). **409** on a 5% tolerance breach, checked across the whole batch (Phase 4-A change, was 400 — see below) |
 | POST | `/api/sales/<id>/invoices/<iid>/book` | Admin | Book (`approx_ship_date` required) → `booked`; sale → `ship_booked` (advance-only CASE). **Gated on production (PBB):** refused with **409** `invoice not produced yet` unless every product on the invoice has a company recipe and an invoice-linked production run, re-checked at both `planned` and `produced` (fail-closed; `invoices.status` alone is not trusted) |
 | POST | `/api/sales/<id>/invoices/<iid>/ship` | Admin | Ship (`actual_ship_date` required) → `shipped` + creates a `shipments` row |
 | POST | `/api/sales/<id>/invoices/<iid>/pay` | Admin | Record payment (`payment_amount>0`, `payment_date`); flips invoice to `paid` when covered |
@@ -917,6 +917,7 @@ commercial report is invoice-driven so an uninvoiced PI contributes 0 to gross s
 | Layer | Strategy |
 |---|---|
 | **Validation** | Pydantic models (`SaleCreateIn`, `SaleItemIn`, etc.) → 400 `{error, details:[{field, message}]}` |
+| **Service refusals** | The status comes from the exception's **type**, never its message. `raas_tracker/_exceptions.py` holds the hierarchy — `ServiceError` (base, 400) → `LifecycleConflict` (409) / `ResourceMissing` (404) → one leaf per condition — and `status_for(exc)` is the single entry point; a plain `ValueError` falls back to 400. Every leaf is a `ValueError`, so an un-migrated `except ValueError` still catches it. See §6.2 |
 | **DB Errors** | `psycopg.IntegrityError` → `ValueError` → 400/409; `OperationalError` → 500 |
 | **Auth** | Missing/invalid → 401/403 JSON; login throttle → 429 + `Retry-After` |
 | **Rate Limit** | 429 + `Retry-After` header; JSON `{error: "rate limit exceeded, slow down"}` |
@@ -952,6 +953,36 @@ Two independent walls, both app-wide:
 Phase 2-B adds the third wall (`math.isfinite` in the service layer), which is what
 covers non-HTTP callers that bypass the parser entirely.
 
+### 6.2 A refusal's status is its type, not its wording (Phase 4-A)
+
+`flask_app._state_error_status`, `_invoice_item_error` and `_lc_attach_error`
+each decided an HTTP status by matching the **words** of a service error
+message (`"invoice already"` → 409, `"exceeds"` → 409, `"lc not found"` → 404,
+…). Message wording is not a contract: re-typing "invoice not produced yet" as
+"this invoice has not been produced" silently downgraded a 409 to a 400, and no
+test asserted the status, so the drift was invisible. All of those mappers are
+deleted. A route now calls `status_for(e)`, which reads the **type**:
+
+| Exception | Status | Condition |
+|---|---|---|
+| `ValueError` (plain) | 400 | malformed input — still the honest answer, and deliberately untyped |
+| `ServiceError` | 400 | base class; only this hierarchy carries a status |
+| `LifecycleConflict` | 409 | valid request, conflicts with current state |
+| `ResourceMissing` | 404 | no such resource, **or not this caller's** — the two are deliberately indistinguishable |
+| `sales.InvoicedLineConflict` | 409 | a PI line `invoice_items` already point at cannot be re-based or deleted |
+
+**Public contract change — the 5% over-invoice tolerance breach is a 409
+everywhere (2026-10-15).** `check_invoice_tolerance` raises `ToleranceExceeded`
+from all three writers of an invoice line. `POST /api/invoices/<id>/items`
+answered 409; `POST /api/sales/<id>/invoices` and
+`POST /api/sales/<id>/invoices/batch` **hardcoded 400** for the same refusal, so
+the same condition returned two different statuses depending on the route.
+Rationale: a breach conflicts with what the sale has already been invoiced for,
+so retrying the identical body will never succeed — RFC 9110 §15.5.10, not a
+malformed request. Both create routes now use `status_for(e)`; the add-line
+route is unchanged. A client that branched on 400 for "bad payload, let the
+user fix it" must now branch on 400 **or** 409 for the invoice-write routes.
+
 ## 7. Testing Strategy
 
 ### Backend (pytest)
@@ -960,7 +991,7 @@ covers non-HTTP callers that bypass the parser entirely.
 - **Fixtures**: `db` (clean conn), `client` (Flask test client), `admin_client`, `user_client`
 - **Bcrypt**: Rounds=4 in tests (vs 13 prod) for speed
 - **Rate Limits**: `RAAS_RATE_LIMITS=off` globally; targeted tests re-enable
-- **Coverage**: 929 passed / 8 skipped (auth, stock, upload, sales, invoices, production, LC, rate limits, PI parse, notifications, schema migration, upload-limit config) — includes `tests/test_invoices_production.py`, `tests/test_invoice_items.py`, `tests/test_schema_migration.py, `tests/test_numeric_integrity.py`, `tests/test_qty_validation.py``, `tests/test_authorization_roles.py` (89 tests: P1-A role classification + P1-B volume limits and payload caps).
+- **Coverage**: **1189 passed / 8 skipped** as of Phase 4-A (auth, stock, upload, sales, invoices, production, LC, rate limits, PI parse, notifications, schema migration, upload-limit config) — includes `tests/test_invoices_production.py`, `tests/test_invoice_items.py`, `tests/test_schema_migration.py`, `tests/test_numeric_integrity.py`, `tests/test_qty_validation.py`, `tests/test_authorization_roles.py` (P1-A role classification + P1-B volume limits and payload caps), and `tests/test_typed_errors.py` (Phase 4-A: every refusal's status is asserted to come from the exception type, not its message).
 
 ### Frontend (Vitest)
 - **Environment**: jsdom

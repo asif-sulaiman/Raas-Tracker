@@ -11,11 +11,27 @@ Finding-5 invariants (service-enforced):
   * when ``sales.company_id`` changes, clear ``sales.lc_id`` (see
     ``raas_tracker.sales.relink_sale_company``, called from
     ``update_sale_full``).
+
+Status-carrying refusals (Phase 4-A) carry their HTTP status on the exception
+TYPE, never in the wording: a duplicate LC number is a
+:class:`~raas_tracker._exceptions.LcNumberAlreadyExists` (409), an absent LC or
+sale a :class:`~raas_tracker._exceptions.LcNotFound` /
+:class:`~raas_tracker._exceptions.LcSaleNotFound` (404), and each readiness
+gate its own conflict class. Plain validation ``ValueError``s stay plain and
+still map to 400.
 """
 
 import psycopg
 from datetime import datetime as _dt, timezone
 from typing import Optional, List, Dict, Any
+
+from ._exceptions import (
+    LcNotFound,
+    LcNotReadyForShipment,
+    LcNotReadyPastShipment,
+    LcNumberAlreadyExists,
+    LcSaleNotFound,
+)
 
 
 def _now_str() -> str:
@@ -49,8 +65,9 @@ def create_lc(conn: psycopg.Connection, company_id: int, lc_number: str,
     """Create an LC for a company. Trims ``lc_number``; rejects blank.
 
     Scoped UNIQUE per ``(company_id, lc_number)``: a trimmed duplicate for
-    the same company raises ``ValueError`` (race-safe via the DB unique
-    index); the same number for a different company is fine. Audits
+    the same company raises ``LcNumberAlreadyExists`` (409) — race-safe via
+    the DB unique index, which raises the same class so the two paths cannot
+    disagree; the same number for a different company is fine. Audits
     ``LC_CREATE``.
     """
     from .audit import log_audit_action
@@ -69,7 +86,7 @@ def create_lc(conn: psycopg.Connection, company_id: int, lc_number: str,
         "WHERE company_id = %s AND trim(lc_number) = %s",
         (company_id, lc_number)).fetchone()
     if dup:
-        raise ValueError(
+        raise LcNumberAlreadyExists(
             f"LC number '{lc_number}' already exists for this company")
 
     def _clean(value):
@@ -91,7 +108,7 @@ def create_lc(conn: psycopg.Connection, company_id: int, lc_number: str,
             conn.rollback()
         except Exception:
             pass
-        raise ValueError(
+        raise LcNumberAlreadyExists(
             f"LC number '{lc_number}' already exists for this company")
     lc = _row_to_dict(row)
     log_audit_action(conn, "LC_CREATE", "lc", lc["id"],
@@ -146,8 +163,14 @@ def attach_pis(conn: psycopg.Connection, lc_id: int, sale_ids: list) -> dict:
     """Link sales (PIs) to an LC in ONE transaction.
 
     Every sale must share the LC's ``company_id`` or the whole call raises
-    ``ValueError`` and links nothing. Mirrors the trimmed ``lc_number`` /
-    ``lc_date`` onto each sale row (compat). Audits ``LC_ATTACH`` per sale.
+    ``LcSaleNotFound`` (404) and links nothing. A sale that belongs to another
+    company is reported **exactly** as a sale that does not exist — same
+    class, same message — because the previous "sale N belongs to a different
+    company" / 400 pairing against a 404 for a missing sale was a
+    cross-tenant enumeration oracle: walking ``sale_id`` values told a caller
+    which ones existed and belonged to somebody else. Mirrors the trimmed
+    ``lc_number`` / ``lc_date`` onto each sale row (compat). Audits
+    ``LC_ATTACH`` per sale.
 
     Linking IS entering LC: every attached sale still at ``pi_issued`` is
     advanced to ``lc_received`` (with ``sales_stage_history`` + ``SALE_MOVE``
@@ -165,20 +188,24 @@ def attach_pis(conn: psycopg.Connection, lc_id: int, sale_ids: list) -> dict:
             (lc_id,)).fetchone()
         if not lc_row:
             conn.rollback()
-            raise ValueError("LC not found")
+            raise LcNotFound("LC not found")
         _, raw_number, lc_company, lc_date = lc_row
         lc_number = (raw_number or "").strip()
         prior_stages = {}
         for sale_id in sale_ids:
+            # Tenant scoping lives in the WHERE clause, not in a Python
+            # comparison, so the cross-tenant path is literally the same query
+            # as the missing path: same primary-key lock, same empty result,
+            # same refusal. Absent and cross-tenant are one condition
+            # deliberately — same class and same text — so the response cannot
+            # be used to tell "no such sale" from "sale exists, wrong tenant".
             sale = conn.execute(
-                "SELECT id, company_id, stage FROM sales WHERE id = %s FOR UPDATE",
-                (sale_id,)).fetchone()
+                "SELECT id, stage FROM sales"
+                " WHERE id = %s AND company_id = %s FOR UPDATE",
+                (sale_id, lc_company)).fetchone()
             if not sale:
-                raise ValueError(f"sale {sale_id} not found")
-            if sale[1] != lc_company:
-                raise ValueError(
-                    f"sale {sale_id} belongs to a different company")
-            prior_stages[sale_id] = sale[2]
+                raise LcSaleNotFound(f"sale {sale_id} not found")
+            prior_stages[sale_id] = sale[1]
         for sale_id in sale_ids:
             conn.execute(
                 "UPDATE sales SET lc_id = %s, lc_number = %s, lc_date = %s,"
@@ -268,9 +295,15 @@ def move_lc_stage(conn: psycopg.Connection, lc_id: int, new_stage: str,
     LC into ``shipment_ongoing`` the gate requires merely that at least one
     invoice exists. When it carries the LC into ``payment_due`` the gate
     additionally requires progress from every invoiced product through a
-    company recipe verified by an invoice-linked production run. ``ValueError``
-    names the missing preconditions (``invoices: ...`` or
-    ``recipes: ...`` / ``production: ...``). Propagates
+    company recipe verified by an invoice-linked production run.
+
+    Each gate raises its own typed refusal at the point the message is
+    built — ``LcNotReadyForShipment`` / ``LcNotReadyPastShipment``, both 409,
+    text unchanged. The route used to recover the status by scanning the text
+    for ``"not ready for shipment"`` / ``"recipes:"`` / ``"invoices:"`` /
+    ``"production:"``, three of which are vocabulary shared with the readiness
+    payload the message is itself assembled from, so any rewording (or any
+    new colon in those words) silently changed the HTTP status. Propagates
     ``sales.stage`` + ``sales_stage_history`` + ``SALE_MOVE`` audit per child
     (``via_lc=True``: linked PIs only travel via this path). Returns False
     when the LC does not exist.
@@ -321,7 +354,7 @@ def move_lc_stage(conn: psycopg.Connection, lc_id: int, new_stage: str,
                     conn.rollback()
                 except Exception:
                     pass
-                raise ValueError(msg)
+                raise LcNotReadyForShipment(msg)
 
         if tgt_idx >= pay_idx > cur_idx:
             prod = production_readiness(conn, lc_company, sale_ids)
@@ -344,7 +377,7 @@ def move_lc_stage(conn: psycopg.Connection, lc_id: int, new_stage: str,
                     conn.rollback()
                 except Exception:
                     pass
-                raise ValueError(msg)
+                raise LcNotReadyPastShipment(msg)
         conn.execute(
             "UPDATE letters_of_credit SET stage = %s, updated_at = %s"
             " WHERE id = %s",
