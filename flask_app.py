@@ -3073,7 +3073,8 @@ def api_edit_payment(sale_id, payment_id):
         return _validation_error_response(e)
     conn = get_db()
     try:
-        ok = update_sale_payment_record(conn, payment_id, patch.payment_date,
+        ok = update_sale_payment_record(conn, sale_id, payment_id,
+                                        patch.payment_date,
                                         patch.payment_amount, patch.notes)
     except ValueError as e:
         conn.close()
@@ -3088,7 +3089,7 @@ def api_edit_payment(sale_id, payment_id):
 @admin_required
 def api_delete_payment(sale_id, payment_id):
     conn = get_db()
-    ok = delete_sale_payment_record(conn, payment_id)
+    ok = delete_sale_payment_record(conn, sale_id, payment_id)
     conn.close()
     if not ok:
         return jsonify({"error": "Payment not found"}), 404
@@ -3232,15 +3233,15 @@ def api_cron_maturity_check():
         today = date.today()
         # Find sales with maturity_date not null, not fully paid
         rows = conn.execute("""
-            SELECT s.id, s.client_name, s.maturity_date, s.company_id,
-                   COALESCE(SUM(sp.payment_amount), 0) AS paid,
-                   COALESCE(ROUND(SUM(si.quantity * si.unit_price)::numeric, 2)::float8, 0) AS total
+            SELECT s.id, s.client_name, s.maturity_date
             FROM sales s
-            LEFT JOIN sale_payments sp ON sp.sale_id = s.id
-            LEFT JOIN sale_items si ON si.sale_id = s.id
             WHERE s.maturity_date IS NOT NULL
-            GROUP BY s.id, s.client_name, s.maturity_date, s.company_id
-            HAVING COALESCE(SUM(sp.payment_amount), 0) < COALESCE(ROUND(SUM(si.quantity * si.unit_price)::numeric, 2)::float8, 0)
+              AND COALESCE((SELECT SUM(sp.payment_amount)
+                            FROM sale_payments sp
+                            WHERE sp.sale_id = s.id), 0)
+                < COALESCE((SELECT ROUND(SUM(si.quantity * si.unit_price)::numeric, 2)::float8
+                            FROM sale_items si
+                            WHERE si.sale_id = s.id), 0)
         """).fetchall()
         
         notified = 0

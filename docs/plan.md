@@ -39,8 +39,8 @@ full backend suite plus an Oracle review, and the working state lives in
 |---|---|---|
 | 3 | Gate integrity — stage barriers, invoice freeze, 5% tolerance | Oracle ✅ (commit `3307b22`) |
 | 4-A | Typed exceptions (`raas_tracker/_exceptions.py`, `status_for`) replace message-wording status coupling; 5% tolerance breach standardised to 409 | Oracle ✅ (commit `6f158b2`) |
-| 4-B | Edge response headers in `vercel.json` (nosniff / DENY / X-XSS-Protection / `no-referrer` / HSTS / Permissions-Policy / **hash-allowlisted CSP**) + `@app.errorhandler(415)` so a wrong Content-Type is 415, not 500 | Oracle 🔴 blocked (F1 HIGH: the CSP deferral rested on a disproven premise; plus stale claims in SPEC/plan) → all remediated → ⬛ re-review pending |
-| 5 | IDOR + limits | ⬜ planned |
+| 4-B | Edge response headers in `vercel.json` (nosniff / DENY / X-XSS-Protection / `no-referrer` / HSTS / Permissions-Policy / **hash-allowlisted CSP**) + `@app.errorhandler(415)` so a wrong Content-Type is 415, not 500 | ✅ committed `b645a3d` (Oracle 2/2, zero code defects) |
+| 5 | IDOR + limits — bind payment records to their sale in URL (`api_edit_payment`/`api_delete_payment` verify `sale_payments.sale_id` → 404 on mismatch); fix maturity cron `HAVING` compare (join fan-out between `sale_payments` × `sale_items` inflates both sums → two independent correlated subqueries) | ✅ committed (TDD: 5 RED → 5 GREEN; full suite 1233/8) |
 
 **4-B decisions worth not re-deriving**
 

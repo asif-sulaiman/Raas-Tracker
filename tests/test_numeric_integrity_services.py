@@ -410,7 +410,7 @@ def test_update_sale_payment_record_rejects_non_finite_and_changes_nothing(db, b
     pid = record_sale_payment(db, sid, "2026-10-30", 40.0)["payment_id"]
 
     with pytest.raises(ValueError):
-        update_sale_payment_record(db, pid, payment_amount=bad)
+        update_sale_payment_record(db, sid, pid, payment_amount=bad)
 
     assert db.execute("SELECT payment_amount FROM sale_payments "
                       "WHERE id = %s", (pid,)).fetchone()[0] == 40.0

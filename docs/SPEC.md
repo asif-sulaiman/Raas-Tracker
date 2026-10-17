@@ -657,8 +657,8 @@ future call sites are covered without opting in:
 | POST | `/api/sales/<id>/move` | Admin | Advance stage (with notes) |
 | PUT | `/api/sales/<id>/lc` | Admin | Legacy per-PI LC entry. **409 when the PI is already linked to an LC** — linked PIs use the `/api/lcs` endpoints instead (a half-linked PI has no UI to undo) |
 | PUT | `/api/sales/<id>/payment` | Admin | Record payment |
-| PUT | `/api/sales/<id>/payments/<pid>` | Admin | Edit payment |
-| DELETE | `/api/sales/<id>/payments/<pid>` | Admin | Delete payment |
+| PUT | `/api/sales/<id>/payments/<pid>` | Admin | Edit payment — **scoped to `<id>`** — 404 if `<pid>` belongs to another sale |
+| DELETE | `/api/sales/<id>/payments/<pid>` | Admin | Delete payment — **scoped to `<id>`** — 404 if `<pid>` belongs to another sale |
 | POST | `/api/sales/<id>/items` | Admin | Add item (product, qty, price, unit) |
 | PUT | `/api/sales/<id>/items/<iid>` | Admin | Update item (incl. unit) |
 | DELETE | `/api/sales/<id>/items/<iid>` | Admin | Delete item (min 1 item); **scoped to `<id>`** — 404 if the line belongs to another sale or is already gone |
@@ -898,7 +898,7 @@ commercial report is invoice-driven so an uninvoiced PI contributes 0 to gross s
 - Test bypass: `RAAS_RATE_LIMITS=off`
 
 ### Cron Jobs (Vercel)
-- `POST /api/cron/maturity-check` — daily 09:00 UTC; checks sales with `maturity_date <= today` and unpaid; creates `maturity_due` (warning) and `maturity_escalated` (critical, at 7+ days overdue) notifications with dedupe; clears dedupe on full payment. Auth: `Authorization: Bearer <CRON_SECRET>`.
+- `POST /api/cron/maturity-check` — daily 09:00 UTC; checks sales with `maturity_date <= today` and unpaid; creates `maturity_due` (warning) and `maturity_escalated` (critical, at 7+ days overdue) notifications with dedupe; clears dedupe on full payment. Auth: `Authorization: Bearer <CRON_SECRET>`. Paid-vs-total compare uses two independent correlated subqueries (`sale_payments` and `sale_items` separately) — never a single JOIN, which inflates both sums via row fan-out when a sale has multiple payments × multiple items.
 
 ### Notifications
 - In-app notifications with dedupe (`notifications.py:notify`)

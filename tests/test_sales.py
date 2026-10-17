@@ -24,8 +24,8 @@ def test_payment_audit_trail_contents(db):
     sid = add_sale(db, {"pi_number": "PI-AUD", "client_name": "ACME"},
                    [{"product_name": "W", "quantity": 10, "unit_price": 10}])
     out = record_sale_payment(db, sid, "2026-09-01", 40.0)
-    update_sale_payment_record(db, out["payment_id"], payment_amount=50.0)
-    delete_sale_payment_record(db, out["payment_id"])
+    update_sale_payment_record(db, sid, out["payment_id"], payment_amount=50.0)
+    delete_sale_payment_record(db, sid, out["payment_id"])
     rows = {r[0]: (r[1], r[2]) for r in db.execute(
         "SELECT action, old_value, new_value FROM audit_logs WHERE entity_type = 'sale'")}
     pay_old, pay_new = rows["SALE_PAYMENT"]

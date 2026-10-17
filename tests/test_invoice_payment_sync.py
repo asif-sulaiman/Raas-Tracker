@@ -81,7 +81,7 @@ def test_deleting_full_payment_unpays_invoice(db):
     assert _status(db, inv) == "paid"
     assert _sale_legacy_paid(db, sid) == 100
 
-    assert delete_sale_payment_record(db, out["payment_id"]) is True
+    assert delete_sale_payment_record(db, sid, out["payment_id"]) is True
 
     assert _status(db, inv) != "paid", "deleted payment must not leave status='paid'"
     assert _paid_amount(db, inv) == 0
@@ -98,7 +98,7 @@ def test_deleting_partial_payment_keeps_paid_invoice(db):
     extra = record_sale_payment(db, sid, "2026-10-31", 25)["payment_id"]
     assert _status(db, inv) == "paid"
 
-    assert delete_sale_payment_record(db, extra) is True
+    assert delete_sale_payment_record(db, sid, extra) is True
     assert _status(db, inv) == "paid", "still covered by the remaining payment"
     assert _paid_amount(db, inv) == 100
 
@@ -112,7 +112,7 @@ def test_editing_payment_down_unpays_invoice(db):
     out = mark_invoice_paid(db, inv, 100, "2026-10-30")
     assert _status(db, inv) == "paid"
 
-    assert update_sale_payment_record(db, out["payment_id"], payment_amount=40) is True
+    assert update_sale_payment_record(db, sid, out["payment_id"], payment_amount=40) is True
 
     assert _status(db, inv) != "paid", "shrinking the payment must flip status back"
     assert _paid_amount(db, inv) == 40
@@ -127,7 +127,7 @@ def test_editing_payment_up_pays_invoice(db):
     assert out["status"] == "planned"
     assert _status(db, inv) == "planned"
 
-    assert update_sale_payment_record(db, out["payment_id"], payment_amount=100) is True
+    assert update_sale_payment_record(db, sid, out["payment_id"], payment_amount=100) is True
 
     assert _status(db, inv) == "paid"
     assert _paid_amount(db, inv) == 100
@@ -146,10 +146,10 @@ def test_sale_level_payment_leaves_invoices_alone(db):
     assert _status(db, inv) == "paid"
     assert _paid_amount(db, inv) == 100
 
-    assert update_sale_payment_record(db, sale_only, payment_amount=25) is True
+    assert update_sale_payment_record(db, sid, sale_only, payment_amount=25) is True
     assert _status(db, inv) == "paid"
 
-    assert delete_sale_payment_record(db, sale_only) is True
+    assert delete_sale_payment_record(db, sid, sale_only) is True
     assert _status(db, inv) == "paid"
     assert _paid_amount(db, inv) == 100
     assert _sale_paid(db, sid) == 100
@@ -166,7 +166,7 @@ def test_legacy_null_amount_invoice_unpays_when_payment_removed(db):
     assert out["status"] == "paid"
     assert _status(db, inv) == "paid"
 
-    assert delete_sale_payment_record(db, out["payment_id"]) is True
+    assert delete_sale_payment_record(db, sid, out["payment_id"]) is True
     assert _status(db, inv) != "paid"
     assert _paid_amount(db, inv) == 0
 
@@ -183,5 +183,5 @@ def test_shipped_invoice_returns_to_shipped_when_unpaid(db):
     out = mark_invoice_paid(db, inv, 100, "2026-10-30")
     assert _status(db, inv) == "paid"
 
-    assert delete_sale_payment_record(db, out["payment_id"]) is True
+    assert delete_sale_payment_record(db, sid, out["payment_id"]) is True
     assert _status(db, inv) == "shipped"

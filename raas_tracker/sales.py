@@ -543,18 +543,25 @@ def update_sale_payment(conn: psycopg.Connection, sale_id: int, payment_date: st
     return True
 
 
-def update_sale_payment_record(conn: psycopg.Connection, payment_id: int,
+def update_sale_payment_record(conn: psycopg.Connection, sale_id: int, payment_id: int,
                                payment_date: Optional[str] = None,
                                payment_amount: Optional[float] = None,
                                notes: Optional[str] = None) -> bool:
     """Edit a payment record. Reverts a completed sale to payment_due
     if the new total no longer covers the invoice, and re-derives the linked
-    invoice's paid status."""
+    invoice's paid status.
+
+    `sale_id` binds the payment to the sale named in the request URL: a
+    payment may only be edited through the sale it belongs to, closing an
+    IDOR where any payment_id could be addressed through any sale's route.
+    """
     row = conn.execute("SELECT sale_id, payment_amount, invoice_id FROM sale_payments WHERE id = %s",
                        (payment_id,)).fetchone()
     if not row:
         return False
-    sale_id, old_amount, invoice_id = row[0], row[1], row[2]
+    db_sale_id, old_amount, invoice_id = row[0], row[1], row[2]
+    if db_sale_id != sale_id:
+        return False
     fields, vals = [], []
     if payment_date is not None:
         fields.append("payment_date = %s")
@@ -592,14 +599,22 @@ def update_sale_payment_record(conn: psycopg.Connection, payment_id: int,
     return True
 
 
-def delete_sale_payment_record(conn: psycopg.Connection, payment_id: int) -> bool:
+def delete_sale_payment_record(conn: psycopg.Connection, sale_id: int, payment_id: int) -> bool:
     """Delete a payment record, re-sync totals, and re-derive the linked
-    invoice's paid status (the invoice may no longer be covered)."""
+    invoice's paid status (the invoice may no longer be covered).
+
+    `sale_id` binds the payment to the sale named in the request URL: a
+    payment may only be deleted through the sale it belongs to, closing an
+    IDOR where any payment_id could be removed through any sale's route.
+    """
     row = conn.execute("SELECT sale_id, payment_amount, invoice_id FROM sale_payments WHERE id = %s",
                        (payment_id,)).fetchone()
     if not row:
         return False
-    sale_id = row[0]
+    db_sale_id = row[0]
+    if db_sale_id != sale_id:
+        return False
+    sale_id = db_sale_id
     invoice_id = row[2]
     conn.execute("DELETE FROM sale_payments WHERE id = %s", (payment_id,))
     _sync_sale_payment_totals(conn, sale_id)

@@ -370,6 +370,49 @@ class TestCronEndpoint:
         initial_notifs = [n for n in notifications if n["type"] == "maturity_due"]
         assert len(initial_notifs) == 0
 
+    def test_cron_no_notify_when_fully_paid_across_multiple_payments(self, client, monkeypatch, db):
+        """Fan-out guard: a sale fully paid across several payments must not
+        notify, even though joining sale_payments x sale_items multiplies each
+        sum by the other side's row count.
+
+        With 1 item (total 5000) and 2 payments (2500 each = 5000), the naive
+        joined HAVING evaluates paid_effective = 5000*1 = 5000 against
+        total_effective = 5000*2 = 10000 and would wrongly notify (5000 <
+        10000). The correct per-sale comparison (5000 < 5000) is false, so no
+        notification.
+        """
+        os.environ["CRON_SECRET"] = "test-secret"
+        monkeypatch.setenv("CRON_SECRET", "test-secret")
+
+        company_id = _create_company(db, "Test Client", code="TC")
+        today = date.today().isoformat()
+        sale_id = add_sale(db, {
+            "pi_number": "PI-020",
+            "pi_date": "2025-01-15",
+            "client_name": "Test Client",
+            "company_id": company_id,
+            "maturity_date": today,
+        }, [
+            {"product_name": "Product A", "quantity": 1, "unit_price": 5000, "unit": "KG"}
+        ])
+
+        record_sale_payment(db, sale_id, "2025-02-01", 2500, "First half")
+        record_sale_payment(db, sale_id, "2025-02-02", 2500, "Second half")
+
+        response = client.post(
+            "/api/cron/maturity-check",
+            headers={"Authorization": "Bearer test-secret"}
+        )
+        assert response.status_code == 200
+
+        ident = {"id": 1, "role": "admin"}
+        notifications = list_notifications_for(db, ident["id"], ident["role"])
+        initial_notifs = [n for n in notifications if n["type"] == "maturity_due"]
+        assert len(initial_notifs) == 0, (
+            f"fully-paid sale across multiple payments must not notify: "
+            f"{initial_notifs}"
+        )
+
     def test_cron_no_notify_future_maturity(self, client, monkeypatch, db):
         """Maturity in future -> no notification."""
         os.environ["CRON_SECRET"] = "test-secret"
