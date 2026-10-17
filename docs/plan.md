@@ -33,6 +33,26 @@ full backend suite plus an Oracle review, and the working state lives in
 | P2-A | Input boundary — app-wide `_FiniteJSONProvider` (`app.json`) rejecting the bare `NaN`/`Infinity`/`-Infinity` literals; shared `_FiniteModel` base (`allow_inf_nan=False`) across the 8 money/quantity write models; `@app.errorhandler(400)` so an undecodable body is a 400 and not a 500; `_req_float` on the two raw-dict numeric routes | Oracle ✅ APPROVED, no HIGH findings (2026-10-14) |
 | P2-B | Output boundary — `math.isfinite()` in `record_sale_payment`, `mark_invoice_paid`, `add_sale_item`, `update_sale_item`; the layer that holds when the parser is bypassed | ⬜ planned |
 
+### Phase 4 — unauthenticated surface (`vercel.json` headers + typed errors)
+
+| Sub-phase | Scope | Gate |
+|---|---|---|
+| 3 | Gate integrity — stage barriers, invoice freeze, 5% tolerance | Oracle ✅ (commit `3307b22`) |
+| 4-A | Typed exceptions (`raas_tracker/_exceptions.py`, `status_for`) replace message-wording status coupling; 5% tolerance breach standardised to 409 | Oracle ✅ (commit `6f158b2`) |
+| 4-B | Edge response headers in `vercel.json` (nosniff / DENY / X-XSS-Protection / `no-referrer` / HSTS / Permissions-Policy / **hash-allowlisted CSP**) + `@app.errorhandler(415)` so a wrong Content-Type is 415, not 500 | Oracle 🔴 blocked (F1 HIGH: the CSP deferral rested on a disproven premise; plus stale claims in SPEC/plan) → all remediated → ⬛ re-review pending |
+| 5 | IDOR + limits | ⬜ planned |
+
+**4-B decisions worth not re-deriving**
+
+| Decision | Choice | Why |
+|---|---|---|
+| Which responses carry the headers | One rule, `source: "/((?!api/).*)"` — every non-`/api` path | Deliberately **not** a copy of the rewrite's `/((?!api/|.*\.).*)`. The rewrite excludes dotted paths so `/assets/*.js` is served as a file; that exclusion is right for routing and wrong for headers, since a hashed bundle needs `nosniff` as much as `index.html` does. `/api/*` stays excluded — those responses are JSON and already carry the app's own controls. Pinned by `tests/test_edge_hardening.py` against the live `url_map`, so a route added later is covered automatically |
+| HSTS | `max-age=31536000; includeSubDomains`, **no `preload`** | One year is the OWASP floor and HSTS only protects once cached. This is the **only** HSTS the production host receives — Flask's copy is gated on `FORCE_HTTPS == "1"` and `FORCE_HTTPS` is unset in `vercel.json`'s `env` — so it is the whole of the protection, not a duplicate. `includeSubDomains` is a no-op on the current host (previews get `*.vercel.app` names) and is kept for the custom-domain case, with the trap recorded in SPEC §6.3.1: on an apex domain it would force HTTPS on every sibling subdomain, reversibly only by waiting out the browser cache. `preload` would claim a preload-list commitment nobody has made |
+| `Referrer-Policy` | `no-referrer` | Reset links carry a token in the URL (`/reset?token=…`) and `ResetPassword.jsx` then fetches `/api/auth/reset-password` same-origin, so any less-strict value put the **full** token URL into this app's own access log — while the cross-origin half of the guarantee had no consumer to protect. Nothing under `flask_app.py` or `src/` reads `document.referrer`/`Referer`, and there is no analytics, no cross-origin asset and no external origin at all, so `no-referrer` costs nothing measurable. Set in **both** layers so they agree; recorded in SPEC §6.3.1 |
+| **`Content-Security-Policy`** | **Shipped at the edge, hash-allowlisted** | Copied verbatim from `flask_app.py`, which had shipped it all along. The deferral rested on a false premise: that Vercel "cannot hash or nonce" the inline theme script because the header is static. A `sha256-…` source expression is a **compile-time constant** — exactly what a static header can express — and no nonce is involved. The cost of the error was concrete, not theoretical: the edge serves `index.html` and `/assets/*`, so the policy had never once applied to the responses it exists for. `script-src` is `'self'` + the recomputed theme-bootstrap digest, **not** `'unsafe-inline'`, which would also disable the hash mechanism. `style-src` keeps `'unsafe-inline'` — but **not** because of the three `style={{…}}` props, which React writes through the CSSOM and which CSP does not govern. The actual consumer is `sonner`, which injects its toast stylesheet as a `<style>` element at runtime, and an injected `<style>` *is* blocked: tightening this silently strips every toast's styling. Getting that stylesheet into the build is the remaining frontend work. Three tests hold the edge and Flask copies identical, including byte-for-byte; SPEC §6.3.2 |
+| 415 scope | Dedicated by-code handler beside 413; body `{error}` only, no `details`, no `code` field | A wrong Content-Type is a distinct client fault from an undecodable body (400), so it gets its own status. By code, not by class: Flask matches the by-class bucket by MRO and consults it for every status without a code handler, so a class entry is a far wider fallback than the status it was written for |
+
+
 **P2-A gate findings, and what closed them**
 
 | Finding | Problem | Resolution |
@@ -420,8 +440,9 @@ this is where to look.
 | Date | Change | Routes affected | Rationale |
 |---|---|---|---|
 | 2026-10-15 | **A 5% over-invoice tolerance breach answers `409`, not `400`.** `ToleranceExceeded` (`raas_tracker/_exceptions.py`) is a conflict with what the sale has already been invoiced for — retrying the identical body will never succeed — so it is RFC 9110 §15.5.10. `POST /api/invoices/<id>/items` already returned 409; `POST /api/sales/<id>/invoices` and `POST /api/sales/<id>/invoices/batch` **hardcoded 400** for the same refusal, so the status depended on which door the request came in by. Both now go through `status_for(e)`. **Not a bug** — `tests/test_typed_errors.py::test_tolerance_breach_is_409_on_every_invoice_write_route` pins all three at once | `POST /api/sales/<id>/invoices`, `POST /api/sales/<id>/invoices/batch` (400 → 409) | One condition must yield one status; the phase's whole purpose. `POST /api/invoices/<id>/items` is unchanged |
+| 2026-10-17 | **A wrong or absent request `Content-Type` answers `415`, not `500`.** `request.get_json()` raises Werkzeug's `UnsupportedMediaType`, which had no handler, so Flask's lookup fell through to the catch-all `Exception` handler. A client that posted a JSON body as `text/plain` (or with no type at all) was told *"internal server error"* — a retry instruction for a fault that is permanently its own. `@app.errorhandler(415)` now answers `{"error": "unsupported media type (expected application/json)"}` | every JSON route (`request.get_json() or {}`) whose `Content-Type` is not JSON (500 → 415) | 415 is RFC 9110 §15.5.16 for exactly this, and it is the only honest answer: the body will never parse until the header changes. **Not authenticated-only** — an earlier draft of this row claimed it was. The three `_PUBLIC_API` routes `/api/auth/login`, `/api/auth/forgot-password` and `/api/auth/reset-password` take `_gate_api`'s `None` path and parse the body before any credential exists, so each went from an unauthenticated **500** to a 415: the change improves the unauthenticated surface rather than leaving it untouched. Pinned by `tests/test_edge_hardening.py::test_a_public_route_answers_415_unauthenticated` |
 
-Also documented in `docs/SPEC.md` §4 ("Sales Invoices", "Invoice Items") and §6.
+Also documented in `docs/SPEC.md` §4 ("Sales Invoices", "Invoice Items"), §6 and §6.3.
 
 ---
 

@@ -167,7 +167,7 @@ def test_security_headers_present(admin_client):
     resp = admin_client.get("/api/auth/status")
     assert resp.headers.get("X-Content-Type-Options") == "nosniff"
     assert resp.headers.get("X-Frame-Options") == "DENY"
-    assert resp.headers.get("Referrer-Policy") == "strict-origin-when-cross-origin"
+    assert resp.headers.get("Referrer-Policy") == "no-referrer"
     assert resp.headers.get("Permissions-Policy") == "camera=(), microphone=(), geolocation=()"
 
 

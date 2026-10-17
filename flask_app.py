@@ -358,9 +358,14 @@ def _set_security_headers(resp):
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["X-XSS-Protection"] = "0"
-    resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     # Content Security Policy
+    # MIRRORED VERBATIM in `vercel.json`'s headers block, so the edge and the
+    # Flask layer enforce the same policy. `test_edge_hardening.py` compares the
+    # two byte-for-byte and recomputes the theme-script digest from the SPA's
+    # SOURCE index.html, so neither copy can drift from the other or from the
+    # script Vite copies into the build verbatim.
     csp = (
         "default-src 'self'; "
         # 'self' alone blocks inline scripts, so the theme bootstrap in
@@ -436,9 +441,10 @@ def _bad_request(_e):
     # (Phase 2-A).
     #
     # It does NOT cover a missing or non-JSON Content-Type: that raises
-    # `UnsupportedMediaType` (415), which has no handler and still falls
-    # through to the catch-all below as a 500. Pre-existing and out of scope —
-    # recorded here so the gap is not mistaken for coverage.
+    # `UnsupportedMediaType` (415), which has its own handler beside the 413
+    # below (`_unsupported_media_type`). The split is deliberate — an
+    # undecodable body and a wrongly-declared body are different client bugs
+    # and get different statuses.
     #
     # Without this handler those land in the catch-all `Exception` handler
     # below and are reported as 500 — "server fault, retry" for what is
@@ -1002,6 +1008,44 @@ def api_revoke_key(key_id):
 def _too_large(_e):
     max_mb = app.config["MAX_CONTENT_LENGTH"] / (1024 * 1024)
     return jsonify({"error": f"file too large (max {max_mb:g}MB)"}), 413
+
+
+@app.errorhandler(415)
+def _unsupported_media_type(_e):
+    """Wrong (or absent) request Content-Type on a JSON route.
+
+    Werkzeug raises `UnsupportedMediaType` from `request.get_json()` when the
+    body is not declared as JSON. Every JSON route here reads its body that way
+    (`request.get_json() or {}`), so one wrong header on any of them reaches
+    this — it is a property of the app's body parsing, not of one route.
+
+    Reachable **unauthenticated** too, and that is the point: `POST
+    /api/auth/login`, `/api/auth/forgot-password` and `/api/auth/reset-password`
+    are in `_PUBLIC_API`, so `_gate_api` returns `None` for them and this route
+    body runs `request.get_json()` before any credential exists. Those three
+    unauthenticated calls used to fall through to the catch-all `Exception`
+    handler and answer 500; the honest status is the change, on exactly the
+    surface this phase exists for.
+
+    Registered **by code**. This docstring is the canonical statement of *why*
+    every handler here is registered by status rather than by exception class;
+    `docs/SPEC.md` §6 and §6.3.3, `docs/plan.md` and
+    `tests/test_edge_hardening.py` cite it rather than restating it. Flask
+    consults the by-code bucket first and only then the by-class one, where it
+    matches by walking the exception's MRO — and it consults that second bucket
+    for *every* status that has no code handler of its own. A by-class
+    registration is therefore a fallback that applies far more widely than the
+    status it was written for: `HTTPException` registered by class, say, would
+    capture every unhandled 4xx into this one response shape. For this single
+    exception the effect would happen to match by-code; the discipline is what
+    keeps it that way.
+
+    Without it, the catch-all `Exception` handler below answered 500
+    "internal server error" — telling the caller to retry a fault that is
+    permanently its own and that no retry can fix.
+    """
+    app.logger.warning("rejected non-JSON request body: %s", _e)
+    return jsonify({"error": "unsupported media type (expected application/json)"}), 415
 
 
 def _req_float(data, field, default=0):

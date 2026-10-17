@@ -39,7 +39,7 @@ Raas-Tracker/
 ├── requirements.txt               # Cross-platform deps
 ├── requirements-win.txt           # Windows-only extras (doc2docx, pywin32)
 ├── requirements-dev.txt           # Dev deps (pytest, pgserver, etc.)
-├── vercel.json                    # Vercel build + SPA rewrite config
+├── vercel.json                    # Vercel build + SPA rewrite + security headers
 ├── .env.example                   # Env template
 ├── .gitignore
 ├── raas_tracker/                  # Data layer (PostgreSQL via psycopg)
@@ -923,7 +923,7 @@ commercial report is invoice-driven so an uninvoiced PI contributes 0 to gross s
 | **Rate Limit** | 429 + `Retry-After` header; JSON `{error: "rate limit exceeded, slow down"}` |
 | **File Upload** | Max 50MB by default (`MAX_CONTENT_LENGTH`, override with `MAX_CONTENT_LENGTH_MB`); allowed ext {.pdf,.xlsx,.xls}; **one canonical filename**, computed once per request by `_safe_upload_filename` (`raas_tracker/uploads.py`) and reused for the extension gate, the stored `uploads.filename`, the `UPLOAD_CREATE` audit row and the JSON response — it strips control chars, path traversal, bidi controls (U+202E/U+200E/U+200F), leading dots and Windows reserved device names, and **preserves non-ASCII** (werkzeug's `secure_filename` is deliberately not used: it flattened a legitimate Arabic name to a bare `xlsx`, so the gate rejected a real file). The on-disk name is separate and stays `uuid4().hex + ext`; parse failure → 400 + file cleanup |
 | **PI Parse** | Only `.pdf`/`.docx` accepted; legacy `.doc` rejected with guidance |
-| **Global** | `@app.errorhandler(404)` → 404 `{"error":"not found"}`; `@app.errorhandler(405)` → 405 `{"error":"method not allowed"}` (a wrong-method /api request must never fall into the catch-all and masquerade as a 500); `@app.errorhandler(400)` → 400 `{"error":"Invalid request body"}` (Werkzeug `BadRequest` — a body that will not decode; see §6.1); `@app.errorhandler(500)` + `@app.errorhandler(Exception)` → 500 `{"error":"internal server error"}` (log full trace). Registered **by status code, not by exception class**, so it cannot shadow 404/405/413/429 |
+| **Global** | `@app.errorhandler(404)` → 404 `{"error":"not found"}`; `@app.errorhandler(405)` → 405 `{"error":"method not allowed"}` (a wrong-method /api request must never fall into the catch-all and masquerade as a 500); `@app.errorhandler(400)` → 400 `{"error":"Invalid request body"}` (Werkzeug `BadRequest` — a body that will not decode; see §6.1); `@app.errorhandler(415)` → 415 `{"error":"unsupported media type (expected application/json)"}` (see §6.3); `@app.errorhandler(500)` + `@app.errorhandler(Exception)` → 500 `{"error":"internal server error"}` (log full trace). Registered **by status code, not by exception class** — the canonical statement of why is the `@app.errorhandler(415)` docstring at `flask_app.py:1012`, deliberately not restated here |
 | **413** | File too large → 413 `{"error":"file too large (max N MB)"}` where N = `MAX_CONTENT_LENGTH_MB` (default 50). On Vercel the platform 4.5MB body limit fires at the edge first, so >4.5MB gets Vercel's own 413 page, not this JSON — set `MAX_CONTENT_LENGTH_MB=4.5` to align the app cap with the platform |
 
 ### 6.1 Numeric integrity (P2-A) — non-finite values cannot enter
@@ -983,6 +983,193 @@ malformed request. Both create routes now use `status_for(e)`; the add-line
 route is unchanged. A client that branched on 400 for "bad payload, let the
 user fix it" must now branch on 400 **or** 409 for the invoice-write routes.
 
+### 6.3 The outermost boundary: edge headers + 415 (Phase 4-B)
+
+Two holes on the **unauthenticated** surface, both found by dumping live state
+rather than reading this document.
+
+#### 6.3.1 `vercel.json` had no `headers` block at all
+
+Its entire content was `env`, `buildCommand`, `rewrites`, `functions`, `crons`.
+Every SPA route is rewritten to `/index.html` at the edge and those responses
+shipped with no `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`,
+`Strict-Transport-Security` or `Permissions-Policy`. `TRUSTED_PROXY: "1"` was
+already in `env`, so the app already assumed Vercel was the sole ingress —
+trust was configured and response hardening was not. The block now carries:
+
+| Header | Value | Why this value |
+|---|---|---|
+| `X-Content-Type-Options` | `nosniff` | The only defence against MIME confusion. `index.html` references hashed bundles under `/assets/`; a browser that is allowed to sniff could execute an attacker-named file as script |
+| `X-Frame-Options` | `DENY` | Clickjacking. `DENY`, not `SAMEORIGIN`: nothing embeds this app, including itself. No iframe/`<object>`/`<embed>` exists anywhere under `src/` |
+| `X-XSS-Protection` | `0` | Deliberately **disables** the legacy reflected-XSS filter rather than enabling it. That filter was itself a source of information-disclosure bugs, and this app's control is the CSP below, not a heuristic body rewriter. `flask_app.py` sends the same value so the layers agree |
+| `Referrer-Policy` | `no-referrer` | Password-reset links carry a token in the URL (`/reset?token=…`), so the question is who ever receives that URL as a `Referer`. `strict-origin-when-cross-origin` answered only the cross-origin half: it still sends the **full** URL on same-origin requests, and `ResetPassword.jsx` reads `?token=` off the URL and then fetches `/api/auth/reset-password` same-origin — so the reset token lands in this app's own access log. `no-referrer` closes that too, and it costs nothing measurable here: nothing under `flask_app.py` or `src/` reads `document.referrer` or `Referer`, there is no analytics, no cross-origin asset and no external origin at all (next rows), so the cross-origin guarantee had no consumer to protect. `flask_app.py` sets the same value so the layers agree |
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | One year is the OWASP floor, and HSTS only protects once browsers have cached it. **This is the only HSTS the production host gets:** Flask sends its own gated on `FORCE_HTTPS == "1"`, and `FORCE_HTTPS` is absent from `env` here — so the edge header is the whole of the protection rather than a duplicate of it, which is the strongest reason it matters. `includeSubDomains` is a no-op on the current host (Vercel preview deployments get `*.vercel.app` hostnames, not subdomains of this host) and is kept for the custom-domain case, with the trap recorded rather than left to be discovered: the same block copied onto an apex domain would force HTTPS on every sibling subdomain, and HSTS is only reversible by waiting out the browser cache. **`preload` is deliberately absent** — the domain is not on the browser preload list, and shipping the token would claim a commitment nobody made |
+| `Permissions-Policy` | `camera=(), microphone=(), geolocation=()` | Each is denied because no code path uses it: no `getUserMedia`/`mediaDevices` (camera, microphone) and no `navigator.geolocation` anywhere under `raas-tracker-frontend/src/`. Denying an unused capability removes a permission-prompt surface — and a prompt the operator could be socially engineered into granting — at no cost |
+
+**Which responses get them.** One rule, `source: "/((?!api/).*)"` — everything
+that is not `/api/…`:
+
+- It is **not** a copy of the rewrite's pattern. `rewrites` is
+  `/((?!api/|.*\.).*)`: it excludes dotted paths because `/assets/*.js` must be
+  served as a file, not rewritten to `index.html`. That is right for routing and
+  wrong for headers — a hashed bundle needs `nosniff` exactly as much as
+  `index.html` does — so the header rule deliberately drops the dotted-path
+  exclusion and keys only on the `/api/` boundary. Copying the rewrite wholesale
+  would have left every static asset unprotected.
+- **`/api/*` is excluded, deliberately.** API responses are JSON, already covered
+  by the app's own auth, rate-limit and audit controls; stamping document headers
+  on them is at best noise and at worst a future CSP applied to a JSON body.
+  Every `/api/…` route in the live `url_map`, plus the scheduled cron path, is
+  asserted uncovered by `tests/test_edge_hardening.py` — read from `url_map`, so
+  a route added later is covered automatically. Every non-API rule matches, which
+  is the positive half of the same invariant (a pattern that accidentally matched
+  nothing would satisfy the negative test alone).
+- It is correct under either edge ordering: matched against the request path
+  (SPA routes keep theirs, `/api/…` never matches) or against the rewritten
+  destination (`/index.html` matches, `/api/…` is never rewritten and so never
+  matches).
+
+#### 6.3.2 Content-Security-Policy — hash-allowlisted, and now on the responses that needed it
+
+The CSP ships **at the edge**, copied verbatim from `flask_app.py`'s
+`after_request`. The policy is:
+
+```
+default-src 'self'; script-src 'self' 'sha256-i0ed3E9hYdck4GBiAzbjd2pnheK6j8fl472P8iayw1Q=';
+style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self';
+connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'
+```
+
+**Why `script-src` is not `'unsafe-inline'`.** The SPA keeps exactly one inline
+`<script>` — the theme bootstrap in `raas-tracker-frontend/index.html`, which Vite
+copies into the build verbatim — and a bare `'self'` blocks inline scripts, which
+is precisely how dark mode was silently broken in production before this policy
+existed. The fix is a **hash allowlist**: `'unsafe-inline'` also disables the hash
+mechanism outright, so it would be strictly weaker than what ships. The digest
+above is recomputed from `index.html` on every test run, so editing the bootstrap
+without updating both copies fails the gate rather than silently dropping the
+script.
+
+**Why the deferral that preceded this was wrong.** The earlier reasoning was that
+the policy could not be shipped because Vercel "cannot hash or nonce" an inline
+script — "the header is static, with no per-request nonce to bind". The premise
+is false: a `sha256-…` source expression is a **compile-time constant**, which is
+exactly what a static header expresses, and a nonce is not involved and never
+was. The cost of the error was concrete rather than theoretical — Flask had
+shipped this policy all along, but the edge serves the SPA document and
+`/assets/*`, so the policy had never once applied to the responses it exists to
+protect.
+
+**`style-src` keeps `'unsafe-inline'`, deliberately — but not for the reason it
+looks like.** The SPA has three inline `style={{…}}` props
+(`MismatchSummary.jsx:142` for the mismatch bar's width,
+`StockDistributionChart.jsx:16` and `ReconciliationChart.jsx:22` for the two chart
+legend swatches), and it is tempting to assume they are what requires the
+exception. **They are not.** React 19 writes those through the CSSOM
+(`style.setProperty` / `style[name] =`), and CSP does not govern CSSOM writes —
+they apply normally under a strict `style-src`. The actual consumer is
+**`sonner`**, which injects a `<style>` element at module scope
+(`__insertCSS` → `document.createElement("style")` → `head.appendChild`) carrying
+the toast stylesheet, and an injected `<style>` element *is* blocked by a strict
+`style-src`. Dropping the exception would silently strip the styling from every
+toast in the app.
+
+That failure mode is worth stating plainly: it would be **invisible**, because the
+three components that look responsible would go on rendering correctly, and the
+guard that would catch it is the one being removed. So removing `'unsafe-inline'`
+needs sonner's stylesheet imported through the app's own build (rather than
+injected at runtime) — not a Tailwind migration of those three props, which would
+achieve nothing. Until then the exception is asserted by test so it cannot be
+tightened by accident.
+
+**No external origin at all**, which is what makes the remaining directives free:
+grep for `https?://` across `src/` returns two hits, both inside a test file. No
+CDN, no webfont host, no third-party API — so `connect-src`/`font-src`/`img-src`
+are all `'self'`. `img-src` additionally carries `data:`, which nothing currently
+needs: the icons are `lucide-react` inline `<svg>`, which `img-src` does not
+govern, and the bundle contains no `data:` URI. It is kept because Vite inlines
+assets under 4 KB as `data:` URLs by default, so without it the first small icon
+or logo added would break in production only.
+
+**Keeping the two copies honest.** `vercel.json` is static JSON and cannot import
+`flask_app.py`, so the policy necessarily exists twice. Three tests hold that
+duplication:
+
+| Guard | What it prevents |
+|---|---|
+| `test_the_edge_csp_is_byte_identical_to_the_one_flask_sends` | The two copies diverging into one policy that means two different things depending on which layer answered |
+| `test_content_security_policy_is_shipped_with_the_theme_hash` | The digest drifting from the bootstrap script — which would silently drop the script and dark mode with it |
+| `test_style_src_keeps_the_inline_exception_the_spa_still_needs` | Someone "tightening" `style-src` while `sonner` still injects its stylesheet at runtime |
+
+`tests/test_features.py` applies the digest guard independently to the Flask copy
+(`test_csp_allows_the_inline_theme_script`); the other two are specific to the
+edge config, which is where the duplication lives.
+
+**Residual, recorded rather than glossed.** There is no staging deployment, so
+enforcement is proven by digest and by review rather than observed live: a policy
+that blanked the deployed SPA would still be green here. What *was* verified is
+narrower than "the built output works" — the theme script's digest matches the
+CSP, and that script is byte-identical across `raas-tracker-frontend/index.html`
+(the source), `raas-tracker-frontend/dist/index.html` (the build output),
+`public/index.html` and `react_frontend/index.html`. The digest guard reads the
+**source** file, which is only sound because Vite copies that script verbatim
+rather than transforming it; the four-way identity above is what makes that
+assumption checkable rather than assumed. That is the strongest substitute
+available without a staging environment.
+
+#### 6.3.3 415 answered 500 for a permanently unfixable client bug
+
+Werkzeug raises `UnsupportedMediaType` from `request.get_json()` when the body is
+not declared as JSON, and every JSON route here reads its body that way
+(`request.get_json() or {}`). No handler was registered for 415, so Flask's
+lookup walked to the catch-all `Exception` handler: a client that sent
+`Content-Type: text/plain` was told *"internal server error"* — "retry" for a
+fault that is permanently its own and that no retry can fix.
+
+`@app.errorhandler(415)` is registered **by code**, beside the 413 handler, and
+answers `{"error": "unsupported media type (expected application/json)"}`.
+
+**Reachable unauthenticated — and that is the improvement.** An earlier version
+of this document said "reachable only by an **authenticated** caller". That is
+wrong, and it understated what changed. Three routes in `_PUBLIC_API` —
+`/api/auth/login`, `/api/auth/forgot-password`, `/api/auth/reset-password` —
+take `_gate_api`'s `None` path, so their route bodies call `request.get_json()`
+before any credential exists. All three used to fall through to the catch-all
+handler and answer **500**; they now answer 415. Three unauthenticated 500s
+removed, on exactly the surface this phase is named for. Pinned live by
+`test_a_public_route_answers_415_unauthenticated`.
+
+On registering by code rather than by exception class, the canonical statement is
+the handler's own docstring in `flask_app.py:1012`. It is deliberately not
+restated here: a rationale copied into four places is four places for it to
+drift, so this document and `docs/plan.md` cite it instead. Live proof that the
+status is 415 and not 500, that nothing is written, and that 400/404/405/413
+still behave: `tests/test_edge_hardening.py`.
+
+#### 6.3.4 The two header layers, and where they diverge
+
+The edge (`vercel.json`) and Flask (`_set_security_headers`) both set security
+headers, and they are **not** the same set. The divergence is deliberate but
+load-bearing, so it is recorded rather than left to be discovered:
+
+- **The edge is the only layer that reaches the SPA.** Vercel serves
+  `index.html` and `/assets/*` itself, so Flask's `after_request` never runs for
+  them. This is the reason 4-B existed.
+- **Flask is the only layer that reaches `/api/*`**, which the edge rule excludes
+  by design. That exclusion is lossless *only* while Flask owns `/api/*` and its
+  `after_request` sets these headers. Move the API off Flask, or serve any part
+  of it as a static file, and the exclusion becomes a hole rather than an
+  optimisation.
+- **HSTS is edge-only in production.** Flask's copy is gated on
+  `FORCE_HTTPS == "1"`, which is not set in `vercel.json`'s `env` (see §8), so on
+  the production host the edge header is the entire HSTS protection rather than a
+  duplicate of Flask's.
+
+Collapsing this to one authoritative layer is not available: static JSON cannot
+import Python, and Flask cannot set headers on a response it never served. The
+duplication is therefore held exact by the byte-identity test in §6.3.2 rather
+than removed.
+
 ## 7. Testing Strategy
 
 ### Backend (pytest)
@@ -991,7 +1178,7 @@ user fix it" must now branch on 400 **or** 409 for the invoice-write routes.
 - **Fixtures**: `db` (clean conn), `client` (Flask test client), `admin_client`, `user_client`
 - **Bcrypt**: Rounds=4 in tests (vs 13 prod) for speed
 - **Rate Limits**: `RAAS_RATE_LIMITS=off` globally; targeted tests re-enable
-- **Coverage**: **1189 passed / 8 skipped** as of Phase 4-A (auth, stock, upload, sales, invoices, production, LC, rate limits, PI parse, notifications, schema migration, upload-limit config) — includes `tests/test_invoices_production.py`, `tests/test_invoice_items.py`, `tests/test_schema_migration.py`, `tests/test_numeric_integrity.py`, `tests/test_qty_validation.py`, `tests/test_authorization_roles.py` (P1-A role classification + P1-B volume limits and payload caps), and `tests/test_typed_errors.py` (Phase 4-A: every refusal's status is asserted to come from the exception type, not its message).
+- **Coverage**: **1228 passed / 8 skipped** as of Phase 4-B (auth, stock, upload, sales, invoices, production, LC, rate limits, PI parse, notifications, schema migration, upload-limit config) — includes `tests/test_invoices_production.py`, `tests/test_invoice_items.py`, `tests/test_schema_migration.py`, `tests/test_numeric_integrity.py`, `tests/test_qty_validation.py`, `tests/test_authorization_roles.py` (P1-A role classification + P1-B volume limits and payload caps), `tests/test_typed_errors.py` (Phase 4-A: every refusal's status is asserted to come from the exception type, not its message), and `tests/test_edge_hardening.py` (Phase 4-B: the `vercel.json` header block, that no header `source` captures any `/api/` route or the cron path, that the edge CSP carries the recomputed theme-bootstrap digest and is byte-identical to Flask's copy, that `style-src` keeps its deliberate exception, that 415 is registered by code without shadowing the existing handlers, and that a wrong `Content-Type` answers 415 rather than 500 — unauthenticated as well as authenticated).
 
 ### Frontend (Vitest)
 - **Environment**: jsdom
@@ -1029,6 +1216,7 @@ user fix it" must now branch on 400 **or** 409 for the invoice-write routes.
 
 | Risk | Mitigation |
 |---|---|
+| **Content-Security-Policy (Phase 4-B, closed)** | Shipped at the edge, hash-allowlisted — see §6.3.2. `script-src` is `'self'` plus the recomputed theme-bootstrap digest, with **no** `'unsafe-inline'`, so an injected inline script is now blocked at the edge as well as by React's escaping. `style-src` deliberately keeps `'unsafe-inline'` for `sonner`, which injects its toast stylesheet as a `<style>` element at runtime — *not* for the three `style={{…}}` props, which React writes through the CSSOM and which CSP does not govern. Moving sonner's stylesheet into the build is the remaining frontend work that would make a strict `style-src` shippable. Residual, recorded: there is no staging deployment, so enforcement is proven by digest against the source script Vite copies verbatim, rather than observed live |
 | **Vercel 4.5MB body limit** | Platform limit is enforced at the edge before Flask; set `MAX_CONTENT_LENGTH_MB=4.5` on Vercel so the app cap matches. Off-Vercel (waitress) the cap is 50MB. Show size warning on upload page. |
 | **Password leakage in chat** | Rotation guide (README); never put passwords in git/chat. |
 | **Supabase project pause (free tier)** | Monitoring + alerts; recommend paid plan for production. |
