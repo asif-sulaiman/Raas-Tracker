@@ -3174,7 +3174,7 @@ def api_update_item(sale_id, item_id):
         return _validation_error_response(e)
     conn = get_db()
     try:
-        update_sale_item(conn, item_id, patch.product_name, patch.quantity, patch.unit_price, patch.unit)
+        ok = update_sale_item(conn, sale_id, item_id, patch.product_name, patch.quantity, patch.unit_price, patch.unit)
     except ValueError as e:
         # Money already invoiced against this PI line must not be silently
         # re-based by editing quantity/price: `InvoicedLineConflict` carries the
@@ -3182,6 +3182,12 @@ def api_update_item(sale_id, item_id):
         _rollback_close(conn)
         return jsonify({"error": str(e)}), status_for(e)
     conn.close()
+    if ok is None:
+        # Not found under this sale (wrong sale's URL, or gone) — same
+        # object-reference rule the DELETE sibling and the payment routes
+        # already enforce. `ok is None` (not falsy) so an empty patch, which
+        # is a legitimate no-op, stays a 200.
+        return jsonify({"error": "Item not found"}), 404
     return jsonify({"message": "Item updated"})
 
 
@@ -3236,7 +3242,7 @@ def api_cron_maturity_check():
             SELECT s.id, s.client_name, s.maturity_date
             FROM sales s
             WHERE s.maturity_date IS NOT NULL
-              AND COALESCE((SELECT SUM(sp.payment_amount)
+              AND COALESCE((SELECT ROUND(SUM(sp.payment_amount)::numeric, 2)::float8
                             FROM sale_payments sp
                             WHERE sp.sale_id = s.id), 0)
                 < COALESCE((SELECT ROUND(SUM(si.quantity * si.unit_price)::numeric, 2)::float8

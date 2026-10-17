@@ -269,9 +269,9 @@ def test_update_sale_item_rejects_non_finite_and_changes_nothing(db, bad):
     assert stored == (10.0, 10.0)
 
     with pytest.raises(ValueError):
-        update_sale_item(db, item_id, quantity=bad)
+        update_sale_item(db, sid, item_id, quantity=bad)
     with pytest.raises(ValueError):
-        update_sale_item(db, item_id, unit_price=bad)
+        update_sale_item(db, sid, item_id, unit_price=bad)
 
     assert db.execute("SELECT quantity, unit_price FROM sale_items WHERE id = %s",
                       (item_id,)).fetchone() == stored
@@ -311,8 +311,8 @@ def test_update_sale_item_still_allows_descriptive_only_edits(db):
     sid = _sale(db)
     item_id = db.execute(
         "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id", (sid,)).fetchone()[0]
-    assert update_sale_item(db, item_id, product_name="Renamed", unit="L") is True
-    assert update_sale_item(db, item_id) is False  # nothing to do
+    assert update_sale_item(db, sid, item_id, product_name="Renamed", unit="L") is True
+    assert update_sale_item(db, sid, item_id) is False  # nothing to do
 
 
 def test_update_sale_item_still_refuses_to_rebase_an_invoiced_line(db):
@@ -324,7 +324,7 @@ def test_update_sale_item_still_refuses_to_rebase_an_invoiced_line(db):
     item_id = db.execute(
         "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id", (sid,)).fetchone()[0]
     with pytest.raises(InvoicedLineConflict):
-        update_sale_item(db, item_id, quantity=float("inf"))
+        update_sale_item(db, sid, item_id, quantity=float("inf"))
 
 
 # ================= 4. the upload path — a different ingress =================
@@ -681,7 +681,7 @@ def test_no_non_finite_value_survives_any_guarded_write(db):
     for call in (
         lambda: record_sale_payment(db, sid, "2026-10-30", inf),
         lambda: add_sale_item(db, sid, "X", inf, inf, "KG"),
-        lambda: update_sale_item(db, item_id, quantity=inf),
+        lambda: update_sale_item(db, sid, item_id, quantity=inf),
         lambda: add_sale(db, {"pi_number": "PI-S"},
                          [{"product_name": "X", "quantity": inf}]),
         lambda: update_stock(db, "Acid", inf),

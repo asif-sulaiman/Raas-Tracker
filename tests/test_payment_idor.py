@@ -1,4 +1,4 @@
-"""P5: IDOR on payment records.
+"""P5: IDOR on nested sale resources.
 
 `PUT /api/sales/<sale_id>/payments/<payment_id>` and
 `DELETE /api/sales/<sale_id>/payments/<payment_id>` take `sale_id` from the
@@ -6,6 +6,11 @@ URL but the writers only filter on `payment_id`, so a caller who knows one
 payment's id can edit or delete it through *any* sale's URL — including a
 sale they do not own. The binding must be enforced: a payment may only be
 touched through the sale it belongs to.
+
+Follow-up (same class): `PUT /api/sales/<sale_id>/items/<item_id>` had the
+same hole — `update_sale_item` filtered on `item_id` only and the route
+discarded its return, so a wrong-sale or unknown id answered a silent
+200. The DELETE sibling was already scoped; PUT now matches it.
 """
 import pytest
 
@@ -93,3 +98,40 @@ def test_delete_payment_through_own_sale_is_200(admin_client, db):
     r = _delete_payment(admin_client, sale_a, pid_a)
     assert r.status_code == 200, f"expected 200, got {r.status_code}: {r.get_json()}"
     assert r.get_json()["message"] == "Payment deleted"
+
+
+# ---------- sale items (same IDOR class, PUT route) ----------
+
+def _update_item(client, sale_id, item_id, name="Tampered"):
+    return client.put(f"/api/sales/{sale_id}/items/{item_id}", json={
+        "product_name": name,
+    })
+
+
+def _first_item_id(client, sale_id):
+    items = client.get(f"/api/sales/{sale_id}").get_json()["items"]
+    return items[0]["id"]
+
+
+def test_update_item_through_wrong_sale_is_404(admin_client, db):
+    """A sale item must not be editable through another sale's URL."""
+    sale_a = _create_sale(admin_client, "PI-IDOR-G")
+    sale_b = _create_sale(admin_client, "PI-IDOR-H")
+    item_a = _first_item_id(admin_client, sale_a)
+
+    r = _update_item(admin_client, sale_b, item_a)
+    assert r.status_code == 404, f"expected 404, got {r.status_code}: {r.get_json()}"
+
+    # The item itself is untouched.
+    after = admin_client.get(f"/api/sales/{sale_a}").get_json()["items"]
+    assert [i for i in after if i["id"] == item_a][0]["product_name"] == "ProdA"
+
+
+def test_update_item_through_own_sale_is_200(admin_client, db):
+    """Editing an item through its own sale still works."""
+    sale_a = _create_sale(admin_client, "PI-IDOR-I")
+    item_a = _first_item_id(admin_client, sale_a)
+
+    r = _update_item(admin_client, sale_a, item_a)
+    assert r.status_code == 200, f"expected 200, got {r.status_code}: {r.get_json()}"
+    assert r.get_json()["message"] == "Item updated"

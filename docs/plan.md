@@ -40,7 +40,8 @@ full backend suite plus an Oracle review, and the working state lives in
 | 3 | Gate integrity — stage barriers, invoice freeze, 5% tolerance | Oracle ✅ (commit `3307b22`) |
 | 4-A | Typed exceptions (`raas_tracker/_exceptions.py`, `status_for`) replace message-wording status coupling; 5% tolerance breach standardised to 409 | Oracle ✅ (commit `6f158b2`) |
 | 4-B | Edge response headers in `vercel.json` (nosniff / DENY / X-XSS-Protection / `no-referrer` / HSTS / Permissions-Policy / **hash-allowlisted CSP**) + `@app.errorhandler(415)` so a wrong Content-Type is 415, not 500 | ✅ committed `b645a3d` (Oracle 2/2, zero code defects) |
-| 5 | IDOR + limits — bind payment records to their sale in URL (`api_edit_payment`/`api_delete_payment` verify `sale_payments.sale_id` → 404 on mismatch); fix maturity cron `HAVING` compare (join fan-out between `sale_payments` × `sale_items` inflates both sums → two independent correlated subqueries) | ✅ committed (TDD: 5 RED → 5 GREEN; full suite 1233/8) |
+| 5 | IDOR + limits — bind payment records to their sale in URL (`api_edit_payment`/`api_delete_payment` verify `sale_payments.sale_id` → 404 on mismatch); fix maturity cron `HAVING` compare (join fan-out between `sale_payments` × `sale_items` inflates both sums → two independent correlated subqueries) | ✅ committed (TDD: 3 RED → 3 GREEN; full suite 1233/8) |
+| 5-fu | Phase 5 follow-up (Oracle P1/P2/P3) — item PUT binds `sale_id` (3-valued return: `None` not-found → 404, `False` empty-patch → 200, `True` updated); cron paid side `ROUND(::numeric, 2)` so a REAL sum of non-binary-exact amounts (e.g. 8.2 → 8.199999809265137) cannot spuriously under-pay; plan.md TDD/call-site counts corrected | ✅ committed (TDD: 2 RED → 3 GREEN; full suite 1236/8) |
 
 **4-B decisions worth not re-deriving**
 

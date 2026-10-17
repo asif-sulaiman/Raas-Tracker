@@ -413,6 +413,46 @@ class TestCronEndpoint:
             f"{initial_notifs}"
         )
 
+    def test_cron_no_notify_when_fully_paid_with_non_exact_binary_amount(self, client, monkeypatch, db):
+        """Rounding guard: a sale fully paid with an amount that is not
+        binary-exact in REAL must still compare equal, not spuriously under.
+
+        8.2 stored in REAL is 8.199999809265137. The total side rounds to
+        2dp (8.20); if the paid side does not, the cron sees
+        8.199999809265137 < 8.20 and fires a spurious maturity_due on a
+        sale that is exactly paid.
+        """
+        os.environ["CRON_SECRET"] = "test-secret"
+        monkeypatch.setenv("CRON_SECRET", "test-secret")
+
+        company_id = _create_company(db, "Test Client", code="TC")
+        today = date.today().isoformat()
+        sale_id = add_sale(db, {
+            "pi_number": "PI-021",
+            "pi_date": "2025-01-15",
+            "client_name": "Test Client",
+            "company_id": company_id,
+            "maturity_date": today,
+        }, [
+            {"product_name": "Product A", "quantity": 1, "unit_price": 8.2, "unit": "KG"}
+        ])
+
+        record_sale_payment(db, sale_id, "2025-02-01", 8.2, "Exact payment")
+
+        response = client.post(
+            "/api/cron/maturity-check",
+            headers={"Authorization": "Bearer test-secret"}
+        )
+        assert response.status_code == 200
+
+        ident = {"id": 1, "role": "admin"}
+        notifications = list_notifications_for(db, ident["id"], ident["role"])
+        initial_notifs = [n for n in notifications if n["type"] == "maturity_due"]
+        assert len(initial_notifs) == 0, (
+            f"exactly-paid sale with a non-binary-exact amount must not notify: "
+            f"{initial_notifs}"
+        )
+
     def test_cron_no_notify_future_maturity(self, client, monkeypatch, db):
         """Maturity in future -> no notification."""
         os.environ["CRON_SECRET"] = "test-secret"

@@ -660,7 +660,7 @@ future call sites are covered without opting in:
 | PUT | `/api/sales/<id>/payments/<pid>` | Admin | Edit payment — **scoped to `<id>`** — 404 if `<pid>` belongs to another sale |
 | DELETE | `/api/sales/<id>/payments/<pid>` | Admin | Delete payment — **scoped to `<id>`** — 404 if `<pid>` belongs to another sale |
 | POST | `/api/sales/<id>/items` | Admin | Add item (product, qty, price, unit) |
-| PUT | `/api/sales/<id>/items/<iid>` | Admin | Update item (incl. unit) |
+| PUT | `/api/sales/<id>/items/<iid>` | Admin | Update item (incl. unit); **scoped to `<id>`** — 404 if the line belongs to another sale or is already gone (empty patch is a legitimate 200 no-op) |
 | DELETE | `/api/sales/<id>/items/<iid>` | Admin | Delete item (min 1 item); **scoped to `<id>`** — 404 if the line belongs to another sale or is already gone |
 | POST | `/api/sales/<id>/shipments` | Admin | Record shipment (date required) |
 | DELETE | `/api/sales/<id>/shipments/<shid>` | Admin | Delete shipment |
@@ -898,7 +898,7 @@ commercial report is invoice-driven so an uninvoiced PI contributes 0 to gross s
 - Test bypass: `RAAS_RATE_LIMITS=off`
 
 ### Cron Jobs (Vercel)
-- `POST /api/cron/maturity-check` — daily 09:00 UTC; checks sales with `maturity_date <= today` and unpaid; creates `maturity_due` (warning) and `maturity_escalated` (critical, at 7+ days overdue) notifications with dedupe; clears dedupe on full payment. Auth: `Authorization: Bearer <CRON_SECRET>`. Paid-vs-total compare uses two independent correlated subqueries (`sale_payments` and `sale_items` separately) — never a single JOIN, which inflates both sums via row fan-out when a sale has multiple payments × multiple items.
+- `POST /api/cron/maturity-check` — daily 09:00 UTC; checks sales with `maturity_date <= today` and unpaid; creates `maturity_due` (warning) and `maturity_escalated` (critical, at 7+ days overdue) notifications with dedupe; clears dedupe on full payment. Auth: `Authorization: Bearer <CRON_SECRET>`. Paid-vs-total compare uses two independent correlated subqueries (`sale_payments` and `sale_items` separately) — never a single JOIN, which inflates both sums via row fan-out when a sale has multiple payments × multiple items. Both sides `ROUND(::numeric, 2)` before comparing: a `REAL` sum of non-binary-exact amounts (8.2 stores as 8.199999809265137) can land a hair below the 2dp total and spuriously notify an exactly-paid sale.
 
 ### Notifications
 - In-app notifications with dedupe (`notifications.py:notify`)

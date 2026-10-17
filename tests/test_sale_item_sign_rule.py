@@ -131,9 +131,9 @@ def test_update_sale_item_rejects_non_positive_and_changes_nothing(db, bad):
     stored = _stored_item(db, item_id)
 
     with pytest.raises(ValueError):
-        update_sale_item(db, item_id, quantity=bad)
+        update_sale_item(db, sid, item_id, quantity=bad)
     with pytest.raises(ValueError):
-        update_sale_item(db, item_id, unit_price=bad)
+        update_sale_item(db, sid, item_id, unit_price=bad)
 
     assert _stored_item(db, item_id) == stored, "a rejected edit still landed"
     assert _audit_count(db, "SALE_ITEM_UPDATE") == 0
@@ -148,9 +148,9 @@ def test_update_sale_item_rejects_non_positive_alongside_a_valid_field(db, bad):
     stored = _stored_item(db, item_id)
 
     with pytest.raises(ValueError):
-        update_sale_item(db, item_id, quantity=bad, unit_price=5.0)
+        update_sale_item(db, sid, item_id, quantity=bad, unit_price=5.0)
     with pytest.raises(ValueError):
-        update_sale_item(db, item_id, quantity=5.0, unit_price=bad)
+        update_sale_item(db, sid, item_id, quantity=5.0, unit_price=bad)
 
     assert _stored_item(db, item_id) == stored
 
@@ -216,7 +216,7 @@ def test_sign_rule_still_accepts_finite_positive_values(db):
     item_id = _first_item_id(db, sid)
     assert add_sale_item(db, sid, "Tiny", 1e-6, 1e-6, "KG")
     assert add_sale_item(db, sid, "Huge", 1e30, 1e30, "KG")
-    assert update_sale_item(db, item_id, quantity=0.5, unit_price=0.25) is True
+    assert update_sale_item(db, sid, item_id, quantity=0.5, unit_price=0.25) is True
     assert _stored_item(db, item_id)[1:3] == (0.5, 0.25)
 
 
@@ -233,13 +233,13 @@ def test_sign_rule_leaves_descriptive_edits_and_the_invoiced_conflict_alone(db):
 
     # No quantity/unit_price supplied -> the sign guard never runs, and the
     # descriptive edit is allowed on an uninvoiced line.
-    assert update_sale_item(db, item_id, product_name="Renamed", unit="L") is True
+    assert update_sale_item(db, sid, item_id, product_name="Renamed", unit="L") is True
 
     create_invoice(db, sid, "INV-SIGN")
     with pytest.raises(InvoicedLineConflict):
-        update_sale_item(db, item_id, quantity=0)
+        update_sale_item(db, sid, item_id, quantity=0)
     with pytest.raises(InvoicedLineConflict):
-        update_sale_item(db, item_id, unit_price=-1)
+        update_sale_item(db, sid, item_id, unit_price=-1)
     assert _stored_item(db, item_id)[1:3] == (10.0, 10.0)
 
 

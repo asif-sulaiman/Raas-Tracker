@@ -667,11 +667,11 @@ def add_sale_item(conn: psycopg.Connection, sale_id: int, product_name: str,
     return item_id
 
 
-def update_sale_item(conn: psycopg.Connection, item_id: int,
+def update_sale_item(conn: psycopg.Connection, sale_id: int, item_id: int,
                      product_name: Optional[str] = None,
                      quantity: Optional[float] = None,
                      unit_price: Optional[float] = None,
-                     unit: Optional[str] = None) -> bool:
+                     unit: Optional[str] = None) -> Optional[bool]:
     """Update fields of a sale line item.
 
     Refuses (409 via the route) to change quantity or unit_price on a line that
@@ -691,13 +691,24 @@ def update_sale_item(conn: psycopg.Connection, item_id: int,
     * INSIDE the `is not None` branch — a patch that does not touch the money
       columns must not be validated against them, or a descriptive-only rename
       of an invoiced line would start failing.
+
+    Phase 5 follow-up: `sale_id` is now required and bound at the SQL level,
+    matching ``delete_sale_item``. A caller who knows one item's id could
+    previously edit it through *any* sale's URL — the same object-reference
+    hole Phase 5 closed on payments. Return contract is deliberately
+    three-valued so the route can tell the two failure modes apart:
+
+    * ``None`` — no such item under this sale (404).
+    * ``False`` — item found, but the patch supplied nothing to write (200).
+    * ``True`` — updated.
     """
-    # Fetch old item for audit
+    # Fetch old item for audit; the AND sale_id is the IDOR binding.
     old_row = conn.execute(
-        "SELECT product_name, quantity, unit_price, unit FROM sale_items WHERE id = %s",
-        (item_id,)).fetchone()
+        "SELECT product_name, quantity, unit_price, unit FROM sale_items"
+        " WHERE id = %s AND sale_id = %s",
+        (item_id, sale_id)).fetchone()
     if not old_row:
-        return False
+        return None
     if quantity is not None or unit_price is not None:
         if conn.execute("SELECT COUNT(*) FROM invoice_items WHERE sale_item_id = %s",
                         (item_id,)).fetchone()[0]:
@@ -727,7 +738,8 @@ def update_sale_item(conn: psycopg.Connection, item_id: int,
     if not fields:
         return False
     vals.append(item_id)
-    conn.execute(f"UPDATE sale_items SET {', '.join(fields)} WHERE id = %s", vals)
+    conn.execute(f"UPDATE sale_items SET {', '.join(fields)}"
+                 " WHERE id = %s AND sale_id = %s", vals + [sale_id])
 
     # Audit log
     new_item = {"product_name": product_name, "quantity": quantity,
