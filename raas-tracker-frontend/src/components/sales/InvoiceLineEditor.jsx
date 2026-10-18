@@ -10,9 +10,10 @@ import InvoiceLineComposer from './InvoiceLineComposer';
  * from the first non-paid row — with several invoices on a sale, silently
  * picking one makes it impossible to know where a line landed.
  *
- * Quantities may EXCEED the PI proposal (INV-REVISION shipment advantage), so
- * there is no ceiling here: the composer shows the proposal-vs-actual variance
- * as reference only. Unit price stays server-owned and is never posted.
+ * Quantities may EXCEED the PI remaining (INV-REVISION shipment advantage),
+ * up to the PI +5% ceiling enforced cumulatively per PI line by the server.
+ * The composer shows Remaining (PI minus invoiced) as reference. Unit price
+ * stays server-owned and is never posted.
  *
  * Props (wiring lane owns the POST):
  *   lines: [{sale_item_id, product_name, unit, pi_quantity, invoiced_quantity, unit_price}]

@@ -59,3 +59,13 @@ export function truncate(str, maxLength = 50) {
   if (!str || str.length <= maxLength) return str;
   return str.substring(0, maxLength) + '...';
 }
+
+/** Today's date in the operator's local time, YYYY-MM-DD (not UTC). */
+export function todayLocalISO() {
+  const d = new Date();
+  return [
+    d.getFullYear(),
+    String(d.getMonth() + 1).padStart(2, '0'),
+    String(d.getDate()).padStart(2, '0'),
+  ].join('-');
+}

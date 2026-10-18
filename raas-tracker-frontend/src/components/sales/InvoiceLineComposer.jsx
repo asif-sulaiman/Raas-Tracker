@@ -1,7 +1,6 @@
 import { useMemo } from 'react';
 import { Lock } from 'lucide-react';
 import { formatNumber, lineTotal } from '../../utils/format';
-import varianceLabel from './varianceLabel';
 
 const inputCls =
   'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
@@ -11,9 +10,9 @@ const inputCls =
  * unit price shown read-only and the exact line total.
  *
  * Purely presentational — the caller owns `value`, staging/submitting, and any
- * error surface. Shared by the "add invoice" form (stages lines before the
- * invoice exists) and InvoiceLineEditor (posts straight to an open invoice),
- * so both collect a line the same way.
+ * error surface. Shared by InvoiceCreateForm (creates an invoice) and
+ * InvoiceLineEditor (adds a line to an open invoice), so both collect a line
+ * the same way.
  *
  * value: { sale_item_id: string, quantity: string }
  */
@@ -29,6 +28,13 @@ export default function InvoiceLineComposer({ lines = [], value, onChange, qtyAr
   const unit = selected ? selected.unit || 'KG' : 'KG';
   const qtyNum = Number(value?.quantity);
   const liveTotal = lineTotal(qtyNum > 0 ? qtyNum : 0, unitPrice);
+
+  // Remaining = PI qty minus everything already invoiced across the sale.
+  // The server caps cumulative invoiced per PI line at PI * 1.05
+  // (raas_tracker.sales.OVER_INVOICE_TOLERANCE), so a new line may add at
+  // most PI * 1.05 - invoiced.
+  const remaining = Math.max(0, piQty - invoiced);
+  const ceiling = piQty * 1.05 - invoiced;
 
   return (
     <>
@@ -72,10 +78,10 @@ export default function InvoiceLineComposer({ lines = [], value, onChange, qtyAr
         </div>
         <div>
           <dt className="text-[11px] uppercase tracking-wider text-slate-400 dark:text-slate-500">
-            Variance
+            Remaining
           </dt>
-          <dd className="text-xs font-semibold text-slate-600 dark:text-slate-300">
-            {varianceLabel(piQty, invoiced, unit)}
+          <dd className="text-sm font-semibold text-slate-900 dark:text-white">
+            {formatNumber(remaining)} {unit} (ceiling {formatNumber(ceiling)} {unit})
           </dd>
         </div>
       </dl>
@@ -83,7 +89,7 @@ export default function InvoiceLineComposer({ lines = [], value, onChange, qtyAr
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <div>
           <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
-            Quantity * <span className="font-normal text-slate-400">— may exceed the PI quantity</span>
+            Quantity * <span className="font-normal text-slate-400">— may exceed PI remaining; total capped at PI +5%</span>
           </label>
           <input
             aria-label={qtyAriaLabel}

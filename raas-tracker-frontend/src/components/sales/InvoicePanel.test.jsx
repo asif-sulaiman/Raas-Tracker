@@ -7,6 +7,7 @@ import { AuthProvider } from '../../context/AuthContext';
 import { ConfirmProvider } from '../../context/ConfirmContext';
 import { toast } from 'sonner';
 import InvoicePanel from './InvoicePanel';
+import { todayLocalISO } from '../../utils/format';
 
 vi.mock('sonner', () => {
   const toastFn = Object.assign(vi.fn(), {
@@ -63,7 +64,7 @@ function jsonResponse(data, ok = true, status = 200) {
   return { ok, status, json: async () => data, headers: { get: () => null } };
 }
 
-function installFetch({ invoices = INVOICES, posts = [], completion, completionStatus = 200, payStatus = 'paid', deleteStatus = 200, deleteBody = null, failInvoicesAfterPost = false, failInvoicesAlways = false, createAmount = 2400 } = {}) {
+function installFetch({ invoices = INVOICES, posts = [], completion, completionStatus = 200, payStatus = 'paid', deleteStatus = 200, deleteBody = null, failInvoicesAfterPost = false, failInvoicesAlways = false, createAmount = 2400, createStatus = 201, createBody = null } = {}) {
   const deletes = [];
   let invoiceReadsFail = failInvoicesAfterPost || failInvoicesAlways;
   // Lets a test flip the invoice read back to healthy to exercise a retry.
@@ -87,6 +88,9 @@ function installFetch({ invoices = INVOICES, posts = [], completion, completionS
       if (u.endsWith('/book')) return jsonResponse({ success: true, status: 'booked' });
       if (u.endsWith('/ship')) return jsonResponse({ invoice_id: 7, shipment_id: 3, status: 'shipped' }, true, 201);
       if (u.endsWith('/pay')) return jsonResponse({ payment_id: 4, status: payStatus }, true, 201);
+      if (createStatus >= 400) {
+        return jsonResponse(createBody || { error: 'Could not create invoice' }, false, createStatus);
+      }
       return jsonResponse({ invoice_id: 10, invoice_number: 'NEW', status: 'planned', amount: createAmount }, true, 201);
     }
     if (u.includes('/completion')) {
@@ -189,7 +193,8 @@ describe('InvoicePanel', () => {
     expect(posts.filter((p) => p.body && p.body.invoice_number === 'INV-3')).toHaveLength(0);
   });
 
-  it('posts the invoice number together with its staged lines', async () => {
+  it('posts the invoice number, its date, and its lines', async () => {
+    // The date is defaulted to today; the operator may override it.
     const posts = [];
     renderPanel({ posts });
     fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
@@ -197,10 +202,9 @@ describe('InvoicePanel', () => {
       target: { value: 'INV-3' },
     });
 
-    fireEvent.change(await screen.findByLabelText('Line quantity'), {
+    fireEvent.change(screen.getByLabelText(/invoice qty for Cotton/i), {
       target: { value: '250' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Stage line' }));
 
     const save = screen.getByRole('button', { name: 'Save invoice' });
     await waitFor(() => expect(save.disabled).toBe(false));
@@ -211,14 +215,15 @@ describe('InvoicePanel', () => {
     expect(post.url).toContain('/api/sales/5/invoices');
     // Lines, never an amount: the money is derived server-side from the
     // server-owned unit price.
-    expect(post.body).toEqual({
+    expect(post.body).toMatchObject({
       invoice_number: 'INV-3',
+      invoice_date: expect.stringMatching(/\d{4}-\d{2}-\d{2}/),
       lines: [{ sale_item_id: 1, quantity: 250 }],
     });
     expect(post.body).not.toHaveProperty('amount');
   });
 
-  it('stages several lines and carries every one of them', async () => {
+  it('posts several lines at once', async () => {
     const posts = [];
     renderPanel({ posts });
     fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
@@ -226,14 +231,12 @@ describe('InvoicePanel', () => {
       target: { value: 'INV-4' },
     });
 
-    fireEvent.change(await screen.findByLabelText('Line quantity'), {
+    fireEvent.change(screen.getByLabelText(/invoice qty for Cotton/i), {
       target: { value: '100' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Stage line' }));
-
-    fireEvent.change(screen.getByLabelText('PI line'), { target: { value: '2' } });
-    fireEvent.change(screen.getByLabelText('Line quantity'), { target: { value: '500' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Stage line' }));
+    fireEvent.change(screen.getByLabelText(/invoice qty for Androma LO2/i), {
+      target: { value: '500' },
+    });
 
     fireEvent.click(screen.getByRole('button', { name: 'Save invoice' }));
     await waitFor(() => expect(posts.filter((p) => p.body && p.body.invoice_number === 'INV-4')).toHaveLength(1));
@@ -244,34 +247,59 @@ describe('InvoicePanel', () => {
     ]);
   });
 
-  it('blocks staging a line with no quantity or no PI line', async () => {
-    const posts = [];
-    renderPanel({ posts });
-    fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
-    fireEvent.change(await screen.findByLabelText('Invoice number'), {
-      target: { value: 'INV-5' },
-    });
-
-    const stage = await screen.findByRole('button', { name: 'Stage line' });
-    expect(stage.disabled).toBe(true);
-    fireEvent.change(screen.getByLabelText('Line quantity'), { target: { value: '0' } });
-    expect(stage.disabled).toBe(true);
-    fireEvent.change(screen.getByLabelText('Line quantity'), { target: { value: '10' } });
-    expect(stage.disabled).toBe(false);
-  });
-
-  it('shows the proposal-vs-actual variance instead of a misleading remaining', async () => {
+  it('shows Remaining per PI line instead of a variance', async () => {
     renderPanel();
     fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
-    // The first PI line is selected by default: 100 proposed, 60 invoiced.
-    expect(await screen.findByText('40.00 KG under PI')).toBeTruthy();
+    // 100 proposed, 60 invoiced -> 40 remaining; ceiling 105 - 60 = 45.
+    const cottonRow = screen.getByText('Cotton').closest('tr');
+    expect(cottonRow.textContent).toContain('40.00 KG (ceiling 45.00 KG)');
+    // Line 2: 3,000 proposed, 3,000 invoiced -> nothing remains.
+    const andromaRow = screen.getByText('Androma LO2').closest('tr');
+    expect(andromaRow.textContent).toContain('0.00 KG (ceiling 150.00 KG)');
+    // No variance wording anywhere in the create form.
+    expect(screen.queryByText(/under PI|over PI|matches PI/i)).toBeNull();
+  });
 
-    // Line 2 is invoiced 3,000 against a PI proposal of 3,000 -> matches.
-    fireEvent.change(screen.getByLabelText('PI line'), { target: { value: '2' } });
-    expect(await screen.findByText('matches PI (3,000.00 KG)')).toBeTruthy();
+  it('defaults the invoice date to today and posts number, date, and lines', async () => {
+    const posts = [];
+    const expected = todayLocalISO();
+    renderPanel({ posts });
+    fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
+    expect(await screen.findByLabelText('Invoice date')).toHaveValue(expected);
+    fireEvent.change(await screen.findByLabelText('Invoice number'), {
+      target: { value: 'INV-3' },
+    });
+    fireEvent.change(screen.getByLabelText(/invoice qty for Cotton/i), {
+      target: { value: '25' },
+    });
+    const save = screen.getByRole('button', { name: 'Save invoice' });
+    await waitFor(() => expect(save.disabled).toBe(false));
+    fireEvent.click(save);
+    await waitFor(() => expect(posts.filter((p) => p.body && p.body.invoice_number === 'INV-3')).toHaveLength(1));
+    const post = posts.find((p) => p.body && p.body.invoice_number === 'INV-3');
+    expect(post.body.invoice_date).toBe(expected);
+    expect(post.body.lines).toEqual([{ sale_item_id: 1, quantity: 25 }]);
+  });
 
-    // A "remaining" figure is never shown: a PI is a quote, not a ledger.
-    expect(screen.queryByText(/remaining/i)).toBeNull();
+  it('shows the server error when the ceiling is breached', async () => {
+    const posts = [];
+    renderPanel({
+      posts,
+      createStatus: 409,
+      createBody: { error: 'PI line 1: invoiced 106.00 exceeds 105.00 (PI qty 100.00 + 5%)' },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
+    fireEvent.change(await screen.findByLabelText('Invoice number'), {
+      target: { value: 'INV-3' },
+    });
+    fireEvent.change(screen.getByLabelText(/invoice qty for Cotton/i), {
+      target: { value: '25' },
+    });
+    const save = screen.getByRole('button', { name: 'Save invoice' });
+    await waitFor(() => expect(save.disabled).toBe(false));
+    fireEvent.click(save);
+    await waitFor(() => expect(screen.getByText(/exceeds/i)).toBeTruthy());
+    expect(posts).toHaveLength(1);
   });
 
   it('keeps Book visible but disabled, with a reason, until produced', async () => {
@@ -380,9 +408,7 @@ describe('InvoicePanel', () => {
     // staged line, so there is nothing for the operator to type.
     expect(screen.queryByLabelText('Amount')).toBeNull();
     expect(screen.queryByLabelText('Payment amount')).toBeNull();
-    expect(
-      await screen.findByText(/never typed/i)
-    ).toBeTruthy();
+    expect(await screen.findByLabelText('Invoice date')).toBeTruthy();
   });
 
   it('reports the server-derived amount after creating an invoice', async () => {
@@ -392,10 +418,9 @@ describe('InvoicePanel', () => {
     fireEvent.change(await screen.findByLabelText('Invoice number'), {
       target: { value: 'INV-9' },
     });
-    fireEvent.change(await screen.findByLabelText('Line quantity'), {
+    fireEvent.change(screen.getByLabelText(/invoice qty for Cotton/i), {
       target: { value: '250' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Stage line' }));
     fireEvent.click(screen.getByRole('button', { name: 'Save invoice' }));
     // The create response carries the amount the server derived from the lines.
     await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Invoiced $2,400.00'));
@@ -405,11 +430,10 @@ describe('InvoicePanel', () => {
     renderPanel({ createAmount: null });
     fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
     fireEvent.change(await screen.findByLabelText('Invoice number'), { target: { value: 'INV-9' } });
-    fireEvent.change(await screen.findByLabelText('Line quantity'), { target: { value: '250' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Stage line' }));
+    fireEvent.change(screen.getByLabelText(/invoice qty for Cotton/i), { target: { value: '250' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save invoice' }));
-    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Invoice added'));
-    expect(toast.success).not.toHaveBeenCalledWith(expect.stringContaining('Invoiced $-'));
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Invoice created'));
+    expect(toast.success).not.toHaveBeenCalledWith(expect.stringContaining('Invoiced $'));
   });
 
   it('shows the remaining balance while recording a payment', async () => {

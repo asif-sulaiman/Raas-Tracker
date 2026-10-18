@@ -18,8 +18,10 @@ describe('InvoiceLineEditor guards', () => {
     const onAdd = vi.fn(async () => {});
     render(<InvoiceLineEditor lines={LINES} onAdd={onAdd} invoiceNumber="INV-1" />);
 
-    // Reference is the variance, not a ceiling.
-    expect(screen.getByText('40.00 KG under PI')).toBeTruthy();
+    // Reference is the PI remaining, with the PI +5% ceiling as the
+    // server-enforced cap.
+    expect(screen.getByText(/40\.00/)).toBeTruthy();
+    expect(screen.queryByText(/under PI|over PI|matches PI/i)).toBeNull();
     expect(screen.getByText('to INV-1')).toBeTruthy();
 
     fireEvent.change(screen.getByLabelText('Line quantity'), { target: { value: '50' } });

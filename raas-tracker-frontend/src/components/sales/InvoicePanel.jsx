@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Plus, Check, Trash2 } from 'lucide-react';
 import Button from '../ui/Button';
-import InvoiceLineComposer from './InvoiceLineComposer';
+import InvoiceCreateForm from './InvoiceCreateForm';
 import { formatDate, formatNumber, toCents, fromCents } from '../../utils/format';
 import { useAuth } from '../../context/AuthContext';
 import { useConfirm } from '../../context/ConfirmContext';
@@ -101,15 +101,11 @@ export default function InvoicePanel({ saleId, isAdmin = false, lines = [], onCh
   // its failure downgrades the totals chip instead of hiding the invoice rows.
   const [totalsUnavailable, setTotalsUnavailable] = useState(false);
   const [adding, setAdding] = useState(false);
-  const [invoiceNumber, setInvoiceNumber] = useState('');
-  // Lines are staged before the invoice exists, then posted with it.
-  const [draft, setDraft] = useState({ sale_item_id: '', quantity: '' });
-  const [staged, setStaged] = useState([]);
+  const [formError, setFormError] = useState(null);
   const [step, setStep] = useState(null); // { invoiceId, kind: 'book' | 'ship' | 'pay' }
   const [stepDate, setStepDate] = useState('');
   const [payAmount, setPayAmount] = useState('');
   const [saving, setSaving] = useState(false);
-  const [formError, setFormError] = useState(null);
 
   /**
    * Independent reads, settled separately. `invoices` is `null` when that read
@@ -203,83 +199,6 @@ export default function InvoicePanel({ saleId, isAdmin = false, lines = [], onCh
 
   const openAdd = () => {
     setAdding(true);
-    setInvoiceNumber('');
-    setStaged([]);
-    setDraft({
-      sale_item_id: lines[0] ? String(lines[0].sale_item_id) : '',
-      quantity: '',
-    });
-    setFormError(null);
-  };
-
-  const closeAdd = () => {
-    setAdding(false);
-    setInvoiceNumber('');
-    setStaged([]);
-    setDraft({ sale_item_id: '', quantity: '' });
-    setFormError(null);
-  };
-
-  // A staged line needs both a real PI line and a positive quantity.
-  const draftQty = Number(draft.quantity);
-  const draftValid = !!draft.sale_item_id && draftQty > 0;
-
-  const handleStage = () => {
-    setFormError(null);
-    if (!draft.sale_item_id) {
-      setFormError('Pick a PI line first');
-      return;
-    }
-    if (!(draftQty > 0)) {
-      setFormError('Enter a quantity greater than 0');
-      return;
-    }
-    setStaged((prev) => [
-      ...prev,
-      { sale_item_id: Number(draft.sale_item_id), quantity: draftQty },
-    ]);
-    setDraft((prev) => ({ ...prev, quantity: '' }));
-  };
-
-  const handleUnstage = (index) => {
-    setStaged((prev) => prev.filter((_, i) => i !== index));
-  };
-
-  const handleAdd = async () => {
-    const number = invoiceNumber.trim();
-    if (!number) {
-      setFormError('Invoice number is required');
-      return;
-    }
-    if (staged.length === 0) {
-      setFormError('Add at least one line to the invoice');
-      return;
-    }
-    setSaving(true);
-    try {
-      // Money is server-owned: it is derived from each line's server-owned unit
-      // price, so the body carries the number and the quantities only.
-      const res = await apiFetch(`/api/sales/${saleId}/invoices`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ invoice_number: number, lines: staged }),
-      });
-      const created = await res.json().catch(() => ({}));
-      // The server-derived amount is the only money figure on this form, so it
-      // is what the operator is told was invoiced.
-      toast.success(
-        typeof created?.amount === 'number'
-          ? `Invoiced ${usd(created.amount)}`
-          : 'Invoice added'
-      );
-      closeAdd();
-      await reload();
-      onChanged?.();
-    } catch (err) {
-      setFormError(err?.message || 'Could not add invoice');
-    } finally {
-      setSaving(false);
-    }
   };
 
   const handleStep = async () => {
@@ -446,6 +365,11 @@ export default function InvoicePanel({ saleId, isAdmin = false, lines = [], onCh
                   <span className="font-mono font-medium text-slate-800 dark:text-slate-200">
                     {inv.invoice_number}
                   </span>
+                  {inv.invoice_date || inv.created_at ? (
+                    <span className="text-[11px] text-slate-400 ml-1">
+                      · {inv.invoice_date || inv.created_at.slice(0, 10)}
+                    </span>
+                  ) : null}
                   <StatusChip status={inv.status} />
                   {inv.amount !== null && inv.amount !== undefined && (
                     <span className="text-[11px] font-medium text-slate-600 dark:text-slate-300">
@@ -576,104 +500,16 @@ export default function InvoicePanel({ saleId, isAdmin = false, lines = [], onCh
           })}
 
           {adding && (
-            <div className="space-y-3 px-2.5 py-2">
-              <div>
-                <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
-                  Invoice number *
-                </label>
-                <input
-                  aria-label="Invoice number"
-                  type="text"
-                  value={invoiceNumber}
-                  onChange={(e) => setInvoiceNumber(e.target.value)}
-                  placeholder="INV-2026-001"
-                  className={`${inputCls} w-full`}
-                />
-              </div>
-
-              <div className="space-y-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50/60 dark:bg-slate-800/40 p-3">
-                <p className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-                  Lines
-                </p>
-                {staged.length === 0 ? (
-                  <p className="text-[11px] text-slate-400 dark:text-slate-500">
-                    No lines yet — an invoice must state what is being shipped.
-                  </p>
-                ) : (
-                  <ul className="divide-y divide-slate-200 dark:divide-slate-700">
-                    {staged.map((l, i) => {
-                      const src = lines.find((x) => x.sale_item_id === l.sale_item_id);
-                      return (
-                        <li key={`${l.sale_item_id}-${i}`} className="flex items-center gap-2 py-1 text-xs">
-                          <span className="font-medium text-slate-800 dark:text-slate-200">
-                            {src?.product_name || `Item ${l.sale_item_id}`}
-                          </span>
-                          <span className="text-slate-500 dark:text-slate-400">
-                            {formatNumber(l.quantity)} {src?.unit || 'KG'}
-                          </span>
-                          <span className="flex-1" />
-                          <button
-                            type="button"
-                            onClick={() => handleUnstage(i)}
-                            className="p-1 text-slate-400 hover:text-rose-600 cursor-pointer"
-                            title="Remove line"
-                            aria-label={`Remove line ${src?.product_name || l.sale_item_id}`}
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
-                        </li>
-                      );
-                    })}
-                  </ul>
-                )}
-
-                {lines.length === 0 ? (
-                  <p className="text-[11px] text-slate-400 dark:text-slate-500">
-                    This PI has no product lines to invoice.
-                  </p>
-                ) : (
-                  <>
-                    <InvoiceLineComposer
-                      lines={lines}
-                      value={draft}
-                      onChange={(next) => {
-                        setDraft(next);
-                        setFormError(null);
-                      }}
-                    />
-                    <div className="flex items-center justify-end">
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        icon={Plus}
-                        onClick={handleStage}
-                        disabled={saving || !draftValid}
-                      >
-                        Stage line
-                      </Button>
-                    </div>
-                  </>
-                )}
-              </div>
-
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="primary"
-                  size="sm"
-                  onClick={handleAdd}
-                  loading={saving}
-                  disabled={saving || !invoiceNumber.trim() || staged.length === 0}
-                >
-                  Save invoice
-                </Button>
-                <Button variant="secondary" size="sm" onClick={closeAdd} disabled={saving}>
-                  Cancel
-                </Button>
-              </div>
-              {formError && (
-                <p className="text-xs font-medium text-rose-600 dark:text-rose-400">{formError}</p>
-              )}
-            </div>
+            <InvoiceCreateForm
+              saleId={saleId}
+              piLines={lines}
+              onSaved={() => {
+                setAdding(false);
+                reload();
+                onChanged?.();
+              }}
+              onCancel={() => setAdding(false)}
+            />
           )}
         </div>
       )}
