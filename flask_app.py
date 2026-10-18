@@ -10,7 +10,6 @@ from flask import Flask, request, jsonify, send_from_directory, g, redirect
 from flask.json.provider import DefaultJSONProvider
 from datetime import date, timedelta
 from functools import wraps
-from typing import Optional
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -2373,15 +2372,21 @@ class InvoiceBatchLineIn(_FiniteModel):
 
 class InvoiceCreateIn(_StrippedModel):
     invoice_number: str = Field(min_length=1)
+    # INVOICE-CONTRACT: the operator-stated date is mandatory; it is what the
+    # invoice report and the printed invoice show, not created_at.
+    invoice_date: str = Field(min_length=1)
     # P1-B: bounded. This is the single-invoice twin of `InvoiceBatchEntryIn.lines`
     # (capped at 200); without the cap here the batch route is bounded and its
     # sibling is not. One SELECT ... FOR UPDATE per line in
     # `validate_invoice_lines`, held inside the sale-row lock.
-    lines: Optional[list[InvoiceBatchLineIn]] = Field(default=None, min_length=1, max_length=200)
+    # INVOICE-CONTRACT: required, min 1: a line-less invoice is not expressible.
+    lines: list[InvoiceBatchLineIn] = Field(min_length=1, max_length=200)
 
 
 class InvoiceBatchEntryIn(_StrippedModel):
     invoice_number: str = Field(min_length=1)
+    # INVOICE-CONTRACT: each entry states its own date (a batch may span days).
+    invoice_date: str = Field(min_length=1)
     # P1-B: bounded. This is the financial write path and amplification is
     # N invoices x M lines in one transaction, so both factors are capped.
     lines: list[InvoiceBatchLineIn] = Field(min_length=1, max_length=200)
@@ -2442,7 +2447,8 @@ def api_create_invoice(sale_id):
         # explicit-lines create.
         result = create_invoice(
             conn, sale_id, payload.invoice_number,
-            lines=([ln.model_dump() for ln in payload.lines] if payload.lines else None),
+            lines=[ln.model_dump() for ln in payload.lines],
+            invoice_date=payload.invoice_date,
         )
     except ValueError as e:
         _rollback_close(conn)

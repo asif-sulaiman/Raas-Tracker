@@ -139,7 +139,10 @@ _SCHEMA_VERSION_KEY = "raas_schema_version"
 #     'YYYY-MM-DD HH24:MI:SS'. Backed by explicit ALTERs below.
 # 5 = INV-REVISION: invoice_items.source_type, invoices.shipment_status,
 #     letters_of_credit.shipment_gate columns added.
-_SCHEMA_VERSION = 5
+# 6 = INVOICE-CONTRACT: invoices.invoice_date column added and backfilled from
+#     created_at on existing databases (invoices are now created with explicit
+#     lines + a stated date; there is no line-less mode any more).
+_SCHEMA_VERSION = 6
 
 # Frozen legacy tokens from builds that shipped them — do NOT add
 # per-migration entries. _SCHEMA_VERSION is authoritative; these only preserve
@@ -977,6 +980,7 @@ def _run_migration(conn: psycopg.Connection) -> None:
             approx_ship_date TEXT,
             actual_ship_date TEXT,
             notes TEXT,
+            invoice_date TEXT,
             created_by INTEGER,
             created_at TEXT DEFAULT (to_char(NOW(), 'YYYY-MM-DD HH24:MI:SS'))
         )
@@ -1014,6 +1018,15 @@ def _run_migration(conn: psycopg.Connection) -> None:
     # INV-REVISION: invoices.shipment_status (per-invoice shipment tracking)
     if "shipment_status" not in _table_columns(conn, "invoices"):
         conn.execute("ALTER TABLE invoices ADD COLUMN shipment_status TEXT DEFAULT 'pending'")
+
+    # INVOICE-CONTRACT: invoices.invoice_date (operator-stated date). Backfilled
+    # from created_at for databases that predate the column; without the
+    # backfill an upgrade would leave every historical invoice dateless while
+    # the UI now always renders the field.
+    if "invoice_date" not in _table_columns(conn, "invoices"):
+        conn.execute("ALTER TABLE invoices ADD COLUMN invoice_date TEXT")
+        conn.execute("UPDATE invoices SET invoice_date = SUBSTR(created_at, 1, 10) "
+                     "WHERE created_at IS NOT NULL")
 
     # Phase 1: LC foundation. sales.lc_number/lc_date TEXT mirrors stay
     # untouched (they become display mirrors); sales.lc_id is the new link.

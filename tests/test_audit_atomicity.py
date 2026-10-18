@@ -46,8 +46,8 @@ def _boom(module, monkeypatch, only=None, fail_on=None, calls=None):
     """Make `module.log_audit_action` raise.
 
     `only` restricts the failure to one action, so a function that audits an
-    intermediate step (`INVOICE_ITEM_ADD` while seeding lines) does not fail
-    before reaching the site under test.
+    intermediate step (`INVOICE_ITEM_ADD` while writing invoice lines) does not
+    fail before reaching the site under test.
 
     With `fail_on`/`calls` the first N-1 calls still run the REAL audit writer
     (each of which commits) and the Nth raises — which is exactly the situation
@@ -333,11 +333,13 @@ def test_create_invoice_survives_a_failed_audit(db, other, monkeypatch):
     from raas_tracker.sales import create_invoice
     _cid, sale_id, _item = _sale_with_items(db, "PI-INVOICE")
     import raas_tracker.sales as mod
-    # Only INVOICE_CREATE fails: the seeded INVOICE_ITEM_ADD rows are part of
-    # this same transaction and their audit must go with it.
+    # Only INVOICE_CREATE fails: the explicit lines' INVOICE_ITEM_ADD rows are
+    # part of this same transaction and their audit must go with it.
     _boom(mod, monkeypatch, only="INVOICE_CREATE")
     with pytest.raises(RuntimeError):
-        create_invoice(db, sale_id, "INV-GHOST")
+        create_invoice(db, sale_id, "INV-GHOST",
+                       lines=[{"sale_item_id": _item, "quantity": 100}],
+                       invoice_date="2026-01-15")
     assert other.execute("SELECT COUNT(*) FROM invoices WHERE invoice_number = %s",
                          ("INV-GHOST",)).fetchone()[0] == 0, \
         "INVOICE_CREATE was committed before its audit row could be written"
@@ -504,7 +506,9 @@ def test_happy_path_create_user_and_invoice(db, other):
     assert _rows(other, "USER_CREATE", uid) == [("user", uid)]
 
     _cid, sale_id, _item = _sale_with_items(db, "PI-HAPPYINV")
-    out = create_invoice(db, sale_id, "INV-HAPPY")
+    out = create_invoice(db, sale_id, "INV-HAPPY",
+                         lines=[{"sale_item_id": _item, "quantity": 100}],
+                         invoice_date="2026-01-15")
     assert other.execute("SELECT COUNT(*) FROM invoices WHERE id = %s",
                          (out["invoice_id"],)).fetchone()[0] == 1
     assert _rows(other, "INVOICE_CREATE", out["invoice_id"]) == [("invoice", out["invoice_id"])]

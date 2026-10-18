@@ -1,19 +1,20 @@
 """Invoice amount + auto-paid rule (invoices.amount NUMERIC(14,2)).
 
 invoices.amount is a DERIVED cache of SUM(invoice_items.line_total). A create
-states only WHICH invoice this is: the money is the sale's remaining uninvoiced
-PI (PI total minus what the invoice lines already carry), seeded one line per
-remaining uninvoiced PI line, and the header is restated in ::numeric from those
-lines. Covered here: a stated amount in the body being ignored, a second invoice
-deriving the remainder, header == its lines on a multi-line PI, awkward money
-never overstating the PI, partial vs full payments flipping status to 'paid', a
-0-derived amount -> paid at creation, legacy NULL amount rows, the no-downgrade
-guard, completion totals (total_amount / paid_amount), list row shape
-(amount + paid_amount), and the 409 guard on deleting an invoiced PI line.
+states WHICH lines the invoice covers (explicit quantities per PI line; the
+unit price is always inherited from the PI line, server-enforced): the money is
+restated in ::numeric from those lines, so header and lines cannot disagree.
+Covered here: a stated amount in the body being ignored, a second invoice
+taking the stated remainder, header == its lines on a multi-line PI, awkward
+money keeping the header exactly on its lines, partial vs full payments
+flipping status to 'paid', a 0-derived amount -> planned at creation, legacy
+NULL amount rows, the no-downgrade guard, completion totals
+(total_amount / paid_amount), list row shape (amount + paid_amount), and the
+409 guard on deleting an invoiced PI line.
 
 A test that wants an invoice SMALLER than the remainder has no amount to state:
-it creates the invoice and then adjusts its lines (_trim_invoice), exactly as
-the operator's line editor would.
+it states exactly the lines it wants, or creates and then adjusts its lines
+(_trim_invoice), exactly as the operator's line editor would.
 
 Patterns/fixtures mirror tests/test_invoices_production.py.
 """
@@ -49,9 +50,34 @@ def _sale(admin_client, company_id, pi, product="ProdAmt", qty=10, unit_price=5)
                          "unit_price": unit_price, "unit": "KG"}])
 
 
-def _create_invoice(admin_client, sale_id, number, body_amount=None):
-    """POST a create. ``body_amount`` is only ever there to be IGNORED."""
-    payload = {"invoice_number": number}
+def _remainder_lines(db, sale_id):
+    """The PI remainder as explicit create lines.
+
+    The old create auto-seeded exactly this (one line per remaining uninvoiced
+    PI line, in PI order). Under the explicit contract the TEST states it, so
+    each invoice's arithmetic stays tied to the PI remainder.
+    """
+    rows = db.execute(
+        """SELECT si.id,
+                  si.quantity - COALESCE(SUM(ii.quantity), 0) AS remaining
+             FROM sale_items si
+             LEFT JOIN invoice_items ii ON ii.sale_item_id = si.id
+            WHERE si.sale_id = %s
+            GROUP BY si.id, si.quantity
+            ORDER BY si.id""", (sale_id,)).fetchall()
+    return [{"sale_item_id": r[0], "quantity": float(r[1])}
+            for r in rows if r[1] is not None and float(r[1]) > 0]
+
+
+def _create_invoice(admin_client, db, sale_id, number, body_amount=None,
+                    lines=None):
+    """POST a create with explicit lines (default: the PI remainder).
+
+    ``body_amount`` is only ever there to be IGNORED.
+    """
+    payload = {"invoice_number": number, "invoice_date": "2026-01-15",
+               "lines": lines if lines is not None
+                        else _remainder_lines(db, sale_id)}
     if body_amount is not None:
         payload["amount"] = body_amount
     r = admin_client.post(f"/api/sales/{sale_id}/invoices", json=payload)
@@ -59,8 +85,8 @@ def _create_invoice(admin_client, sale_id, number, body_amount=None):
     return r.get_json()
 
 
-def _invoice(admin_client, sale_id, number):
-    return _create_invoice(admin_client, sale_id, number)["invoice_id"]
+def _invoice(admin_client, db, sale_id, number):
+    return _create_invoice(admin_client, db, sale_id, number)["invoice_id"]
 
 
 def _sale_item_ids(db, sale_id):
@@ -70,12 +96,11 @@ def _sale_item_ids(db, sale_id):
 
 
 def _trim_invoice(db, invoice_id, sale_item_id, quantity):
-    """Drop a seeded invoice's lines and re-add ONE partial line.
+    """Drop an invoice's lines and re-add ONE partial line.
 
-    The create seeds the whole remainder; a test that needs an invoice smaller
-    than the remainder (so a follow-up invoice has something left to derive)
-    says so by adjusting the lines. create_invoice_item restates the header
-    from the lines in the same write.
+    A test that needs an invoice smaller than the remainder says so by
+    adjusting the lines. create_invoice_item restates the header from the
+    lines in the same write.
     """
     db.execute("DELETE FROM invoice_items WHERE invoice_id = %s", (invoice_id,))
     db.commit()
@@ -138,7 +163,7 @@ def test_create_invoice_ignores_stated_amount_and_derives_from_pi(admin_client, 
     cid = _company(admin_client, db, name="AmtStated")
     sid = _sale(admin_client, cid, "PI-AMT-1", qty=20)  # 20 x 5 = 100
 
-    body = _create_invoice(admin_client, sid, "INV-AMT-1", body_amount=40)
+    body = _create_invoice(admin_client, db, sid, "INV-AMT-1", body_amount=40)
     assert body["status"] == "planned"
     assert body["invoice_id"]
     assert body["amount"] == pytest.approx(100.0)   # derived, not the stated 40
@@ -158,7 +183,7 @@ def test_create_invoice_derives_amount_from_whole_pi(admin_client, db):
     cid = _company(admin_client, db, name="AmtDefault")
     sid = _sale(admin_client, cid, "PI-AMT-2")  # 10 x 5 = 50
 
-    body = _create_invoice(admin_client, sid, "INV-AMT-2")
+    body = _create_invoice(admin_client, db, sid, "INV-AMT-2")
     assert body["amount"] == pytest.approx(50.0)
     assert body["status"] == "planned"
 
@@ -172,7 +197,7 @@ def test_create_invoice_derives_amount_from_whole_pi(admin_client, db):
 def test_partial_payment_keeps_status_and_reports_paid_amount(admin_client, db):
     cid = _company(admin_client, db, name="AmtPartial")
     sid = _sale(admin_client, cid, "PI-AMT-4", qty=20)  # 20 x 5 = 100
-    inv = _invoice(admin_client, sid, "INV-AMT-4")
+    inv = _invoice(admin_client, db, sid, "INV-AMT-4")
 
     _pay(admin_client, sid, inv, 40)
 
@@ -188,7 +213,7 @@ def test_partial_payment_keeps_status_and_reports_paid_amount(admin_client, db):
 def test_full_payment_flips_status_to_paid(admin_client, db):
     cid = _company(admin_client, db, name="AmtFull")
     sid = _sale(admin_client, cid, "PI-AMT-5", qty=20)  # 20 x 5 = 100
-    inv = _invoice(admin_client, sid, "INV-AMT-5")
+    inv = _invoice(admin_client, db, sid, "INV-AMT-5")
 
     _pay(admin_client, sid, inv, 60)
     assert _status(db, inv) == "planned", "partial coverage must not flip"
@@ -217,8 +242,8 @@ def test_zero_derived_amount_is_planned_not_paid(admin_client, db):
     below is unchanged — the claim under test is still that a create-time
     derivation landing on 0 yields `planned`. It is reached through the other
     real route to zero, sub-cent rounding on an explicit invoice line:
-    0.0001 x 5 = 0.00. (The auto-seed route to the same zero — a fully
-    invoiced PI with nothing left over — is covered by
+    0.0001 x 5 = 0.00. (The other route to the same zero — a fully invoiced
+    PI with nothing left over — is covered by
     ``test_zero_remainder_invoice_is_planned_not_paid`` below.)
     """
     cid = _company(admin_client, db, name="AmtZero")
@@ -227,6 +252,7 @@ def test_zero_derived_amount_is_planned_not_paid(admin_client, db):
 
     r = admin_client.post(f"/api/sales/{sid}/invoices", json={
         "invoice_number": "INV-AMT-6",
+        "invoice_date": "2026-01-15",
         "lines": [{"sale_item_id": sale_item_id, "quantity": 0.0001}]})
     assert r.status_code == 201, r.get_json()
     body = r.get_json()
@@ -241,21 +267,25 @@ def test_zero_derived_amount_is_planned_not_paid(admin_client, db):
 
 
 def test_zero_remainder_invoice_is_planned_not_paid(admin_client, db):
-    """The phantom-paid bug: invoice #2 on a fully-invoiced PI.
+    """The phantom-paid bug: invoice #2 whose money derives to 0.
 
-    Invoice #1 consumes the whole remainder, so #2 derives 0. It must be born
-    'planned' and stay workable — never a terminal 'paid' row with no money
-    moved, which used to also report "1/2 invoices paid" on the panel.
+    Invoice #1 covers the whole PI (100), so #2 states only a sub-cent slice of
+    the exhausted line and its money lands on 0.00. It must be born 'planned'
+    and stay workable — never a terminal 'paid' row with no money moved, which
+    used to also report "1/2 invoices paid" on the panel.
     """
     cid = _company(admin_client, db, name="AmtRemainder")
     sid = _sale(admin_client, cid, "PI-AMT-11", qty=20)  # 20 x 5 = 100
 
-    first = _invoice(admin_client, sid, "INV-AMT-11")   # seeds the full 100
-    second = _invoice(admin_client, sid, "INV-AMT-12")  # remainder is now 0
+    first = _invoice(admin_client, db, sid, "INV-AMT-11")   # covers the full 100
+    second = _create_invoice(
+        admin_client, db, sid, "INV-AMT-12",
+        lines=[{"sale_item_id": _sale_item_ids(db, sid)[0],
+                "quantity": 0.0001}])["invoice_id"]
 
     assert _status(db, first) == "planned"
     assert _status(db, second) == "planned", (
-        "a zero remainder is not a payment — the invoice must stay workable")
+        "a zero derived amount is not a payment — the invoice must stay workable")
 
     # And it is not counted as settled by the sale-level completion summary.
     body = admin_client.get(f"/api/sales/{sid}/completion").get_json()
@@ -270,9 +300,9 @@ def test_legacy_null_amount_payment_marks_paid(admin_client, db):
     cid = _company(admin_client, db, name="AmtLegacy")
     sid = _sale(admin_client, cid, "PI-AMT-7", qty=40)  # 40 x 5 = 200
 
-    paid_inv = _invoice(admin_client, sid, "INV-AMT-7")          # seeds 200
+    paid_inv = _invoice(admin_client, db, sid, "INV-AMT-7")          # seeds 200
     _trim_invoice(db, paid_inv, _sale_item_ids(db, sid)[0], 20)  # -> 100
-    unpaid_inv = _invoice(admin_client, sid, "INV-AMT-8")        # -> the rest
+    unpaid_inv = _invoice(admin_client, db, sid, "INV-AMT-8")        # -> the rest
     assert _header(db, paid_inv) == Decimal("100.00")
     assert _header(db, unpaid_inv) == Decimal("100.00")
     db.execute("UPDATE invoices SET amount = NULL WHERE sale_id = %s", (sid,))
@@ -297,7 +327,7 @@ def test_paid_status_never_downgrades(admin_client, db):
 
     # (a) fully covered invoice -> the guarded UPDATE must not re-fire.
     sid = _sale(admin_client, cid, "PI-AMT-9", qty=20)  # 20 x 5 = 100
-    inv = _invoice(admin_client, sid, "INV-AMT-9")
+    inv = _invoice(admin_client, db, sid, "INV-AMT-9")
     _pay(admin_client, sid, inv, 100)
     assert _status(db, inv) == "paid"
     assert _sync_invoice_paid_status(db, inv) is False
@@ -325,11 +355,11 @@ def test_completion_carries_total_amount_and_paid_amount(admin_client, db):
                             "invoices": []}
 
     si = _sale_item_ids(db, sid)[0]
-    a = _invoice(admin_client, sid, "INV-AMT-11")   # seeds 250
+    a = _invoice(admin_client, db, sid, "INV-AMT-11")   # seeds 250
     _trim_invoice(db, a, si, 20)                    # -> 100
-    b = _invoice(admin_client, sid, "INV-AMT-12")   # -> the rest
+    b = _invoice(admin_client, db, sid, "INV-AMT-12")   # -> the rest
     _trim_invoice(db, b, si, 10)                    # -> 50
-    c = _invoice(admin_client, sid, "INV-AMT-13")   # -> the rest
+    c = _invoice(admin_client, db, sid, "INV-AMT-13")   # -> the rest
     _trim_invoice(db, c, si, 6)                     # -> 30
     assert [_header(db, i) for i in (a, b, c)] == [Decimal("100.00"),
                                                    Decimal("50.00"),
@@ -365,7 +395,7 @@ def test_completion_carries_total_amount_and_paid_amount(admin_client, db):
 def test_list_rows_carry_amount_and_paid_amount(admin_client, db):
     cid = _company(admin_client, db, name="AmtShape")
     sid = _sale(admin_client, cid, "PI-AMT-14", qty=15)  # 15 x 5 = 75
-    inv = _invoice(admin_client, sid, "INV-AMT-14")
+    inv = _invoice(admin_client, db, sid, "INV-AMT-14")
 
     rows = _rows(admin_client, sid)
     assert len(rows) == 1
@@ -401,7 +431,7 @@ def _payments(db, sale_id):
 def test_ship_on_paid_refused_without_phantom_shipment(admin_client, db):
     cid = _company(admin_client, db, name="IntShipPaid")
     sid = _sale(admin_client, cid, "PI-INT-1")  # 10 x 5 = 50
-    inv = _invoice(admin_client, sid, "INV-INT-1")
+    inv = _invoice(admin_client, db, sid, "INV-INT-1")
     _pay(admin_client, sid, inv, 50)
     assert _status(db, inv) == "paid"
 
@@ -418,7 +448,7 @@ def test_book_ship_pay_delete_reject_cross_sale_invoice(admin_client, db):
     cid = _company(admin_client, db, name="IntScope")
     sid_a = _sale(admin_client, cid, "PI-INT-A")
     sid_b = _sale(admin_client, cid, "PI-INT-B")
-    inv = _invoice(admin_client, sid_b, "INV-INT-SC")
+    inv = _invoice(admin_client, db, sid_b, "INV-INT-SC")
 
     r = admin_client.post(f"/api/sales/{sid_a}/invoices/{inv}/book",
                           json={"approx_ship_date": "2026-11-01"})
@@ -462,7 +492,7 @@ def test_book_ship_pay_reject_missing_invoice(admin_client, db):
 def test_partial_pay_returns_actual_status(admin_client, db, produce_for):
     cid = _company(admin_client, db, name="IntHonest")
     sid = _sale(admin_client, cid, "PI-INT-H", qty=40)  # 40 x 5 = 200
-    inv = _invoice(admin_client, sid, "INV-INT-H")
+    inv = _invoice(admin_client, db, sid, "INV-INT-H")
 
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/pay",
                           json={"payment_amount": 50, "payment_date": "2026-11-04"})
@@ -500,7 +530,7 @@ def test_partial_pay_returns_actual_status(admin_client, db, produce_for):
 def test_book_on_shipped_refused_and_sale_untouched(admin_client, db):
     cid = _company(admin_client, db, name="IntBookShip")
     sid = _sale(admin_client, cid, "PI-INT-BS")
-    inv = _invoice(admin_client, sid, "INV-INT-BS")
+    inv = _invoice(admin_client, db, sid, "INV-INT-BS")
 
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/ship",
                           json={"actual_ship_date": "2026-11-08"})
@@ -529,7 +559,7 @@ def test_produce_on_paid_refused(admin_client, db):
     r = admin_client.post("/api/recipes/Recipe-IntPP/items", json={
         "chemical": "Chem-IntPP", "percentage": 40, "company_id": cid})
     assert r.status_code == 200, r.get_json()
-    inv = _invoice(admin_client, sid, "INV-INT-PP")
+    inv = _invoice(admin_client, db, sid, "INV-INT-PP")
     _pay(admin_client, sid, inv, 50)
     assert _status(db, inv) == "paid"
 
@@ -546,12 +576,14 @@ def test_second_invoice_derives_the_remainder(admin_client, db):
     cid = _company(admin_client, db, name="IntAmtReq")
     sid = _sale(admin_client, cid, "PI-INT-AR", qty=40)  # 40 x 5 = 200
 
-    first = _invoice(admin_client, sid, "INV-INT-AR1")
+    first = _invoice(admin_client, db, sid, "INV-INT-AR1")
     assert _header(db, first) == Decimal("200.00")
     _trim_invoice(db, first, _sale_item_ids(db, sid)[0], 20)   # -> 100
 
     r = admin_client.post(f"/api/sales/{sid}/invoices",
-                          json={"invoice_number": "INV-INT-AR2"})
+                          json={"invoice_number": "INV-INT-AR2",
+                                "invoice_date": "2026-01-16",
+                                "lines": _remainder_lines(db, sid)})
     assert r.status_code == 201, r.get_json()
     second = r.get_json()["invoice_id"]
     assert r.get_json()["amount"] == pytest.approx(100.0)
@@ -564,14 +596,15 @@ def test_second_invoice_derives_the_remainder(admin_client, db):
     assert len(_rows(admin_client, sid)) == 2
 
 
-def test_derived_invoices_never_overstate_pi_for_awkward_money(admin_client, db):
+def test_awkward_money_header_stays_exactly_its_lines(admin_client, db):
     """Half-KG quantities + 2dp prices: the PI total and the line sum differ.
 
     2.5 x 33.33 = 83.325 and 1.5 x 11.11 = 16.665, so per-line 2dp rounding
     gives 83.33 + 16.67 = 100.00 against a PI total of 99.99. The old
-    "no-overstatement" cap rejected a creation like this outright (it fired on
-    7.7% of legitimate creates); the derived amount must instead absorb the
-    cent, so the sale can never be invoiced above its own PI.
+    money-derived create absorbed the cent (a budget cap trimmed the last
+    line); the explicit-lines contract has no money cap — the only ceiling is
+    the 5% quantity tolerance — so the cent stays on the stated lines and the
+    header must be exactly their sum.
     """
     cid = _company(admin_client, db, name="IntCap")
     sid = _sale_lines(admin_client, cid, "PI-INT-CAP", [
@@ -582,18 +615,19 @@ def test_derived_invoices_never_overstate_pi_for_awkward_money(admin_client, db)
     total = _pi_total(db, sid)
     assert total == Decimal("99.99")
 
-    first = _invoice(admin_client, sid, "INV-INT-CAP1")
+    first = _invoice(admin_client, db, sid, "INV-INT-CAP1")
     assert _header(db, first) == _lines_total(db, first)
-    assert _header(db, first) <= total
+    assert _header(db, first) == Decimal("100.00"), (
+        "each stated line rounds to 2dp; the header is their exact sum")
 
-    # A follow-up invoice over the rounding remainder must not tip it over.
-    _invoice(admin_client, sid, "INV-INT-CAP2")
     summed = db.execute(
         "SELECT COALESCE(SUM(amount), 0) FROM invoices WHERE sale_id = %s",
         (sid,)).fetchone()[0]
-    assert summed <= total, f"invoiced {summed} > PI total {total}"
-    assert summed == Decimal("99.99"), "the derived amount must absorb the cent"
-    assert len(_rows(admin_client, sid)) == 2
+    assert summed == Decimal("100.00")
+    assert len(_rows(admin_client, sid)) == 1
+    # The PI is fully covered (2.5 + 1.5 units), so there is no remainder left
+    # to state on a follow-up invoice.
+    assert _remainder_lines(db, sid) == []
 
 
 def test_null_amount_legacy_does_not_block_next_derived_create(admin_client, db):
@@ -601,12 +635,12 @@ def test_null_amount_legacy_does_not_block_next_derived_create(admin_client, db)
     next derived amount, which comes from the LINES, not from the headers."""
     cid = _company(admin_client, db, name="IntNullSkip")
     sid = _sale(admin_client, cid, "PI-INT-NS", qty=20)  # 20 x 5 = 100
-    first = _invoice(admin_client, sid, "INV-INT-NS1")   # seeds 100
+    first = _invoice(admin_client, db, sid, "INV-INT-NS1")   # seeds 100
     _trim_invoice(db, first, _sale_item_ids(db, sid)[0], 6)   # -> 30
     db.execute("UPDATE invoices SET amount = NULL WHERE id = %s", (first,))
     db.commit()
 
-    second = _invoice(admin_client, sid, "INV-INT-NS2")   # derives 100 - 30
+    second = _invoice(admin_client, db, sid, "INV-INT-NS2")   # derives 100 - 30
     assert _header(db, second) == Decimal("70.00")
     assert _header(db, second) == _lines_total(db, second)
     assert len(_rows(admin_client, sid)) == 2
@@ -615,7 +649,7 @@ def test_null_amount_legacy_does_not_block_next_derived_create(admin_client, db)
 def test_void_paid_invoice_keeps_sale_payment_truth(admin_client, db):
     cid = _company(admin_client, db, name="IntVoid")
     sid = _sale(admin_client, cid, "PI-INT-V")  # 10 x 5 = 50
-    inv = _invoice(admin_client, sid, "INV-INT-V")
+    inv = _invoice(admin_client, db, sid, "INV-INT-V")
     _pay(admin_client, sid, inv, 50)
     assert _status(db, inv) == "paid"
 
@@ -647,7 +681,7 @@ def test_void_paid_invoice_keeps_sale_payment_truth(admin_client, db):
 def test_double_pay_sums_without_loss(admin_client, db):
     cid = _company(admin_client, db, name="IntDoublePay")
     sid = _sale(admin_client, cid, "PI-INT-DP", qty=40)  # 40 x 5 = 200
-    inv = _invoice(admin_client, sid, "INV-INT-DP")
+    inv = _invoice(admin_client, db, sid, "INV-INT-DP")
 
     _pay(admin_client, sid, inv, 120)
     assert _status(db, inv) == "planned"
@@ -676,7 +710,7 @@ def test_derived_header_equals_sum_of_lines_on_multi_line_pi(admin_client, db):
          "unit": "KG"}])
     assert _pi_total(db, sid) == Decimal("52.00")   # 37.50 + 14.50
 
-    inv = _invoice(admin_client, sid, "INV-AMT-15")
+    inv = _invoice(admin_client, db, sid, "INV-AMT-15")
     assert _header(db, inv) == Decimal("52.00")
     assert _lines_total(db, inv) == Decimal("52.00")
     assert _header(db, inv) == _lines_total(db, inv)
@@ -705,7 +739,7 @@ def test_deleting_invoiced_pi_line_refused_and_sale_unchanged(admin_client, db):
         {"product_name": "DelA", "quantity": 4, "unit_price": 25, "unit": "KG"},
         {"product_name": "DelB", "quantity": 2, "unit_price": 15, "unit": "KG"}])
     item_id = _sale_item_ids(db, sid)[0]
-    inv = _invoice(admin_client, sid, "INV-AMT-16")
+    inv = _invoice(admin_client, db, sid, "INV-AMT-16")
     before_items = _detail(admin_client, sid)["items"]
     before_amount = _header(db, inv)
     assert before_amount == Decimal("130.00")   # 100.00 + 30.00
@@ -733,7 +767,7 @@ def test_editing_invoiced_pi_line_quantity_or_price_refused(admin_client, db):
     sid = _sale_lines(admin_client, cid, "PI-AMT-17", [
         {"product_name": "EditA", "quantity": 4, "unit_price": 25, "unit": "KG"}])
     item_id = _sale_item_ids(db, sid)[0]
-    inv = _invoice(admin_client, sid, "INV-AMT-17")
+    inv = _invoice(admin_client, db, sid, "INV-AMT-17")
     before_amount = _header(db, inv)
     assert before_amount == Decimal("100.00")
 
@@ -760,7 +794,7 @@ def test_bulk_update_removing_invoiced_pi_line_refused_with_409(admin_client, db
         {"product_name": "BulkA", "quantity": 4, "unit_price": 25, "unit": "KG"},
         {"product_name": "BulkB", "quantity": 2, "unit_price": 15, "unit": "KG"}])
     ids = _sale_item_ids(db, sid)
-    inv = _invoice(admin_client, sid, "INV-AMT-18")
+    inv = _invoice(admin_client, db, sid, "INV-AMT-18")
     before_amount = _header(db, inv)
     before_items = _detail(admin_client, sid)["items"]
 
@@ -781,15 +815,15 @@ def test_bulk_update_removing_invoiced_pi_line_refused_with_409(admin_client, db
 def test_concurrent_creates_cannot_over_invoice_the_sale(admin_client, db, pg_dsn):
     """Best-effort invariant check under real concurrency, NOT a race reproducer.
 
-    `log_audit_action` defaults to atomic=True, which COMMITs. Calling it per
-    seeded line therefore committed on the first line, dropping the sales and
-    sale_items locks before the remaining lines were inserted; a concurrent
-    create could then derive the same remainder and the sale was invoiced to
-    162% of its PI. Whether the interleaving happens depends on timing, so this
-    asserts the invariant the lock exists to protect - the sale is never billed
+    `log_audit_action` defaults to atomic=True, which COMMITs. A commit inside
+    the create's line loop therefore dropped the sales and sale_items locks
+    before the remaining lines were inserted; a concurrent create could then
+    state the same quantities and the sale was invoiced to 162% of its PI.
+    Whether the interleaving happens depends on timing, so this asserts the
+    invariant the lock + 5% ceiling exist to protect - the sale is never billed
     past its PI and no invoice header disagrees with its own lines - while
-    `test_seeded_line_audit_never_commits_mid_seed` is the deterministic guard
-    that actually pins the cause.
+    `test_line_audit_never_commits_mid_create` is the deterministic guard that
+    actually pins the cause.
     """
     import threading
 
@@ -806,12 +840,18 @@ def test_concurrent_creates_cannot_over_invoice_the_sale(admin_client, db, pg_ds
     pi_total = _pi_total(db, sid)
     assert pi_total == Decimal("544.98")   # 125 + 120 + 100 + 199.98
 
+    # Every thread states the SAME full-PI lines: only one may get through.
+    full_lines = [{"sale_item_id": r[0], "quantity": float(r[1])}
+                  for r in db.execute(
+                      "SELECT id, quantity FROM sale_items "
+                      "WHERE sale_id = %s ORDER BY id", (sid,)).fetchall()]
     errors = []
 
     def _create(number):
         conn = get_connection(pg_dsn)
         try:
-            create_invoice(conn, sid, number)
+            create_invoice(conn, sid, number, lines=full_lines,
+                           invoice_date="2026-01-15")
         except Exception as e:            # noqa: BLE001 - recorded, asserted below
             errors.append(e)
         finally:
@@ -842,15 +882,15 @@ def test_concurrent_creates_cannot_over_invoice_the_sale(admin_client, db, pg_ds
             f"invoice {invoice_id} header {amount} != its lines {lines}")
 
 
-def test_seeded_line_audit_never_commits_mid_seed(admin_client, db, monkeypatch):
+def test_line_audit_never_commits_mid_create(admin_client, db, monkeypatch):
     """Deterministic guard for the race the threaded test only sometimes wins.
 
-    `log_audit_action` commits when `atomic=True`. A commit inside
-    `_seed_invoice_lines` releases the `sales` and `sale_items` row locks the
-    seed depends on, so a concurrent create derives the same remainder and bills
-    the sale twice - and a mid-seed failure would persist a header that no line
-    backs. Asserting the call is non-atomic is deterministic; provoking the race
-    is not.
+    `log_audit_action` commits when `atomic=True`. A commit inside the create's
+    line loop releases the `sales` and `sale_items` row locks the create depends
+    on, so a concurrent create states the same quantities and bills the sale
+    twice - and a mid-create failure would persist a header that no line backs.
+    Asserting the call is non-atomic is deterministic; provoking the race is
+    not.
     """
     from raas_tracker import sales as salesmod
 
@@ -867,13 +907,18 @@ def test_seeded_line_audit_never_commits_mid_seed(admin_client, db, monkeypatch)
         return real(conn, action, *args, **kwargs)
 
     monkeypatch.setattr(salesmod, "log_audit_action", spy)
-    salesmod.create_invoice(db, sid, "INV-AMT-20")
+    lines = [{"sale_item_id": r[0], "quantity": float(r[1])}
+             for r in db.execute(
+                 "SELECT id, quantity FROM sale_items "
+                 "WHERE sale_id = %s ORDER BY id", (sid,)).fetchall()]
+    salesmod.create_invoice(db, sid, "INV-AMT-20", lines=lines,
+                            invoice_date="2026-01-15")
 
-    seeded = [flag for action, flag in seen if action == "INVOICE_ITEM_ADD"]
-    assert len(seeded) == 2, f"both seeded lines must be audited: {seen}"
-    assert all(flag is False for flag in seeded), (
-        "seeding must not commit mid-transaction; it would release the row locks"
-        f" the derivation depends on (saw atomic={seeded})")
+    audited = [flag for action, flag in seen if action == "INVOICE_ITEM_ADD"]
+    assert len(audited) == 2, f"both stated lines must be audited: {seen}"
+    assert all(flag is False for flag in audited), (
+        "the line loop must not commit mid-transaction; it would release the"
+        f" row locks the create depends on (saw atomic={audited})")
 
 
 def test_bulk_update_rebasing_an_invoiced_pi_line_refused(admin_client, db):
@@ -889,7 +934,7 @@ def test_bulk_update_rebasing_an_invoiced_pi_line_refused(admin_client, db):
         {"product_name": "Reb1", "quantity": 4, "unit_price": 25, "unit": "KG"},
         {"product_name": "Reb2", "quantity": 2, "unit_price": 15, "unit": "KG"}])
     ids = _sale_item_ids(db, sid)
-    inv = _invoice(admin_client, sid, "INV-AMT-21")
+    inv = _invoice(admin_client, db, sid, "INV-AMT-21")
     before_amount = _header(db, inv)
     before_items = _detail(admin_client, sid)["items"]
 

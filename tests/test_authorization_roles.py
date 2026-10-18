@@ -545,7 +545,7 @@ def test_invoice_batch_rejects_a_batch_over_the_total_row_budget():
     per_invoice = 200
     n_invoices = MAX_BATCH_ROWS // per_invoice + 1
     payload = {"invoices": [
-        {"invoice_number": f"INV-{i}",
+        {"invoice_number": f"INV-{i}", "invoice_date": "2026-01-15",
          "lines": [{"sale_item_id": 1, "quantity": 1.0}] * per_invoice}
         for i in range(n_invoices)]}
     assert n_invoices <= 50, "precondition: invoice count within its own cap"
@@ -612,7 +612,7 @@ ROW_FANNING_CAPS = [
     ("SaleFullUpdateIn", "removedIds", lambda n: list(range(n))),
     # MED-1 — N invoices x M lines, the financial write path.
     ("InvoiceBatchCreateIn", "invoices", lambda n: [
-        {"invoice_number": f"INV-{i}", "lines": [
+        {"invoice_number": f"INV-{i}", "invoice_date": "2026-01-15", "lines": [
             {"sale_item_id": 1, "quantity": 1.0}]} for i in range(n)]),
     ("InvoiceBatchEntryIn", "lines", lambda n: [
         {"sale_item_id": 1, "quantity": 1.0}] * n),
@@ -635,8 +635,10 @@ _ROW_FAN_REQUIRED_SIBLINGS = {
         "items": [{"product_name": "P", "quantity": 1.0,
                    "unit_price": 1.0, "unit": "kg"}]},
     ("InvoiceBatchCreateIn", "invoices"): {},
-    ("InvoiceBatchEntryIn", "lines"): {"invoice_number": "INV-1"},
-    ("InvoiceCreateIn", "lines"): {"invoice_number": "INV-1"},
+    ("InvoiceBatchEntryIn", "lines"): {"invoice_number": "INV-1",
+                                       "invoice_date": "2026-01-15"},
+    ("InvoiceCreateIn", "lines"): {"invoice_number": "INV-1",
+                                   "invoice_date": "2026-01-15"},
     ("LcAttachIn", "sale_ids"): {},
 }
 

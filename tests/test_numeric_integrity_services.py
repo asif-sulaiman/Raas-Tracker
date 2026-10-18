@@ -80,6 +80,16 @@ def _sale(db, pi="PI-NF", total=100.0, company_id=None):
                     [{"product_name": "W", "quantity": 10, "unit_price": total / 10}])
 
 
+def _invoice(db, sale_id, number):
+    """Create an invoice covering the sale's PI lines in full."""
+    lines = [{"sale_item_id": r[0], "quantity": float(r[1])}
+             for r in db.execute(
+                 "SELECT id, quantity FROM sale_items WHERE sale_id = %s "
+                 "ORDER BY id", (sale_id,)).fetchall()]
+    return create_invoice(db, sale_id, number, lines=lines,
+                          invoice_date="2026-01-15")
+
+
 def _sale_at_payment_due(db):
     """A sale parked in ``payment_due`` — the state the cascade completes FROM."""
     sid = _sale(db)
@@ -134,7 +144,7 @@ def test_record_sale_payment_infinity_cannot_complete_the_sale(db):
     arrived, and ``sales.stage`` drives the whole pipeline.
     """
     sid = _sale_at_payment_due(db)
-    create_invoice(db, sid, "INV-CASCADE")
+    _invoice(db, sid, "INV-CASCADE")
     assert _sale_row(db, sid)[0] == "payment_due"
 
     with pytest.raises(ValueError):
@@ -151,7 +161,7 @@ def test_record_sale_payment_infinity_cannot_pay_the_invoice(db):
     """The other half of the cascade: ``_resync_invoice_payment_status`` flips
     the linked invoice to 'paid' because ``inf >= amount``."""
     sid = _sale_at_payment_due(db)
-    inv = create_invoice(db, sid, "INV-PAID")["invoice_id"]
+    inv = _invoice(db, sid, "INV-PAID")["invoice_id"]
     before = db.execute("SELECT status FROM invoices WHERE id = %s", (inv,)).fetchone()[0]
     assert before != "paid"
 
@@ -208,7 +218,7 @@ def test_record_sale_payment_still_accepts_finite_amounts(db):
 @NON_FINITE
 def test_mark_invoice_paid_rejects_non_finite_and_writes_nothing(db, bad):
     sid = _sale(db)
-    inv = create_invoice(db, sid, "INV-MIP")["invoice_id"]
+    inv = _invoice(db, sid, "INV-MIP")["invoice_id"]
     before = db.execute("SELECT status FROM invoices WHERE id = %s", (inv,)).fetchone()[0]
     assert before != "paid"
 
@@ -224,7 +234,7 @@ def test_mark_invoice_paid_rejects_non_finite_and_writes_nothing(db, bad):
 
 def test_mark_invoice_paid_still_rejects_zero_and_negative(db):
     sid = _sale(db)
-    inv = create_invoice(db, sid, "INV-ZERO")["invoice_id"]
+    inv = _invoice(db, sid, "INV-ZERO")["invoice_id"]
     for bad in (0, 0.0, -1):
         with pytest.raises(ValueError):
             mark_invoice_paid(db, inv, bad, "2026-10-30")
@@ -235,7 +245,7 @@ def test_mark_invoice_paid_still_accepts_partial_and_overpayment(db):
     """Overpayment is accepted by design ("money received is truth"). A
     finiteness guard must not quietly become an amount cap."""
     sid = _sale(db)
-    inv = create_invoice(db, sid, "INV-OK")["invoice_id"]
+    inv = _invoice(db, sid, "INV-OK")["invoice_id"]
     assert mark_invoice_paid(db, inv, 40, "2026-10-30")["status"] != "paid"
     assert mark_invoice_paid(db, inv, 1e6, "2026-10-31")["status"] == "paid"
     assert _payment_count(db, sid) == 2
@@ -320,7 +330,7 @@ def test_update_sale_item_still_refuses_to_rebase_an_invoiced_line(db):
     a 400, or a non-finite value on an invoiced line would silently change the
     error shape the frontend already handles."""
     sid = _sale(db)
-    create_invoice(db, sid, "INV-LINE")
+    _invoice(db, sid, "INV-LINE")
     item_id = db.execute(
         "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id", (sid,)).fetchone()[0]
     with pytest.raises(InvoicedLineConflict):
@@ -671,7 +681,7 @@ def test_no_non_finite_value_survives_any_guarded_write(db):
     """End-to-end: after driving every guarded writer with ``inf``, not one REAL
     column in the tables these services touch may hold a non-finite value."""
     sid = _sale_at_payment_due(db)
-    create_invoice(db, sid, "INV-SWEEP")
+    _invoice(db, sid, "INV-SWEEP")
     add_chemical(db, "Acid", 10, "KG")
     inf = float("inf")
     item_id = db.execute(

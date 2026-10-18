@@ -103,9 +103,15 @@ def _sale(admin_client, company_id, pi, product, qty=10, price=5):
     return r.get_json()["id"]
 
 
-def _invoice(admin_client, sale_id, number):
+def _invoice(admin_client, db, sale_id, number):
+    lines = [{"sale_item_id": r[0], "quantity": float(r[1])}
+             for r in db.execute(
+                 "SELECT id, quantity FROM sale_items WHERE sale_id = %s "
+                 "ORDER BY id", (sale_id,)).fetchall()]
     r = admin_client.post(f"/api/sales/{sale_id}/invoices",
-                          json={"invoice_number": number})
+                          json={"invoice_number": number,
+                                "invoice_date": "2026-01-15",
+                                "lines": lines})
     assert r.status_code == 201, r.get_json()
     return r.get_json()["invoice_id"]
 
@@ -364,7 +370,7 @@ def test_produce_route_409_for_terminal_invoice(admin_client, db):
     cid = _company(admin_client, db, "TypedProdCo")
     sid = _sale(admin_client, cid, "PI-TP-1", "TypedProd")
     _recipe(admin_client, cid, "TypedProd", "TypedRecipe", "TypedChem")
-    inv = _invoice(admin_client, sid, "INV-TP-1")
+    inv = _invoice(admin_client, db, sid, "INV-TP-1")
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/ship",
                           json={"actual_ship_date": "2026-10-20"})
     assert r.status_code == 201, r.get_json()
@@ -400,7 +406,7 @@ def test_produce_route_404_for_missing_linked_invoice(admin_client, db):
     _recipe(admin_client, cid_a, "TypedProdAI", "TypedRecipeAI", "TypedChemAI")
     cid_b = _company(admin_client, db, "TypedInvB")
     sid_b = _sale(admin_client, cid_b, "PI-TIB-1", "TypedProdBI")
-    inv_b = _invoice(admin_client, sid_b, "INV-TIB-1")
+    inv_b = _invoice(admin_client, db, sid_b, "INV-TIB-1")
 
     r = admin_client.post("/api/recipes/TypedRecipeAI/produce", json={
         "production_qty": 10, "company_id": cid_a,
@@ -415,7 +421,7 @@ def test_book_route_409_when_not_produced(admin_client, db):
     cid = _company(admin_client, db, "TypedBookCo")
     sid = _sale(admin_client, cid, "PI-TB-1", "TypedBookProd")
     _recipe(admin_client, cid, "TypedBookProd", "TypedBookRecipe", "TypedBookChem")
-    inv = _invoice(admin_client, sid, "INV-TB-1")
+    inv = _invoice(admin_client, db, sid, "INV-TB-1")
 
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
                           json={"approx_ship_date": "2026-11-01"})
@@ -429,7 +435,7 @@ def test_ship_route_409_for_terminal_invoice(admin_client, db):
     """sales.py:2224 — shipping an already-paid invoice is a 409."""
     cid = _company(admin_client, db, "TypedShipCo")
     sid = _sale(admin_client, cid, "PI-TS-1", "TypedShipProd")
-    inv = _invoice(admin_client, sid, "INV-TS-1")
+    inv = _invoice(admin_client, db, sid, "INV-TS-1")
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/pay",
                           json={"payment_amount": 50, "payment_date": "2026-10-25"})
     assert r.status_code == 201, r.get_json()
@@ -445,7 +451,7 @@ def test_invoice_item_route_409_over_tolerance(admin_client, db):
     cid = _company(admin_client, db, "TypedTolCo")
     sid = _sale(admin_client, cid, "PI-TT-1", "TypedTolProd")
     item_id = _sale_item_id(db, sid)
-    inv = _invoice(admin_client, sid, "INV-TT-1")
+    inv = _invoice(admin_client, db, sid, "INV-TT-1")
 
     r = admin_client.post(f"/api/invoices/{inv}/items",
                           json={"sale_item_id": item_id, "quantity": 11})
@@ -472,13 +478,15 @@ def test_tolerance_breach_is_409_on_every_invoice_write_route(admin_client, db):
     item_id = _sale_item_id(db, sid)
     # The seeded invoice already carries the PI line's full 10, so every
     # request below trips the same 10.5 ceiling.
-    inv = _invoice(admin_client, sid, "INV-TT3-SEED")
+    inv = _invoice(admin_client, db, sid, "INV-TT3-SEED")
 
     r_create = admin_client.post(f"/api/sales/{sid}/invoices", json={
         "invoice_number": "INV-TT3-A",
+        "invoice_date": "2026-01-15",
         "lines": [{"sale_item_id": item_id, "quantity": 1}]})
     r_batch = admin_client.post(f"/api/sales/{sid}/invoices/batch", json={
         "invoices": [{"invoice_number": "INV-TT3-B",
+                      "invoice_date": "2026-01-15",
                       "lines": [{"sale_item_id": item_id, "quantity": 1}]}]})
     r_item = admin_client.post(f"/api/invoices/{inv}/items",
                                json={"sale_item_id": item_id, "quantity": 1})
@@ -502,7 +510,7 @@ def test_invoice_item_route_404_missing_sale_item(admin_client, db):
     """sales.py:2592 — a sale item that does not exist is a 404."""
     cid = _company(admin_client, db, "TypedItemCo")
     sid = _sale(admin_client, cid, "PI-TI-1", "TypedItemProd")
-    inv = _invoice(admin_client, sid, "INV-TI-1")
+    inv = _invoice(admin_client, db, sid, "INV-TI-1")
 
     r = admin_client.post(f"/api/invoices/{inv}/items",
                           json={"sale_item_id": 999999, "quantity": 1})
@@ -516,7 +524,7 @@ def test_invoice_item_route_still_400_for_plain_validation(admin_client, db):
     sid = _sale(admin_client, cid, "PI-TPL-1", "TypedPlainProd")
     other = _sale(admin_client, cid, "PI-TPL-2", "TypedPlainProd2")
     item_id = _sale_item_id(db, other)
-    inv = _invoice(admin_client, sid, "INV-TPL-1")
+    inv = _invoice(admin_client, db, sid, "INV-TPL-1")
 
     r = admin_client.post(f"/api/invoices/{inv}/items",
                           json={"sale_item_id": item_id, "quantity": 1})
@@ -550,7 +558,7 @@ def test_invoiced_line_conflict_routes_are_409_through_status_for(admin_client, 
         "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id",
         (sid,)).fetchall()]
     invoiced_id = ids[0]
-    _invoice(admin_client, sid, "INV-ILC-1")
+    _invoice(admin_client, db, sid, "INV-ILC-1")
 
     r_delete = admin_client.delete(f"/api/sales/{sid}/items/{invoiced_id}")
     r_patch = admin_client.put(f"/api/sales/{sid}/items/{invoiced_id}",
@@ -613,7 +621,12 @@ def test_update_invoice_status_backward_move_is_a_typed_conflict(db):
     sid = salesmod.add_sale(
         db, {"pi_number": "PI-TF-1", "client_name": "x", "company_id": co},
         [{"product_name": "TypedFwdProd", "quantity": 10, "unit_price": 5}])
-    inv = salesmod.create_invoice(db, sid, "INV-TF-1", seed_lines=False)["invoice_id"]
+    item = db.execute("SELECT id FROM sale_items WHERE sale_id = %s",
+                      (sid,)).fetchone()[0]
+    inv = salesmod.create_invoice(
+        db, sid, "INV-TF-1",
+        lines=[{"sale_item_id": item, "quantity": 10}],
+        invoice_date="2026-01-15")["invoice_id"]
     assert salesmod.update_invoice_status(db, inv, "produced") is True
 
     with pytest.raises(InvoiceAlreadyAdvanced) as ei:
@@ -860,7 +873,7 @@ def test_move_lc_stage_payment_gate_is_typed(admin_client, db):
     lc = _mk_lc(admin_client, cid, "LC-SVC-PAY-1")
     sid = _sale(admin_client, cid, "PI-SVCP-1", "TypedLcSvcPayProd")
     lcsmod.attach_pis(db, lc["id"], [sid])
-    _invoice(admin_client, sid, "INV-SVCP-1")
+    _invoice(admin_client, db, sid, "INV-SVCP-1")
     db.commit()
 
     with pytest.raises(LcNotReadyPastShipment) as ei:

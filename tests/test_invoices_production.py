@@ -29,8 +29,28 @@ def _sale(admin_client, company_id, pi, product="ProdInv", item_no=None):
 from raas_tracker.sales import create_invoice_item
 
 
-def _invoice(admin_client, sale_id, number, amount=None):
-    payload = {"invoice_number": number}
+def _remainder_lines(db, sale_id):
+    """The PI remainder as explicit create lines (one per uninvoiced PI line)."""
+    rows = db.execute(
+        """SELECT si.id,
+                  si.quantity - COALESCE(SUM(ii.quantity), 0) AS remaining
+             FROM sale_items si
+             LEFT JOIN invoice_items ii ON ii.sale_item_id = si.id
+            WHERE si.sale_id = %s
+            GROUP BY si.id, si.quantity
+            ORDER BY si.id""", (sale_id,)).fetchall()
+    return [{"sale_item_id": r[0], "quantity": float(r[1])}
+            for r in rows if r[1] is not None and float(r[1]) > 0]
+
+
+def _invoice(admin_client, db, sale_id, number, amount=None, lines=None):
+    """Create an invoice via the API with explicit lines (default: remainder).
+
+    ``amount`` is only ever there to be IGNORED by the server.
+    """
+    payload = {"invoice_number": number, "invoice_date": "2026-01-15",
+               "lines": lines if lines is not None
+                        else _remainder_lines(db, sale_id)}
     if amount is not None:
         payload["amount"] = amount
     r = admin_client.post(f"/api/sales/{sale_id}/invoices", json=payload)
@@ -76,7 +96,7 @@ def test_invoice_create_list_duplicate_and_cross_sale_reuse(admin_client, db):
     s1 = _sale(admin_client, cid, "PI-DUP-1")
     s2 = _sale(admin_client, cid, "PI-DUP-2")
 
-    inv1 = _invoice(admin_client, s1, "INV-SAME")
+    inv1 = _invoice(admin_client, db, s1, "INV-SAME")
 
     lst = admin_client.get(f"/api/sales/{s1}/invoices").get_json()
     assert len(lst) == 1
@@ -85,15 +105,20 @@ def test_invoice_create_list_duplicate_and_cross_sale_reuse(admin_client, db):
     assert lst[0]["status"] == "planned"
 
     # Duplicate invoice number on the SAME sale -> 400 with error
+    dup_item = db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s", (s1,)).fetchone()[0]
     r = admin_client.post(f"/api/sales/{s1}/invoices",
-                          json={"invoice_number": "INV-SAME"})
+                          json={"invoice_number": "INV-SAME",
+                                "invoice_date": "2026-01-15",
+                                "lines": [{"sale_item_id": dup_item,
+                                           "quantity": 1}]})
     assert r.status_code == 400
     body = r.get_json()
     assert "error" in body and "already exists" in body["error"]
     assert len(admin_client.get(f"/api/sales/{s1}/invoices").get_json()) == 1
 
     # A DIFFERENT sale may reuse the same number
-    inv2 = _invoice(admin_client, s2, "INV-SAME")
+    inv2 = _invoice(admin_client, db, s2, "INV-SAME")
     assert inv2 != inv1
     lst2 = admin_client.get(f"/api/sales/{s2}/invoices").get_json()
     assert len(lst2) == 1 and lst2[0]["invoice_number"] == "INV-SAME"
@@ -107,21 +132,21 @@ def test_first_invoice_sets_production_running_and_never_downgrades(
 
     s_run = _sale(admin_client, cid, "PI-RUN-1")
     assert _detail(admin_client, s_run)["shipment_status"] is None
-    _invoice(admin_client, s_run, "INV-RUN-1")
+    _invoice(admin_client, db, s_run, "INV-RUN-1")
     assert _detail(admin_client, s_run)["shipment_status"] == "production_running"
 
     s_done = _sale(admin_client, cid, "PI-DONE-1")
     db.execute("UPDATE sales SET shipment_status = 'production_done' "
                "WHERE id = %s", (s_done,))
     db.commit()
-    _invoice(admin_client, s_done, "INV-DONE-1")
+    _invoice(admin_client, db, s_done, "INV-DONE-1")
     assert _detail(admin_client, s_done)["shipment_status"] == "production_done"
 
     s_book = _sale(admin_client, cid, "PI-BOOK-1")
     db.execute("UPDATE sales SET shipment_status = 'ship_booked' "
                "WHERE id = %s", (s_book,))
     db.commit()
-    _invoice(admin_client, s_book, "INV-BOOK-1")
+    _invoice(admin_client, db, s_book, "INV-BOOK-1")
     assert _detail(admin_client, s_book)["shipment_status"] == "ship_booked"
 
 
@@ -158,7 +183,7 @@ def test_book_requires_approx_date_and_sets_ship_booked(admin_client, db):
 def test_ship_creates_shipment_row_and_marks_shipped(admin_client, db):
     cid = _company(admin_client, db, name="ShipCo")
     sid = _sale(admin_client, cid, "PI-SH-1")
-    inv = _invoice(admin_client, sid, "INV-SH-1")
+    inv = _invoice(admin_client, db, sid, "INV-SH-1")
 
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/ship",
                           json={"actual_ship_date": "2026-10-20"})
@@ -181,7 +206,7 @@ def test_ship_creates_shipment_row_and_marks_shipped(admin_client, db):
 def test_pay_records_payment_and_syncs_sale_totals(admin_client, db):
     cid = _company(admin_client, db, name="PayCo")
     sid = _sale(admin_client, cid, "PI-PAY-1")  # 10 x 5 = 50
-    inv = _invoice(admin_client, sid, "INV-PAY-1")
+    inv = _invoice(admin_client, db, sid, "INV-PAY-1")
 
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/pay",
                           json={"payment_amount": 25.5,
@@ -220,7 +245,7 @@ def test_completion_reflects_invoice_counts(admin_client, db):
     # Two invoices, neither paid. The first derives the whole 50 remainder, so it
     # is trimmed to 30 to leave a real remainder for the second, keeping each
     # invoice's money non-zero and the assertion below about real coverage.
-    first = _invoice(admin_client, sid, "INV-CMP-1")
+    first = _invoice(admin_client, db, sid, "INV-CMP-1")
     unit_price, qty = db.execute(
         "SELECT unit_price, quantity FROM sale_items WHERE sale_id = %s "
         "ORDER BY id LIMIT 1", (sid,)).fetchone()
@@ -230,7 +255,7 @@ def test_completion_reflects_invoice_counts(admin_client, db):
     db.execute("DELETE FROM invoice_items WHERE invoice_id = %s", (first,))
     db.commit()
     create_invoice_item(db, first, sale_item_id, 30 / float(unit_price))
-    _invoice(admin_client, sid, "INV-CMP-2")  # derives the remaining 20
+    _invoice(admin_client, db, sid, "INV-CMP-2")  # derives the remaining 20
     body = admin_client.get(f"/api/sales/{sid}/completion").get_json()
     assert body["total"] == 2
     assert body["paid"] == 0
@@ -309,6 +334,7 @@ def test_partial_production_reports_cannot_book_despite_produced_status(
         "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id", (sid,)).fetchall()]
     r = admin_client.post(f"/api/sales/{sid}/invoices", json={
         "invoice_number": "INV-LISTP-1",
+        "invoice_date": "2026-01-15",
         "lines": [{"sale_item_id": item_a, "quantity": 10},
                   {"sale_item_id": item_b, "quantity": 10}]})
     assert r.status_code == 201, r.get_json()
@@ -358,10 +384,12 @@ def test_invoice_readiness_ignores_a_produced_sibling(admin_client, db):
         "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id", (sid,)).fetchall()]
     r = admin_client.post(f"/api/sales/{sid}/invoices", json={
         "invoice_number": "INV-LISTS-A",
+        "invoice_date": "2026-01-15",
         "lines": [{"sale_item_id": item_a, "quantity": 5}]})
     inv_a = r.get_json()["invoice_id"]
     r = admin_client.post(f"/api/sales/{sid}/invoices", json={
         "invoice_number": "INV-LISTS-B",
+        "invoice_date": "2026-01-16",
         "lines": [{"sale_item_id": item_b, "quantity": 5}]})
     inv_b = r.get_json()["invoice_id"]
 
@@ -456,7 +484,7 @@ def test_book_is_refused_when_only_some_invoiced_products_are_produced(
             "company_id": cid})
         assert r.status_code == 200, r.get_json()
 
-    inv = _invoice(admin_client, sid, "INV-PART-1")
+    inv = _invoice(admin_client, db, sid, "INV-PART-1")
     assert len(_detail(admin_client, sid)["invoices"]) == 1
 
     # Produce ProdA only. This does flip the invoice to 'produced'...
@@ -497,16 +525,18 @@ def test_producing_a_sibling_invoice_does_not_unlock_this_one(admin_client, db):
             "chemical": chem, "percentage": 40, "company_id": cid})
         assert r.status_code == 200, r.get_json()
 
-    # Two invoices, one product each (explicit lines: the legacy auto-seed
-    # would hand every remaining PI line to the first invoice).
+    # Two invoices, one product each (so both products stay visible to the
+    # per-invoice readiness checks).
     item_a, item_b = [r[0] for r in db.execute(
         "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id", (sid,)).fetchall()]
     r = admin_client.post(f"/api/sales/{sid}/invoices", json={
-        "invoice_number": "INV-SIB-A", "lines": [{"sale_item_id": item_a, "quantity": 5}]})
+        "invoice_number": "INV-SIB-A", "invoice_date": "2026-01-15",
+        "lines": [{"sale_item_id": item_a, "quantity": 5}]})
     assert r.status_code == 201, r.get_json()
     inv_a = r.get_json()["invoice_id"]
     r = admin_client.post(f"/api/sales/{sid}/invoices", json={
-        "invoice_number": "INV-SIB-B", "lines": [{"sale_item_id": item_b, "quantity": 5}]})
+        "invoice_number": "INV-SIB-B", "invoice_date": "2026-01-16",
+        "lines": [{"sale_item_id": item_b, "quantity": 5}]})
     assert r.status_code == 201, r.get_json()
     inv_b = r.get_json()["invoice_id"]
 
@@ -535,7 +565,7 @@ def _production_setup(admin_client, db, tag):
     r = admin_client.post(f"/api/recipes/Recipe-{tag}/items", json={
         "chemical": f"Chem-{tag}", "percentage": 40, "company_id": cid})
     assert r.status_code == 200, r.get_json()
-    inv = _invoice(admin_client, sid, f"INV-PR-{tag}")
+    inv = _invoice(admin_client, db, sid, f"INV-PR-{tag}")
     return cid, sid, inv
 
 
@@ -617,7 +647,7 @@ def test_produce_never_downgrades_ship_booked_sale_or_booked_invoice(
 def test_produce_cross_sale_invoice_uses_invoices_own_sale(admin_client, db):
     cid, sid_a, _ = _production_setup(admin_client, db, "C")
     sid_b = _sale(admin_client, cid, pi="PI-PR-C2", product="Prod-C")
-    inv_b = _invoice(admin_client, sid_b, "INV-PR-C2")
+    inv_b = _invoice(admin_client, db, sid_b, "INV-PR-C2")
 
     r = admin_client.post("/api/recipes/Recipe-C/produce", json={
         "production_qty": 5, "company_id": cid,
@@ -649,7 +679,7 @@ def test_move_to_shipment_ongoing_sets_production_running(admin_client, db):
     assert _detail(admin_client, sid)["shipment_status"] is None
 
     # Phase 3-A: need an invoice to advance to shipment_ongoing
-    _invoice(admin_client, sid, "INV-MOVE-1")
+    _invoice(admin_client, db, sid, "INV-MOVE-1")
 
     r = admin_client.post(f"/api/sales/{sid}/move", json={"notes": "to ship"})
     assert r.status_code == 200
@@ -673,7 +703,7 @@ def test_sales_list_has_shipment_status_detail_has_item_no(admin_client, db):
     assert "shipment_status" in row
     assert row["shipment_status"] is None
 
-    _invoice(admin_client, sid, "INV-SHAPE-1")
+    _invoice(admin_client, db, sid, "INV-SHAPE-1")
     assert _row()["shipment_status"] == "production_running"
 
     detail = _detail(admin_client, sid)
@@ -696,7 +726,7 @@ def test_production_source_products_with_recipes(admin_client, db):
 
     # Production products are now invoice-scoped: a sale with no invoice
     # offers nothing, so create one (it seeds lines for SrcProd).
-    _invoice(admin_client, sid, "INV-SRC-1")
+    _invoice(admin_client, db, sid, "INV-SRC-1")
 
     r = admin_client.get(f"/api/production-source?sale_id={sid}")
     assert r.status_code == 200, r.get_json()

@@ -37,13 +37,20 @@ def _sale(db, company_id, product="Product A", qty=100, price=100):
                     [{"product_name": product, "quantity": qty, "unit_price": price}])
 
 
-def _invoice(db, sale_id, invoice_number="INV-001", seed_lines=False):
+def _invoice(db, sale_id, invoice_number="INV-001", lines=None,
+             invoice_date="2026-01-15"):
     """Create an invoice for a sale. Returns invoice_id.
-    
-    By default, does NOT auto-seed lines (seed_lines=False) so tests can
-    control exact line quantities for tolerance testing.
+
+    An invoice is always born with >= 1 explicit line now (the header-only
+    seam is gone), so by default a single baseline unit of the first PI line
+    is used and the tests add the quantities under test via
+    create_invoice_item under the same 5% aggregate ceiling.
     """
-    result = create_invoice(db, sale_id, invoice_number, seed_lines=seed_lines)
+    if lines is None:
+        item = _get_sale_items(db, sale_id)[0]
+        lines = [{"sale_item_id": item[0], "quantity": 1}]
+    result = create_invoice(db, sale_id, invoice_number, lines=lines,
+                            invoice_date=invoice_date)
     return result["invoice_id"]
 
 
@@ -68,9 +75,9 @@ class TestInvoiceTolerance:
         pi_qty = Decimal(str(items[0][2]))
         ceiling = (pi_qty * Decimal("1.05")).quantize(Decimal("0.000001"))
         
-        inv_id = _invoice(db, sid, "INV-1", seed_lines=False)
+        inv_id = _invoice(db, sid, "INV-1")
         
-        # Try to add line exceeding ceiling (106 > 105)
+        # Baseline 1 + 106 = 107 > 105 ceiling
         with pytest.raises(ValueError, match=f"exceeds {ceiling:g}"):
             create_invoice_item(db, inv_id, sale_item_id, float(ceiling) + 1)
 
@@ -83,11 +90,11 @@ class TestInvoiceTolerance:
         pi_qty = Decimal(str(items[0][2]))
         ceiling = (pi_qty * Decimal("1.05")).quantize(Decimal("0.000001"))
         
-        inv_id = _invoice(db, sid, "INV-2", seed_lines=False)
+        inv_id = _invoice(db, sid, "INV-2")
         
-        # Add line exactly at ceiling (105 == 105)
-        line = create_invoice_item(db, inv_id, sale_item_id, float(ceiling))
-        assert line["quantity"] == float(ceiling)
+        # Baseline 1 + 104 = 105 exactly at the ceiling
+        line = create_invoice_item(db, inv_id, sale_item_id, float(ceiling) - 1)
+        assert line["quantity"] == float(ceiling) - 1
 
     def test_create_invoice_item_under_tolerance_accepted(self, db):
         """create_invoice_item with quantity < ceiling is accepted."""
@@ -96,7 +103,7 @@ class TestInvoiceTolerance:
         items = _get_sale_items(db, sid)
         sale_item_id = items[0][0]
         
-        inv_id = _invoice(db, sid, "INV-3", seed_lines=False)
+        inv_id = _invoice(db, sid, "INV-3")
         
         # Add line under ceiling (50 < 105)
         line = create_invoice_item(db, inv_id, sale_item_id, 50.0)
@@ -115,7 +122,7 @@ class TestInvoiceTolerance:
         with pytest.raises(ValueError, match=f"exceeds {ceiling:g}"):
             create_invoice(db, sid, "INV-OVER", lines=[
                 {"sale_item_id": sale_item_id, "quantity": float(ceiling) + 1}
-            ], seed_lines=False)
+            ], invoice_date="2026-01-15")
 
     def test_create_invoice_explicit_at_ceiling_accepted(self, db):
         """create_invoice with explicit lines at ceiling is accepted."""
@@ -128,7 +135,7 @@ class TestInvoiceTolerance:
         
         result = create_invoice(db, sid, "INV-AT-CEILING", lines=[
             {"sale_item_id": sale_item_id, "quantity": float(ceiling)}
-        ], seed_lines=False)
+        ], invoice_date="2026-01-15")
         assert result["status"] == "planned"
 
     def test_create_invoice_explicit_under_tolerance_accepted(self, db):
@@ -140,7 +147,7 @@ class TestInvoiceTolerance:
         
         result = create_invoice(db, sid, "INV-UNDER", lines=[
             {"sale_item_id": sale_item_id, "quantity": 50.0}
-        ], seed_lines=False)
+        ], invoice_date="2026-01-15")
         assert result["status"] == "planned"
 
     def test_create_invoice_batch_over_tolerance_rejected(self, db):
@@ -155,7 +162,8 @@ class TestInvoiceTolerance:
         # Batch with one invoice having line over ceiling
         with pytest.raises(ValueError, match=f"exceeds {ceiling:g}"):
             create_invoices_batch(db, sid, [
-                {"invoice_number": "INV-BATCH-1", "lines": [
+                {"invoice_number": "INV-BATCH-1", "invoice_date": "2026-01-15",
+                 "lines": [
                     {"sale_item_id": sale_item_id, "quantity": float(ceiling) + 1}
                 ]}
             ])
@@ -180,10 +188,12 @@ class TestInvoiceTolerance:
         # Batch: first invoice OK, second invoice has line over ceiling for A
         with pytest.raises(ValueError, match=f"exceeds {ceiling_a:g}"):
             create_invoices_batch(db, sid, [
-                {"invoice_number": "INV-BATCH-OK", "lines": [
+                {"invoice_number": "INV-BATCH-OK", "invoice_date": "2026-01-15",
+                 "lines": [
                     {"sale_item_id": item_a_id, "quantity": 50.0}
                 ]},
-                {"invoice_number": "INV-BATCH-BAD", "lines": [
+                {"invoice_number": "INV-BATCH-BAD", "invoice_date": "2026-01-15",
+                 "lines": [
                     {"sale_item_id": item_a_id, "quantity": float(ceiling_a) + 1}
                 ]}
             ])
@@ -198,10 +208,12 @@ class TestInvoiceTolerance:
         ceiling = (pi_qty * Decimal("1.05")).quantize(Decimal("0.000001"))
         
         result = create_invoices_batch(db, sid, [
-            {"invoice_number": "INV-BATCH-1", "lines": [
+            {"invoice_number": "INV-BATCH-1", "invoice_date": "2026-01-15",
+             "lines": [
                 {"sale_item_id": sale_item_id, "quantity": float(ceiling) / 2}
             ]},
-            {"invoice_number": "INV-BATCH-2", "lines": [
+            {"invoice_number": "INV-BATCH-2", "invoice_date": "2026-01-15",
+             "lines": [
                 {"sale_item_id": sale_item_id, "quantity": float(ceiling) / 2}
             ]}
         ])
@@ -221,10 +233,12 @@ class TestInvoiceTolerance:
         # Two invoices, each 60 units = 120 total > 105 ceiling
         with pytest.raises(ValueError, match=f"exceeds {ceiling:g}"):
             create_invoices_batch(db, sid, [
-                {"invoice_number": "INV-BATCH-1", "lines": [
+                {"invoice_number": "INV-BATCH-1", "invoice_date": "2026-01-15",
+                 "lines": [
                     {"sale_item_id": sale_item_id, "quantity": 60.0}
                 ]},
-                {"invoice_number": "INV-BATCH-2", "lines": [
+                {"invoice_number": "INV-BATCH-2", "invoice_date": "2026-01-15",
+                 "lines": [
                     {"sale_item_id": sale_item_id, "quantity": 60.0}
                 ]}
             ])
@@ -238,10 +252,10 @@ class TestInvoiceTolerance:
         pi_qty = Decimal(str(items[0][2]))
         ceiling = (pi_qty * Decimal("1.05")).quantize(Decimal("0.000001"))
         
-        inv_id = _invoice(db, sid, "INV-EXISTING", seed_lines=False)
+        inv_id = _invoice(db, sid, "INV-EXISTING")
         # Add first line: 60 units
         create_invoice_item(db, inv_id, sale_item_id, 60.0)
-        # Try to add second line: 50 units (total 110 > 105)
+        # Try to add second line: 50 units (baseline 1 + 60 + 50 = 111 > 105)
         with pytest.raises(ValueError, match=f"exceeds {ceiling:g}"):
             create_invoice_item(db, inv_id, sale_item_id, 50.0)
 
@@ -353,12 +367,12 @@ class TestMultipleInvoicesSameSaleItem:
         pi_qty = Decimal(str(items[0][2]))
         ceiling = (pi_qty * Decimal("1.05")).quantize(Decimal("0.000001"))
         
-        # First invoice: 60 units
-        inv1_id = _invoice(db, sid, "INV-1", seed_lines=False)
+        # First invoice: baseline 1 + 60 = 61
+        inv1_id = _invoice(db, sid, "INV-1")
         create_invoice_item(db, inv1_id, sale_item_id, 60.0)
         
-        # Second invoice: 50 units (total 110 > 105) should be rejected
-        inv2_id = _invoice(db, sid, "INV-2", seed_lines=False)
+        # Second invoice: 50 more (61 + 1 + 50 = 112 > 105) should be rejected
+        inv2_id = _invoice(db, sid, "INV-2")
         with pytest.raises(ValueError, match=f"exceeds {ceiling:g}"):
             create_invoice_item(db, inv2_id, sale_item_id, 50.0)
 
@@ -371,11 +385,11 @@ class TestMultipleInvoicesSameSaleItem:
         pi_qty = Decimal(str(items[0][2]))
         ceiling = (pi_qty * Decimal("1.05")).quantize(Decimal("0.000001"))
         
-        # First invoice: 50 units
-        inv1_id = _invoice(db, sid, "INV-1", seed_lines=False)
+        # First invoice: baseline 1 + 50 = 51
+        inv1_id = _invoice(db, sid, "INV-1")
         create_invoice_item(db, inv1_id, sale_item_id, 50.0)
         
-        # Second invoice: 55 units (total 105 == ceiling) should be accepted
-        inv2_id = _invoice(db, sid, "INV-2", seed_lines=False)
-        line = create_invoice_item(db, inv2_id, sale_item_id, 55.0)
-        assert line["quantity"] == 55.0
+        # Second invoice: baseline 1 + 53 = 54; grand total 105 == ceiling
+        inv2_id = _invoice(db, sid, "INV-2")
+        line = create_invoice_item(db, inv2_id, sale_item_id, 53.0)
+        assert line["quantity"] == 53.0

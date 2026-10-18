@@ -40,12 +40,17 @@ def test_nonfinite_pi_total_returns_400_not_500(admin_client, db):
     """NaN quantity is bad data (400), and nothing may be persisted."""
     cid = _company(admin_client, db)
     sid = _sale(admin_client, cid)
+    item_id = db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s", (sid,)).fetchone()[0]
     db.execute("UPDATE sale_items SET quantity = %s WHERE sale_id = %s",
                (float("nan"), sid))
     db.commit()
 
     r = admin_client.post(f"/api/sales/{sid}/invoices",
-                          json={"invoice_number": "INV-NAN"})
+                          json={"invoice_number": "INV-NAN",
+                                "invoice_date": "2026-01-15",
+                                "lines": [{"sale_item_id": item_id,
+                                           "quantity": 1}]})
     assert r.status_code == 400
     body = r.get_json()
     assert "error" in body and "non-finite" in body["error"]
@@ -59,12 +64,17 @@ def test_infinite_unit_price_returns_400_not_500(admin_client, db):
     """Inf unit price is bad data (400), and nothing may be persisted."""
     cid = _company(admin_client, db, name="ErrCoInf")
     sid = _sale(admin_client, cid, pi="PI-ERR-INF")
+    item_id = db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s", (sid,)).fetchone()[0]
     db.execute("UPDATE sale_items SET unit_price = %s WHERE sale_id = %s",
                (float("inf"), sid))
     db.commit()
 
     r = admin_client.post(f"/api/sales/{sid}/invoices",
-                          json={"invoice_number": "INV-INF"})
+                          json={"invoice_number": "INV-INF",
+                                "invoice_date": "2026-01-15",
+                                "lines": [{"sale_item_id": item_id,
+                                           "quantity": 1}]})
     assert r.status_code == 400
     assert "non-finite" in r.get_json()["error"]
 
@@ -77,8 +87,13 @@ def test_nonfinite_invoiced_lines_return_400_not_500(admin_client, db):
     """A legacy NaN line_total must not 500 a follow-up invoice create."""
     cid = _company(admin_client, db, name="ErrCoLegacy")
     sid = _sale(admin_client, cid, pi="PI-ERR-LEGACY")
+    item_id = db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s", (sid,)).fetchone()[0]
     r = admin_client.post(f"/api/sales/{sid}/invoices",
-                          json={"invoice_number": "INV-LEGACY-1"})
+                          json={"invoice_number": "INV-LEGACY-1",
+                                "invoice_date": "2026-01-15",
+                                "lines": [{"sale_item_id": item_id,
+                                           "quantity": 1}]})
     assert r.status_code == 201, r.get_json()
     inv_id = r.get_json()["invoice_id"]
     db.execute("UPDATE invoice_items SET line_total = 'NaN' "
@@ -86,6 +101,9 @@ def test_nonfinite_invoiced_lines_return_400_not_500(admin_client, db):
     db.commit()
 
     r = admin_client.post(f"/api/sales/{sid}/invoices",
-                          json={"invoice_number": "INV-LEGACY-2"})
+                          json={"invoice_number": "INV-LEGACY-2",
+                                "invoice_date": "2026-01-16",
+                                "lines": [{"sale_item_id": item_id,
+                                           "quantity": 1}]})
     assert r.status_code == 400
     assert "non-finite" in r.get_json()["error"]

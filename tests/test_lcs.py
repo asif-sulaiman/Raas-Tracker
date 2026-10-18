@@ -36,6 +36,16 @@ def _sale(conn, company_id, pi=None, product="Prod", qty=10, price=5):
     return sale_id
 
 
+def _invoice(conn, sale_id, number):
+    """Create an invoice covering the sale's PI lines in full."""
+    lines = [{"sale_item_id": r[0], "quantity": float(r[1])}
+             for r in conn.execute(
+                 "SELECT id, quantity FROM sale_items WHERE sale_id = %s "
+                 "ORDER BY id", (sale_id,)).fetchall()]
+    return salesmod.create_invoice(conn, sale_id, number, lines=lines,
+                                   invoice_date="2026-01-15")
+
+
 # --------------------------------------------------------------------------- #
 # create_lc
 # --------------------------------------------------------------------------- #
@@ -291,7 +301,7 @@ def test_move_lc_stage_propagates(db):
             (f"R-MV-{prod}-{_tag()}", co, prod),
         )
     db.commit()
-    salesmod.create_invoice(db, s1, f"INV-MV-{_tag()}")
+    _invoice(db, s1, f"INV-MV-{_tag()}")
     assert lcsmod.move_lc_stage(db, lc["id"], "shipment_ongoing", notes="go") is True
     assert lcsmod.get_lc(db, lc["id"])["stage"] == "shipment_ongoing"
     for sid in (s1, s2):
@@ -324,7 +334,7 @@ def test_move_lc_stage_sequential_double_move(db):
         (f"R-SEQ-{_tag()}", co, "PSeq"),
     )
     db.commit()
-    salesmod.create_invoice(db, s1, f"INV-SEQ-{_tag()}")
+    _invoice(db, s1, f"INV-SEQ-{_tag()}")
     # P1-14: reaching payment_due is a SECOND barrier. It needs a production
     # run linked to the invoice line, not merely a recipe, so the
     # single-barrier setup this test carried could no longer finish the move.
@@ -451,7 +461,7 @@ def _lc_ready_setup(db, co, product, with_recipe=True, with_invoice=True):
         )
         db.commit()
     if with_invoice:
-        salesmod.create_invoice(db, sid, f"INV-{_tag()}")
+        _invoice(db, sid, f"INV-{_tag()}")
     return lc["id"], sid
 
 
@@ -471,7 +481,7 @@ def test_move_lc_stage_gate_unready_raises(db):
     assert lcsmod.get_lc(db, lc_id)["stage"] == "lc_received"
     # An invoice alone satisfies barrier 1 - a recipe is NOT required to
     # reach shipment_ongoing; it belongs to barrier 2.
-    salesmod.create_invoice(db, sid, f"INV-{_tag()}")
+    _invoice(db, sid, f"INV-{_tag()}")
     assert lcsmod.move_lc_stage(db, lc_id, "shipment_ongoing") is True
 
 

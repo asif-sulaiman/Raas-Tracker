@@ -274,7 +274,8 @@ def test_fast_path_is_a_noop_once_current(pg_dsn, monkeypatch):
 # Task 6 — INV-REVISION schema upgrade (v4 → v5)
 # --------------------------------------------------------------------------- #
 def test_inv_revision_columns_added_on_v4_to_v5_upgrade(pg_dsn):
-    """INV-REVISION v5 migration adds three new columns with correct defaults."""
+    """INV-REVISION v5 migration adds three new columns with correct defaults,
+    and an old stored version replays the whole chain up to the current one."""
     # Start from a fully migrated v4 database
     dbmod.get_connection(pg_dsn).close()
 
@@ -287,12 +288,15 @@ def test_inv_revision_columns_added_on_v4_to_v5_upgrade(pg_dsn):
     conn.commit()
     conn.close()
 
-    # Now get a new connection - should trigger v4→v5 migration
+    # Now get a new connection - should trigger the v4->current migration chain
     conn = dbmod.get_connection(pg_dsn)
     try:
         # Check all three new columns exist
         inv_cols = _table_columns(conn, "invoices")
         assert "shipment_status" in inv_cols, "invoices.shipment_status missing"
+        # ...and the later revision rode along: the forced-old version runs the
+        # whole migration chain, not just v5.
+        assert "invoice_date" in inv_cols, "invoices.invoice_date missing"
 
         lc_cols = _table_columns(conn, "letters_of_credit")
         assert "shipment_gate" in lc_cols, "letters_of_credit.shipment_gate missing"
@@ -340,11 +344,12 @@ def test_inv_revision_columns_added_on_v4_to_v5_upgrade(pg_dsn):
         src = conn.execute("SELECT source_type FROM invoice_items WHERE id = %s", (ii_id,)).fetchone()[0]
         assert src == "pi_line", f"invoice_items.source_type default != 'pi_line', got {src}"
 
-        # Verify schema version was updated to 5
+        # Verify the migration stamped the current schema version
         conn2 = dbmod.get_connection(pg_dsn)
         conn2.close()
         stored = _setting(pg_dsn, dbmod._SCHEMA_VERSION_KEY)
-        assert stored is not None and int(stored[0]) == 5, "schema version not updated to 5"
+        assert stored is not None and int(stored[0]) == dbmod._SCHEMA_VERSION, \
+            "schema version not updated to current"
     finally:
         conn.close()
 

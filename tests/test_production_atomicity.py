@@ -33,8 +33,25 @@ def _sale(admin_client, company_id, pi, product):
     return r.get_json()["id"]
 
 
-def _invoice(admin_client, sale_id, number):
-    r = admin_client.post(f"/api/sales/{sale_id}/invoices", json={"invoice_number": number})
+def _remainder_lines(db, sale_id):
+    """The PI remainder as explicit create lines (one per uninvoiced PI line)."""
+    rows = db.execute(
+        """SELECT si.id,
+                  si.quantity - COALESCE(SUM(ii.quantity), 0) AS remaining
+             FROM sale_items si
+             LEFT JOIN invoice_items ii ON ii.sale_item_id = si.id
+            WHERE si.sale_id = %s
+            GROUP BY si.id, si.quantity
+            ORDER BY si.id""", (sale_id,)).fetchall()
+    return [{"sale_item_id": r[0], "quantity": float(r[1])}
+            for r in rows if r[1] is not None and float(r[1]) > 0]
+
+
+def _invoice(admin_client, db, sale_id, number):
+    r = admin_client.post(f"/api/sales/{sale_id}/invoices", json={
+        "invoice_number": number,
+        "invoice_date": "2026-01-15",
+        "lines": _remainder_lines(db, sale_id)})
     assert r.status_code == 201, r.get_json()
     return r.get_json()["invoice_id"]
 
@@ -97,7 +114,7 @@ def test_produce_short_on_third_ingredient_rolls_everything_back(admin_client, d
         _chemical(admin_client, name, 100)
     _recipe_with_items(admin_client, cid, "AtomicProd", "AtomicRecipe",
                        [(name, 10) for name in chems])
-    inv = _invoice(admin_client, sid, "INV-ATOMIC-1")
+    inv = _invoice(admin_client, db, sid, "INV-ATOMIC-1")
 
     # Loop order is by chemical name, so AtomicChem-3 is the third deduction
     # and cannot cover required_per_unit (0.1) * production_qty (10) = 1.0.
@@ -130,7 +147,7 @@ def test_produce_retried_after_shortage_deducts_exactly_once(admin_client, db):
         _chemical(admin_client, name, 100)
     _recipe_with_items(admin_client, cid, "RetryProd", "RetryRecipe",
                        [(name, 10) for name in chems])
-    inv = _invoice(admin_client, sid, "INV-RETRY-1")
+    inv = _invoice(admin_client, db, sid, "INV-RETRY-1")
     db.execute("UPDATE chemicals SET current_qty = 0.5 WHERE name = %s", (chems[1],))
     db.commit()
 
@@ -156,7 +173,7 @@ def test_produce_multi_recipe_second_invalid_rolls_back_first(admin_client, db):
     _chemical(admin_client, "MultiChem-1", 100)
     _recipe_with_items(admin_client, cid, "MultiProd", "MultiRecipe-1",
                        [("MultiChem-1", 10)])
-    inv = _invoice(admin_client, sid, "INV-MULTI-1")
+    inv = _invoice(admin_client, db, sid, "INV-MULTI-1")
 
     before_stock = _stock(db, ["MultiChem-1"])
     before_state = _state(db, sid, inv)
@@ -182,7 +199,7 @@ def test_produce_multi_recipe_all_valid_commits_once(admin_client, db):
                        [("MultiOkChem-1", 10)])
     _recipe_with_items(admin_client, cid, "MultiOkProd", "MultiOkRecipe-2",
                        [("MultiOkChem-2", 10)])
-    inv = _invoice(admin_client, sid, "INV-MULTOK-1")
+    inv = _invoice(admin_client, db, sid, "INV-MULTOK-1")
 
     r = admin_client.post("/api/recipes/MultiOkRecipe-1/produce", json={
         "production_qty": 10, "company_id": cid,
@@ -208,7 +225,7 @@ def test_produce_multi_recipe_all_valid_commits_once(admin_client, db):
 def test_book_invoice_moves_invoice_and_sale_together(admin_client, db, produce_for):
     cid = _company(admin_client, db, "BookCo")
     sid = _sale(admin_client, cid, "PI-BOOK-AT-1", "BookProd")
-    inv = _invoice(admin_client, sid, "INV-BOOK-AT-1")
+    inv = _invoice(admin_client, db, sid, "INV-BOOK-AT-1")
     produce_for(cid, sid, inv, "BookAT", "BookProd")
 
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
@@ -226,7 +243,7 @@ def test_book_invoice_second_write_failure_leaves_both_unchanged(
 
     cid = _company(admin_client, db, "BookFailCo")
     sid = _sale(admin_client, cid, "PI-BOOKF-1", "BookFailProd")
-    inv = _invoice(admin_client, sid, "INV-BOOKF-1")
+    inv = _invoice(admin_client, db, sid, "INV-BOOKF-1")
     before = _state(db, sid, inv)
 
     def _book_then_fail(conn, invoice_id, approx_ship_date):
@@ -250,7 +267,7 @@ def test_book_invoice_refused_transition_does_not_move_sale(admin_client, db):
     """Book refused (409) after a ship: the sale badge must not advance."""
     cid = _company(admin_client, db, "Book409Co")
     sid = _sale(admin_client, cid, "PI-BOOK409-1", "Book409Prod")
-    inv = _invoice(admin_client, sid, "INV-BOOK409-1")
+    inv = _invoice(admin_client, db, sid, "INV-BOOK409-1")
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/ship",
                           json={"actual_ship_date": "2026-10-20"})
     assert r.status_code == 201, r.get_json()
@@ -277,7 +294,7 @@ def test_produce_refuses_links_belonging_to_another_company(admin_client, db):
 
     cid_b = _company(admin_client, db, "OwnCoB")
     sid_b = _sale(admin_client, cid_b, "PI-OWNB-1", "OwnProdB")
-    inv_b = _invoice(admin_client, sid_b, "INV-OWN-B")
+    inv_b = _invoice(admin_client, db, sid_b, "INV-OWN-B")
 
     before_stock = _stock(db, ["OwnChem-A"])
     before_state = _state(db, sid_b, inv_b)
@@ -302,7 +319,7 @@ def test_produce_does_not_downgrade_paid_invoice(admin_client, db):
     _chemical(admin_client, "PaidChem-1", 100)
     _recipe_with_items(admin_client, cid, "PaidProd", "PaidRecipe",
                        [("PaidChem-1", 10)])
-    inv = _invoice(admin_client, sid, "INV-PAID-1")
+    inv = _invoice(admin_client, db, sid, "INV-PAID-1")
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/pay",
                           json={"payment_amount": 50, "payment_date": "2026-10-25"})
     assert r.status_code == 201, r.get_json()
@@ -331,7 +348,7 @@ def test_produce_never_downgrades_shipped_invoice_or_ship_booked_sale(admin_clie
                        [("FwdChem-1", 10)])
 
     # (a) shipped invoice -> refused, nothing moves
-    inv_ship = _invoice(admin_client, sid, "INV-FWD-SHIPPED")
+    inv_ship = _invoice(admin_client, db, sid, "INV-FWD-SHIPPED")
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv_ship}/ship",
                           json={"actual_ship_date": "2026-10-20"})
     assert r.status_code == 201, r.get_json()
@@ -345,7 +362,7 @@ def test_produce_never_downgrades_shipped_invoice_or_ship_booked_sale(admin_clie
 
     # (b) a booked sale (shipment_status='ship_booked') is never pushed back
     sid_book = _sale(admin_client, cid, "PI-FWD-2", "FwdProd")
-    inv_book = _invoice(admin_client, sid_book, "INV-FWD-BOOKED")
+    inv_book = _invoice(admin_client, db, sid_book, "INV-FWD-BOOKED")
     # Booking requires production first.
     r = admin_client.post("/api/recipes/FwdRecipe/produce", json={
         "production_qty": 10, "company_id": cid,
@@ -378,7 +395,7 @@ def test_produce_keeps_booked_invoice_booked(admin_client, db):
     _chemical(admin_client, "BkdChem-1", 100)
     _recipe_with_items(admin_client, cid, "BkdProd", "BkdRecipe",
                        [("BkdChem-1", 10)])
-    inv = _invoice(admin_client, sid, "INV-BKD-1")
+    inv = _invoice(admin_client, db, sid, "INV-BKD-1")
     # Booking requires production first.
     r = admin_client.post("/api/recipes/BkdRecipe/produce", json={
         "production_qty": 10, "company_id": cid,
@@ -420,7 +437,7 @@ def test_produce_on_booked_invoice_is_idempotent_on_re_run(admin_client, db):
     _chemical(admin_client, "ReRunChem-1", 100)
     _recipe_with_items(admin_client, cid, "ReRunProd", "ReRunRecipe",
                        [("ReRunChem-1", 10)])
-    inv = _invoice(admin_client, sid, "INV-RERUN-1")
+    inv = _invoice(admin_client, db, sid, "INV-RERUN-1")
     # Booking requires production first.
     pre = admin_client.post("/api/recipes/ReRunRecipe/produce", json={
         "production_qty": 10, "company_id": cid,
@@ -453,7 +470,7 @@ def test_non_admin_gets_403_on_mutating_invoice_and_production_routes(
     _chemical(admin_client, "AuthChem-1", 100)
     _recipe_with_items(admin_client, cid, "AuthProd", "AuthRecipe",
                        [("AuthChem-1", 10)])
-    inv = _invoice(admin_client, sid, "INV-AUTH-1")
+    inv = _invoice(admin_client, db, sid, "INV-AUTH-1")
 
     before_stock = _stock(db, ["AuthChem-1"])
     before_state = _state(db, sid, inv)
@@ -481,10 +498,16 @@ def test_non_admin_gets_403_on_mutating_invoice_and_production_routes(
 
 def test_create_invoice_for_unknown_sale_returns_404(admin_client, db):
     cid = _company(admin_client, db, "MissingSaleCo")
-    _sale(admin_client, cid, "PI-MISS-1", "MissingSaleProd")
+    sid = _sale(admin_client, cid, "PI-MISS-1", "MissingSaleProd")
+    item = db.execute("SELECT id FROM sale_items WHERE sale_id = %s",
+                      (sid,)).fetchone()[0]
     before = db.execute("SELECT COUNT(*) FROM invoices").fetchone()[0]
 
+    # Valid payload so the 404 can only come from the sale lookup, not from a
+    # body-validation 400.
     r = admin_client.post("/api/sales/999999/invoices",
-                          json={"invoice_number": "INV-MISS-1"})
+                          json={"invoice_number": "INV-MISS-1",
+                                "invoice_date": "2026-01-15",
+                                "lines": [{"sale_item_id": item, "quantity": 1}]})
     assert r.status_code == 404, r.get_json()
     assert db.execute("SELECT COUNT(*) FROM invoices").fetchone()[0] == before

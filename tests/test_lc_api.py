@@ -262,13 +262,16 @@ def test_move_happy_skips_gate_for_other_stages(admin_client, db):
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
     assert add_recipe(db, f"R-MV-{tag}", 100, 0, co, product) is not False
-    inv_id = create_invoice(db, sid, f"INV-MV-{tag}")['invoice_id']
-    recipe_id = db.execute(
-        "SELECT id FROM recipes WHERE company_id = %s AND lower(name)=lower(%s)",
-        (co, f"R-MV-{tag}")).fetchone()[0]
     sale_item_id = db.execute(
         "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id LIMIT 1",
         (sid,)).fetchone()[0]
+    inv_id = create_invoice(
+        db, sid, f"INV-MV-{tag}",
+        lines=[{"sale_item_id": sale_item_id, "quantity": 10}],
+        invoice_date="2026-01-15")['invoice_id']
+    recipe_id = db.execute(
+        "SELECT id FROM recipes WHERE company_id = %s AND lower(name)=lower(%s)",
+        (co, f"R-MV-{tag}")).fetchone()[0]
     run_id = db.execute(
         "INSERT INTO production_runs (recipe_id, sale_item_id, order_number, batch_number, production_date, qty_produced, created_by) VALUES (%s, %s, NULL, NULL, NULL, 10, NULL) RETURNING id",
         (recipe_id, sale_item_id)).fetchone()[0]
@@ -310,13 +313,16 @@ def test_move_passes_gate_with_recipe_and_invoice(admin_client, db):
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
     assert add_recipe(db, f"R-GP-{tag}", 100, 0, co, product) is not False
-    inv_id = create_invoice(db, sid, f"INV-GP-{tag}")['invoice_id']
-    recipe_id = db.execute(
-        "SELECT id FROM recipes WHERE company_id = %s AND lower(name)=lower(%s)",
-        (co, f"R-GP-{tag}")).fetchone()[0]
     sale_item_id = db.execute(
         "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id LIMIT 1",
         (sid,)).fetchone()[0]
+    inv_id = create_invoice(
+        db, sid, f"INV-GP-{tag}",
+        lines=[{"sale_item_id": sale_item_id, "quantity": 10}],
+        invoice_date="2026-01-15")['invoice_id']
+    recipe_id = db.execute(
+        "SELECT id FROM recipes WHERE company_id = %s AND lower(name)=lower(%s)",
+        (co, f"R-GP-{tag}")).fetchone()[0]
     run_id = db.execute(
         "INSERT INTO production_runs (recipe_id, sale_item_id, order_number, batch_number, production_date, qty_produced, created_by) VALUES (%s, %s, NULL, NULL, NULL, 10, NULL) RETURNING id",
         (recipe_id, sale_item_id)).fetchone()[0]
@@ -411,7 +417,14 @@ def _invoiced_setup(db, tag, qty=10, price=5.0):
     co = _company(db, f"LC II {tag}")
     sid = _sale(db, f"PI-II-{tag}", company_id=co, qty=qty, price=price)
     item_id = _sale_item_id(db, sid)
-    inv = create_invoice(db, sid, f"INV-II-{tag}", seed_lines=False)
+    # Created with its baseline line, then cleared: the route tests below add
+    # the real quantities themselves, so the invoice must start empty.
+    inv = create_invoice(db, sid, f"INV-II-{tag}",
+                         lines=[{"sale_item_id": item_id, "quantity": 1}],
+                         invoice_date="2026-01-15")
+    db.execute("DELETE FROM invoice_items WHERE invoice_id = %s",
+               (inv["invoice_id"],))
+    db.commit()
     return inv["invoice_id"], item_id
 
 
@@ -561,7 +574,10 @@ def test_legacy_gate_passes_move(admin_client, db):
         (f"Legacy-R-{tag}", co),
     )
     db.commit()
-    create_invoice(db, sid, f"INV-LEG-{tag}")
+    create_invoice(db, sid, f"INV-LEG-{tag}",
+                   lines=[{"sale_item_id": _sale_item_id(db, sid),
+                           "quantity": 10}],
+                   invoice_date="2026-01-15")
     r = admin_client.get(f"/api/production-source?sale_id={sid}")
     assert r.status_code == 200
     assert r.get_json()["products"][0]["recipes"], \

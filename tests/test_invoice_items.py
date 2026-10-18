@@ -45,14 +45,19 @@ def _sale_item(conn, sale_id):
 
 
 def _invoice(conn, sale_id, number=None):
-    """Header-only invoice for the line-level unit tests.
+    """Invoice with a single baseline line for the line-level unit tests.
 
-    ``seed_lines=False`` stops create_invoice from seeding the PI's remaining
-    lines (seeding has its own tests), so these tests own the full remaining
-    quantity and can exercise create_invoice_item's rules.
+    An invoice can no longer be created without lines (the header-only seam is
+    gone), so the baseline of one unit keeps the invoice real while these tests
+    own the quantities they add via create_invoice_item under the shared 5%
+    aggregate ceiling.
     """
     number = number or f"INV-{_tag()}"
-    return salesmod.create_invoice(conn, sale_id, number, seed_lines=False)["invoice_id"]
+    si_id, _, _ = _sale_item(conn, sale_id)
+    return salesmod.create_invoice(
+        conn, sale_id, number,
+        lines=[{"sale_item_id": si_id, "quantity": 1}],
+        invoice_date="2026-01-15")["invoice_id"]
 
 
 def _recipe(conn, company_id, product, name=None):
@@ -90,16 +95,14 @@ def test_over_qty_allowed(db):
     sid = _sale(db, co, qty=10, price=5)
     si_id, _, _ = _sale_item(db, sid)
     inv = _invoice(db, sid)
-    # PI qty = 10, ceiling = 10.5 (5% tolerance)
-    # First invoice with 6 (within PI qty)
+    # PI qty = 10, ceiling = 10.5 (5% tolerance); the baseline line uses 1
+    # First added line: 6 (total 7, within PI qty)
     salesmod.create_invoice_item(db, inv, si_id, 6)
-    # Second invoice with 4.5 (total 10.5 = ceiling) - allowed at ceiling
-    salesmod.create_invoice_item(db, inv, si_id, 4.5)
+    # Second added line: 3.5 (total 10.5 = ceiling) - allowed at ceiling
+    salesmod.create_invoice_item(db, inv, si_id, 3.5)
     db.commit()
     items = salesmod.list_invoice_items(db, inv)
-    assert len(items) == 2
-    assert items[0]["quantity"] == 6
-    assert items[1]["quantity"] == 4.5
+    assert [i["quantity"] for i in items] == [1, 6, 3.5]
 
 
 def test_over_qty_rejected_at_ceiling(db):
@@ -110,7 +113,7 @@ def test_over_qty_rejected_at_ceiling(db):
     inv = _invoice(db, sid)
     # PI qty = 10, ceiling = 10.5
     salesmod.create_invoice_item(db, inv, si_id, 6)
-    salesmod.create_invoice_item(db, inv, si_id, 4.5)  # total = 10.5 (at ceiling)
+    salesmod.create_invoice_item(db, inv, si_id, 3.5)  # total = 10.5 (at ceiling)
     # Adding more should be rejected
     with pytest.raises(ValueError, match="exceeds 10.5"):
         salesmod.create_invoice_item(db, inv, si_id, 0.1)
@@ -125,14 +128,14 @@ def test_remaining_qty_math(db):
     inv = _invoice(db, sid)
     salesmod.create_invoice_item(db, inv, si_id, 3)
     salesmod.create_invoice_item(db, inv, si_id, 4)
-    # 7 used, 3 remain: exact fill OK (total 10)
-    salesmod.create_invoice_item(db, inv, si_id, 3)
+    # 8 used of 10; exact fill with 2 OK (total 10)
+    salesmod.create_invoice_item(db, inv, si_id, 2)
     # Now 10 used, 0 remain - can add up to 0.5 more (5% tolerance)
     salesmod.create_invoice_item(db, inv, si_id, 0.5)
     db.commit()
     items = salesmod.list_invoice_items(db, inv)
-    assert len(items) == 4
-    assert items[3]["quantity"] == 0.5  # 5% tolerance allowance
+    assert len(items) == 5
+    assert items[4]["quantity"] == 0.5  # 5% tolerance allowance
 
 
 def test_quantity_must_be_finite_and_positive(db):
@@ -175,11 +178,12 @@ def test_list_invoice_items(db):
     sid = _sale(db, co, qty=10, price=5)
     si_id, _, _ = _sale_item(db, sid)
     inv = _invoice(db, sid)
-    assert salesmod.list_invoice_items(db, inv) == []
+    baseline = salesmod.list_invoice_items(db, inv)
+    assert len(baseline) == 1, "the invoice is born with its baseline line"
     l1 = salesmod.create_invoice_item(db, inv, si_id, 2)
     l2 = salesmod.create_invoice_item(db, inv, si_id, 3)
     rows = salesmod.list_invoice_items(db, inv)
-    assert [r["id"] for r in rows] == [l1["id"], l2["id"]]
+    assert [r["id"] for r in rows] == [baseline[0]["id"], l1["id"], l2["id"]]
 
 
 def test_invoiced_total_for_sale(db):
@@ -190,7 +194,7 @@ def test_invoiced_total_for_sale(db):
     inv = _invoice(db, sid)
     salesmod.create_invoice_item(db, inv, si_id, 2)  # 2*5=10
     salesmod.create_invoice_item(db, inv, si_id, 3)  # 3*5=15
-    assert salesmod.invoiced_total_for_sale(db, sid) == pytest.approx(25.0)
+    assert salesmod.invoiced_total_for_sale(db, sid) == pytest.approx(30.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -231,8 +235,9 @@ def test_shipment_ready_recipe_only(db):
 def test_shipment_ready_invoice_only(db):
     co = _company(db, f"Gate I {_tag()}")
     lc_id, sid = _lc_with_sale(db, co, product=f"IProd-{_tag()}")
-    # Seeded invoice so the sale's product is actually invoiced/under the LC.
-    salesmod.create_invoice(db, sid, f"INV-{_tag()}")
+    # One explicit invoice line so the sale's product is actually invoiced
+    # under the LC.
+    _invoice(db, sid)
     out = salesmod.check_lc_shipment_ready(db, lc_id)
     assert out["invoices_ok"] is True
     # A real recipe and an invoice-linked production run are both still owed.
@@ -246,7 +251,7 @@ def test_shipment_ready_both(db):
     prod = f"BProd-{tag}"
     lc_id, sid = _lc_with_sale(db, co, product=prod)
     _recipe(db, co, prod)
-    salesmod.create_invoice(db, sid, f"INV-{_tag()}")
+    _invoice(db, sid)
     out = salesmod.check_lc_shipment_ready(db, lc_id)
     assert out["recipes_ok"] is True
     assert out["invoices_ok"] is True
@@ -264,14 +269,14 @@ def test_sequential_double_create_boundary_allowed(db):
     si_id, _, _ = _sale_item(db, sid)
     inv = _invoice(db, sid)
     salesmod.create_invoice_item(db, inv, si_id, 6)
-    salesmod.create_invoice_item(db, inv, si_id, 4)  # exactly consumed (total 10)
-    assert len(salesmod.list_invoice_items(db, inv)) == 2
+    salesmod.create_invoice_item(db, inv, si_id, 3)  # exactly consumed (total 10)
+    assert len(salesmod.list_invoice_items(db, inv)) == 3
     # Now we can add up to 0.5 more (5% tolerance ceiling = 10.5)
     salesmod.create_invoice_item(db, inv, si_id, 0.5)
     db.commit()
     items = salesmod.list_invoice_items(db, inv)
-    assert len(items) == 3
-    assert items[2]["quantity"] == 0.5
+    assert len(items) == 4
+    assert items[3]["quantity"] == 0.5
 
 
 def test_invoice_amount_derived_cache(db):
@@ -280,18 +285,25 @@ def test_invoice_amount_derived_cache(db):
     sid = _sale(db, co, qty=10, price=5)
     si_id, _, _ = _sale_item(db, sid)
     inv = _invoice(db, sid)
-    salesmod.create_invoice_item(db, inv, si_id, 2)  # 2*5=10
+    salesmod.create_invoice_item(db, inv, si_id, 2)  # baseline 5 + 10 = 15
     row = db.execute(
         "SELECT amount FROM invoices WHERE id = %s", (inv,)).fetchone()
-    assert float(row[0]) == pytest.approx(10.0)
-    salesmod.create_invoice_item(db, inv, si_id, 3)  # +15 => 25
+    assert float(row[0]) == pytest.approx(15.0)
+    salesmod.create_invoice_item(db, inv, si_id, 3)  # +15 => 30
     row = db.execute(
         "SELECT amount FROM invoices WHERE id = %s", (inv,)).fetchone()
-    assert float(row[0]) == pytest.approx(25.0)
+    assert float(row[0]) == pytest.approx(30.0)
 
 
-def test_legacy_fallback_passes_gate(db):
-    """P2: legacy company (recipes without product_name) passes the gate."""
+def test_legacy_recipe_without_product_link_does_not_satisfy_the_gate(db):
+    """Strict product match — the NULL-product_name fallback is gone (7a7ae73).
+
+    This used to pass vacuously: the header-only invoice carried no lines, so
+    no product was invoice-scoped and the recipe check never ran. The invoice
+    now carries its line, so the gate sees the product and reports the missing
+    product-linked recipe; only a matching ``recipes.product_name`` satisfies
+    the barrier.
+    """
     tag = _tag()
     co = _company(db, f"Gate Legacy {_tag()}")
     prod = f"LegacyProd-{tag}"
@@ -305,70 +317,89 @@ def test_legacy_fallback_passes_gate(db):
     )
     db.commit()
     out = salesmod.check_lc_shipment_ready(db, lc_id)
-    assert out["recipes_ok"] is True
     assert out["invoices_ok"] is True
+    assert out["recipes_ok"] is False, (
+        "strict match: a NULL product_name is not a recipe for the product")
+    assert prod in out["detail"]["missing_recipes"]
+
+    # The product-linked recipe satisfies the recipe barrier; production is
+    # still owed, so the produced barrier keeps blocking.
+    _recipe(db, co, prod)
+    out = salesmod.check_lc_shipment_ready(db, lc_id)
+    assert out["recipes_ok"] is True
+    assert out["produced_ok"] is False
 
 
 
 
 # --------------------------------------------------------------------------- #
-# Gate 4 B1: invoices are never line-less by default
+# Gate 4 B1: invoices are never line-less
 # --------------------------------------------------------------------------- #
-def test_create_invoice_seeds_remaining_pi_lines(db):
-    """A default invoice carries one line per PI line, so the report is truthful."""
+def test_create_invoice_refuses_a_line_less_invoice(db):
+    """The legacy auto-seed and header-only modes are gone.
+
+    A default create used to seed the PI's remaining lines; a header-only
+    create produced an invoice the report could not see. Both modes are
+    removed, so ``lines`` is required and must be non-empty.
+    """
+    from raas_tracker._exceptions import ServiceError
+
     co = _company(db)
     sid = _sale(db, co, product="SeedProd", qty=10, price=7.5)
-    inv = salesmod.create_invoice(db, sid, f"INV-{_tag()}")["invoice_id"]
-
-    items = salesmod.list_invoice_items(db, inv)
-    assert len(items) == 1, "default invoice must seed its PI line"
-    line = items[0]
-    assert line["quantity"] == pytest.approx(10)
-    assert line["unit_price"] == pytest.approx(7.5)
-    assert line["line_total"] == pytest.approx(75.0)
-    assert line["sale_item_id"] == _sale_item(db, sid)[0]
-    # amount stays the PI total, matching the pre-seeding contract.
-    amount = db.execute("SELECT amount FROM invoices WHERE id = %s",
-                        (inv,)).fetchone()[0]
-    assert float(amount) == pytest.approx(75.0)
+    for bad in (None, []):
+        with pytest.raises(ServiceError, match="lines are required"):
+            salesmod.create_invoice(db, sid, f"INV-{_tag()}", lines=bad,
+                                    invoice_date="2026-01-15")
+        db.rollback()
+    assert db.execute(
+        "SELECT COUNT(*) FROM invoices WHERE sale_id = %s", (sid,)
+    ).fetchone()[0] == 0, "a refused create leaves no header behind"
 
 
-def test_second_invoice_seeds_only_the_remainder(db):
-    """A partial first invoice leaves exactly the rest for the follow-up."""
+def test_second_invoice_takes_the_explicit_remainder(db):
+    """A partial first invoice leaves the rest for the follow-up to state."""
     co = _company(db)
     sid = _sale(db, co, product="SplitSeed", qty=10, price=4)  # PI total 40
     si_id, _, _ = _sale_item(db, sid)
 
-    first = salesmod.create_invoice(db, sid, f"INV-{_tag()}")["invoice_id"]
-    # The operator trims the first invoice to 6 of the 10 units (24 of the 40).
-    db.execute("DELETE FROM invoice_items WHERE invoice_id = %s", (first,))
-    db.commit()
-    salesmod.create_invoice_item(db, first, si_id, 6)
+    first = salesmod.create_invoice(
+        db, sid, f"INV-{_tag()}",
+        lines=[{"sale_item_id": si_id, "quantity": 6}],
+        invoice_date="2026-01-15")["invoice_id"]
+    first_amount = float(db.execute("SELECT amount FROM invoices WHERE id = %s",
+                                    (first,)).fetchone()[0])
+    assert first_amount == pytest.approx(24.0)
 
-    second = salesmod.create_invoice(db, sid, f"INV-{_tag()}")["invoice_id"]
+    second = salesmod.create_invoice(
+        db, sid, f"INV-{_tag()}",
+        lines=[{"sale_item_id": si_id, "quantity": 4}],
+        invoice_date="2026-01-16")["invoice_id"]
     items = salesmod.list_invoice_items(db, second)
-    assert len(items) == 1, "seeds only the lines that still have quantity left"
-    assert items[0]["quantity"] == pytest.approx(4), "only what is left"
+    assert len(items) == 1, "the follow-up carries exactly its explicit line"
+    assert items[0]["quantity"] == pytest.approx(4), "the remainder"
     assert items[0]["line_total"] == pytest.approx(16.0)
-    # The derived header is the remainder, not the PI total, and it equals its
-    # own lines exactly.
+    # The header is its own lines exactly, and the sale totals whole.
     second_amount = float(db.execute("SELECT amount FROM invoices WHERE id = %s",
                                      (second,)).fetchone()[0])
     assert second_amount == pytest.approx(16.0)
     assert salesmod.invoiced_total_for_sale(db, sid) == pytest.approx(40.0)
 
 
-def test_seed_lines_false_creates_a_header_only_invoice(db):
-    """The internal test seam still derives the money, it just skips the lines."""
+def test_create_invoice_header_is_exactly_its_explicit_lines(db):
+    """The header is the line sum, never a stated figure or the PI total."""
     co = _company(db)
     sid = _sale(db, co, product="HeaderOnly", qty=5, price=20)  # PI total 100
-    inv = salesmod.create_invoice(
-        db, sid, f"INV-{_tag()}", seed_lines=False)["invoice_id"]
-
-    assert salesmod.list_invoice_items(db, inv) == [], "no seeded lines"
+    si_id, _, _ = _sale_item(db, sid)
+    out = salesmod.create_invoice(
+        db, sid, f"INV-{_tag()}",
+        lines=[{"sale_item_id": si_id, "quantity": 1.5}],
+        invoice_date="2026-01-15")
+    inv = out["invoice_id"]
+    assert out["amount"] == pytest.approx(30.0), "1.5 * 20, not the PI's 100"
     amount = float(db.execute("SELECT amount FROM invoices WHERE id = %s",
                               (inv,)).fetchone()[0])
-    assert amount == pytest.approx(100.0), "still derived, never a stated 0"
+    assert amount == pytest.approx(30.0), "still derived, never a stated figure"
+    assert len(salesmod.list_invoice_items(db, inv)) == 1
 
 
 def test_create_invoice_takes_no_stated_amount(db):
@@ -384,4 +415,5 @@ def test_create_invoice_takes_no_stated_amount(db):
     params = inspect.signature(salesmod.create_invoice).parameters
     assert "amount" not in params, (
         "create_invoice must not accept a stated amount; the money is derived")
-    assert set(params) == {"conn", "sale_id", "invoice_number", "seed_lines", "lines"}
+    assert set(params) == {"conn", "sale_id", "invoice_number", "lines",
+                           "invoice_date"}

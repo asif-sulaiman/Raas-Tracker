@@ -18,7 +18,7 @@ Phase 3-B:
 8. create_invoice_item on planned invoice is allowed
 9. create_invoice with explicit lines succeeds (new invoice is planned)
 10. create_invoices_batch succeeds (new invoices are planned)
-11. create_invoice with seed_lines=True succeeds (new invoice is planned)
+11. create_invoice without lines is refused (the auto-seed mode is gone)
 """
 
 import pytest
@@ -79,14 +79,19 @@ def _recipe(db, company_id, product_name):
 
 
 def _invoice(db, sale_id, invoice_number="INV-001"):
-    """Create an invoice for a sale (auto-seed from PI). Returns invoice_id."""
-    result = create_invoice(db, sale_id, invoice_number)
+    """Create an invoice for a sale with one baseline line. Returns invoice_id."""
+    items = _get_sale_items(db, sale_id)
+    result = create_invoice(
+        db, sale_id, invoice_number,
+        lines=[{"sale_item_id": items[0][0], "quantity": 1}],
+        invoice_date="2026-01-15")
     return result["invoice_id"]
 
 
 def _invoice_explicit(db, sale_id, invoice_number, lines):
     """Create an invoice with explicit lines. lines = [{"sale_item_id": int, "quantity": float}, ...]."""
-    result = create_invoice(db, sale_id, invoice_number, lines=lines)
+    result = create_invoice(db, sale_id, invoice_number, lines=lines,
+                            invoice_date="2026-01-15")
     return result["invoice_id"]
 
 
@@ -358,13 +363,16 @@ def test_create_invoice_item_on_planned_invoice_allowed(db):
     """create_invoice_item on a planned invoice succeeds."""
     co = _company(db)
     sid = _sale(db, co)
-    # Create invoice without auto-seeding (which would fill PI qty and exceed 5% ceiling)
-    from raas_tracker.sales import create_invoice
-    result = create_invoice(db, sid, "INV-PLANNED", seed_lines=False)
-    inv_id = result["invoice_id"]
     items = _get_sale_items(db, sid)
     sale_item_id = items[0][0]
-    # Should succeed - 5 units is within 5% ceiling (PI qty=10, ceiling=10.5)
+    # Born with its baseline line (1 unit); the ceiling allows 10.5
+    from raas_tracker.sales import create_invoice
+    result = create_invoice(
+        db, sid, "INV-PLANNED",
+        lines=[{"sale_item_id": sale_item_id, "quantity": 1}],
+        invoice_date="2026-01-15")
+    inv_id = result["invoice_id"]
+    # Should succeed - 1 + 5 is within 5% ceiling (PI qty=10, ceiling=10.5)
     line = create_invoice_item(db, inv_id, sale_item_id, 5.0)
     assert line["quantity"] == 5.0
 
@@ -376,7 +384,9 @@ def test_create_invoice_explicit_lines_allowed(db):
     items = _get_sale_items(db, sid)
     sale_item_id = items[0][0]
     # Should succeed - new invoice starts as 'planned'
-    result = create_invoice(db, sid, "INV-EXPLICIT", lines=[{"sale_item_id": sale_item_id, "quantity": 5}])
+    result = create_invoice(db, sid, "INV-EXPLICIT",
+                            lines=[{"sale_item_id": sale_item_id, "quantity": 5}],
+                            invoice_date="2026-01-15")
     assert result["status"] == "planned"
     assert result["amount"] > 0
 
@@ -389,22 +399,28 @@ def test_create_invoices_batch_allowed(db):
     sale_item_id = items[0][0]
     # Should succeed - new invoices start as 'planned'
     result = create_invoices_batch(db, sid, [
-        {"invoice_number": "INV-BATCH-1", "lines": [{"sale_item_id": sale_item_id, "quantity": 3}]},
-        {"invoice_number": "INV-BATCH-2", "lines": [{"sale_item_id": sale_item_id, "quantity": 4}]},
+        {"invoice_number": "INV-BATCH-1", "invoice_date": "2026-01-15",
+         "lines": [{"sale_item_id": sale_item_id, "quantity": 3}]},
+        {"invoice_number": "INV-BATCH-2", "invoice_date": "2026-01-16",
+         "lines": [{"sale_item_id": sale_item_id, "quantity": 4}]},
     ])
     assert len(result["invoices"]) == 2
     for inv in result["invoices"]:
         assert inv["status"] == "planned"
 
 
-def test_create_invoice_seed_lines_allowed(db):
-    """create_invoice with seed_lines=True succeeds (new invoice is planned)."""
+def test_create_invoice_without_lines_refused(db):
+    """The auto-seed mode is gone; create_invoice requires explicit lines."""
+    from raas_tracker._exceptions import ServiceError
+
     co = _company(db)
     sid = _sale(db, co)
-    # Should succeed - new invoice starts as 'planned'
-    result = create_invoice(db, sid, "INV-SEED", seed_lines=True)
-    assert result["status"] == "planned"
-    assert result["amount"] > 0
+    with pytest.raises(ServiceError, match="lines are required"):
+        create_invoice(db, sid, "INV-SEED", lines=None,
+                       invoice_date="2026-01-15")
+    db.rollback()
+    assert db.execute(
+        "SELECT COUNT(*) FROM invoices WHERE sale_id = %s", (sid,)).fetchone()[0] == 0
 
 
 def test_assert_invoice_mutable_helper(db):

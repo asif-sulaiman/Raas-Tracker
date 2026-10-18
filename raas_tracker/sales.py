@@ -18,6 +18,7 @@ from ._exceptions import (
     InvoiceNotProduced,
     LifecycleConflict,
     SaleItemNotFound,
+    ServiceError,
     ToleranceExceeded,
 )
 
@@ -1787,99 +1788,21 @@ def _assert_invoice_mutable(conn: psycopg.Connection, invoice_id: int) -> None:
         raise ValueError(f"cannot modify a {status} invoice")
 
 
-def _seed_invoice_lines(conn: psycopg.Connection, invoice_id: int,
-                        sale_id: int, budget: Decimal) -> None:
-    """Give a freshly created invoice one line per remaining uninvoiced PI line.
-
-    Without this an invoice row carries no lines, and the invoice-driven report
-    would sum zero for a real receivable and report it as paid.
-
-    Only the REMAINING (uninvoiced) quantity of each PI line is seeded, so a
-    follow-up invoice picks up exactly the rest. Unit price comes from the PI
-    line, exactly as ``create_invoice_item`` does. ``line_total`` is computed by
-    the database in ``::numeric`` so the header and the report cannot disagree
-    through float drift.
-
-    ``budget`` caps the money this invoice may carry (the sale's remaining
-    money). On a clean sale it exactly covers the remaining quantity, so every
-    line is filled whole. It only bites when legacy line-less invoices already
-    claimed part of the PI: the last line is then filled partially so the
-    seeded total can never overstate the PI.
-
-    Concurrency: the lock MUST be a separate statement from the arithmetic. Under
-    READ COMMITTED a statement's snapshot is taken before it blocks on a lock, so
-    locking and reading the remaining quantity in one statement would read the
-    pre-wait value and seed the same units twice. ``create_invoice_item`` uses
-    this same two-statement shape. Callers must also hold the ``sales`` row lock
-    so two creates on one sale cannot both derive the same remainder.
-    """
-    conn.execute(
-        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id FOR UPDATE",
-        (sale_id,)).fetchall()
-    rows = conn.execute(
-        """SELECT si.id, si.product_name, si.unit, si.unit_price,
-                  (si.quantity::numeric
-                   - COALESCE((SELECT SUM(ii.quantity)::numeric
-                               FROM invoice_items ii
-                               WHERE ii.sale_item_id = si.id), 0)) AS remaining
-           FROM sale_items si
-           WHERE si.sale_id = %s
-           ORDER BY si.id""",
-        (sale_id,)).fetchall()
-    left = _money(budget)
-    for item_id, product_name, unit, unit_price, remaining in rows:
-        if remaining is None or _to_decimal(remaining) <= 0 or left <= 0:
-            continue
-        rem = _to_decimal(remaining)
-        price = _money(unit_price or 0)
-        qty = rem
-        if price > 0 and _money(rem * price) > left:
-            # Fill only as much as the remaining money can carry. Quantities are
-            # fractional in this domain (half-quantity KG), so a partial line is
-            # ordinary, not a rounding artefact.
-            qty = (left / price).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
-            if qty <= 0:
-                break
-        row = conn.execute(
-            """INSERT INTO invoice_items
-                   (invoice_id, sale_item_id, product_name, unit,
-                    quantity, unit_price, line_total)
-               VALUES (%s, %s, %s, %s, %s, %s,
-                       ROUND(%s::numeric * %s::numeric, 2))
-               RETURNING id, line_total""",
-            (invoice_id, item_id, product_name, unit or "KG", qty, unit_price,
-             qty, unit_price)).fetchone()
-        line_id, line_total = row
-        left = max(left - _money(line_total or 0), Decimal("0"))
-        # Seeded lines now drive the report, so they are audited like any other
-        # line write even though they are not operator-entered (AGENTS.md:
-        # audit every mutating action).
-        # atomic=False is REQUIRED, not stylistic: atomic=True commits, and a
-        # commit here would release the sales/sale_items row locks this whole
-        # operation depends on, letting a concurrent create_invoice derive the
-        # same remainder and bill the sale twice. It would also persist a
-        # partially seeded header that no line backs if a later line fails.
-        # create_invoice owns the single commit at the end.
-        log_audit_action(conn, "INVOICE_ITEM_ADD", "invoice_item", line_id,
-                         new_value=(f"seeded from sale_item {item_id} "
-                                    f"qty={qty} total={_money(line_total or 0)}"),
-                         atomic=False)
-
-
 def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
-                   lines: Optional[List[Dict[str, Any]]] = None,
-                   seed_lines: bool = True) -> Dict[str, Any]:
-    """Create a new invoice for a sale.
+                   lines: List[Dict[str, Any]],
+                   invoice_date: str) -> Dict[str, Any]:
+    """Create a new invoice for a sale with explicit lines and a stated date.
 
-    Two modes:
-    1. Explicit lines provided (lines=[{"sale_item_id": int, "quantity": float}, ...]):
-       - Quantities can exceed PI quantities (shipment advantage)
-       - Unit price always inherited from PI line (server-enforced)
-       - No quantity ceiling enforced
-    2. lines=None, seed_lines=True (default): legacy auto-seed from PI remainder
-    3. lines=None, seed_lines=False: header only (tests only, not exposed via API)
+    This is the only create mode. ``lines`` is required and non-empty
+    (``[{"sale_item_id": int, "quantity": float}, ...]``):
+    - Quantities may exceed PI quantities (shipment advantage; the 5% ceiling
+      in ``check_invoice_tolerance`` still applies).
+    - Unit price is always inherited from the PI line (server-enforced).
+    - ``invoice_date`` is required and stored as given (stripped).
 
-    Unit price is always inherited from the PI line (server-enforced).
+    The legacy auto-seed and the header-only test seam are gone: an invoice can
+    no longer exist without the lines the invoice-driven report sums.
+
     Invoice amount is always Σ line totals (single source of truth).
     Every invoice is born ``planned``: ``paid`` asserts money was received, so
     only a payment record may set it (``_sync_invoice_paid_status``). Create-time
@@ -1888,6 +1811,11 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
     if not invoice_number or not invoice_number.strip():
         raise ValueError("invoice_number is required")
     invoice_number = invoice_number.strip()
+    if not invoice_date or not str(invoice_date).strip():
+        raise ServiceError("invoice_date is required")
+    invoice_date = str(invoice_date).strip()
+    if not lines:
+        raise ServiceError("lines are required")
     # Duplicate check first so a repeated number still reports "already exists".
     dup = conn.execute(
         "SELECT id FROM invoices WHERE sale_id = %s AND invoice_number = %s",
@@ -1895,110 +1823,68 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
     ).fetchone()
     if dup:
         raise ValueError(f"Invoice number '{invoice_number}' already exists for this sale")
-    # Serialise invoice creation per sale BEFORE deriving the remainder. Two
-    # concurrent creates would otherwise both read the same "already invoiced"
-    # state and each seed the whole remainder, invoicing the sale twice. The cap
-    # this replaces could not catch that: it read the same stale rows.
+    # Serialise invoice creation per sale BEFORE validating the lines. Without
+    # this lock two concurrent creates could both pass the tolerance check
+    # against the same pre-existing total and each write the full ceiling.
     if not conn.execute("SELECT id FROM sales WHERE id = %s FOR UPDATE",
                         (sale_id,)).fetchone():
         raise ValueError("sale not found")
 
-    # Build invoice lines: explicit lines or legacy auto-seed
-    if lines is not None:
-        # Explicit lines mode: validate and use provided quantities
-        validated_lines = validate_invoice_lines(conn, sale_id, lines)
-        # Phase 3-C: Enforce 5% over-invoice tolerance (aggregate with existing lines)
-        check_invoice_tolerance(conn, sale_id, validated_lines)
-        amount = _money(sum(l["line_total"] for l in validated_lines))
-        # INV-REVISION: a create NEVER births 'paid'. 'paid' asserts money was
-        # received, so only a payment record can set it (_sync_invoice_paid_status).
-        # Deriving status from create-time arithmetic made a zero-amount invoice
-        # a terminal, unfulfilled row reported as settled.
-        status = "planned"
+    # Non-finite guard: the VALUE is intentionally unused now that no remainder
+    # is billed, but the call must stay. A NaN/Inf REAL in a PI line (or a
+    # legacy line_total) would otherwise poison Decimal arithmetic inside
+    # validate/tolerance and surface as a generic 500 instead of this named 400.
+    remaining_invoice_money(conn, sale_id)
 
-        try:
-            cursor = conn.execute(
-                """INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at)
-                   VALUES (%s, %s, %s, ROUND(%s::numeric, 2), %s) RETURNING id""",
-                (sale_id, invoice_number, status, amount, _now_str())
-            )
-            invoice_id = cursor.fetchone()[0]
-        except psycopg.IntegrityError:
-            raise ValueError(f"Invoice number '{invoice_number}' already exists for this sale")
+    validated_lines = validate_invoice_lines(conn, sale_id, lines)
+    # Phase 3-C: Enforce 5% over-invoice tolerance (aggregate with existing lines)
+    check_invoice_tolerance(conn, sale_id, validated_lines)
+    amount = _money(sum(l["line_total"] for l in validated_lines))
+    # INV-REVISION: a create NEVER births 'paid'. 'paid' asserts money was
+    # received, so only a payment record can set it (_sync_invoice_paid_status).
+    # Deriving status from create-time arithmetic made a zero-amount invoice
+    # a terminal, unfulfilled row reported as settled.
+    status = "planned"
 
-        # Phase 3-B: Freeze invoice lines once booked/paid/shipped/void
-        # (New invoices are 'planned' so this passes, but provides defense in depth)
-        _assert_invoice_mutable(conn, invoice_id)
+    try:
+        cursor = conn.execute(
+            """INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at, invoice_date)
+               VALUES (%s, %s, %s, ROUND(%s::numeric, 2), %s, %s) RETURNING id""",
+            (sale_id, invoice_number, status, amount, _now_str(), invoice_date)
+        )
+        invoice_id = cursor.fetchone()[0]
+    except psycopg.IntegrityError:
+        raise ValueError(f"Invoice number '{invoice_number}' already exists for this sale")
 
-        # Insert validated lines
-        for vl in validated_lines:
-            row = conn.execute(
-                """INSERT INTO invoice_items
-                       (invoice_id, sale_item_id, product_name, unit,
-                        quantity, unit_price, line_total, source_type)
-                   VALUES (%s, %s, %s, %s, %s, %s,
-                           ROUND(%s::numeric * %s::numeric, 2), 'pi_line')
-                   RETURNING id, line_total""",
-                (invoice_id, vl["sale_item_id"], vl["product_name"], vl["unit"],
-                 vl["quantity"], vl["unit_price"], vl["quantity"], vl["unit_price"])
-            ).fetchone()
-            line_id, line_total = row
-            log_audit_action(conn, "INVOICE_ITEM_ADD", "invoice_item", line_id,
-                             new_value=(f"explicit line for sale_item {vl['sale_item_id']} "
-                                        f"qty={vl['quantity']} total={_money(line_total or 0)}"),
-                             atomic=False)
+    # Phase 3-B: Freeze invoice lines once booked/paid/shipped/void
+    # (New invoices are 'planned' so this passes, but provides defense in depth)
+    _assert_invoice_mutable(conn, invoice_id)
 
-        # Restate header from lines (single source of truth)
-        amount = _money(conn.execute(
-            """UPDATE invoices SET amount =
-                   (SELECT COALESCE(SUM(line_total), 0) FROM invoice_items
-                     WHERE invoice_id = %s)
-               WHERE id = %s RETURNING amount""",
-            (invoice_id, invoice_id)).fetchone()[0])
+    # Insert validated lines
+    for vl in validated_lines:
+        row = conn.execute(
+            """INSERT INTO invoice_items
+                   (invoice_id, sale_item_id, product_name, unit,
+                    quantity, unit_price, line_total, source_type)
+               VALUES (%s, %s, %s, %s, %s, %s,
+                       ROUND(%s::numeric * %s::numeric, 2), 'pi_line')
+               RETURNING id, line_total""",
+            (invoice_id, vl["sale_item_id"], vl["product_name"], vl["unit"],
+             vl["quantity"], vl["unit_price"], vl["quantity"], vl["unit_price"])
+        ).fetchone()
+        line_id, line_total = row
+        log_audit_action(conn, "INVOICE_ITEM_ADD", "invoice_item", line_id,
+                         new_value=(f"explicit line for sale_item {vl['sale_item_id']} "
+                                    f"qty={vl['quantity']} total={_money(line_total or 0)}"),
+                         atomic=False)
 
-    elif seed_lines:
-        # Legacy auto-seed from PI remainder (backward compatible)
-        amount = remaining_invoice_money(conn, sale_id)
-        # See the explicit-lines branch: create-time arithmetic never sets 'paid'.
-        status = "planned"
-
-        try:
-            cursor = conn.execute(
-                """INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at)
-                   VALUES (%s, %s, %s, ROUND(%s::numeric, 2), %s) RETURNING id""",
-                (sale_id, invoice_number, status, amount, _now_str())
-            )
-            invoice_id = cursor.fetchone()[0]
-        except psycopg.IntegrityError:
-            raise ValueError(f"Invoice number '{invoice_number}' already exists for this sale")
-
-        # Phase 3-B: Freeze invoice lines once booked/paid/shipped/void
-        _assert_invoice_mutable(conn, invoice_id)
-
-        _seed_invoice_lines(conn, invoice_id, sale_id, amount)
-        # Restate the header from the lines actually written, in ::numeric, so
-        # the header is exactly the sum the report will compute.
-        amount = _money(conn.execute(
-            """UPDATE invoices SET amount =
-                   (SELECT COALESCE(SUM(line_total), 0) FROM invoice_items
-                     WHERE invoice_id = %s)
-               WHERE id = %s RETURNING amount""",
-            (invoice_id, invoice_id)).fetchone()[0])
-
-    else:
-        # Header-only invoice (tests only) - still derive amount from PI total,
-        # but don't create invoice_items rows (internal test seam)
-        amount = remaining_invoice_money(conn, sale_id)
-        status = "planned"
-        try:
-            cursor = conn.execute(
-                """INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at)
-                   VALUES (%s, %s, %s, ROUND(%s::numeric, 2), %s) RETURNING id""",
-                (sale_id, invoice_number, status, amount, _now_str())
-            )
-            invoice_id = cursor.fetchone()[0]
-        except psycopg.IntegrityError:
-            raise ValueError(f"Invoice number '{invoice_number}' already exists for this sale")
+    # Restate header from lines (single source of truth)
+    amount = _money(conn.execute(
+        """UPDATE invoices SET amount =
+               (SELECT COALESCE(SUM(line_total), 0) FROM invoice_items
+                 WHERE invoice_id = %s)
+           WHERE id = %s RETURNING amount""",
+        (invoice_id, invoice_id)).fetchone()[0])
 
     # Entering production: only set production_running when no status yet
     # (COALESCE so a sale already at production_done/ship_booked never downgrades)
@@ -2007,7 +1893,7 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
         (_now_str(), sale_id)
     )
 
-    # atomic=False, commit below: the header, its seeded lines, the shipment
+    # atomic=False, commit below: the header, its lines, the shipment
     # status flip and the audit row are one transaction. This commit is also
     # what releases the `sales ... FOR UPDATE` lock taken above, so it must stay
     # AFTER the audit write — committing first would release the lock early and
@@ -2017,7 +1903,8 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
                      atomic=False)
     conn.commit()
     return {"invoice_id": invoice_id, "invoice_number": invoice_number,
-            "status": status, "amount": float(amount)}
+            "status": status, "amount": float(amount),
+            "invoice_date": invoice_date}
 
 
 def create_invoices_batch(conn: psycopg.Connection, sale_id: int,
@@ -2031,11 +1918,11 @@ def create_invoices_batch(conn: psycopg.Connection, sale_id: int,
     ``SUM(invoice_items.line_total)`` exactly as ``create_invoice`` does, so
     ``invoices.amount`` is always the real line sum and never a typed figure.
 
-    Guards: every invoice needs ≥1 line; each line quantity finite and > 0;
-    each ``sale_item_id`` belongs to this sale; Σ per sale item across the
-    batch never exceeds what is still uninvoiced; no duplicate invoice number
-    within the batch or against the sale. The caller owns no separate commit —
-    this function commits once, atomically.
+    Guards: every invoice needs ≥1 line and its own ``invoice_date``; each line
+    quantity finite and > 0; each ``sale_item_id`` belongs to this sale; Σ per
+    sale item across the batch never exceeds what is still uninvoiced; no
+    duplicate invoice number within the batch or against the sale. The caller
+    owns no separate commit — this function commits once, atomically.
     """
     if not invoices:
         raise ValueError("at least one invoice required")
@@ -2055,6 +1942,10 @@ def create_invoices_batch(conn: psycopg.Connection, sale_id: int,
         num = (inv.get("invoice_number") or "").strip()
         if not num:
             raise ValueError("invoice_number is required")
+        # INVOICE-CONTRACT: each entry states its own date (a batch may span
+        # days); a missing one refuses the whole batch before any write.
+        if not str(inv.get("invoice_date") or "").strip():
+            raise ServiceError(f"Invoice '{num}' requires an invoice_date")
         lines = inv.get("lines") or []
         if not lines:
             raise ValueError(f"Invoice '{num}' must have at least one line")
@@ -2096,11 +1987,12 @@ def create_invoices_batch(conn: psycopg.Connection, sale_id: int,
     results = []
     for inv in invoices:
         num = inv["invoice_number"].strip()
+        inv_date = str(inv.get("invoice_date") or "").strip()
         try:
             cur = conn.execute(
-                """INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at)
-                   VALUES (%s, %s, 'planned', 0, %s) RETURNING id""",
-                (sale_id, num, _now_str()))
+                """INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at, invoice_date)
+                   VALUES (%s, %s, 'planned', 0, %s, %s) RETURNING id""",
+                (sale_id, num, _now_str(), inv_date))
             invoice_id = cur.fetchone()[0]
         except psycopg.IntegrityError:
             raise ValueError(
@@ -2139,7 +2031,8 @@ def create_invoices_batch(conn: psycopg.Connection, sale_id: int,
         log_audit_action(conn, "INVOICE_CREATE", "invoice", invoice_id,
                          new_value=f"{num} amount={amount}", atomic=False)
         results.append({"invoice_id": invoice_id, "invoice_number": num,
-                        "status": "planned", "amount": float(amount)})
+                        "status": "planned", "amount": float(amount),
+                        "invoice_date": inv_date})
 
     # Entering production: only set production_running when no status yet
     # (never downgrade an LC's later shipment_status).
@@ -2502,12 +2395,12 @@ def list_invoices(conn: psycopg.Connection, sale_id: int,
     rows = [
         {"invoice_id": r[0], "invoice_number": r[1], "status": r[2],
          "approx_ship_date": r[3], "actual_ship_date": r[4], "notes": r[5],
-         "created_at": r[6],
-         "amount": (float(r[7]) if r[7] is not None else None),
-         "paid_amount": float(r[8])}
+         "invoice_date": r[6], "created_at": r[7],
+         "amount": (float(r[8]) if r[8] is not None else None),
+         "paid_amount": float(r[9])}
         for r in conn.execute(
             """SELECT id, invoice_number, status, approx_ship_date, actual_ship_date,
-                      notes, created_at, amount,
+                      notes, invoice_date, created_at, amount,
                       (SELECT COALESCE(ROUND(SUM(sp.payment_amount)::numeric, 2)::float8, 0)
                        FROM sale_payments sp WHERE sp.invoice_id = invoices.id) AS paid_amount
                FROM invoices WHERE sale_id = %s ORDER BY id""",

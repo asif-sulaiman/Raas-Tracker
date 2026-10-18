@@ -269,9 +269,13 @@ def test_book_invoice_writes_audit(admin_client, db, produce_for):
                  "company_id": company_id},
         "items": [{"product_name": "W", "quantity": 1, "unit_price": 10}]})
     sid = r.get_json().get("id") or r.get_json()["sale"]["id"]
+    item = db.execute("SELECT id FROM sale_items WHERE sale_id = %s",
+                      (sid,)).fetchone()[0]
     inv = admin_client.post(
         f"/api/sales/{sid}/invoices",
-        json={"invoice_number": "INV-AUD-BOOK"}).get_json()["invoice_id"]
+        json={"invoice_number": "INV-AUD-BOOK", "invoice_date": "2026-01-15",
+              "lines": [{"sale_item_id": item, "quantity": 1}]}
+    ).get_json()["invoice_id"]
     produce_for(company_id, sid, inv, "AUD", "W")
     r = admin_client.post(
         f"/api/sales/{sid}/invoices/{inv}/book",
@@ -295,9 +299,13 @@ def test_refused_book_writes_no_audit(admin_client, db, produce_for):
                  "company_id": company_id},
         "items": [{"product_name": "W", "quantity": 1, "unit_price": 10}]})
     sid = r.get_json().get("id") or r.get_json()["sale"]["id"]
+    item = db.execute("SELECT id FROM sale_items WHERE sale_id = %s",
+                      (sid,)).fetchone()[0]
     inv = admin_client.post(
         f"/api/sales/{sid}/invoices",
-        json={"invoice_number": "INV-AUD-BOOK2"}).get_json()["invoice_id"]
+        json={"invoice_number": "INV-AUD-BOOK2", "invoice_date": "2026-01-15",
+              "lines": [{"sale_item_id": item, "quantity": 1}]}
+    ).get_json()["invoice_id"]
     produce_for(company_id, sid, inv, "REF", "W")
     ok = admin_client.post(
         f"/api/sales/{sid}/invoices/{inv}/book",

@@ -9,7 +9,6 @@ paid_amount 0 — a permanent silent financial misstatement.
 from raas_tracker.sales import (
     add_sale,
     create_invoice,
-    create_invoice_item,
     delete_sale_payment_record,
     mark_invoice_paid,
     record_sale_payment,
@@ -25,21 +24,19 @@ def _sale(db, pi_number="PI-SYNC-1", total=100.0):
 
 
 def _invoice(db, sale_id, number, amount=None):
-    """Create an invoice. Its money is DERIVED (the sale's uninvoiced PI total),
-    so ``amount`` is only used to trim the seeded line down to a smaller
-    invoice — there is no way to state one any more."""
-    inv = create_invoice(db, sale_id, number)["invoice_id"]
-    if amount is not None:
-        sale_item_id = db.execute(
-            "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id",
-            (sale_id,)).fetchone()[0]
-        unit_price = float(db.execute(
-            "SELECT unit_price FROM sale_items WHERE id = %s",
-            (sale_item_id,)).fetchone()[0])
-        db.execute("DELETE FROM invoice_items WHERE invoice_id = %s", (inv,))
-        db.commit()
-        create_invoice_item(db, inv, sale_item_id, round(amount / unit_price, 6))
-    return inv
+    """Create an invoice with explicit lines.
+
+    The sale's single PI line is invoiced in full; ``amount`` trims it to a
+    smaller invoice amount (``amount / unit_price`` quantity).
+    """
+    sale_item_id, quantity, unit_price = db.execute(
+        "SELECT id, quantity, unit_price FROM sale_items WHERE sale_id = %s "
+        "ORDER BY id", (sale_id,)).fetchone()
+    qty = float(quantity) if amount is None else round(amount / float(unit_price), 6)
+    return create_invoice(
+        db, sale_id, number,
+        lines=[{"sale_item_id": sale_item_id, "quantity": qty}],
+        invoice_date="2026-01-15")["invoice_id"]
 
 
 def _status(db, invoice_id):

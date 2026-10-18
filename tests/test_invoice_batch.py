@@ -47,9 +47,9 @@ def test_batch_two_invoices_split_by_line_allocation(admin_client, db):
     sid = _sale_two_items(admin_client, cid, "PI-BATCH-1")
     a, b = _item_ids(db, sid)
     payload = {"invoices": [
-        {"invoice_number": "INV-B1-A",
+        {"invoice_number": "INV-B1-A", "invoice_date": "2026-01-15",
          "lines": [{"sale_item_id": a, "quantity": 4}]},
-        {"invoice_number": "INV-B1-B",
+        {"invoice_number": "INV-B1-B", "invoice_date": "2026-01-16",
          "lines": [{"sale_item_id": b, "quantity": 10},
                    {"sale_item_id": a, "quantity": 6}]},
     ]}
@@ -85,9 +85,9 @@ def test_batch_over_allocation_rejected_and_atomic(admin_client, db):
     sid = _sale_two_items(admin_client, cid, "PI-BATCH-2")
     a, b = _item_ids(db, sid)
     payload = {"invoices": [
-        {"invoice_number": "INV-B2-A",
+        {"invoice_number": "INV-B2-A", "invoice_date": "2026-01-15",
          "lines": [{"sale_item_id": a, "quantity": 8}]},
-        {"invoice_number": "INV-B2-B",
+        {"invoice_number": "INV-B2-B", "invoice_date": "2026-01-16",
          "lines": [{"sale_item_id": a, "quantity": 5}]},  # 8+5 > 10
     ]}
     r = admin_client.post(f"/api/sales/{sid}/invoices/batch", json=payload)
@@ -100,8 +100,11 @@ def test_batch_over_allocation_rejected_and_atomic(admin_client, db):
 def test_batch_single_invoice_path_still_works(admin_client, db):
     cid = _company(admin_client, db, name="BatchCo3")
     sid = _sale_two_items(admin_client, cid, "PI-BATCH-3")
+    a = _item_ids(db, sid)[0]
     r = admin_client.post(f"/api/sales/{sid}/invoices",
-                          json={"invoice_number": "INV-SINGLE"})
+                          json={"invoice_number": "INV-SINGLE",
+                                "invoice_date": "2026-01-15",
+                                "lines": [{"sale_item_id": a, "quantity": 4}]})
     assert r.status_code == 201
 
 
@@ -110,9 +113,11 @@ def test_batch_duplicate_invoice_number_rejected(admin_client, db):
     sid = _sale_two_items(admin_client, cid, "PI-BATCH-4")
     a, b = _item_ids(db, sid)
     admin_client.post(f"/api/sales/{sid}/invoices",
-                      json={"invoice_number": "INV-EXISTING"})
+                      json={"invoice_number": "INV-EXISTING",
+                            "invoice_date": "2026-01-15",
+                            "lines": [{"sale_item_id": a, "quantity": 1}]})
     payload = {"invoices": [
-        {"invoice_number": "INV-EXISTING",
+        {"invoice_number": "INV-EXISTING", "invoice_date": "2026-01-16",
          "lines": [{"sale_item_id": a, "quantity": 1}]},
     ]}
     r = admin_client.post(f"/api/sales/{sid}/invoices/batch", json=payload)
@@ -122,6 +127,7 @@ def test_batch_duplicate_invoice_number_rejected(admin_client, db):
 def test_batch_empty_invoice_lines_rejected(admin_client, db):
     cid = _company(admin_client, db, name="BatchCo5")
     sid = _sale_two_items(admin_client, cid, "PI-BATCH-5")
-    payload = {"invoices": [{"invoice_number": "INV-EMPTY", "lines": []}]}
+    payload = {"invoices": [{"invoice_number": "INV-EMPTY",
+                             "invoice_date": "2026-01-15", "lines": []}]}
     r = admin_client.post(f"/api/sales/{sid}/invoices/batch", json=payload)
     assert r.status_code == 400

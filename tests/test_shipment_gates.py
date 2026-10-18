@@ -46,6 +46,16 @@ def _sale_item_id(db, sale_id):
         (sale_id,)).fetchone()[0]
 
 
+def _invoice(db, sale_id, number):
+    """Create an invoice covering the sale's PI lines in full."""
+    lines = [{"sale_item_id": r[0], "quantity": float(r[1])}
+             for r in db.execute(
+                 "SELECT id, quantity FROM sale_items WHERE sale_id = %s "
+                 "ORDER BY id", (sale_id,)).fetchall()]
+    return create_invoice(db, sale_id, number, lines=lines,
+                          invoice_date="2026-01-15")
+
+
 def _mk_lc(admin_client, company_id, lc_number, **kw):
     r = admin_client.post("/api/lcs", json={
         "company_id": company_id,
@@ -89,7 +99,7 @@ def test_shipment_ongoing_passes_with_invoice_only(admin_client, db):
         json={"sale_ids": [sid]}).status_code == 200
     # No recipe and no production run — the old combined gate would reject
     # this move. The new split gate allows it with only an invoice.
-    create_invoice(db, sid, f"INV-G2-{tag}")
+    _invoice(db, sid, f"INV-G2-{tag}")
 
     r = admin_client.post(f"/api/lcs/{lc['id']}/move",
                           json={"new_stage": "shipment_ongoing"})
@@ -110,7 +120,7 @@ def test_payment_due_blocked_without_recipe_or_run(admin_client, db):
     assert admin_client.post(
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
-    create_invoice(db, sid, f"INV-G3-{tag}")
+    _invoice(db, sid, f"INV-G3-{tag}")
     # No recipe and no production yet. Move to shipment_ongoing first.
     r = admin_client.post(f"/api/lcs/{lc['id']}/move",
                           json={"new_stage": "shipment_ongoing"})
@@ -134,7 +144,7 @@ def test_payment_due_blocked_with_recipe_but_no_run(admin_client, db):
     assert admin_client.post(
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
-    create_invoice(db, sid, f"INV-G4-{tag}")
+    _invoice(db, sid, f"INV-G4-{tag}")
     assert add_recipe(db, f"R-G4-{tag}", 100, 0, co, product) is not False
     r = admin_client.post(f"/api/lcs/{lc['id']}/move",
                           json={"new_stage": "shipment_ongoing"})
@@ -156,7 +166,7 @@ def test_payment_due_blocked_when_run_linked_only_to_sale_not_invoice(admin_clie
     assert admin_client.post(
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
-    create_invoice(db, sid, f"INV-G5-{tag}")
+    _invoice(db, sid, f"INV-G5-{tag}")
     assert add_recipe(db, f"R-G5-{tag}", 100, 0, co, product) is not False
     # Production run attached to the sale but NOT to its invoice.
     recipe_id = db.execute(
@@ -188,7 +198,7 @@ def test_payment_due_passes_with_invoice_linked_run(admin_client, db):
     assert admin_client.post(
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
-    create_invoice(db, sid, f"INV-G6-{tag}")
+    _invoice(db, sid, f"INV-G6-{tag}")
     # Get the invoice id just created.
     inv_id = db.execute(
         "SELECT id FROM invoices WHERE sale_id = %s AND invoice_number = %s",
@@ -257,7 +267,7 @@ def test_readiness_endpoint_reports_barrier_state(admin_client, db):
     assert drafts[0]["items"][0]["remaining"] == pytest.approx(10)
 
     # After invoicing, the invoice barrier clears and the draft empties.
-    create_invoice(db, sid, f"INV-G8-{tag}")
+    _invoice(db, sid, f"INV-G8-{tag}")
     out = admin_client.get(f"/api/lcs/{lc['id']}/readiness").get_json()
     assert out["invoices_ok"] is True
     # Seeded invoice consumed the remaining qty, so the draft is empty now.

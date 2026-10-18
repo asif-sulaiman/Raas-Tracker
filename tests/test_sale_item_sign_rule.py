@@ -235,7 +235,9 @@ def test_sign_rule_leaves_descriptive_edits_and_the_invoiced_conflict_alone(db):
     # descriptive edit is allowed on an uninvoiced line.
     assert update_sale_item(db, sid, item_id, product_name="Renamed", unit="L") is True
 
-    create_invoice(db, sid, "INV-SIGN")
+    create_invoice(db, sid, "INV-SIGN",
+                   lines=[{"sale_item_id": item_id, "quantity": 10.0}],
+                   invoice_date="2026-01-15")
     with pytest.raises(InvoicedLineConflict):
         update_sale_item(db, sid, item_id, quantity=0)
     with pytest.raises(InvoicedLineConflict):

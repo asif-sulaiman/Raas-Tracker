@@ -1011,16 +1011,21 @@ def test_api_created_invoice_always_has_lines_backing_its_header(admin_client, d
     nothing and the assertion was satisfied by construction.
 
     There is no report-level guard left to assert, because the API can no longer
-    produce the bad state: ``create_invoice`` takes no amount and always seeds
-    lines, and the migration backfills legacy ones. What is worth asserting is
-    the boundary itself - every invoice the UI can create is fully backed by
-    lines and reads as a real receivable. A stated ``amount`` in the body is
-    ignored, so the old phantom-Paid cannot come back through this route.
+    produce the bad state: ``create_invoice`` requires explicit lines and an
+    ``invoice_date``, and the migration backfills legacy ones. What is worth
+    asserting is the boundary itself - every invoice the UI can create is fully
+    backed by lines and reads as a real receivable. A stated ``amount`` in the
+    body is ignored, so the old phantom-Paid cannot come back through this route.
     """
     sid = _sale(db, "PI-API-LINES", maturity_date="2099-12-31", invoice_lines=None,
                 items=[{"product_name": "A", "quantity": 10, "unit_price": 10}])
+    item_id = db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id", (sid,)
+    ).fetchone()[0]
     r = admin_client.post(f"/api/sales/{sid}/invoices",
-                          json={"invoice_number": "INV-API-1", "amount": 40})
+                          json={"invoice_number": "INV-API-1", "amount": 40,
+                                "invoice_date": "2026-01-15",
+                                "lines": [{"sale_item_id": item_id, "quantity": 10}]})
     assert r.status_code == 201, r.get_json()
     invoice_id = r.get_json()["invoice_id"]
 
@@ -1041,12 +1046,17 @@ def test_default_created_invoice_reports_its_receivable(admin_client, db):
     """Gate 4 B1 fix: the ordinary create path now reports the real amount."""
     from raas_tracker.sales import create_invoice
 
-    # Header-only PI: create_invoice seeds the lines itself (the production path).
+    # The production path: explicit lines and date, no create_invoice_item calls.
     sid = _sale(db, "PI-SEEDED", maturity_date="2099-12-31", invoice_lines=None,
                 items=[{"product_name": "A", "quantity": 10, "unit_price": 10}])
     db.execute("DELETE FROM invoices WHERE sale_id = %s", (sid,))
     db.commit()
-    create_invoice(db, sid, "INV-SEEDED")
+    item_id = db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id", (sid,)
+    ).fetchone()[0]
+    create_invoice(db, sid, "INV-SEEDED",
+                   lines=[{"sale_item_id": item_id, "quantity": 10}],
+                   invoice_date="2026-01-15")
 
     row = _of(_rows(admin_client), sid)[0]
     assert row["quantity"] == 10
