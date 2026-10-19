@@ -432,6 +432,63 @@ while later products are still unbuilt.
 
 ---
 
+## 🧾 Phase INV-UNIFY: PI-faithful invoice editor (In progress)
+
+One invoice-entry surface instead of two divergent ones (`InvoiceCreateForm`
+vs `InvoiceLineEditor` + `InvoiceLineComposer`). The invoice mirrors the PI:
+product and unit price are inherited from the PI line and are **server-owned**;
+the operator types quantity only. Executed in gated phases, one at a time.
+
+| # | Phase | Oracle gate | State |
+|---|---|---|---|
+| 0 | Baseline + deployment reconciliation | — | ✅ 2026-10-19 |
+| 1 | Close the batch-vs-add-line race (`FOR UPDATE` on `sale_items`) | ✅ | ⬜ |
+| 2 | Delete `backfill_invoice_lines` + its tests (auto-invoicing) | ✅ | ⬜ |
+| 3 | `GET /api/sales/<id>/invoice-lines` (kills the N+1 fetch) | — | ⬜ |
+| 4 | Pin the backend invoice contract with tests | — | ⬜ |
+| 5 | `InvoiceEditor` + rewritten `InvoiceLineComposer` | ✅ spec-first | ⬜ |
+| 6 | Swap call sites, delete the legacy files | ✅ | ⬜ |
+| 7 | Docs close-out | — | ⬜ |
+
+### Phase 0 baseline (HEAD `8a35c2f`, clean tree)
+
+| Gate | Result |
+|---|---|
+| `pytest tests/ -q` | 1246 passed, 8 skipped — 16:48 |
+| `npm test` (vitest) | 317 passed / 317 — 1:41 |
+| `npx oxlint` | 0 errors, 11 warnings |
+| `npx vite build` | success, 2.08 s (1.07 MB chunk warning) |
+
+Timings matter when judging whether a run has hung: the backend suite takes
+~17 minutes and the frontend ~100 s. Never pipe the backend suite through
+`| Select-Object` in PowerShell — the pipeline buffers the whole output, so a
+healthy run looks identical to a hang.
+
+An earlier, abandoned attempt at the unified UI was parked in `stash@{0}`
+("wip: unified invoice editor (restore at Phase 6)"). It failed 9 frontend
+tests and *removed* 2 net tests; it is reference material for Phase 5/6, not a
+starting point.
+
+### Deployment reconciliation finding (open)
+
+Production (`njanawhckyhyaduxcodr`, the same database as the app DSN) is **one
+schema version behind `main`**:
+
+- `app_settings.raas_schema_version` = **`5`**; `raas_tracker/db.py:145` is at **`6`**.
+- `public.invoices` has **no `invoice_date` column** — the v6 migration
+  (`710e36f`) has never run there.
+- `raas_schema_sig` is present (7,642 chars), but `_version_is_current("5")` is
+  `False` and `_schema_current()` requires it (`db.py:313`), so `_create_tables()`
+  and `_run_migration()` execute on **every** connection. `backfill_invoice_lines`
+  therefore also runs on every connection — harmless today only because the
+  tables are empty: `invoices` 0, `invoice_items` 0, `sale_items` 1, `sales` 1,
+  `recipe_items` 0, `production_runs` 0.
+- Consequence: deploying `main` applies the v6 DDL on first boot. That is
+  intended, but it must be **observed, not assumed** — after the deploy, re-read
+  `raas_schema_version` (expect `6`) and confirm `invoices.invoice_date` exists.
+
+---
+
 ## 📜 Public contract changes
 
 Every entry here is an **intentional** change to a response a client can
@@ -494,7 +551,7 @@ When starting any task above:
 
 ## 📌 Notes for Agent
 
-- **Current branch:** `main` (commit `c3400c6` + working-tree PBB gate)
+- **Current branch:** `main` (baseline taken at `8a35c2f`)
 - **Local DB:** `DATABASE_URL` set via `setx` (Supabase pooler, encoded pw)
 - **Vercel Preview:** `https://chemcalc-omega.vercel.app/` — auto-deploys on push
 - **Test DB:** `pgserver` embedded (offline) or `TEST_DATABASE_URL`
