@@ -445,7 +445,7 @@ the operator types quantity only. Executed in gated phases, one at a time.
 | 1 | Close the batch-vs-add-line race (`FOR UPDATE` on `sale_items`) | ✅ | ✅ 2026-10-21 (already closed; locked by tests) |
 | 2 | Delete `backfill_invoice_lines` + its tests (auto-invoicing) | ✅ | ✅ 2026-10-21 |
 | 3 | `GET /api/sales/<id>/invoice-lines` (kills the N+1 fetch) | — | ✅ 2026-10-21 |
-| 4 | Pin the backend invoice contract with tests | — | ⬜ |
+| 4 | Pin the backend invoice contract with tests | — | ✅ 2026-10-21 |
 | 5 | `InvoiceEditor` + rewritten `InvoiceLineComposer` | ✅ spec-first | ⬜ |
 | 6 | Swap call sites, delete the legacy files | ✅ | ⬜ |
 | 7 | Docs close-out | — | ⬜ |
@@ -555,6 +555,31 @@ as a non-finite guard) and `pi_proposal_vs_invoiced` has no callers — nothing
 reconciles the two. Synthesising quantity from a header amount would be the
 deleted backfill again, so the endpoint reports the inconsistency instead.
 Production has zero such rows; this is a contract guard, not a live bug.
+
+### Phase 4: writer contract pinned (2026-10-21, tests only)
+
+Most of the contract was already covered, so Phase 4 added only the gaps rather
+than restating `test_invoice_tolerance.py` / `test_invoice_amount.py`:
+
+| Property | Where |
+|---|---|
+| Forged `unit_price`/`line_total` in the POST body is inert: 201, stored price = PI price | `test_create_invoice_ignores_a_forged_unit_price` |
+| Same at the service seam (`validate_invoice_lines` rebuilds the price from `sale_items`) | `test_validate_invoice_lines_ignores_a_forged_unit_price` |
+| The Phase 3 endpoint's 6 dp `ceiling` is accepted verbatim by the writer; `ceiling + 1e-6` is `ToleranceExceeded` | `test_endpoint_ceiling_is_exactly_what_the_writer_accepts` |
+| One `INVOICE_CREATE` per invoice, one `INVOICE_ITEM_ADD` per line, header audited **last** | `test_create_invoice_audits_each_line_then_the_header` |
+| Non-finite PI data → named `ValueError`, no invoice written (the `remaining_invoice_money` call that is otherwise value-unused) | `test_create_invoice_refuses_a_non_finite_pi_total_before_writing` |
+
+Already covered, not duplicated: ceiling boundaries for all three writers
+(`test_invoice_tolerance.py`), atomicity of a failed batch
+(`test_batch_over_allocation_rejected_and_atomic`), create-vs-create race
+(`test_concurrent_creates_cannot_over_invoice_the_sale`), the line-loop audit
+never committing (`test_line_audit_never_commits_mid_create`), and Phase 1's
+batch-vs-add-line lock test.
+
+Mutation check: making `validate_invoice_lines` trust `line.get("unit_price")`
+fails `test_validate_invoice_lines_ignores_a_forged_unit_price` (0.01 vs 7.5).
+The API-level twin keeps passing under that mutation by design — Pydantic drops
+the field before the service sees it, so the two tests pin different layers.
 
 ### Phase 0 baseline (HEAD `8a35c2f`, clean tree)
 
