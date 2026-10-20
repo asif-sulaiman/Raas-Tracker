@@ -416,8 +416,9 @@ class TestWriterLockDiscipline:
       then checks tolerance (``:2529``)
 
     These are characterisation tests: the locks already exist (the batch lock
-    dates from 7a7ae73), so they pass on the current code. Each was verified to
-    bite by deleting the lock it covers and re-running it.
+    dates from 7a7ae73), so they pass on the current code. The batch lock was
+    mutation-checked by deleting ``sales.py:1933-1935`` and observing both
+    tests fail; see each test for what it does and does not pin.
     """
 
     @staticmethod
@@ -435,18 +436,26 @@ class TestWriterLockDiscipline:
         Returns the exception the writer raised. A writer that takes the PI
         line lock blocks and trips ``lock_timeout``; one that does not returns
         normally, and the caller's assertion fails.
+
+        ``lock_timeout`` is set transaction-locally (``set_config(..., true)``)
+        because the pool has no ``reset=`` callback (``db.py:202-208``) and
+        ``_PooledConnection.close()`` commits instead of closing
+        (``db.py:55-72``). A session-scoped setting would therefore leak onto
+        the next test that reuses this physical connection, and a plain
+        ``close()`` would commit a half-written probe.
         """
         errors = []
 
         def _target():
             conn = get_connection(pg_dsn)
             try:
-                conn.execute("SELECT set_config('lock_timeout', %s, false)",
+                conn.execute("SELECT set_config('lock_timeout', %s, true)",
                              (f"{timeout_ms}ms",))
                 call(conn)
             except Exception as e:          # noqa: BLE001 - asserted by the caller
                 errors.append(e)
             finally:
+                conn.rollback()
                 conn.close()
 
         thread = threading.Thread(target=_target, daemon=True)
@@ -494,6 +503,14 @@ class TestWriterLockDiscipline:
         Both writers are parked on the same PI line lock, so whichever loses
         cannot evaluate tolerance until the winner commits. 60 + 60 against a
         105 ceiling therefore admits exactly one, in either grant order.
+
+        This is an *outcome* test, not a deterministic mutation detector for
+        the add-line lock. Delete that lock and whether this fails depends on
+        which request is queued first on the row: if the unlocked writer wins
+        the queue it commits, the other correctly refuses, and the assertion
+        still holds. ``test_batch_locks_every_pi_line_of_the_sale`` is the
+        deterministic detector, because it bills a *different* PI line and so
+        removes the foreign-key confound.
         """
         co = _company(db)
         sid = _sale(db, co, qty=100, price=100)
@@ -515,6 +532,7 @@ class TestWriterLockDiscipline:
             except Exception as e:          # noqa: BLE001 - asserted below
                 errors.append(e)
             finally:
+                conn.rollback()
                 conn.close()
 
         def _batch():
@@ -525,6 +543,7 @@ class TestWriterLockDiscipline:
             except Exception as e:          # noqa: BLE001 - asserted below
                 errors.append(e)
             finally:
+                conn.rollback()
                 conn.close()
 
         holder = self._hold_pi_line(pg_dsn, sale_item_id)
