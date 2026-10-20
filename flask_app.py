@@ -162,7 +162,7 @@ from raas_tracker.sales import (
     create_invoice, list_invoices, book_invoice, ship_invoice,
     mark_invoice_paid, void_invoice, get_sale_completion, _now_str,
     check_lc_shipment_ready, create_invoice_item, list_invoice_items,
-    create_invoices_batch,
+    create_invoices_batch, list_sale_invoice_lines,
     # Per-invoice production gate for GET /api/invoices/<id>/readiness, plus the
     # shared blocked-message so the readiness hint and book_invoice's 409 agree.
     invoice_production_readiness, _production_blocked_message,
@@ -2502,6 +2502,25 @@ def api_list_invoices(sale_id):
     invoices = list_invoices(conn, sale_id, with_readiness=True)
     conn.close()
     return jsonify(invoices)
+
+
+@app.route("/api/sales/<int:sale_id>/invoice-lines")
+@limited()
+def api_list_sale_invoice_lines(sale_id):
+    """PI lines with their invoice budget: invoiced, remaining, ceiling.
+
+    One request replaces the N+1 (sale detail, then one items call per invoice)
+    and exposes the 6 dp ceiling the writer enforces, so the composer can stop
+    the operator before the server has to.
+    """
+    conn = get_db()
+    if not conn.execute("SELECT 1 FROM sales WHERE id = %s",
+                        (sale_id,)).fetchone():
+        _rollback_close(conn)
+        return jsonify({"error": "Sale not found"}), 404
+    result = list_sale_invoice_lines(conn, sale_id)
+    conn.close()
+    return jsonify(result)
 
 
 def _invoice_url_sale_check(conn, sale_id, invoice_id):

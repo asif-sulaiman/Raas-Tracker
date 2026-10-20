@@ -2590,6 +2590,70 @@ def list_invoice_items(conn: psycopg.Connection,
     ]
 
 
+def list_sale_invoice_lines(conn: psycopg.Connection,
+                            sale_id: int) -> Dict[str, Any]:
+    """PI lines of a sale with what has been invoiced against each.
+
+    One row per ``sale_items`` line, aggregated across **every** invoice of the
+    sale, exactly as ``check_invoice_tolerance`` counts them (no status filter),
+    so the budget the UI shows and the refusal the writer raises cannot
+    disagree.
+
+    ``remaining`` is quantity only (``PI - invoiced``), floored at zero for
+    display. A fully invoiced line is still returned: it does not disappear from
+    the composer just because it has no budget left.
+
+    ``ceiling`` is ``PI * OVER_INVOICE_TOLERANCE`` at 6 dp, computed with the
+    same ``Decimal(str(...))`` expression as ``check_invoice_tolerance`` so a
+    quantity the UI offers is exactly a quantity the writer accepts.
+
+    ``has_line_less_invoices`` warns that a legacy invoice carries header money
+    that no line backs. Its quantity contributes 0 here, so ``remaining`` would
+    overstate the budget; callers must not treat it as authoritative in that
+    case.
+    """
+    rows = conn.execute(
+        """SELECT si.id, si.product_name, si.unit, si.quantity, si.unit_price,
+                  COALESCE(SUM(ii.quantity)::numeric, 0) AS invoiced,
+                  COALESCE(array_agg(DISTINCT ii.invoice_id)
+                           FILTER (WHERE ii.invoice_id IS NOT NULL), '{}')
+               FROM sale_items si
+               LEFT JOIN invoice_items ii ON ii.sale_item_id = si.id
+               LEFT JOIN invoices i ON i.id = ii.invoice_id
+               WHERE si.sale_id = %s
+               GROUP BY si.id, si.product_name, si.unit, si.quantity, si.unit_price
+               ORDER BY si.id""",
+        (sale_id,)
+    ).fetchall()
+
+    lines: List[Dict[str, Any]] = []
+    for item_id, product_name, unit, pi_qty, unit_price, invoiced, invoice_ids in rows:
+        pi = Decimal(str(pi_qty or 0))
+        done = Decimal(str(invoiced or 0))
+        ceiling = (pi * OVER_INVOICE_TOLERANCE).quantize(Decimal("0.000001"))
+        lines.append({
+            "sale_id": sale_id,
+            "sale_item_id": item_id,
+            "product_name": product_name,
+            "unit": unit or "KG",
+            "pi_quantity": float(pi),
+            "invoiced_quantity": float(done),
+            "remaining": float(max(pi - done, Decimal("0"))),
+            "ceiling": float(ceiling),
+            "unit_price": float(unit_price or 0),
+            "invoice_ids": sorted(invoice_ids),
+        })
+
+    legacy = conn.execute(
+        """SELECT EXISTS (
+               SELECT 1 FROM invoices i
+               WHERE i.sale_id = %s
+                 AND NOT EXISTS (SELECT 1 FROM invoice_items ii
+                                 WHERE ii.invoice_id = i.id))""",
+        (sale_id,)).fetchone()[0]
+    return {"lines": lines, "has_line_less_invoices": bool(legacy)}
+
+
 def invoiced_total_for_sale(conn: psycopg.Connection, sale_id: int) -> float:
     """SUM of an entire sale's invoice lines (``line_total``), 0.0 when none."""
     row = conn.execute(
