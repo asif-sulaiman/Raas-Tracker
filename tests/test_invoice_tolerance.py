@@ -9,11 +9,17 @@ Three writers must share one helper:
 3. create_invoices_batch (N invoices x M lines)
 """
 
-import pytest
+import threading
+import time
 from decimal import Decimal
 
+import psycopg
+import pytest
+
+from chem_stock import get_connection
 from raas_tracker.sales import (
     add_sale,
+    add_sale_item,
     create_invoice,
     create_invoice_item,
     create_invoices_batch,
@@ -393,3 +399,150 @@ class TestMultipleInvoicesSameSaleItem:
         inv2_id = _invoice(db, sid, "INV-2")
         line = create_invoice_item(db, inv2_id, sale_item_id, 53.0)
         assert line["quantity"] == 53.0
+
+
+class TestWriterLockDiscipline:
+    """Each writer must hold the PI line lock *before* it decides tolerance.
+
+    The 5% ceiling is only sound if a second writer cannot read the same
+    pre-existing total while the first is still mid-flight. Every writer
+    therefore takes ``sale_items ... FOR UPDATE`` and holds it until commit:
+
+    - ``create_invoice``        -> ``validate_invoice_lines`` locks each line
+      (``sales.py:1714-1717``), then checks tolerance (``:1841``)
+    - ``create_invoices_batch`` -> locks every PI line of the sale up front
+      (``sales.py:1933-1935``), then checks tolerance (``:1985``)
+    - ``create_invoice_item``   -> locks its single PI line (``sales.py:2518-2521``),
+      then checks tolerance (``:2529``)
+
+    These are characterisation tests: the locks already exist (the batch lock
+    dates from 7a7ae73), so they pass on the current code. Each was verified to
+    bite by deleting the lock it covers and re-running it.
+    """
+
+    @staticmethod
+    def _hold_pi_line(pg_dsn, sale_item_id):
+        """A second connection holding the PI line lock, like a writer mid-flight."""
+        conn = get_connection(pg_dsn)
+        conn.execute("SELECT id FROM sale_items WHERE id = %s FOR UPDATE",
+                     (sale_item_id,))
+        return conn
+
+    @staticmethod
+    def _run_locked_out(pg_dsn, call, timeout_ms=300):
+        """Run ``call(conn)`` on a thread with a short ``lock_timeout``.
+
+        Returns the exception the writer raised. A writer that takes the PI
+        line lock blocks and trips ``lock_timeout``; one that does not returns
+        normally, and the caller's assertion fails.
+        """
+        errors = []
+
+        def _target():
+            conn = get_connection(pg_dsn)
+            try:
+                conn.execute("SELECT set_config('lock_timeout', %s, false)",
+                             (f"{timeout_ms}ms",))
+                call(conn)
+            except Exception as e:          # noqa: BLE001 - asserted by the caller
+                errors.append(e)
+            finally:
+                conn.close()
+
+        thread = threading.Thread(target=_target, daemon=True)
+        thread.start()
+        thread.join(timeout=30)
+        assert not thread.is_alive(), "writer never returned"
+        return errors
+
+    def test_batch_locks_every_pi_line_of_the_sale(self, db, pg_dsn):
+        """A batch invoicing one product still waits on a lock held on another.
+
+        Probe design matters here. Any writer that eventually INSERTs an
+        ``invoice_items`` row blocks on the referenced ``sale_items`` row
+        anyway, because the foreign key takes ``FOR KEY SHARE`` and that
+        conflicts with ``FOR UPDATE``. Holding the lock on a *different* PI
+        line of the same sale removes that confound, so a pass can only come
+        from ``create_invoices_batch`` locking the whole sale up front
+        (``sales.py:1933-1935``) rather than just the lines it bills.
+        """
+        co = _company(db)
+        sid = _sale(db, co, qty=100, price=100)
+        add_sale_item(db, sid, "Product B", 100, 100)
+        first, second = _get_sale_items(db, sid)[:2]
+
+        # The batch bills ONLY the second PI line.
+        batch = [{"invoice_number": "INV-BATCH", "invoice_date": "2026-01-15",
+                  "lines": [{"sale_item_id": second[0], "quantity": 5.0}]}]
+
+        holder = self._hold_pi_line(pg_dsn, first[0])
+        try:
+            errors = self._run_locked_out(
+                pg_dsn,
+                lambda conn: create_invoices_batch(conn, sid, batch),
+            )
+        finally:
+            holder.rollback()
+            holder.close()
+
+        assert len(errors) == 1, "batch billed a line the sale-level lock still holds"
+        assert isinstance(errors[0], psycopg.errors.LockNotAvailable), errors[0]
+
+    def test_add_line_and_batch_cannot_jointly_exceed_the_ceiling(self, db, pg_dsn):
+        """The loser re-reads the winner's rows, so the two cannot jointly exceed 105.
+
+        Both writers are parked on the same PI line lock, so whichever loses
+        cannot evaluate tolerance until the winner commits. 60 + 60 against a
+        105 ceiling therefore admits exactly one, in either grant order.
+        """
+        co = _company(db)
+        sid = _sale(db, co, qty=100, price=100)
+        sale_item_id = _get_sale_items(db, sid)[0][0]
+        target_invoice = _invoice(db, sid, "INV-A")
+        _invoice(db, sid, "INV-B")          # baseline: 2 units already invoiced
+
+        batch = [{"invoice_number": "INV-BATCH", "invoice_date": "2026-01-15",
+                  "lines": [{"sale_item_id": sale_item_id, "quantity": 60.0}]}]
+
+        errors = []
+        parked = threading.Barrier(2, timeout=10)
+
+        def _add_line():
+            conn = get_connection(pg_dsn)
+            try:
+                parked.wait()
+                create_invoice_item(conn, target_invoice, sale_item_id, 60.0)
+            except Exception as e:          # noqa: BLE001 - asserted below
+                errors.append(e)
+            finally:
+                conn.close()
+
+        def _batch():
+            conn = get_connection(pg_dsn)
+            try:
+                parked.wait()
+                create_invoices_batch(conn, sid, batch)
+            except Exception as e:          # noqa: BLE001 - asserted below
+                errors.append(e)
+            finally:
+                conn.close()
+
+        holder = self._hold_pi_line(pg_dsn, sale_item_id)
+        threads = [threading.Thread(target=_add_line, daemon=True),
+                   threading.Thread(target=_batch, daemon=True)]
+        for thread in threads:
+            thread.start()
+        time.sleep(0.2)                     # let both park on the lock
+        holder.rollback()
+        holder.close()
+        for thread in threads:
+            thread.join(timeout=30)
+        assert not any(t.is_alive() for t in threads), "a writer never returned"
+
+        invoiced = db.execute(
+            "SELECT COALESCE(SUM(ii.quantity), 0) FROM invoice_items ii "
+            "JOIN invoices i ON i.id = ii.invoice_id WHERE i.sale_id = %s",
+            (sid,)).fetchone()[0]
+        assert Decimal(str(invoiced)) <= Decimal("105"), (
+            f"over-invoiced: {invoiced} > 105")
+        assert len(errors) == 1, f"exactly one writer must lose, got {errors}"
