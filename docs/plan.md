@@ -443,7 +443,7 @@ the operator types quantity only. Executed in gated phases, one at a time.
 |---|---|---|---|
 | 0 | Baseline + deployment reconciliation | — | ✅ 2026-10-21 |
 | 1 | Close the batch-vs-add-line race (`FOR UPDATE` on `sale_items`) | ✅ | ✅ 2026-10-21 (already closed; locked by tests) |
-| 2 | Delete `backfill_invoice_lines` + its tests (auto-invoicing) | ✅ | ⬜ |
+| 2 | Delete `backfill_invoice_lines` + its tests (auto-invoicing) | ✅ | ✅ 2026-10-21 |
 | 3 | `GET /api/sales/<id>/invoice-lines` (kills the N+1 fetch) | — | ⬜ |
 | 4 | Pin the backend invoice contract with tests | — | ⬜ |
 | 5 | `InvoiceEditor` + rewritten `InvoiceLineComposer` | ✅ spec-first | ⬜ |
@@ -488,12 +488,33 @@ non-default `default_transaction_isolation`. A database or role default of
 REPEATABLE READ would let the loser keep a pre-lock snapshot and miss the
 winner's rows.
 
-Still unlocked, and *not* fixed here: `db.py:506` (`backfill_invoice_lines`)
-evaluates quantities with no `sale_items` lock — Phase 2 deletes it. Separately,
+The remaining unlocked writer, `backfill_invoice_lines` (then `db.py:506`), was
+deleted in Phase 2 — it evaluated quantities with no `sale_items` lock. Separately,
 `delete_sale_item` (`sales.py:770-790`) counts `invoice_items` unlocked and then
-deletes the parent, which `ON DELETE SET NULL` (`db.py:1062`) turns into an
+deletes the parent, which `ON DELETE SET NULL` (`db.py:959`) turns into an
 orphaned invoice line; that TOCTOU belongs with the other parent-mutation gaps
 tracked at the end of this file, not with Phase 1.
+
+### Phase 2: auto-invoicing removed (2026-10-21)
+
+`backfill_invoice_lines` and its call inside `_create_tables` are gone, along
+with the `Decimal` / `ROUND_HALF_UP` import and the `_D` alias that only it used.
+No invoice line can now be written without an operator action.
+
+Two tests went with it, not the one the plan named:
+`test_backfill_invoice_lines_seeds_and_is_idempotent` **and**
+`test_backfill_reachable_through_get_connection` — the second took the file's tail
+plus its `salesmod_leftover_count` helper (`tests/test_lc_schema.py:353-457`).
+Deleting the function before the tests turned both red (`AttributeError`, and
+`backfill did not run on version bump`), which is the evidence they were really
+exercising it rather than decoration.
+
+`_SCHEMA_VERSION` was deliberately **not** bumped: `_schema_signature_live`
+(`db.py:260-270`) hashes columns and indexes only, and this phase changes neither.
+
+Accepted consequence: a legacy line-less invoice stays line-less. That is the
+intended behaviour — it is exactly the fabricated-receivable path this phase
+removes — and production has zero invoices.
 
 ### Phase 0 baseline (HEAD `8a35c2f`, clean tree)
 
@@ -519,14 +540,14 @@ starting point.
 Production (`njanawhckyhyaduxcodr`, the same database as the app DSN) is **one
 schema version behind `main`**:
 
-- `app_settings.raas_schema_version` = **`5`**; `raas_tracker/db.py:145` is at **`6`**.
+- `app_settings.raas_schema_version` = **`5`**; `raas_tracker/db.py:141` is at **`6`**.
 - `public.invoices` has **no `invoice_date` column** — the v6 migration
   (`710e36f`) has never run there.
 - `raas_schema_sig` is present (7,642 chars), but `_version_is_current("5")` is
-  `False` and `_schema_current()` requires it (`db.py:313`), so `_create_tables()`
-  and `_run_migration()` execute on **every** connection. `backfill_invoice_lines`
-  therefore also runs on every connection — harmless today only because the
-  tables are empty: `invoices` 0, `invoice_items` 0, `sale_items` 1, `sales` 1,
+  `False` and `_schema_current()` requires it (`db.py:309`), so `_create_tables()`
+  and `_run_migration()` execute on **every** connection. (Until Phase 2,
+  `backfill_invoice_lines` ran there too.) Harmless today because the tables are
+  empty: `invoices` 0, `invoice_items` 0, `sale_items` 1, `sales` 1,
   `recipe_items` 0, `production_runs` 0.
 - Consequence: deploying `main` applies the v6 DDL on first boot. That is
   intended, but it must be **observed, not assumed** — after the deploy, re-read
@@ -584,7 +605,7 @@ Also documented in `docs/SPEC.md` §4 ("Sales Invoices", "Invoice Items"), §6 a
 
 | # | Limitation | Why it stands | What closing it needs |
 |---|---|---|---|
-| 1 | **The gate matches products by name**, not by a stable id: `lower(recipes.product_name) = lower(invoice_items.product_name)`, and `invoice_items.product_name` is a denormalised copy taken at line-creation time. Rename a product after invoicing and the gate looks for a recipe under the old name, refusing booking indefinitely. | `production_runs.sale_item_id` exists but is **always NULL** — the only INSERT (`recipes.py:637`) never sets it and its `NOT NULL` was dropped at `db.py:950`. There is no other stable link. | Populate `production_runs.sale_item_id` in `create_production_run`, then join on it in `invoice_production_readiness` with a name fallback for historical rows. |
+| 1 | **The gate matches products by name**, not by a stable id: `lower(recipes.product_name) = lower(invoice_items.product_name)`, and `invoice_items.product_name` is a denormalised copy taken at line-creation time. Rename a product after invoicing and the gate looks for a recipe under the old name, refusing booking indefinitely. | `production_runs.sale_item_id` exists but is **always NULL** — the only INSERT (`recipes.py:637`) never sets it and its `NOT NULL` was dropped at `db.py:860`. There is no other stable link. | Populate `production_runs.sale_item_id` in `create_production_run`, then join on it in `invoice_production_readiness` with a name fallback for historical rows. |
 | 2 | **The gate asserts production *presence*, not *quantity*.** Producing 1 KG against a 3,000 KG invoice line unblocks booking. | Decided deliberately: booking is a commercial act, and the production department owns whether a batch was sufficient. | Compare `SUM(qty_produced)` per invoice line against `invoice_items.quantity`. Blocked on a unit: neither `recipes` nor `production_runs` stores the product unit, so the two numbers cannot be compared soundly without one. |
 | 3 | **The batch endpoint still caps quantity at the PI remainder**, while the single-invoice path allows over-PI quantities. Invoices needing more than the remainder must be created one at a time. | Left as-is to avoid widening the blast radius of the booking-gate change. | Drop the `remaining` ceiling in `create_invoices_batch` (`sales.py:1864-1868`) to match the single-invoice contract. |
 
