@@ -497,9 +497,10 @@ tracked at the end of this file, not with Phase 1.
 
 ### Phase 2: auto-invoicing removed (2026-10-21)
 
-`backfill_invoice_lines` and its call inside `_create_tables` are gone, along
-with the `Decimal` / `ROUND_HALF_UP` import and the `_D` alias that only it used.
-No invoice line can now be written without an operator action.
+`backfill_invoice_lines` and its call inside `_run_migration` (invoked by
+`_create_tables`, `db.py:347`) are gone, along with the `Decimal` /
+`ROUND_HALF_UP` import and the `_D` alias that only it used. No invoice line can
+now be written without an operator action.
 
 Two tests went with it, not the one the plan named:
 `test_backfill_invoice_lines_seeds_and_is_idempotent` **and**
@@ -507,14 +508,44 @@ Two tests went with it, not the one the plan named:
 plus its `salesmod_leftover_count` helper (`tests/test_lc_schema.py:353-457`).
 Deleting the function before the tests turned both red (`AttributeError`, and
 `backfill did not run on version bump`), which is the evidence they were really
-exercising it rather than decoration.
+exercising it rather than decoration. A guard replaces them:
+`test_migration_never_invents_invoice_lines` forces a full migration pass on a
+line-less invoice and asserts the line count is still 0. It was mutation-checked
+by temporarily re-adding a seeding write, which turned it red.
 
-`_SCHEMA_VERSION` was deliberately **not** bumped: `_schema_signature_live`
-(`db.py:260-270`) hashes columns and indexes only, and this phase changes neither.
+`_SCHEMA_VERSION` was deliberately **not** bumped. The bump rule (`db.py:122-124`)
+requires a bump when `_create_tables()` gains DDL, changes a column default, or
+adds a one-shot data migration; this phase does none of those. Deleting a seed is
+not a reason to bump — a bump would re-run every migration everywhere for no
+benefit. (`_schema_signature_live`, `db.py:260-270`, hashes columns and indexes
+only, and those are unchanged.)
 
-Accepted consequence: a legacy line-less invoice stays line-less. That is the
-intended behaviour — it is exactly the fabricated-receivable path this phase
-removes — and production has zero invoices.
+Accepted consequence, stated precisely: a legacy line-less invoice stays
+line-less, contributes nothing to `sale_total`, and makes a sale whose only
+invoice it is report `gross_sales = 0`, `due = 0` and therefore
+`payment_status = "Paid"` (`sales.py:1203-1206`, `:1240-1242`, `:1045-1046`).
+That is the honest outcome versus inventing a receivable. Production has zero
+invoices, so nothing is affected today; any other deployment must verify
+line-less invoices = 0 before trusting its commercial report.
+
+### Phase 3 contract note (from the Phase 2 review)
+
+`remaining` must be defined explicitly, because `invoice_items` is no longer
+guaranteed to cover a PI line:
+
+- **Quantity** is `PI qty − SUM(invoice_items.quantity)`. A line-less legacy
+  invoice contributes 0, so the whole PI quantity reads as remaining and the 5%
+  ceiling would permit re-invoicing it.
+- **Money** has a helper that *does* count a header-only invoice
+  (`_invoice_money_already_on_sale`, `sales.py:1618-1643`), but its result is
+  discarded at `sales.py:1837` (kept only as a non-finite guard) and
+  `pi_proposal_vs_invoiced` has no callers. Nothing reconciles the two today.
+
+Do **not** synthesise quantity from a header amount — that is the deleted
+backfill again. Return a `has_line_less_invoices` flag (or the legacy header
+total) so the UI never treats the quantity as authoritative, and add a test that
+inserts one line-less invoice directly. Production has zero, so this is a
+contract guard, not a live bug.
 
 ### Phase 0 baseline (HEAD `8a35c2f`, clean tree)
 
@@ -607,7 +638,7 @@ Also documented in `docs/SPEC.md` §4 ("Sales Invoices", "Invoice Items"), §6 a
 |---|---|---|---|
 | 1 | **The gate matches products by name**, not by a stable id: `lower(recipes.product_name) = lower(invoice_items.product_name)`, and `invoice_items.product_name` is a denormalised copy taken at line-creation time. Rename a product after invoicing and the gate looks for a recipe under the old name, refusing booking indefinitely. | `production_runs.sale_item_id` exists but is **always NULL** — the only INSERT (`recipes.py:637`) never sets it and its `NOT NULL` was dropped at `db.py:860`. There is no other stable link. | Populate `production_runs.sale_item_id` in `create_production_run`, then join on it in `invoice_production_readiness` with a name fallback for historical rows. |
 | 2 | **The gate asserts production *presence*, not *quantity*.** Producing 1 KG against a 3,000 KG invoice line unblocks booking. | Decided deliberately: booking is a commercial act, and the production department owns whether a batch was sufficient. | Compare `SUM(qty_produced)` per invoice line against `invoice_items.quantity`. Blocked on a unit: neither `recipes` nor `production_runs` stores the product unit, so the two numbers cannot be compared soundly without one. |
-| 3 | **The batch endpoint still caps quantity at the PI remainder**, while the single-invoice path allows over-PI quantities. Invoices needing more than the remainder must be created one at a time. | Left as-is to avoid widening the blast radius of the booking-gate change. | Drop the `remaining` ceiling in `create_invoices_batch` (`sales.py:1864-1868`) to match the single-invoice contract. |
+| 3 | **A line-less legacy invoice is invisible to quantity checks** but its header money is still real. `remaining` derives from `invoice_items` only, so the PI quantity reads as fully uninvoiced. | Phase 2 removed the seed that hid this; production has zero such rows. | Surface `has_line_less_invoices` from `GET /api/sales/<id>/invoice-lines` (see the Phase 3 contract note) rather than repairing the data. |
 
 ---
 
