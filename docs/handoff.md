@@ -5,6 +5,68 @@
 
 ---
 
+## 2026-10-21 — Invoice overhaul Phases 0–5 (editor built, call sites not swapped)
+
+### What was completed
+- **Phase 0** (`a92b01a`): baseline on `8a35c2f`; red WIP UI work parked in
+  `stash@{0}` ("wip: unified invoice editor (restore at Phase 6)"); production
+  schema facts recorded.
+- **Phase 1** (`712f66a`, `9e89c60`, `0cd51bf`): the batch-vs-add-line race was
+  **already closed** (`sales.py:1933-1935` locks `sale_items FOR UPDATE`);
+  added `TestWriterLockDiscipline` + transaction-local `lock_timeout`.
+- **Phase 2** (`2cc7b0f`, `9a7881b`, `f687c08`, `9a2be16`): deleted
+  `backfill_invoice_lines` and `tests/test_lc_schema.py:353-457`; guard test
+  that no migration invents invoice lines; corrected PRD/SPEC/plan claims.
+- **Phase 3** (`866e870`, `c2b45a5`): `list_sale_invoice_lines` +
+  `GET /api/sales/<id>/invoice-lines`; 8 contract tests.
+- **Phase 4** (`d79cab6`, `e27dfdb`): 5 characterisation pins (forged price,
+  endpoint/writer ceiling parity, audit shape, non-finite guard).
+- **Phase 5** (`f6c7fe4`, `23b8743`): `InvoiceEditor` (create | add-line) +
+  `useInvoiceBudget` + 12 tests; `code` on the add-line 404
+  (`invoice_gone` | `pi_line_gone`); `ApiError.code`.
+
+### Decisions made & why
+- **The ceiling is a hard stop, not advertised headroom.** Over-limit is
+  `typed > 0 && invoiced + typed > ceiling + 1e-9`; the maximum comes from the
+  payload's absolute `ceiling`, never `pi * 1.05`.
+- **Refusals are classified structurally** — status code plus the reloaded
+  budget, plus `code` for the ambiguous 404. No message parsing anywhere.
+- **No `_SCHEMA_VERSION` bump in Phase 2.** The rule (`db.py:122-124`) covers new
+  DDL, a column-default change, or a one-shot data migration; deleting a
+  one-shot migration is none of those.
+- **The editor is unrendered on purpose.** Nothing imports it yet, so the
+  composer rewrite waits for Phase 6 rather than leaving two dead composers.
+
+### What remains + next steps
+1. **Phase 6 (Oracle gate 4).** Swap the four call sites (`InvoicePanel.jsx:502`,
+   `SaleDetailModal.jsx:39-99`, `InvoicesRequiredModal.jsx:61`,
+   `ProductionRunModal.jsx:222`), rewrite `InvoiceLineComposer.jsx`, then delete
+   `InvoiceCreateForm`, `InvoiceLineEditor` (+test), `InvoiceBuilderModal`,
+   `fetchSaleInvoiceLines`, `useSaleInvoiceLines`. Also: rewrite
+   `InvoicesRequiredModal.test.jsx:93` (asserts the broken payload) and the
+   `SaleDetailModal.test.jsx` F10 case, fix the `aria-label="Invoice number"`
+   collision, drop the dead `lcId` props, add `@limited()` to
+   `api_list_invoices` (`flask_app.py:2497`). Zero-post runs must not toast
+   success.
+2. **Phase 7 — docs:** PRD Flow 6, SPEC §4/§6 (`SPEC:449` wording), the stale
+   `useSaleInvoiceLines` docstring at `InvoicePanel.jsx:84`.
+3. **Production deploy check (open since Phase 0):** prod is at
+   `raas_schema_version` 5 with no `invoices.invoice_date`. After deploying,
+   re-read the version (expect 6) and confirm the column exists — observed, not
+   assumed.
+
+### Known issues
+- **`npm test` flakes under full-suite load** (1–4 tests in the slowest files,
+  different set each run, all pass alone and as a group). Worker starvation, not
+  behaviour — see `docs/plan.md`.
+- **Backend suite is ~25 min serially** (real PG, fixtures TRUNCATE) — never
+  parallelise, and never pipe it through `| Select-Object`.
+- **`stash@{0}` is reference only** — keep until Phase 6 lands, then drop.
+- **Line-less legacy invoices contribute 0 quantity** by design; a sale whose
+  only invoice is line-less reports `gross_sales = 0`, `due = 0`, "Paid".
+
+---
+
 ## 2026-10-12 — Docs currency pass (INV-REVISION + PBB gate)
 
 ### What was completed
