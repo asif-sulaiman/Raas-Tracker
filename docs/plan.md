@@ -462,22 +462,38 @@ its own line (`sales.py:2518-2521`); all three hold the lock to commit
 (`sales.py:1904`, `:2042`, `:2560`).
 
 **No production code changed.** `TestWriterLockDiscipline`
-(`tests/test_invoice_tolerance.py`) pins the behaviour instead, and both tests
-were verified to bite by deleting the lock each one covers:
+(`tests/test_invoice_tolerance.py`) pins the behaviour instead. The batch lock
+was mutation-checked by deleting `sales.py:1933-1935` and re-running:
 
 | Test | Lock deleted | Observed failure |
 |---|---|---|
-| `test_batch_locks_every_pi_line_of_the_sale` | the batch's sale-level `FOR UPDATE` | batch billed a line the lock still held |
-| `test_add_line_and_batch_cannot_jointly_exceed_the_ceiling` | the batch's, then the add-line's | `over-invoiced: 122.0 > 105` either way |
+| `test_batch_locks_every_pi_line_of_the_sale` | the `sale_items ... FOR UPDATE` at `sales.py:1933-1935` (**not** the `sales` row at `:1929`) | batch billed a line the lock still held |
+| `test_add_line_and_batch_cannot_jointly_exceed_the_ceiling` | the batch's, then the add-line's `:2520` | `over-invoiced: 122.0 > 105` either way |
 
-A naive "does it block?" probe cannot test this: any writer that inserts an
-`invoice_items` row waits on the foreign key's `FOR KEY SHARE` for the
+Only the first is a deterministic mutation detector. The joint test is an
+*outcome* test: delete the add-line lock and whether it fails depends on which
+request is queued first on the row, because the unlocked writer checks
+tolerance before it blocks. Do not cite it as proof that the add-line lock is
+pinned.
+
+A naive "does it block?" probe cannot test this either: any writer that inserts
+an `invoice_items` row waits on the foreign key's `FOR KEY SHARE` for the
 referenced `sale_items` row, which conflicts with `FOR UPDATE` anyway. The first
 test therefore holds the lock on a **different** PI line of the same sale, which
 removes the confound.
 
-The only writer that still evaluates quantities without a `sale_items` lock is
-`db.py:506` (`backfill_invoice_lines`) — Phase 2 deletes it.
+**Precondition for the whole argument:** it holds under PostgreSQL READ
+COMMITTED, which is what the app uses — nothing sets `SET TRANSACTION` or a
+non-default `default_transaction_isolation`. A database or role default of
+REPEATABLE READ would let the loser keep a pre-lock snapshot and miss the
+winner's rows.
+
+Still unlocked, and *not* fixed here: `db.py:506` (`backfill_invoice_lines`)
+evaluates quantities with no `sale_items` lock — Phase 2 deletes it. Separately,
+`delete_sale_item` (`sales.py:770-790`) counts `invoice_items` unlocked and then
+deletes the parent, which `ON DELETE SET NULL` (`db.py:1062`) turns into an
+orphaned invoice line; that TOCTOU belongs with the other parent-mutation gaps
+tracked at the end of this file, not with Phase 1.
 
 ### Phase 0 baseline (HEAD `8a35c2f`, clean tree)
 
