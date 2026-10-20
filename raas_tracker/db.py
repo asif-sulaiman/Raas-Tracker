@@ -30,11 +30,7 @@ import atexit
 import logging as _logging
 import os
 import threading
-from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Set
-
-# Exact Decimal for DB numeric/REAL values; money is never float here.
-_D = Decimal
 
 import psycopg
 from psycopg_pool import ConnectionPool
@@ -430,105 +426,6 @@ def backfill_lc_links(conn: psycopg.Connection) -> int:
         logger.info("Backfilled %s sales rows to letters_of_credit.", linked)
     return linked
 
-
-def backfill_invoice_lines(conn: psycopg.Connection) -> int:
-    """Give legacy line-less invoices their invoice_items rows.
-
-    The commercial report is invoice-driven, so an invoice with no lines
-    contributes 0 to gross and sale_total - a real receivable would report as
-    paid. Invoices created before invoice_items existed have no lines at all.
-
-    Each legacy invoice is filled from its OWN header ``amount``, because that
-    header is the only record of what was actually billed for it. An earlier
-    version seeded the whole PI into the first line-less invoice, which invented
-    a full receivable for a 30% advance. Now the PI's remaining quantity is
-    allocated across a sale's line-less invoices in id order, each capped at its
-    header amount, so a partial/advance invoice keeps its own value and the rest
-    of the PI stays uninvoiced (and correctly shows as outstanding).
-
-    Idempotent: only invoices with zero lines are touched.
-
-    A line-less invoice with a NULL amount is deliberately LEFT ALONE and logged.
-    Its amount is unknown, so any lines invented for it would be a guess; an
-    unknown invoice contributing 0 to gross is honest, a fabricated one is not.
-
-    Commit-free: _create_tables owns the single transaction.
-    """
-    sales_rows = conn.execute(
-        """SELECT DISTINCT i.sale_id
-           FROM invoices i
-           WHERE NOT EXISTS (SELECT 1 FROM invoice_items ii WHERE ii.invoice_id = i.id)
-             AND EXISTS (SELECT 1 FROM sale_items si WHERE si.sale_id = i.sale_id)
-           ORDER BY i.sale_id"""
-    ).fetchall()
-    seeded = 0
-    unknown = 0
-    for (sale_id,) in sales_rows:
-        # Remaining PI quantity for this sale, shared across its line-less
-        # invoices so the same units can never be billed twice.
-        remaining = conn.execute(
-            """SELECT si.id, si.product_name, si.unit, si.unit_price,
-                      (si.quantity::numeric
-                       - COALESCE((SELECT SUM(ii.quantity)::numeric
-                                    FROM invoice_items ii
-                                   WHERE ii.sale_item_id = si.id), 0)) AS rem
-               FROM sale_items si WHERE si.sale_id = %s ORDER BY si.id""",
-            (sale_id,)).fetchall()
-        pool = [[_D(r[0]), r[1], r[2], _D(r[3] or 0), _D(r[4] or 0)] for r in remaining]
-        invoices = conn.execute(
-            """SELECT id, amount FROM invoices i
-               WHERE i.sale_id = %s
-                 AND NOT EXISTS (SELECT 1 FROM invoice_items ii
-                                 WHERE ii.invoice_id = i.id)
-               ORDER BY i.id""",
-            (sale_id,)).fetchall()
-        for invoice_id, amount in invoices:
-            if amount is None:
-                unknown += 1
-                logger.warning(
-                    "Invoice %s has no lines and a NULL amount; left line-less on "
-                    "purpose because its real value is unknown.", invoice_id)
-                continue
-            budget = _D(amount).quantize(_D("0.01"), rounding=ROUND_HALF_UP)
-            got = Decimal("0")
-            for line in pool:
-                item_id, product_name, unit, price, rem = line
-                if rem <= 0 or budget <= 0:
-                    continue
-                qty = rem
-                if price > 0 and _D(rem * price).quantize(
-                        _D("0.01"), rounding=ROUND_HALF_UP) > budget:
-                    qty = (budget / price).quantize(
-                        _D("0.000001"), rounding=ROUND_HALF_UP)
-                    if qty <= 0:
-                        continue
-                row = conn.execute(
-                    """INSERT INTO invoice_items
-                           (invoice_id, sale_item_id, product_name, unit,
-                            quantity, unit_price, line_total)
-                       VALUES (%s, %s, %s, %s, %s, %s,
-                               ROUND(%s::numeric * %s::numeric, 2))
-                       RETURNING line_total""",
-                    (invoice_id, item_id, product_name, unit or "KG",
-                     qty, price, qty, price)).fetchone()
-                line[4] = rem - qty
-                budget = max(budget - _D(row[0] or 0), Decimal("0"))
-                got += _D(row[0] or 0)
-                seeded += 1
-            # The operator reinterprets money here, so make the delta visible
-            # rather than only logging a total row count.
-            logger.info(
-                "Seeded legacy invoice %s (sale %s): header %s -> lines %s (delta %s)",
-                invoice_id, sale_id, _D(amount),
-                got.quantize(_D("0.01"), rounding=ROUND_HALF_UP),
-                (_D(amount) - got).quantize(_D("0.01"), rounding=ROUND_HALF_UP))
-    if unknown:
-        logger.warning(
-            "%s line-less invoice(s) kept a NULL amount and were not backfilled; "
-            "review them manually.", unknown)
-    if seeded:
-        logger.info("Seeded %s invoice_items rows for legacy invoices.", seeded)
-    return seeded
 
 
 # P1-18: (table, column) pairs whose DEFAULT renders a TEXT timestamp.
@@ -1076,7 +973,6 @@ def _run_migration(conn: psycopg.Connection) -> None:
     if "source_type" not in _table_columns(conn, "invoice_items"):
         conn.execute("ALTER TABLE invoice_items ADD COLUMN source_type TEXT DEFAULT 'pi_line'")
     backfill_lc_links(conn)
-    backfill_invoice_lines(conn)
 
     # P1-18: re-assert every timestamp DEFAULT, then clear the two tables whose
     # stored values were written in the malformed format and are rebuilt
