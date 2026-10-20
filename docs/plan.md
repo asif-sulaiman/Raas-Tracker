@@ -581,6 +581,145 @@ fails `test_validate_invoice_lines_ignores_a_forged_unit_price` (0.01 vs 7.5).
 The API-level twin keeps passing under that mutation by design — Pydantic drops
 the field before the service sees it, so the two tests pin different layers.
 
+### Phase 5: `InvoiceEditor` (component + hook landed 2026-10-21; call sites in Phase 6)
+
+**Why one component.** Five places write invoices; four of them collect lines
+differently, and three still speak the pre-PHASE-1 contract:
+
+| Call site | Today | State at HEAD |
+|---|---|---|
+| `InvoicePanel.jsx:502` | `InvoiceCreateForm` + `piLines` prop | works, N+1 fed |
+| `SaleDetailModal.jsx:90` | `InvoiceLineEditor` + `useSaleInvoiceLines` | works, N+1 fed |
+| `InvoicesRequiredModal.jsx:61` | `POST {invoice_number}` | **400** — `invoice_date` and `lines` are required (`flask_app.py:2374-2383`); `InvoicesRequiredModal.test.jsx:93` asserts the broken payload |
+| `ProductionRunModal.jsx:222` | `POST {invoice_number}` | **400**, same cause; the comment at `:210-213` still describes the deleted auto-seed |
+| `InvoiceBuilderModal.jsx:252` | `POST {invoice_number, lines}` | **400** — no `invoice_date`; dead code (imported by `Sales.jsx:14`, never rendered) → delete |
+
+So Phase 6 is not a cosmetic swap: two user-facing flows are broken right now,
+and only the LC-barrier modal is gated (it cannot create the invoice the
+shipment barrier demands).
+
+**Contract**
+
+```
+<InvoiceEditor
+  mode="create" | "add-line"
+  saleId={number}
+  invoiceLabel?={string}      // add-line: the target invoice's number
+  targetInvoiceId?={number}   // add-line: required in that mode
+  onDone={(result) => void}   // after a successful write
+  onCancel={() => void}
+/>
+```
+
+- The editor owns `GET /api/sales/<saleId>/invoice-lines` through a new
+  `useInvoiceBudget(saleId)` hook returning `{lines, hasLineLessInvoices,
+  loading, error, reload}`. All four call sites then share one source of truth,
+  and `useSaleInvoiceLines` / `fetchSaleInvoiceLines` are deleted.
+- `mode="create"` renders number + date (default `todayLocalISO()`), then one
+  row per PI line. `mode="add-line"` renders the same rows without the header
+  fields, scoped to `targetInvoiceId`.
+- Unit price is a **read-only `<input>`** (asserted, not incidental) sourced
+  from the payload and **never** put in a request body.
+
+**Hard stop, not advertised headroom.** The row shows PI qty, invoiced and
+remaining. It does **not** advertise a ceiling. The ceiling is still enforced
+from the payload's absolute `ceiling` (never recomputed as `pi * 1.05`: with
+`quantity` stored as REAL the two disagree, e.g. PI `0.56` → server `0.588000`
+vs recomputed `0.5880000025`):
+
+- over-limit when `typed > 0 && invoiced_quantity + typed > ceiling + 1e-9`;
+  the `typed > 0` term keeps a pre-existing over-ceiling row (only reachable via
+  the Phase-1 tracked race) from poisoning the whole sale;
+- Save stays enabled while every row is at or under the limit, including a
+  quantity above `remaining` but within the ceiling — that is the
+  shipment-advantage case;
+- over-limit rows show the correctable number
+  (`maximum you can still add is X`) and disable Save.
+
+The `1e-9` allowance is one-directional: an input in that band is accepted by
+the UI and refused by the writer, where the `409` resync is the backstop. It is
+not a promise that UI and server agree bit-for-bit.
+
+**409 / 400 handling (create).** Classification is **structural**, never by
+parsing the server's prose: the server's only contract is the status code and
+the reloaded budget. Create is atomic, so a refusal writes nothing:
+
+1. `409` (`ToleranceExceeded`) → reload, keep number, date and every typed
+   quantity, then mark whichever rows the *reloaded* figures put over the limit
+   as `over-budget` (rose).
+2. `400` (a PI line deleted between load and submit) → reload; the staged
+   entries whose `sale_item_id` is gone are dropped and listed by product name
+   in one form-level amber notice (`N PI line(s) are no longer on this PI —
+   review and resubmit`). A dropped row cannot carry its own mark, so the
+   notice is the mark.
+3. anything else → generic rose error; staged state untouched.
+
+**409 / 404 handling (add-line).** A `409` flags the row and **resyncs** (the
+reloaded figures are what decide whether it is still over). A `404` is
+genuinely ambiguous server-side — either the invoice is gone or the PI line is
+(`sales.py:2512-2524`, both mapped to 404) — so the add-line response body
+carries a `code` field (`invoice_gone` | `pi_line_gone`); the editor marks the
+target `superseded` and disables Save only for `invoice_gone`. The backend half
+is **done** (`flask_app.py:3927-3960`, pinned by
+`tests/test_invoice_contract.py:test_api_add_line_404_carries_a_code`, and
+`ApiError` now forwards `data.code` so the client can read it).
+
+**Tests to write first (red).**
+
+`InvoiceEditor.test.jsx`
+1. create renders number, date (defaults to today), one row per PI line, a
+   read-only unit price, and no "ceiling" copy.
+2. Save disabled until a number and at least one quantity > 0 exist.
+3. create POST body is exactly `{invoice_number, invoice_date,
+   lines:[{sale_item_id, quantity}]}` — no `unit_price` key anywhere.
+4. a quantity above `ceiling - invoiced` shows the over-limit message and
+   disables Save without POSTing.
+5. a quantity exactly at `ceiling - invoiced` is accepted and POSTs.
+6. a quantity above `remaining` but within the ceiling stays submittable.
+7. the offered maximum comes from the payload, not `pi * 1.05` (fixture where
+   `ceiling !== pi_quantity * 1.05`).
+8. add-line POSTs `/api/invoices/<id>/items` with `{sale_item_id, quantity}`.
+9. create 409 → budget reloaded, the *reloaded* invoiced/max-add figures are
+   rendered, Save is now disabled, and number/date/quantities are preserved.
+10. create 400 → vanished product name appears in the amber "no longer on this
+    PI" notice and the header is preserved.
+11. success → `onDone` receives the created invoice.
+
+`InvoicesRequiredModal.test.jsx` (rewrite, not delete): each POST carries
+`invoice_date` and a `lines` array covering that PI's remaining quantity; a PI
+with no budget left is skipped rather than posted line-less, and a run that
+creates nothing does **not** toast success or call `onSuccess` (the barrier
+counts invoices across all the LC's sales, so a silent zero would just retry
+into a 409).
+
+`ProductionRunModal.test.jsx`: the invoice-create POST carries `invoice_date`
+and `lines`.
+
+**Landed (2026-10-21).**
+
+| Piece | Where |
+|---|---|
+| `useInvoiceBudget(saleId)` | `src/components/sales/useInvoiceBudget.js` — one `GET /api/sales/<id>/invoice-lines`; returns the reloaded `{lines, hasLineLessInvoices}` so callers can resync |
+| `InvoiceEditor` (create / add-line) | `src/components/sales/InvoiceEditor.jsx` |
+| `code` on add-line 404 | `flask_app.py` + `ApiError.code` (`src/utils/api.js:3`, forwarded in `src/context/AuthContext.jsx:94-100`) |
+| 12 red-first tests | `src/components/sales/InvoiceEditor.test.jsx` |
+
+Two corrections made while turning the spec into tests:
+
+- The 409 test as first drafted typed a quantity already over the *initial*
+  budget, so the hard stop (correctly) prevented the POST and no 409 could
+  happen. It now types `6` (allowed against a stale `invoiced=2`, over once the
+  server reports `invoiced=6` → max add `4.50`), which is the only shape a real
+  409 can take from this UI.
+- In add-line mode a `pi_line_gone` reloads and drops the row through the same
+  superseded path as create; only `invoice_gone` disables Save, because the
+  target itself is the thing that vanished.
+
+`InvoiceLineComposer.jsx` is **not** rewritten yet: nothing renders the new
+editor until Phase 6 swaps the four call sites, and rewriting the composer
+first would leave two composers with no callers. Phase 6 owns that plus the
+deletions listed in the table at the top of this section.
+
 ### Phase 0 baseline (HEAD `8a35c2f`, clean tree)
 
 | Gate | Result |
@@ -599,6 +738,15 @@ An earlier, abandoned attempt at the unified UI was parked in `stash@{0}`
 ("wip: unified invoice editor (restore at Phase 6)"). It failed 9 frontend
 tests and *removed* 2 net tests; it is reference material for Phase 5/6, not a
 starting point.
+
+**`npm test` flake under full-suite load (observed 2026-10-21, pre-existing).**
+A full `vitest` run intermittently fails 1–4 tests in the slowest files
+(`MultiPICreateModal`, `ProductionRunModal`, `Sales`, `Reports`), and the failing
+set changes between runs — 1:41 elapsed on a clean baseline versus 66 s for
+`MultiPICreateModal` alone when it fails. Every one of them passes in isolation
+and the whole group passes when run together (`24 passed`), so this is worker
+starvation, not behaviour. Judge the suite by whether the failures move and
+reproduce alone, not by one red line on a loaded machine.
 
 ### Deployment reconciliation finding (open)
 

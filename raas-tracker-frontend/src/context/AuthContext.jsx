@@ -95,7 +95,8 @@ export function AuthProvider({ children }) {
         res.status,
         data.error || data.message || `Request failed (HTTP ${res.status})`,
         data.fields || data.details || data.errors || null,
-        res.headers.get('Retry-After')
+        res.headers.get('Retry-After'),
+        data.code ?? null
       );
       if (data.missing !== undefined) err.missing = data.missing;
       throw err;
