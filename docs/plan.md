@@ -446,7 +446,7 @@ the operator types quantity only. Executed in gated phases, one at a time.
 | 2 | Delete `backfill_invoice_lines` + its tests (auto-invoicing) | ✅ | ✅ 2026-10-21 |
 | 3 | `GET /api/sales/<id>/invoice-lines` (kills the N+1 fetch) | — | ✅ 2026-10-21 |
 | 4 | Pin the backend invoice contract with tests | — | ✅ 2026-10-21 |
-| 5 | `InvoiceEditor` + rewritten `InvoiceLineComposer` | ✅ spec-first | ⬜ |
+| 5 | `InvoiceEditor` + rewritten `InvoiceLineComposer` | ✅ spec-first | 🟡 2026-10-21 — editor + hook + `code` on 404 landed (`f6c7fe4`, `23b8743`); composer rewrite rides with the Phase 6 swap so no dead composer is left behind |
 | 6 | Swap call sites, delete the legacy files | ✅ | ⬜ |
 | 7 | Docs close-out | — | ⬜ |
 
