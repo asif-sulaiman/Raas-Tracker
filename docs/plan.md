@@ -444,7 +444,7 @@ the operator types quantity only. Executed in gated phases, one at a time.
 | 0 | Baseline + deployment reconciliation | — | ✅ 2026-10-21 |
 | 1 | Close the batch-vs-add-line race (`FOR UPDATE` on `sale_items`) | ✅ | ✅ 2026-10-21 (already closed; locked by tests) |
 | 2 | Delete `backfill_invoice_lines` + its tests (auto-invoicing) | ✅ | ✅ 2026-10-21 |
-| 3 | `GET /api/sales/<id>/invoice-lines` (kills the N+1 fetch) | — | ⬜ |
+| 3 | `GET /api/sales/<id>/invoice-lines` (kills the N+1 fetch) | — | ✅ 2026-10-21 |
 | 4 | Pin the backend invoice contract with tests | — | ⬜ |
 | 5 | `InvoiceEditor` + rewritten `InvoiceLineComposer` | ✅ spec-first | ⬜ |
 | 6 | Swap call sites, delete the legacy files | ✅ | ⬜ |
@@ -528,24 +528,33 @@ That is the honest outcome versus inventing a receivable. Production has zero
 invoices, so nothing is affected today; any other deployment must verify
 line-less invoices = 0 before trusting its commercial report.
 
-### Phase 3 contract note (from the Phase 2 review)
+### Phase 3: PI-line budget endpoint (2026-10-21)
 
-`remaining` must be defined explicitly, because `invoice_items` is no longer
-guaranteed to cover a PI line:
+`GET /api/sales/<id>/invoice-lines` (Session/Key, 300/min) returns
+`{lines: [...], has_line_less_invoices: bool}` in one request, replacing the N+1
+(`/api/sales/<id>` then `/api/invoices/<id>/items` per invoice):
 
-- **Quantity** is `PI qty − SUM(invoice_items.quantity)`. A line-less legacy
-  invoice contributes 0, so the whole PI quantity reads as remaining and the 5%
-  ceiling would permit re-invoicing it.
-- **Money** has a helper that *does* count a header-only invoice
-  (`_invoice_money_already_on_sale`, `sales.py:1618-1643`), but its result is
-  discarded at `sales.py:1837` (kept only as a non-finite guard) and
-  `pi_proposal_vs_invoiced` has no callers. Nothing reconciles the two today.
+| Field | Rule |
+|---|---|
+| `pi_quantity`, `unit_price` | from `sale_items`; `unit` falls back to `'KG'` when blank |
+| `invoiced_quantity` | `SUM(invoice_items.quantity)` across **every** invoice of the sale, no status filter — identical to `check_invoice_tolerance` |
+| `remaining` | `max(0, PI − invoiced)`; fully invoiced lines are still returned |
+| `ceiling` | `PI × 1.05` quantized to 6 dp with the writer's own `Decimal(str(...))` expression |
+| `invoice_ids` | `array_agg(DISTINCT …)` of the invoices holding lines for that PI line |
+| `has_line_less_invoices` | `true` when a legacy invoice has header money no line backs; `remaining` overstates the budget in that case |
 
-Do **not** synthesise quantity from a header amount — that is the deleted
-backfill again. Return a `has_line_less_invoices` flag (or the legacy header
-total) so the UI never treats the quantity as authoritative, and add a test that
-inserts one line-less invoice directly. Production has zero, so this is a
-contract guard, not a live bug.
+404 on an unknown sale; `{lines: [], has_line_less_invoices: false}` for a sale
+with no PI lines. 8 tests in `tests/test_invoice_contract.py` §6, including a
+directly inserted line-less invoice.
+
+Why the flag exists: quantity is `PI − invoice_items`, so a line-less legacy
+invoice contributes 0 and the whole PI reads as uninvoiced. The money side has a
+helper that *does* count a header-only invoice (`_invoice_money_already_on_sale`,
+`sales.py:1618-1643`), but its result is discarded at `sales.py:1837` (kept only
+as a non-finite guard) and `pi_proposal_vs_invoiced` has no callers — nothing
+reconciles the two. Synthesising quantity from a header amount would be the
+deleted backfill again, so the endpoint reports the inconsistency instead.
+Production has zero such rows; this is a contract guard, not a live bug.
 
 ### Phase 0 baseline (HEAD `8a35c2f`, clean tree)
 
@@ -638,7 +647,7 @@ Also documented in `docs/SPEC.md` §4 ("Sales Invoices", "Invoice Items"), §6 a
 |---|---|---|---|
 | 1 | **The gate matches products by name**, not by a stable id: `lower(recipes.product_name) = lower(invoice_items.product_name)`, and `invoice_items.product_name` is a denormalised copy taken at line-creation time. Rename a product after invoicing and the gate looks for a recipe under the old name, refusing booking indefinitely. | `production_runs.sale_item_id` exists but is **always NULL** — the only INSERT (`recipes.py:637`) never sets it and its `NOT NULL` was dropped at `db.py:860`. There is no other stable link. | Populate `production_runs.sale_item_id` in `create_production_run`, then join on it in `invoice_production_readiness` with a name fallback for historical rows. |
 | 2 | **The gate asserts production *presence*, not *quantity*.** Producing 1 KG against a 3,000 KG invoice line unblocks booking. | Decided deliberately: booking is a commercial act, and the production department owns whether a batch was sufficient. | Compare `SUM(qty_produced)` per invoice line against `invoice_items.quantity`. Blocked on a unit: neither `recipes` nor `production_runs` stores the product unit, so the two numbers cannot be compared soundly without one. |
-| 3 | **A line-less legacy invoice is invisible to quantity checks** but its header money is still real. `remaining` derives from `invoice_items` only, so the PI quantity reads as fully uninvoiced. | Phase 2 removed the seed that hid this; production has zero such rows. | Surface `has_line_less_invoices` from `GET /api/sales/<id>/invoice-lines` (see the Phase 3 contract note) rather than repairing the data. |
+| 3 | **A line-less legacy invoice is invisible to quantity checks** but its header money is still real. `remaining` derives from `invoice_items` only, so the PI quantity reads as fully uninvoiced. | Phase 2 removed the seed that hid this; production has zero such rows. | `GET /api/sales/<id>/invoice-lines` now surfaces `has_line_less_invoices` (Phase 3) rather than repairing the data. |
 
 ---
 
