@@ -17,7 +17,7 @@ import uuid
 import pytest
 
 from raas_tracker import sales as salesmod
-from raas_tracker._exceptions import ServiceError
+from raas_tracker._exceptions import ServiceError, ToleranceExceeded
 from raas_tracker.db import _SCHEMA_VERSION, _table_columns
 
 INVOICE_DATE = "2026-01-15"
@@ -340,3 +340,123 @@ def test_api_sale_invoice_lines_404s_for_an_unknown_sale(admin_client):
 def test_api_sale_invoice_lines_requires_auth(client):
     r = client.get("/api/sales/1/invoice-lines")
     assert r.status_code == 401, r.get_json()
+
+
+# --------------------------------------------------------------------------- #
+# 7. server-owned price, audit shape, and endpoint/writer ceiling parity
+# --------------------------------------------------------------------------- #
+def test_create_invoice_ignores_a_forged_unit_price(admin_client, db):
+    """The price is resolved from the PI line, so a client-stated price is inert.
+
+    ``InvoiceBatchLineIn`` declares only ``sale_item_id`` and ``quantity`` and
+    Pydantic's default is to ignore extra keys, so the forged fields never reach
+    the service. This pins the outcome (201 with the PI price, not a 400 and not
+    the forged number) so adding ``extra="forbid"`` or mapping a client price
+    through would both have to be a deliberate, test-visible change.
+    """
+    cid = _api_company(admin_client, db)
+    sid = _api_sale(admin_client, cid)          # 10 x 5.0
+    si = _sale_item_id(db, sid)
+
+    r = admin_client.post(f"/api/sales/{sid}/invoices", json={
+        "invoice_number": f"INV-{_tag()}", "invoice_date": INVOICE_DATE,
+        "lines": [{"sale_item_id": si, "quantity": 2,
+                   "unit_price": 0.01, "line_total": 0.01}]})
+    assert r.status_code == 201, r.get_json()
+    assert r.get_json()["amount"] == 10.0
+
+    price, total = db.execute(
+        "SELECT unit_price, line_total FROM invoice_items WHERE invoice_id = %s",
+        (r.get_json()["invoice_id"],)).fetchone()
+    assert float(price) == 5.0
+    assert float(total) == 10.0
+
+
+def test_validate_invoice_lines_ignores_a_forged_unit_price(db):
+    """Service-level twin: even a dict carrying ``unit_price`` is rebuilt from the PI."""
+    co = _company(db)
+    sid = _sale(db, co, product="ForgedPrice", qty=10, price=7.5)
+    si = _sale_item_id(db, sid)
+
+    validated = salesmod.validate_invoice_lines(db, sid, [{
+        "sale_item_id": si, "quantity": 2,
+        "unit_price": 0.01, "line_total": 0.01}])
+
+    assert validated[0]["unit_price"] == 7.5
+    assert validated[0]["line_total"] == 15.0
+
+
+def test_endpoint_ceiling_is_exactly_what_the_writer_accepts(db):
+    """The 6 dp ceiling the UI offers must be a quantity the writer takes.
+
+    ``list_sale_invoice_lines`` and ``check_invoice_tolerance`` compute the
+    ceiling with the same ``Decimal(str(...)) * 1.05`` expression precisely so
+    this boundary holds; a float-converted ceiling that rounded the wrong way
+    would make the UI refuse a legal invoice or offer an illegal one.
+    """
+    co = _company(db)
+    sid = _sale(db, co, product="CeilingParity", qty=3.7, price=2)
+    si = _sale_item_id(db, sid)
+
+    ceiling = salesmod.list_sale_invoice_lines(db, sid)["lines"][0]["ceiling"]
+    assert ceiling == 3.885
+
+    created = salesmod.create_invoice(
+        db, sid, f"INV-{_tag()}", lines=[_line(si, ceiling)],
+        invoice_date=INVOICE_DATE)
+    assert created["status"] == "planned"
+
+    with pytest.raises(ToleranceExceeded):
+        salesmod.create_invoice_item(db, created["invoice_id"], si, 0.000001)
+
+    done = salesmod.list_sale_invoice_lines(db, sid)["lines"][0]
+    assert done["invoiced_quantity"] == pytest.approx(3.885)
+    assert done["remaining"] == 0.0
+
+
+def test_create_invoice_audits_each_line_then_the_header(admin_client, db,
+                                                         monkeypatch):
+    """One ``INVOICE_CREATE`` per invoice, one ``INVOICE_ITEM_ADD`` per line, header last."""
+    cid = _api_company(admin_client, db)
+    sid = _api_sale(admin_client, cid)
+    si = _sale_item_id(db, sid)
+    seen = []
+    real = salesmod.log_audit_action
+
+    def spy(conn, action, *args, **kwargs):
+        seen.append(action)
+        return real(conn, action, *args, **kwargs)
+
+    monkeypatch.setattr(salesmod, "log_audit_action", spy)
+    r = admin_client.post(f"/api/sales/{sid}/invoices", json={
+        "invoice_number": f"INV-{_tag()}", "invoice_date": INVOICE_DATE,
+        "lines": [_line(si, 2), _line(si, 1)]})
+    assert r.status_code == 201, r.get_json()
+
+    assert seen.count("INVOICE_ITEM_ADD") == 2, seen
+    assert seen.count("INVOICE_CREATE") == 1, seen
+    assert seen[-1] == "INVOICE_CREATE", (
+        f"the header audit must follow its lines: {seen}")
+
+
+def test_create_invoice_refuses_a_non_finite_pi_total_before_writing(db):
+    """The ``remaining_invoice_money`` guard turns bad PI data into a 400, not a 500.
+
+    A NaN ``sale_items.quantity`` poisons the sale total. The guard runs before
+    ``validate_invoice_lines``, so it fires even when the invoiced line itself is
+    healthy - removing the call would let the invoice through and defer the
+    blow-up to the next money read.
+    """
+    co = _company(db)
+    sid = _sale(db, co, product="NaNProd", qty=10, price=5)
+    si = _sale_item_id(db, sid)
+    db.execute("UPDATE sale_items SET quantity = 'NaN'::real WHERE id = %s", (si,))
+    db.commit()
+
+    with pytest.raises(ValueError, match="non-finite"):
+        salesmod.create_invoice(db, sid, f"INV-{_tag()}", lines=[_line(si, 1)],
+                                invoice_date=INVOICE_DATE)
+
+    db.rollback()
+    assert db.execute("SELECT COUNT(*) FROM invoices WHERE sale_id = %s",
+                      (sid,)).fetchone()[0] == 0
