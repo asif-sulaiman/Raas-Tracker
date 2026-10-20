@@ -441,14 +441,43 @@ the operator types quantity only. Executed in gated phases, one at a time.
 
 | # | Phase | Oracle gate | State |
 |---|---|---|---|
-| 0 | Baseline + deployment reconciliation | — | ✅ 2026-10-19 |
-| 1 | Close the batch-vs-add-line race (`FOR UPDATE` on `sale_items`) | ✅ | ⬜ |
+| 0 | Baseline + deployment reconciliation | — | ✅ 2026-10-21 |
+| 1 | Close the batch-vs-add-line race (`FOR UPDATE` on `sale_items`) | ✅ | ✅ 2026-10-21 (already closed; locked by tests) |
 | 2 | Delete `backfill_invoice_lines` + its tests (auto-invoicing) | ✅ | ⬜ |
 | 3 | `GET /api/sales/<id>/invoice-lines` (kills the N+1 fetch) | — | ⬜ |
 | 4 | Pin the backend invoice contract with tests | — | ⬜ |
 | 5 | `InvoiceEditor` + rewritten `InvoiceLineComposer` | ✅ spec-first | ⬜ |
 | 6 | Swap call sites, delete the legacy files | ✅ | ⬜ |
 | 7 | Docs close-out | — | ⬜ |
+
+### Phase 1 finding: the batch race was already closed (2026-10-21)
+
+The plan said `create_invoices_batch` read `sale_items` at `sales.py:2007`
+without `FOR UPDATE`, racing `create_invoice_item`. It does not:
+`create_invoices_batch` has taken `SELECT id FROM sale_items WHERE sale_id = %s
+ORDER BY id FOR UPDATE` (`sales.py:1933-1935`) since `7a7ae73` (2026-10-04),
+before it evaluates tolerance. `create_invoice` locks each line inside
+`validate_invoice_lines` (`sales.py:1714-1717`) and `create_invoice_item` locks
+its own line (`sales.py:2518-2521`); all three hold the lock to commit
+(`sales.py:1904`, `:2042`, `:2560`).
+
+**No production code changed.** `TestWriterLockDiscipline`
+(`tests/test_invoice_tolerance.py`) pins the behaviour instead, and both tests
+were verified to bite by deleting the lock each one covers:
+
+| Test | Lock deleted | Observed failure |
+|---|---|---|
+| `test_batch_locks_every_pi_line_of_the_sale` | the batch's sale-level `FOR UPDATE` | batch billed a line the lock still held |
+| `test_add_line_and_batch_cannot_jointly_exceed_the_ceiling` | the batch's, then the add-line's | `over-invoiced: 122.0 > 105` either way |
+
+A naive "does it block?" probe cannot test this: any writer that inserts an
+`invoice_items` row waits on the foreign key's `FOR KEY SHARE` for the
+referenced `sale_items` row, which conflicts with `FOR UPDATE` anyway. The first
+test therefore holds the lock on a **different** PI line of the same sale, which
+removes the confound.
+
+The only writer that still evaluates quantities without a `sale_items` lock is
+`db.py:506` (`backfill_invoice_lines`) — Phase 2 deletes it.
 
 ### Phase 0 baseline (HEAD `8a35c2f`, clean tree)
 
@@ -486,6 +515,37 @@ schema version behind `main`**:
 - Consequence: deploying `main` applies the v6 DDL on first boot. That is
   intended, but it must be **observed, not assumed** — after the deploy, re-read
   `raas_schema_version` (expect `6`) and confirm `invoices.invoice_date` exists.
+
+### Phase 1 — writer lock discipline (no production code change)
+
+**Finding: the race this phase was meant to close is already closed.** All three
+invoice writers take the PI-line lock *before* they decide tolerance:
+
+| Writer | Lock | Then tolerance |
+|---|---|---|
+| `create_invoice` | `validate_invoice_lines` locks each line (`sales.py:1714-1717`), under the sale-row lock (`:1829`) | `:1841` |
+| `create_invoices_batch` | every PI line of the sale, up front (`:1933-1935`, in since `7a7ae73`) | `:1985` |
+| `create_invoice_item` | its single line (`:2518-2521`, in since `10585061`) | `:2529` |
+
+Under READ COMMITTED the loser blocks on `FOR UPDATE`, and its tolerance
+aggregate re-runs against a statement snapshot taken *after* the winner
+committed, so 60 + 60 against a 105 ceiling admits exactly one writer.
+
+Deliverable is therefore evidence, not code: `TestWriterLockDiscipline` in
+`tests/test_invoice_tolerance.py` pins all three locks plus the joint outcome.
+Both tests are mutation-verified — deleting the batch pre-lock and the add-line
+lock makes them fail, and the joint test then measured **122.0 units invoiced
+against a 105 ceiling**.
+
+**Tracked gap found while verifying (not closed here).** The two PI-rebase
+writers check `invoice_items` and then write *without* holding the PI-line lock:
+`update_sale_item` (`:707-710` / the count at `:713-718`) and
+`update_sale_full` (`:941-958`). A concurrent create can insert a line between
+the count and the `UPDATE`, leaving a PI quantity/price below what is already
+invoiced. Closing it needs a lock-order decision (`update_*` would take the sale
+row; `create_invoice_item` currently starts at the invoice row), so it is
+recorded rather than folded in. This is the same defect class as Phase 2-B's
+sign rule and matters most before Phase 5 swaps the UI onto these writers.
 
 ---
 
