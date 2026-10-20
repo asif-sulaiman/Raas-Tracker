@@ -460,3 +460,39 @@ def test_create_invoice_refuses_a_non_finite_pi_total_before_writing(db):
     db.rollback()
     assert db.execute("SELECT COUNT(*) FROM invoices WHERE sale_id = %s",
                       (sid,)).fetchone()[0] == 0
+
+
+# --------------------------------------------------------------------------- #
+# 8. an add-line 404 must name what is missing (the UI cannot tell 404s apart)
+# --------------------------------------------------------------------------- #
+def test_api_add_line_404_carries_a_code(admin_client, db):
+    """Both "invoice gone" and "PI line gone" are 404, so the body must say which.
+
+    Without this the composer cannot know whether to blame the invoice (disable
+    the form) or the PI line (keep the target and pick another line) - the two
+    cases are indistinguishable by status alone.
+    """
+    cid = _api_company(admin_client, db)
+    sid = _api_sale(admin_client, cid)
+    si = _sale_item_id(db, sid)
+
+    gone_invoice = admin_client.post(
+        "/api/invoices/99999999/items",
+        json={"sale_item_id": si, "quantity": 1})
+    assert gone_invoice.status_code == 404
+    assert gone_invoice.get_json()["code"] == "invoice_gone"
+
+    inv = admin_client.post(f"/api/sales/{sid}/invoices", json={
+        "invoice_number": f"INV-{_tag()}", "invoice_date": INVOICE_DATE,
+        "lines": [_line(si, 1)]}).get_json()["invoice_id"]
+    orphan = db.execute(
+        "INSERT INTO sale_items (sale_id, product_name, quantity, unit_price, unit) "
+        "VALUES (%s, 'Orphan', 1, 1, 'KG') RETURNING id", (sid,)).fetchone()[0]
+    db.execute("DELETE FROM sale_items WHERE id = %s", (orphan,))
+    db.commit()
+
+    gone_line = admin_client.post(
+        f"/api/invoices/{inv}/items",
+        json={"sale_item_id": orphan, "quantity": 1})
+    assert gone_line.status_code == 404
+    assert gone_line.get_json()["code"] == "pi_line_gone"

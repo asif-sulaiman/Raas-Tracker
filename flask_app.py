@@ -169,7 +169,9 @@ from raas_tracker.sales import (
 )
 from raas_tracker.stock import sync_reorder_notifications
 # Phase 4-A: the HTTP status of a service refusal comes from its TYPE.
-from raas_tracker._exceptions import LifecycleConflict, status_for
+from raas_tracker._exceptions import (
+    InvoiceNotFound, LifecycleConflict, SaleItemNotFound, status_for,
+)
 
 # ---- AuthN/Z: sessions (humans) OR api_keys (scripts) ----
 # The legacy RAAS_TOKEN env gate is retired: per-key api_keys provide
@@ -3938,19 +3940,30 @@ def api_create_invoice_item(invoice_id):
     if not conn.execute("SELECT 1 FROM invoices WHERE id = %s",
                         (invoice_id,)).fetchone():
         conn.close()
-        return jsonify({"error": "Invoice not found"}), 404
+        return jsonify({"error": "Invoice not found",
+                        "code": "invoice_gone"}), 404
     try:
         line = create_invoice_item(conn, invoice_id, payload.sale_item_id,
                                    payload.quantity)
     except LookupError as e:
         _rollback_close(conn)
+        # No `code` here: create_invoice_item's own misses are typed
+        # _exceptions (handled below). A bare LookupError would be something we
+        # have not diagnosed, so the client must not be told which object died.
         return jsonify({"error": str(e)}), 404
     except ValueError as e:
         _rollback_close(conn)
         # Status comes from the exception TYPE (raas_tracker._exceptions):
         # over-tolerance -> 409, missing invoice/sale item -> 404, and any
         # remaining validation refusal -> 400. Never from the message text.
-        return jsonify({"error": str(e)}), status_for(e)
+        # Both 404 causes need a `code`: the client cannot tell them apart, and
+        # they recover differently (drop the target vs pick another line).
+        body = {"error": str(e)}
+        if isinstance(e, SaleItemNotFound):
+            body["code"] = "pi_line_gone"
+        elif isinstance(e, InvoiceNotFound):
+            body["code"] = "invoice_gone"
+        return jsonify(body), status_for(e)
     except Exception:
         _rollback_close(conn)
         app.logger.exception("invoice item creation failed")
