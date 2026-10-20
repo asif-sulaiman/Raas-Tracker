@@ -237,6 +237,41 @@ def test_missing_version_key_forces_full_ddl(pg_dsn, monkeypatch):
     assert _setting(pg_dsn, dbmod._SCHEMA_VERSION_KEY) is not None
 
 
+def test_migration_never_invents_invoice_lines(db, pg_dsn):
+    """No connection-time migration may write ``invoice_items`` on its own.
+
+    Phase 2 deleted ``backfill_invoice_lines``, which seeded lines for legacy
+    line-less invoices every time the schema ran. The only writers left are the
+    three operator endpoints, so a full migration pass must leave a line-less
+    invoice exactly as it found it.
+    """
+    dbmod.get_connection(pg_dsn).close()  # ensure fully migrated
+    sid = db.execute(
+        "INSERT INTO sales (stage, pi_number, pi_date, client_name) "
+        "VALUES ('pi_issued', 'PI-NOBACKFILL', '2026-01-15', 'No Backfill Co') "
+        "RETURNING id").fetchone()[0]
+    db.execute(
+        "INSERT INTO sale_items (sale_id, product_name, quantity, unit_price, unit) "
+        "VALUES (%s, 'NoBackfill', 10, 5, 'KG')", (sid,))
+    inv = db.execute(
+        "INSERT INTO invoices (sale_id, invoice_number, status, amount) "
+        "VALUES (%s, 'INV-NOBACKFILL', 'planned', 50) RETURNING id",
+        (sid,)).fetchone()[0]
+    # A stale stamp forces the next connection through the full DDL + migration
+    # path, which is where the removed backfill used to run.
+    db.execute(
+        "INSERT INTO app_settings (key, value) VALUES (%s, %s) "
+        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        (dbmod._SCHEMA_VERSION_KEY, str(dbmod._SCHEMA_VERSION - 1)))
+    db.commit()
+
+    dbmod.get_connection(pg_dsn).close()
+
+    assert db.execute(
+        "SELECT COUNT(*) FROM invoice_items WHERE invoice_id = %s",
+        (inv,)).fetchone()[0] == 0, "a migration must never invent invoice lines"
+
+
 def test_non_numeric_version_forces_full_ddl(pg_dsn, monkeypatch):
     """A corrupt/unparseable stored version must not skip DDL either."""
     dbmod.get_connection(pg_dsn).close()

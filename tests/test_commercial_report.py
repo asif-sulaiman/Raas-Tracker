@@ -1012,7 +1012,9 @@ def test_api_created_invoice_always_has_lines_backing_its_header(admin_client, d
 
     There is no report-level guard left to assert, because the API can no longer
     produce the bad state: ``create_invoice`` requires explicit lines and an
-    ``invoice_date``, and the migration backfills legacy ones. What is worth
+    ``invoice_date``, and no migration invents lines for a legacy invoice
+    (``test_schema_migration.py::test_migration_never_invents_invoice_lines``).
+    What is worth
     asserting is the boundary itself - every invoice the UI can create is fully
     backed by lines and reads as a real receivable. A stated ``amount`` in the
     body is ignored, so the old phantom-Paid cannot come back through this route.
