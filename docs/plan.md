@@ -448,7 +448,7 @@ the operator types quantity only. Executed in gated phases, one at a time.
 | 4 | Pin the backend invoice contract with tests | — | ✅ 2026-10-21 |
 | 5 | `InvoiceEditor` + rewritten `InvoiceLineComposer` | ✅ spec-first | ✅ 2026-10-21 — editor + hook + `code` on 404 landed (`f6c7fe4`, `23b8743`); the composer was deleted in Phase 6 instead of rewritten |
 | 6 | Swap call sites, delete the legacy files | ✅ | ✅ 2026-10-21 (`d016093`, `96c2520`, `925a814`, review fixes `a1d272a`) |
-| 7 | Docs close-out | — | ⬜ |
+| 7 | Docs close-out | ✅ | ✅ 2026-10-21 (`7db063e`, `bbde7e7`, `35a9426`, `0cacef3`) |
 
 ### Phase 1 finding: the batch race was already closed (2026-10-21)
 
