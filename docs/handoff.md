@@ -5,6 +5,55 @@
 
 ---
 
+## 2026-10-21 — Invoice overhaul Phases 6–7 (all call sites on `InvoiceEditor`)
+
+### What was completed
+- **Phase 6, call sites** (`d016093`, `96c2520`, `925a814`): `InvoicePanel` and
+  `SaleDetailModal` render `InvoiceEditor`; the two create shortcuts state
+  `invoice_date` + `lines`; `InvoiceBuilderModal` deleted, dead `lcId` props
+  dropped. Deleted with their last caller: `InvoiceCreateForm`,
+  `InvoiceLineEditor` (+ test), `InvoiceLineComposer`, `useSaleInvoiceLines`.
+- **Phase 6, Oracle review fixes** (`a1d272a`): partial success is reported in
+  both places (the barrier no longer calls `onSuccess` on a partially failed
+  batch; add-line calls `onDone` whenever ≥1 row landed), add-line 404
+  `pi_line_gone` resyncs and drops the vanished row, both shortcuts refuse a PI
+  with a header-only invoice, and the write-only `barrierLcId` state is gone.
+- **Phase 7 docs** : `plan.md` Phase 6 section + phase table, PRD Flow 6 item 3
+  (the two shortcuts invoice the whole remainder and refuse when nothing is
+  left), SPEC `POST /api/sales/<id>/invoices` (`invoice_date` required), SPEC
+  frontend coverage line (40 files / 335 tests, 7 warnings).
+- **Gates:** frontend full suite **335/335**, `oxlint` 0 errors, `vite build` ok.
+  Backend untouched since `f6c7fe4` (no `.py` in the diff), so the 1261-passed
+  suite still stands.
+
+### Decisions made & why
+- **`InvoiceLineComposer` was deleted, not rewritten.** Its one-line
+  select+quantity model does not exist in the table the editor renders, and its
+  only caller was `InvoiceCreateForm`.
+- **`api_list_invoices` does not get `@limited()`.** It is a read, it already
+  runs under the 300/min default, and the editor reloads after every 409 — a
+  15/min stamp would break that recovery path.
+- **Header-only invoices are refused by both shortcuts**, because `remaining`
+  cannot see their money and auto-invoicing would bill the goods twice. Invoicing
+  them is still possible from the sale, by adding lines.
+- **A partially failed barrier batch stays open.** `onSuccess` closes the modal
+  and retries the LC move; the gate only needs one invoice across the LC, so
+  calling it early would advance an LC whose PI still has none.
+
+### What remains + next steps
+1. **Production deploy check (open since Phase 0):** prod is at
+   `raas_schema_version` 5 with no `invoices.invoice_date`. After deploying,
+   re-read the version (expect 6) and confirm the column exists — observed, not
+   assumed.
+2. **Push:** 26 commits ahead of `origin/main`, unpushed by request.
+3. **`fetchSaleInvoiceLines.js`** is still untracked (user's file; nothing
+   imports it, and its docstring names the two deleted components). Delete when
+   convenient.
+4. **Optional:** `npm test` worker starvation — `pool: 'vmThreads'` would cut the
+   jsdom cost that makes the slow files flake under load.
+
+---
+
 ## 2026-10-21 — Invoice overhaul Phases 0–5 (editor built, call sites not swapped)
 
 ### What was completed
