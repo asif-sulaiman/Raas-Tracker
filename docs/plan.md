@@ -447,7 +447,7 @@ the operator types quantity only. Executed in gated phases, one at a time.
 | 3 | `GET /api/sales/<id>/invoice-lines` (kills the N+1 fetch) | — | ✅ 2026-10-21 |
 | 4 | Pin the backend invoice contract with tests | — | ✅ 2026-10-21 |
 | 5 | `InvoiceEditor` + rewritten `InvoiceLineComposer` | ✅ spec-first | ✅ 2026-10-21 — editor + hook + `code` on 404 landed (`f6c7fe4`, `23b8743`); the composer was deleted in Phase 6 instead of rewritten |
-| 6 | Swap call sites, delete the legacy files | ✅ | ✅ 2026-10-21 (`d016093`, `96c2520`, `925a814`) |
+| 6 | Swap call sites, delete the legacy files | ✅ | ✅ 2026-10-21 (`d016093`, `96c2520`, `925a814`, review fixes `a1d272a`) |
 | 7 | Docs close-out | — | ⬜ |
 
 ### Phase 1 finding: the batch race was already closed (2026-10-21)
@@ -702,7 +702,7 @@ and `lines`.
 | `useInvoiceBudget(saleId)` | `src/components/sales/useInvoiceBudget.js` — one `GET /api/sales/<id>/invoice-lines`; returns the reloaded `{lines, hasLineLessInvoices}` so callers can resync |
 | `InvoiceEditor` (create / add-line) | `src/components/sales/InvoiceEditor.jsx` |
 | `code` on add-line 404 | `flask_app.py` + `ApiError.code` (`src/utils/api.js:3`, forwarded in `src/context/AuthContext.jsx:94-100`) |
-| 12 red-first tests | `src/components/sales/InvoiceEditor.test.jsx` |
+| 15 tests (13 red-first + 2 partial-success from the Phase 6 review) | `src/components/sales/InvoiceEditor.test.jsx` |
 
 Two corrections made while turning the spec into tests:
 
@@ -729,6 +729,7 @@ second composer with no callers. Phase 6 also corrected this table's own premise
 | `d016093` | `InvoicePanel` and `SaleDetailModal` render `InvoiceEditor`; `InvoiceCreateForm`, `InvoiceLineEditor` (+ test), `InvoiceLineComposer`, `useSaleInvoiceLines` deleted |
 | `96c2520` | `InvoicesRequiredModal` and `ProductionRunModal` state `invoice_date` + `lines` instead of posting a bare number |
 | `925a814` | `InvoiceBuilderModal` deleted; dead `lcId` props dropped from `Sales.jsx` |
+| `a1d272a` | Oracle review fixes: partial success is reported, `pi_line_gone` handled, header-only invoices refused |
 
 **Both broken flows are fixed.** Each barrier now reads
 `/api/sales/<id>/invoice-lines` and posts the rows that still have budget. A
@@ -737,10 +738,28 @@ dropped silently — the operator typed a number expecting an invoice, and the A
 would reject quantity `0` anyway. A batch that creates nothing does not toast
 success, call `onSuccess`, or close: the barrier would refuse again immediately.
 
+**Partial success is reported, never assumed away.** Both of the first-cut
+shapes were wrong in the same way — the happy path was wired, the half-failed
+one was not:
+
+- the barrier called `onSuccess` even when some rows failed. `onSuccess` closes
+  the modal and retries the LC move, so the failed rows were unreadable and the
+  LC could advance with a PI that still had no invoice (the gate only needs one
+  invoice across the LC). It now stays open with the failures shown and does not
+  advance.
+- the add-line loop fired `onDone` only after the last row, so a mid-sequence
+  refusal skipped it even though the earlier POSTs had committed. `onDone` now
+  fires whenever at least one row landed.
+
 **Add-line posts every staged row.** The first cut sent only the first row,
-silently discarding the rest. Each row is now one `POST /api/invoices/<id>/items`
-and `onDone` fires once; rows are cleared as they land, so a mid-sequence refusal
-leaves exactly the unposted rows on screen with the reloaded budget marking them.
+silently discarding the rest. Each row is now one `POST /api/invoices/<id>/items`;
+rows are cleared as they land, so a mid-sequence refusal leaves exactly the
+unposted rows on screen with the reloaded budget marking them.
+
+**Header-only invoices are refused by both shortcuts.** `remaining` cannot see a
+legacy invoice that carries money with no line rows, so auto-invoicing the
+remainder would bill the same goods twice. The composer warns
+(`hasLineLessInvoices`); the two shortcuts now stop with a reason instead.
 
 **Test premises corrected while swapping** (none weakened a guarantee):
 
@@ -751,19 +770,22 @@ leaves exactly the unposted rows on screen with the reloaded budget marking them
 - `InvoicePanel`'s over-ceiling case typed 250/100/500 to make the *server*
   refuse; the editor refuses first, so those became at-ceiling quantities
   (40/45/150). The 409 case remains the server-refusal test.
+- `InvoiceEditor`'s two new partial-success tests had to stay inside the
+  ceiling: a fully invoiced row has only its 5% slack left, so the staged
+  quantity is `0.2`, not `1` — the hard stop, not the server, would otherwise
+  block the sequence before the refusal this test is about.
 
 **`api_list_invoices` deliberately does _not_ get `@limited()`.** It is a read,
 it already runs under the 300/min default, and the editor reloads its budget
 after every `409` — a 15/min stamp would break the recovery path rather than
 protect it.
 
-**Gates.** Backend: no Python file changed between `f6c7fe4` and `925a814`
+**Gates.** Backend: no Python file changed between `f6c7fe4` and `a1d272a`
 (`git diff --name-only`), so the 1261-passed suite from Phase 5 still stands.
-Frontend: `oxlint` 0 errors (9 pre-existing warnings), `vite build` ok. Full
-`npm test` passed 330/330 after the call-site swap (`d016093`..`96c2520`), then
-observed the documented flake once on the last run — 4 failures in
-`MultiPICreateModal` and `Reports`, both green when run together (13 passed) and
-unrelated to the deleted file.
+Frontend: `oxlint` 0 errors, 7 warnings; `vite build` ok; full `npm test`
+**335/335**. The documented worker-starvation flake appeared once mid-phase
+(4 failures in `MultiPICreateModal` and `Reports`, 13/13 when run together).
+
 
 ### Phase 0 baseline (HEAD `8a35c2f`, clean tree)
 
