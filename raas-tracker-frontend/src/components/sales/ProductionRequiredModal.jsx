@@ -8,7 +8,6 @@ import { Plus, X, AlertCircle, Loader2, Factory } from 'lucide-react';
 export default function ProductionRequiredModal({
   isOpen,
   onClose,
-  lcId,
   saleId,
   missingDetail,
   onSuccess,

@@ -404,4 +404,93 @@ describe('InvoiceEditor — add-line mode', () => {
     expect(await screen.findByText(/no longer available/i)).toBeTruthy();
     expect(screen.getByRole('button', { name: /add line/i }).disabled).toBe(true);
   });
+
+  it('reports the rows that landed when a later row is refused', async () => {
+    // Each POST is its own transaction, so stopping half-way still invoiced the
+    // rows before it. The parent must hear about them, or the sale keeps
+    // showing the pre-submit totals until something unrelated refreshes.
+    let attempt = 0;
+    const calls = installFetch({
+      budgets: [
+        budget(),
+        budget({
+          lines: [
+            { ...budget().lines[0], invoiced_quantity: 4, remaining: 6 },
+            budget().lines[1],
+          ],
+        }),
+      ],
+      addReply: () => {
+        attempt += 1;
+        if (attempt === 1) {
+          return jsonResponse(
+            { id: 5, sale_item_id: 101, quantity: 2, unit_price: 5 }, true, 201,
+          );
+        }
+        return jsonResponse(
+          { error: 'PI line 102: invoiced 4.2 exceeds 4.2 (PI qty 4 + 5%)' },
+          false, 409,
+        );
+      },
+    });
+    const { onDone } = renderEditor({
+      mode: 'add-line',
+      targetInvoiceId: INVOICE_ID,
+      invoiceLabel: 'INV-55',
+    });
+    await screen.findByText('Alpha');
+
+    // Beta is fully invoiced, so only the 0.2 left inside its 5% ceiling is
+    // submittable - anything more would be blocked by the hard stop, not the
+    // server, and this test is about a refusal that arrives mid-sequence.
+    fireEvent.change(qtyFor('Alpha'), { target: { value: '2' } });
+    fireEvent.change(qtyFor('Beta'), { target: { value: '0.2' } });
+    fireEvent.click(screen.getByRole('button', { name: /add line/i }));
+
+    await waitFor(() => expect(calls.adds).toHaveLength(2));
+    await waitFor(() => expect(onDone).toHaveBeenCalledTimes(1));
+    // The landed row is cleared; the refused one keeps what was typed.
+    await waitFor(() => expect(qtyFor('Alpha').value).toBe(''));
+    expect(qtyFor('Beta').value).toBe('0.2');
+  });
+
+  it('drops a PI line that vanished under add-line and says so', async () => {
+    // An add-line 404 is ambiguous, so the body carries a code. A vanished PI
+    // line is not a dead target invoice: resync, name it, keep editing.
+    let attempt = 0;
+    const calls = installFetch({
+      budgets: [budget(), budget({ lines: [budget().lines[0]] })],
+      addReply: () => {
+        attempt += 1;
+        if (attempt === 1) {
+          return jsonResponse(
+            { id: 6, sale_item_id: 101, quantity: 1, unit_price: 5 }, true, 201,
+          );
+        }
+        return jsonResponse(
+          { error: 'sale item not found', code: 'pi_line_gone' }, false, 404,
+        );
+      },
+    });
+    const { onDone } = renderEditor({
+      mode: 'add-line',
+      targetInvoiceId: INVOICE_ID,
+      invoiceLabel: 'INV-55',
+    });
+    await screen.findByText('Alpha');
+
+    fireEvent.change(qtyFor('Alpha'), { target: { value: '1' } });
+    fireEvent.change(qtyFor('Beta'), { target: { value: '0.2' } });
+    fireEvent.click(screen.getByRole('button', { name: /add line/i }));
+
+    await waitFor(() => expect(calls.adds).toHaveLength(2));
+    expect(
+      await screen.findByText(/1 PI line\(s\) are no longer on this PI/i),
+    ).toBeTruthy();
+    // The vanished row is gone, not left as a permanent refusal.
+    await waitFor(() => expect(screen.queryByLabelText('Invoice qty for Beta')).toBeNull());
+    expect(screen.queryByText(/sale item not found/i)).toBeNull();
+    expect(screen.queryByText(/no longer available/i)).toBeNull();
+    expect(onDone).toHaveBeenCalledTimes(1);
+  });
 });

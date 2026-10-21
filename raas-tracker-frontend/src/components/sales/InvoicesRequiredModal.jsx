@@ -64,6 +64,12 @@ export default function InvoicesRequiredModal({
         try {
           const budgetRes = await apiFetch(`/api/sales/${row.saleId}/invoice-lines`);
           const budget = await budgetRes.json();
+          if (budget?.has_line_less_invoices) {
+            // A header-only invoice means `remaining` overstates what is left.
+            // Auto-invoicing that remainder would bill the same goods twice.
+            failures[row.saleId] = 'This PI has an older invoice with no lines — add lines to it from the sale first.';
+            continue;
+          }
           const lines = (Array.isArray(budget?.lines) ? budget.lines : [])
             .filter((line) => Number(line?.remaining) > 0)
             .map((line) => ({
@@ -95,7 +101,9 @@ export default function InvoicesRequiredModal({
             ? `${created} invoice${created === 1 ? '' : 's'} created — fix the highlighted rows and retry.`
             : 'Some invoices failed — fix the highlighted rows and retry.',
         );
-        if (created > 0 && onSuccess) await onSuccess();
+        // Deliberately no onSuccess here: the caller closes this modal and
+        // retries the LC move, which would hide the failed rows and let the LC
+        // advance with a PI that still has no invoice.
         return;
       }
       toast.success(

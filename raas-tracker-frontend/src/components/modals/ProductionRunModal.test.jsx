@@ -260,6 +260,24 @@ describe('ProductionRunModal', () => {
     expect(toast.success).not.toHaveBeenCalled();
   });
 
+  it('refuses to create an invoice when the PI has a header-only invoice', async () => {
+    // `remaining` cannot see a line-less invoice, so these lines would bill
+    // goods that are already on the books.
+    const posts = installFetch({
+      invoiceLines: { ...BUDGET, has_line_less_invoices: true },
+    });
+    renderModal();
+
+    await pickCompanyAndPi();
+    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
+    fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-DUP' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
+
+    expect(await screen.findByText(/older invoice with no lines/i)).toBeTruthy();
+    expect(posts.invoicePosts).toHaveLength(0);
+    expect(posts).toHaveLength(0);
+  });
+
   it('omits the amount from the create body for a sale with no invoices', async () => {
     const posts = installFetch({ invoices: [] });
     renderModal();

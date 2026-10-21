@@ -35,8 +35,9 @@ function overflow(line, typed) {
  *
  * A refusal is classified structurally, never by parsing the server's prose:
  * 409 means the budget moved, so reload and let the fresh figures mark the
- * rows; 400 means a PI line vanished, so reload and name the product; a 404
- * with code="invoice_gone" means the target invoice is gone.
+ * rows; create-mode 400 means a PI line vanished, so reload and name the
+ * product; add-line 404 carries code="invoice_gone" (the target is gone) or
+ * "pi_line_gone" (the line is gone — drop it and say so, same as the 400).
  */
 export default function InvoiceEditor({
   mode = 'create',
@@ -106,12 +107,16 @@ export default function InvoiceEditor({
     }
     if (err?.status === 400 && await resyncDropping()) return;
     if (err?.status === 404) {
-      await reload();
       if (err?.code === 'invoice_gone') {
+        await reload();
         setTargetGone(true);
         return;
       }
+      // The PI line vanished mid-sequence: drop it and say so, rather than
+      // echoing "sale item not found" over a row the operator can still see.
+      if (err?.code === 'pi_line_gone' && await resyncDropping()) return;
     }
+    await reload();
     setError(err?.message || 'Could not save the invoice');
   };
 
@@ -149,24 +154,32 @@ export default function InvoiceEditor({
         // partial success is real (each POST is its own transaction). Clearing
         // a row as it lands means a mid-sequence refusal leaves exactly the
         // unposted rows on screen, with the reloaded budget marking them.
+        let landed = 0;
         let result = null;
-        for (const row of staged) {
-          const res = await apiFetch(`/api/invoices/${targetInvoiceId}/items`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              sale_item_id: row.line.sale_item_id,
-              quantity: row.typed,
-            }),
-          });
-          result = await res.json();
-          setQtys((prev) => {
-            const next = { ...prev };
-            delete next[row.line.sale_item_id];
-            return next;
-          });
+        try {
+          for (const row of staged) {
+            const res = await apiFetch(`/api/invoices/${targetInvoiceId}/items`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                sale_item_id: row.line.sale_item_id,
+                quantity: row.typed,
+              }),
+            });
+            result = await res.json();
+            landed += 1;
+            setQtys((prev) => {
+              const next = { ...prev };
+              delete next[row.line.sale_item_id];
+              return next;
+            });
+          }
+        } finally {
+          // Whatever landed is committed whether or not the loop finished, so
+          // the parent is told even when the sequence stops part-way — its
+          // totals would otherwise stay stale until an unrelated refresh.
+          if (landed > 0) onDone?.(result);
         }
-        onDone?.(result);
         await reload();
       }
     } catch (err) {

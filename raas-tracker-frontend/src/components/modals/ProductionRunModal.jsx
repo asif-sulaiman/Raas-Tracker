@@ -159,7 +159,7 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
   };
 
   // Money is never typed here: the server derives the new invoice's amount from
-  // the sale's remaining uninvoiced PI lines and returns it on create.
+  // the lines this form posts, which are the PI's remaining quantities.
   const addRecipeRow = () => {
     setRecipeRows((prev) => [
       ...prev,
@@ -221,6 +221,15 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
           `/api/sales/${encodeURIComponent(saleId)}/invoice-lines`,
         );
         const budget = await budgetRes.json();
+        if (budget?.has_line_less_invoices) {
+          // `remaining` cannot see a header-only invoice, so invoicing it would
+          // bill goods that are already on the books.
+          setError(
+            'This PI has an older invoice with no lines — add lines to it from the sale first.',
+          );
+          setSaving(false);
+          return;
+        }
         const lines = (Array.isArray(budget?.lines) ? budget.lines : [])
           .filter((line) => Number(line?.remaining) > 0)
           .map((line) => ({

@@ -49,7 +49,7 @@ function jsonResponse(data, ok = true, status = 200) {
   return { ok, status, json: async () => data, headers: { get: () => null } };
 }
 
-function installFetch(posts, { failWith = null, budgets = {}, budgetFails = false } = {}) {
+function installFetch(posts, { failWith = null, failSaleIds = null, budgets = {}, budgetFails = false } = {}) {
   const budgetReads = [];
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
     const u = String(url);
@@ -66,7 +66,9 @@ function installFetch(posts, { failWith = null, budgets = {}, budgetFails = fals
     }
     if (u.includes('/invoices') && method === 'POST') {
       posts.push({ url: u, body: JSON.parse(options.body) });
-      if (failWith) return jsonResponse(failWith, false, failWith.status || 400);
+      const postSaleId = Number((u.match(/\/api\/sales\/(\d+)\/invoices/) || [])[1]);
+      const shouldFail = failWith && (!failSaleIds || failSaleIds.includes(postSaleId));
+      if (shouldFail) return jsonResponse(failWith, false, failWith.status || 400);
       return jsonResponse(
         { invoice_id: 100 + posts.length, status: 'planned', amount: 50 },
         true, 201,
@@ -226,6 +228,53 @@ describe('InvoicesRequiredModal (LC barrier, one-or-many invoices)', () => {
     fireEvent.click(screen.getByRole('button', { name: /create invoices?/i }));
 
     expect(await screen.findByText(/sale not found/i)).toBeTruthy();
+    expect(posts).toHaveLength(0);
+    expect(onSuccess).not.toHaveBeenCalled();
+  });
+
+  it('stays open and does not advance when only some rows were created', async () => {
+    // onSuccess is what closes this modal and retries the LC move; the gate is
+    // satisfied by any one invoice, so calling it here would move the LC while a
+    // PI still has none - and the failed row's reason would never be read.
+    const posts = [];
+    installFetch(posts, {
+      failWith: { error: 'duplicate invoice number', status: 400 },
+      failSaleIds: [22],
+    });
+    const { onSuccess, onClose } = openModal();
+    const inputs = screen.getAllByPlaceholderText(/INV-/i);
+    fireEvent.change(inputs[0], { target: { value: 'INV-A' } });
+    fireEvent.change(inputs[1], { target: { value: 'INV-B' } });
+    fireEvent.click(screen.getByRole('button', { name: /create invoices?/i }));
+
+    expect(await screen.findByText(/duplicate invoice number/i)).toBeTruthy();
+    expect(posts).toHaveLength(2);
+    // The successful row is reported, but the modal keeps the failed one.
+    expect(screen.getByText(/1 invoice created/i)).toBeTruthy();
+    expect(screen.getByDisplayValue('INV-B')).toBeTruthy();
+    expect(onSuccess).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it('refuses a PI whose older invoice has no lines instead of re-billing it', async () => {
+    // `remaining` cannot see a header-only invoice, so auto-invoicing it would
+    // bill the same goods twice.
+    const posts = [];
+    installFetch(posts, {
+      budgets: {
+        11: {
+          lines: [{ sale_item_id: 201, product_name: 'Cotton', remaining: 5 }],
+          has_line_less_invoices: true,
+        },
+      },
+    });
+    const { onSuccess } = openModal();
+    const inputs = screen.getAllByPlaceholderText(/INV-/i);
+    fireEvent.change(inputs[0], { target: { value: 'INV-A' } });
+    fireEvent.click(screen.getByRole('button', { name: /create invoices?/i }));
+
+    expect(await screen.findByText(/older invoice with no lines/i)).toBeTruthy();
     expect(posts).toHaveLength(0);
     expect(onSuccess).not.toHaveBeenCalled();
   });

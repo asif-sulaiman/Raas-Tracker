@@ -53,7 +53,6 @@ export default function Sales() {
   // Barrier modals
   const [showInvoicesRequired, setShowInvoicesRequired] = useState(false);
   const [showProductionRequired, setShowProductionRequired] = useState(false);
-  const [barrierLcId, setBarrierLcId] = useState(null);
   const [barrierSaleId, setBarrierSaleId] = useState(null);
   // PIs of the LC blocked on the invoice barrier (modal renders one row per
   // PI so an LC can carry a single invoice or one per PI), plus the move to
@@ -223,13 +222,11 @@ export default function Sales() {
             toast.error('No PIs are linked to this LC, so there is nothing to invoice.');
             return;
           }
-          setBarrierLcId(lc.id);
           setBarrierSaleId(null);
           setBarrierPis(pis);
           setBarrierMove({ lcId: lc.id, next });
           setShowInvoicesRequired(true);
         } else if (blocked.barrier === 'production') {
-          setBarrierLcId(lc.id);
           setBarrierSaleId(null);
           setBarrierDetail(blocked.detail || {});
           setShowProductionRequired(true);
@@ -277,7 +274,6 @@ export default function Sales() {
       toast.error(err.message || 'Could not move LC');
     } finally {
       setMovingId(null);
-      setBarrierLcId(null);
       setBarrierSaleId(null);
       setBarrierDetail({});
       fetchData();
@@ -639,7 +635,6 @@ export default function Sales() {
         isOpen={showInvoicesRequired}
         onClose={() => {
           setShowInvoicesRequired(false);
-          setBarrierLcId(null);
           setBarrierSaleId(null);
           setBarrierPis([]);
           setBarrierMove(null);
@@ -653,7 +648,6 @@ export default function Sales() {
         isOpen={showProductionRequired}
         onClose={() => {
           setShowProductionRequired(false);
-          setBarrierLcId(null);
           setBarrierSaleId(null);
           setBarrierDetail({});
         }}
