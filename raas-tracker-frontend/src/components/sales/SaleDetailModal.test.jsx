@@ -166,7 +166,7 @@ describe('SaleDetailModal shipments', () => {
     expect(screen.queryByText('INV-9')).toBeNull();
   });
 
-  it('F8 renders nothing for the invoice-lines section when there is no invoice', async () => {
+  it('F8 renders no add-line section when there is no open invoice', async () => {
     const noInv = { ...DETAIL, invoices: [], stage: 'shipment_ongoing' };
     vi.stubGlobal('fetch', vi.fn(async (url) => {
       const u = String(url);
@@ -185,30 +185,29 @@ describe('SaleDetailModal shipments', () => {
       </MemoryRouter>
     );
     expect(await screen.findByText('Cotton')).toBeTruthy();
-    expect(screen.queryByText(/add an invoice line/i)).toBeNull();
+    // Nothing can receive a line, so the composer is not offered at all.
+    expect(screen.queryByLabelText('Target invoice')).toBeNull();
+    expect(screen.queryByText(/add lines to invoice/i)).toBeNull();
   });
 
-  it('F10 refetches invoice lines when invoice ids change and surfaces 404', async () => {
+  it('F10 reads the add-line budget from the sale endpoint and surfaces its 404', async () => {
+    // The per-invoice items read is gone: one call now feeds every row of the
+    // composer, and a failure must be reported rather than rendered as an
+    // empty PI (which would read as "nothing left to invoice").
     const withInv = {
       ...DETAIL,
       invoices: [{ invoice_id: 101, invoice_number: 'INV-101', status: 'planned' }],
     };
-    const voided = { ...DETAIL, invoices: [] };
-    let saleCalls = 0;
-    let itemsCalls = 0;
+    let budgetCalls = 0;
     vi.stubGlobal('fetch', vi.fn(async (url, options) => {
       const u = String(url);
       const method = options?.method || 'GET';
       if (u.includes('/api/auth/me')) return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
-      if (u.match(/\/api\/invoices\/101\/items/) && method === 'GET') {
-        itemsCalls += 1;
-        if (itemsCalls === 1) return jsonResponse([{ sale_item_id: 21, quantity: 10 }]);
-        return jsonResponse({ error: 'Invoice not found' }, false, 404);
+      if (u.includes('/invoice-lines') && method === 'GET') {
+        budgetCalls += 1;
+        return jsonResponse({ error: 'Sale not found' }, false, 404);
       }
-      if (u.match(/\/api\/sales\/5$/)) {
-        saleCalls += 1;
-        return jsonResponse(saleCalls === 1 ? withInv : voided);
-      }
+      if (u.match(/\/api\/sales\/5$/)) return jsonResponse(withInv);
       if (u.includes('/api/sales/5')) return jsonResponse(withInv);
       return jsonResponse({});
     }));
@@ -223,9 +222,11 @@ describe('SaleDetailModal shipments', () => {
       </MemoryRouter>
     );
     expect(await screen.findByText('Cotton')).toBeTruthy();
-    // The sale detail can render before the invoice-items effect fires; wait
-    // for the refetch instead of sampling the counter at an arbitrary instant.
-    await waitFor(() => expect(itemsCalls).toBeGreaterThanOrEqual(1));
+    // An open invoice makes the composer available; its budget read is the
+    // sale-level endpoint, not one call per invoice.
+    expect(await screen.findByLabelText('Target invoice')).toBeTruthy();
+    await waitFor(() => expect(budgetCalls).toBeGreaterThanOrEqual(1));
+    expect(await screen.findByText(/sale not found/i)).toBeTruthy();
   });
 });
 

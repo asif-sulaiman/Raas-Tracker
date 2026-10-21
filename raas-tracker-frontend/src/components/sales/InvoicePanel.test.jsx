@@ -47,16 +47,19 @@ const INVOICES = [
   },
 ];
 
-// PI lines the sale proposes. `invoiced_quantity` is what is already invoiced
-// across every invoice of the sale (proposal-vs-actual reference only).
+// PI lines the sale proposes, as `/api/sales/<id>/invoice-lines` returns them:
+// `invoiced_quantity` is what is already invoiced across every invoice of the
+// sale, and `ceiling` is the server's PI x 1.05 at 6 dp (not recomputed here).
 const PI_LINES = [
   {
     sale_item_id: 1, product_name: 'Cotton', unit: 'KG',
-    pi_quantity: 100, invoiced_quantity: 60, unit_price: 2.5,
+    pi_quantity: 100, invoiced_quantity: 60, remaining: 40, ceiling: 105,
+    unit_price: 2.5,
   },
   {
     sale_item_id: 2, product_name: 'Androma LO2', unit: 'KG',
-    pi_quantity: 3000, invoiced_quantity: 3000, unit_price: 0.56,
+    pi_quantity: 3000, invoiced_quantity: 3000, remaining: 0, ceiling: 3150,
+    unit_price: 0.56,
   },
 ];
 
@@ -64,17 +67,26 @@ function jsonResponse(data, ok = true, status = 200) {
   return { ok, status, json: async () => data, headers: { get: () => null } };
 }
 
-function installFetch({ invoices = INVOICES, posts = [], completion, completionStatus = 200, payStatus = 'paid', deleteStatus = 200, deleteBody = null, failInvoicesAfterPost = false, failInvoicesAlways = false, createAmount = 2400, createStatus = 201, createBody = null } = {}) {
+function installFetch({ invoices = INVOICES, posts = [], completion, completionStatus = 200, payStatus = 'paid', deleteStatus = 200, deleteBody = null, failInvoicesAfterPost = false, failInvoicesAlways = false, createAmount = 2400, createStatus = 201, createBody = null, piLines = PI_LINES, piLinesAfterPost = null, hasLineLess = false } = {}) {
   const deletes = [];
   let invoiceReadsFail = failInvoicesAfterPost || failInvoicesAlways;
   // Lets a test flip the invoice read back to healthy to exercise a retry.
   posts.failInvoices = (on) => { invoiceReadsFail = on; };
   posts.deletes = deletes;
+  let budgetReads = 0;
+  posts.budgetReads = () => budgetReads;
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
     const u = String(url);
     const method = options?.method || 'GET';
     if (u.includes('/api/auth/me')) {
       return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
+    }
+    if (u.includes('/invoice-lines') && method === 'GET') {
+      // One row per PI line, ceiling included: the editor must trust these
+      // figures rather than recompute pi * 1.05 in the browser.
+      budgetReads += 1;
+      const served = posts.length > 0 && piLinesAfterPost ? piLinesAfterPost : piLines;
+      return jsonResponse({ lines: served, has_line_less_invoices: hasLineLess });
     }
     if (u.includes('/invoices') && method === 'DELETE') {
       deletes.push({ url: u });
@@ -121,7 +133,6 @@ function renderPanel(opts = {}) {
           <InvoicePanel
             saleId={5}
             isAdmin={opts.isAdmin ?? true}
-            lines={opts.piLines || PI_LINES}
             onChanged={opts.onChanged || vi.fn()}
           />
         </ConfirmProvider>
@@ -203,7 +214,7 @@ describe('InvoicePanel', () => {
     });
 
     fireEvent.change(screen.getByLabelText(/invoice qty for Cotton/i), {
-      target: { value: '250' },
+      target: { value: '40' },
     });
 
     const save = screen.getByRole('button', { name: 'Save invoice' });
@@ -218,7 +229,7 @@ describe('InvoicePanel', () => {
     expect(post.body).toMatchObject({
       invoice_number: 'INV-3',
       invoice_date: expect.stringMatching(/\d{4}-\d{2}-\d{2}/),
-      lines: [{ sale_item_id: 1, quantity: 250 }],
+      lines: [{ sale_item_id: 1, quantity: 40 }],
     });
     expect(post.body).not.toHaveProperty('amount');
   });
@@ -231,33 +242,36 @@ describe('InvoicePanel', () => {
       target: { value: 'INV-4' },
     });
 
+    // Both quantities sit exactly on their ceiling (105 - 60 and 3150 - 3000),
+    // which is allowed: the hard stop is "above", not "at".
     fireEvent.change(screen.getByLabelText(/invoice qty for Cotton/i), {
-      target: { value: '100' },
+      target: { value: '45' },
     });
     fireEvent.change(screen.getByLabelText(/invoice qty for Androma LO2/i), {
-      target: { value: '500' },
+      target: { value: '150' },
     });
 
     fireEvent.click(screen.getByRole('button', { name: 'Save invoice' }));
     await waitFor(() => expect(posts.filter((p) => p.body && p.body.invoice_number === 'INV-4')).toHaveLength(1));
     const post = posts.find((p) => p.body && p.body.invoice_number === 'INV-4');
     expect(post.body.lines).toEqual([
-      { sale_item_id: 1, quantity: 100 },
-      { sale_item_id: 2, quantity: 500 },
+      { sale_item_id: 1, quantity: 45 },
+      { sale_item_id: 2, quantity: 150 },
     ]);
   });
 
-  it('shows Remaining per PI line instead of a variance', async () => {
+  it('shows Remaining per PI line and stops advertising the ceiling', async () => {
     renderPanel();
     fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
-    // 100 proposed, 60 invoiced -> 40 remaining; ceiling 105 - 60 = 45.
-    const cottonRow = screen.getByText('Cotton').closest('tr');
-    expect(cottonRow.textContent).toContain('40.00 KG (ceiling 45.00 KG)');
+    // 100 proposed, 60 invoiced -> 40 remaining.
+    const cottonRow = (await screen.findByText('Cotton')).closest('tr');
+    expect(cottonRow.textContent).toContain('40.00 KG');
     // Line 2: 3,000 proposed, 3,000 invoiced -> nothing remains.
     const andromaRow = screen.getByText('Androma LO2').closest('tr');
-    expect(andromaRow.textContent).toContain('0.00 KG (ceiling 150.00 KG)');
-    // No variance wording anywhere in the create form.
-    expect(screen.queryByText(/under PI|over PI|matches PI/i)).toBeNull();
+    expect(andromaRow.textContent).toContain('0.00 KG');
+    // No variance wording, and no ceiling headroom offered as a target: the
+    // ceiling is a server-enforced hard stop, surfaced only when crossed.
+    expect(screen.queryByText(/under PI|over PI|matches PI|ceiling/i)).toBeNull();
   });
 
   it('defaults the invoice date to today and posts number, date, and lines', async () => {
@@ -281,12 +295,19 @@ describe('InvoicePanel', () => {
     expect(post.body.lines).toEqual([{ sale_item_id: 1, quantity: 25 }]);
   });
 
-  it('shows the server error when the ceiling is breached', async () => {
+  it('resyncs on a 409 instead of echoing the server prose', async () => {
+    // Another operator invoiced the same PI line between load and submit. The
+    // refusal is classified by status only: the budget is refetched, and the
+    // RELOADED figures decide whether the typed quantity is still allowed.
     const posts = [];
     renderPanel({
       posts,
       createStatus: 409,
       createBody: { error: 'PI line 1: invoiced 106.00 exceeds 105.00 (PI qty 100.00 + 5%)' },
+      piLinesAfterPost: [
+        { ...PI_LINES[0], invoiced_quantity: 100, remaining: 0 },
+        PI_LINES[1],
+      ],
     });
     fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
     fireEvent.change(await screen.findByLabelText('Invoice number'), {
@@ -298,8 +319,15 @@ describe('InvoicePanel', () => {
     const save = screen.getByRole('button', { name: 'Save invoice' });
     await waitFor(() => expect(save.disabled).toBe(false));
     fireEvent.click(save);
-    await waitFor(() => expect(screen.getByText(/exceeds/i)).toBeTruthy());
+
+    // 105 ceiling - 100 invoiced leaves 5, so 25 is now refused in the form.
+    expect(
+      await screen.findByText(/maximum you can still add is 5\.00/i),
+    ).toBeTruthy();
     expect(posts).toHaveLength(1);
+    expect(posts.budgetReads()).toBeGreaterThanOrEqual(2);
+    // The server's message is not the contract: never render it verbatim.
+    expect(screen.queryByText(/exceeds/i)).toBeNull();
   });
 
   it('keeps Book visible but disabled, with a reason, until produced', async () => {
@@ -419,7 +447,7 @@ describe('InvoicePanel', () => {
       target: { value: 'INV-9' },
     });
     fireEvent.change(screen.getByLabelText(/invoice qty for Cotton/i), {
-      target: { value: '250' },
+      target: { value: '40' },
     });
     fireEvent.click(screen.getByRole('button', { name: 'Save invoice' }));
     // The create response carries the amount the server derived from the lines.
@@ -430,7 +458,7 @@ describe('InvoicePanel', () => {
     renderPanel({ createAmount: null });
     fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
     fireEvent.change(await screen.findByLabelText('Invoice number'), { target: { value: 'INV-9' } });
-    fireEvent.change(screen.getByLabelText(/invoice qty for Cotton/i), { target: { value: '250' } });
+    fireEvent.change(screen.getByLabelText(/invoice qty for Cotton/i), { target: { value: '40' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save invoice' }));
     await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Invoice created'));
     expect(toast.success).not.toHaveBeenCalledWith(expect.stringContaining('Invoiced $'));

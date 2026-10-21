@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { AlertTriangle, Lock } from 'lucide-react';
+import { toast } from 'sonner';
 import { useAuth } from '../../context/AuthContext';
 import Button from '../ui/Button';
 import { formatNumber, lineTotal, todayLocalISO } from '../../utils/format';
@@ -133,21 +134,39 @@ export default function InvoiceEditor({
             })),
           }),
         });
-        onDone?.(await res.json());
+        const created = await res.json();
+        // The amount is the server's, derived from the server-owned unit price.
+        toast.success(
+          typeof created?.amount === 'number'
+            ? `Invoiced $${formatNumber(created.amount)}`
+            : 'Invoice created',
+        );
+        onDone?.(created);
         setInvoiceNumber('');
         await reload();
       } else {
-        const row = staged[0];
-        const res = await apiFetch(`/api/invoices/${targetInvoiceId}/items`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            sale_item_id: row.line.sale_item_id,
-            quantity: row.typed,
-          }),
-        });
-        onDone?.(await res.json());
-        setQtys({});
+        // One request per staged row: the endpoint takes a single line, and a
+        // partial success is real (each POST is its own transaction). Clearing
+        // a row as it lands means a mid-sequence refusal leaves exactly the
+        // unposted rows on screen, with the reloaded budget marking them.
+        let result = null;
+        for (const row of staged) {
+          const res = await apiFetch(`/api/invoices/${targetInvoiceId}/items`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              sale_item_id: row.line.sale_item_id,
+              quantity: row.typed,
+            }),
+          });
+          result = await res.json();
+          setQtys((prev) => {
+            const next = { ...prev };
+            delete next[row.line.sale_item_id];
+            return next;
+          });
+        }
+        onDone?.(result);
         await reload();
       }
     } catch (err) {
@@ -302,9 +321,11 @@ export default function InvoiceEditor({
       )}
 
       <div className="flex items-center justify-end gap-2">
-        <Button variant="secondary" size="sm" onClick={onCancel} disabled={saving}>
-          Cancel
-        </Button>
+        {onCancel && (
+          <Button variant="secondary" size="sm" onClick={onCancel} disabled={saving}>
+            Cancel
+          </Button>
+        )}
         <Button
           variant="primary"
           size="sm"

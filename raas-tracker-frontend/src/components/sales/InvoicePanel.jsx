@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Plus, Check, Trash2 } from 'lucide-react';
 import Button from '../ui/Button';
-import InvoiceCreateForm from './InvoiceCreateForm';
+import InvoiceEditor from './InvoiceEditor';
 import { formatDate, formatNumber, toCents, fromCents } from '../../utils/format';
 import { useAuth } from '../../context/AuthContext';
 import { useConfirm } from '../../context/ConfirmContext';
@@ -81,13 +81,13 @@ function StatusChip({ status }) {
  * Rendered inside SaleDetailModal while the sale sits in Shipment Ongoing.
  * Mutations are admin-only (the API enforces that), so actions hide for users.
  *
- * `lines` carries the sale's PI lines (see useSaleInvoiceLines) so a new
- * invoice can be created with its lines in one step. An invoice with no lines
- * is refused: INV-REVISION makes the invoice the practical shipment document,
- * so it must state what is being shipped rather than inheriting the PI
- * remainder (which silently produced a $0 "paid" row).
+ * Creation is delegated to `InvoiceEditor`, which reads the sale's PI lines
+ * from `/api/sales/<id>/invoice-lines` itself. An invoice with no lines is
+ * refused: INV-REVISION makes the invoice the practical shipment document, so
+ * it must state what is being shipped rather than inheriting the PI remainder
+ * (which silently produced a $0 "paid" row).
  */
-export default function InvoicePanel({ saleId, isAdmin = false, lines = [], onChanged }) {
+export default function InvoicePanel({ saleId, isAdmin = false, onChanged }) {
   const { apiFetch } = useAuth();
   const { confirm } = useConfirm();
   const [invoices, setInvoices] = useState([]);
@@ -500,10 +500,10 @@ export default function InvoicePanel({ saleId, isAdmin = false, lines = [], onCh
           })}
 
           {adding && (
-            <InvoiceCreateForm
+            <InvoiceEditor
+              mode="create"
               saleId={saleId}
-              piLines={lines}
-              onSaved={() => {
+              onDone={() => {
                 setAdding(false);
                 reload();
                 onChanged?.();

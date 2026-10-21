@@ -326,6 +326,30 @@ describe('InvoiceEditor — add-line mode', () => {
     await waitFor(() => expect(onDone).toHaveBeenCalled());
   });
 
+  it('posts every staged row, one request each, and reports once', async () => {
+    // add-line mode still shows the whole table, so more than one row can be
+    // staged; silently dropping all but the first would lose the operator's
+    // input without saying so.
+    const calls = installFetch();
+    const { onDone } = renderEditor({
+      mode: 'add-line',
+      targetInvoiceId: INVOICE_ID,
+      invoiceLabel: 'INV-55',
+    });
+    await screen.findByText('Alpha');
+
+    fireEvent.change(qtyFor('Alpha'), { target: { value: '2' } });
+    fireEvent.change(qtyFor('Beta'), { target: { value: '0.2' } });
+    fireEvent.click(screen.getByRole('button', { name: /add line/i }));
+
+    await waitFor(() => expect(calls.adds).toHaveLength(2));
+    expect(calls.adds.map((a) => a.body)).toEqual([
+      { sale_item_id: 101, quantity: 2 },
+      { sale_item_id: 102, quantity: 0.2 },
+    ]);
+    await waitFor(() => expect(onDone).toHaveBeenCalledTimes(1));
+  });
+
   it('flags the failing line on a 409, resyncs and keeps its quantity', async () => {
     const calls = installFetch({
       budgets: [
