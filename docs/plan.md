@@ -446,8 +446,8 @@ the operator types quantity only. Executed in gated phases, one at a time.
 | 2 | Delete `backfill_invoice_lines` + its tests (auto-invoicing) | ✅ | ✅ 2026-10-21 |
 | 3 | `GET /api/sales/<id>/invoice-lines` (kills the N+1 fetch) | — | ✅ 2026-10-21 |
 | 4 | Pin the backend invoice contract with tests | — | ✅ 2026-10-21 |
-| 5 | `InvoiceEditor` + rewritten `InvoiceLineComposer` | ✅ spec-first | 🟡 2026-10-21 — editor + hook + `code` on 404 landed (`f6c7fe4`, `23b8743`); composer rewrite rides with the Phase 6 swap so no dead composer is left behind |
-| 6 | Swap call sites, delete the legacy files | ✅ | ⬜ |
+| 5 | `InvoiceEditor` + rewritten `InvoiceLineComposer` | ✅ spec-first | ✅ 2026-10-21 — editor + hook + `code` on 404 landed (`f6c7fe4`, `23b8743`); the composer was deleted in Phase 6 instead of rewritten |
+| 6 | Swap call sites, delete the legacy files | ✅ | ✅ 2026-10-21 (`d016093`, `96c2520`, `925a814`) |
 | 7 | Docs close-out | — | ⬜ |
 
 ### Phase 1 finding: the batch race was already closed (2026-10-21)
@@ -715,10 +715,55 @@ Two corrections made while turning the spec into tests:
   superseded path as create; only `invoice_gone` disables Save, because the
   target itself is the thing that vanished.
 
-`InvoiceLineComposer.jsx` is **not** rewritten yet: nothing renders the new
-editor until Phase 6 swaps the four call sites, and rewriting the composer
-first would leave two composers with no callers. Phase 6 owns that plus the
-deletions listed in the table at the top of this section.
+`InvoiceLineComposer.jsx` was **deleted, not rewritten** (deviation from the
+table at the top of this section, recorded in Phase 6): its one-line
+select-and-quantity model has no place in the table the editor renders, and once
+its only caller (`InvoiceCreateForm`) went, rewriting it would have produced a
+second composer with no callers. Phase 6 also corrected this table's own premise:
+`InvoiceBuilderModal` was dead code, not a live 400.
+
+### Phase 6: call sites swapped, legacy files deleted (2026-10-21)
+
+| Commit | Content |
+|---|---|
+| `d016093` | `InvoicePanel` and `SaleDetailModal` render `InvoiceEditor`; `InvoiceCreateForm`, `InvoiceLineEditor` (+ test), `InvoiceLineComposer`, `useSaleInvoiceLines` deleted |
+| `96c2520` | `InvoicesRequiredModal` and `ProductionRunModal` state `invoice_date` + `lines` instead of posting a bare number |
+| `925a814` | `InvoiceBuilderModal` deleted; dead `lcId` props dropped from `Sales.jsx` |
+
+**Both broken flows are fixed.** Each barrier now reads
+`/api/sales/<id>/invoice-lines` and posts the rows that still have budget. A
+filled row whose PI is exhausted is **refused with a reason** rather than being
+dropped silently — the operator typed a number expecting an invoice, and the API
+would reject quantity `0` anyway. A batch that creates nothing does not toast
+success, call `onSuccess`, or close: the barrier would refuse again immediately.
+
+**Add-line posts every staged row.** The first cut sent only the first row,
+silently discarding the rest. Each row is now one `POST /api/invoices/<id>/items`
+and `onDone` fires once; rows are cleared as they land, so a mid-sequence refusal
+leaves exactly the unposted rows on screen with the reloaded budget marking them.
+
+**Test premises corrected while swapping** (none weakened a guarantee):
+
+- `SaleDetailModal` F10 pinned one `GET /api/invoices/<id>/items` per invoice.
+  The wiring is now a single `/api/sales/<id>/invoice-lines` read, so F10 asserts
+  the new source and that its `404` surfaces inline instead of rendering as "no
+  lines left".
+- `InvoicePanel`'s over-ceiling case typed 250/100/500 to make the *server*
+  refuse; the editor refuses first, so those became at-ceiling quantities
+  (40/45/150). The 409 case remains the server-refusal test.
+
+**`api_list_invoices` deliberately does _not_ get `@limited()`.** It is a read,
+it already runs under the 300/min default, and the editor reloads its budget
+after every `409` — a 15/min stamp would break the recovery path rather than
+protect it.
+
+**Gates.** Backend: no Python file changed between `f6c7fe4` and `925a814`
+(`git diff --name-only`), so the 1261-passed suite from Phase 5 still stands.
+Frontend: `oxlint` 0 errors (9 pre-existing warnings), `vite build` ok. Full
+`npm test` passed 330/330 after the call-site swap (`d016093`..`96c2520`), then
+observed the documented flake once on the last run — 4 failures in
+`MultiPICreateModal` and `Reports`, both green when run together (13 passed) and
+unrelated to the deleted file.
 
 ### Phase 0 baseline (HEAD `8a35c2f`, clean tree)
 
