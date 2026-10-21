@@ -4,15 +4,20 @@ import { toast } from 'sonner';
 import Modal from '../modals/Modal';
 import Button from '../ui/Button';
 import { Plus } from 'lucide-react';
+import { todayLocalISO } from '../../utils/format';
 
 /**
  * Shipment barrier: an LC needs >= 1 invoice before moving to
  * Shipment Ongoing (the gate counts invoices across ALL of the LC's sales).
  * One invoice number per PI here — a single invoice or one per PI, so an LC
- * with several PIs can carry several invoices. Splitting ONE PI across
- * several invoices stays in the PI detail view (InvoiceLineEditor), because
- * each create auto-seeds the PI's whole remainder: a second blind create on
- * the same PI would only mint a zero-amount row.
+ * with several PIs can carry several invoices.
+ *
+ * Each create states its own lines: the API refuses an invoice without them
+ * (there is no server-side auto-seed any more), so the barrier invoices each
+ * PI's whole remaining quantity from `/api/sales/<id>/invoice-lines`. A PI with
+ * nothing left can still be labelled with an invoice number, but the row is
+ * refused rather than posted as a zero line — splitting one PI across several
+ * invoices stays in the PI detail view.
  */
 export default function InvoicesRequiredModal({
   isOpen,
@@ -53,20 +58,44 @@ export default function InvoicesRequiredModal({
     setRowErrors({});
     try {
       const failures = {};
+      const invoiceDate = todayLocalISO();
+      let created = 0;
       for (const row of filled) {
         try {
+          const budgetRes = await apiFetch(`/api/sales/${row.saleId}/invoice-lines`);
+          const budget = await budgetRes.json();
+          const lines = (Array.isArray(budget?.lines) ? budget.lines : [])
+            .filter((line) => Number(line?.remaining) > 0)
+            .map((line) => ({
+              sale_item_id: line.sale_item_id,
+              quantity: Number(line.remaining),
+            }));
+          if (lines.length === 0) {
+            failures[row.saleId] = 'Nothing left to invoice on this PI.';
+            continue;
+          }
           await apiFetch(`/api/sales/${row.saleId}/invoices`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ invoice_number: row.invoiceNumber }),
+            body: JSON.stringify({
+              invoice_number: row.invoiceNumber,
+              invoice_date: invoiceDate,
+              lines,
+            }),
           });
+          created += 1;
         } catch (err) {
           failures[row.saleId] = err?.message || 'Failed to create invoice';
         }
       }
       if (Object.keys(failures).length > 0) {
         setRowErrors(failures);
-        setFormError('Some invoices failed — fix the highlighted rows and retry.');
+        setFormError(
+          created > 0
+            ? `${created} invoice${created === 1 ? '' : 's'} created — fix the highlighted rows and retry.`
+            : 'Some invoices failed — fix the highlighted rows and retry.',
+        );
+        if (created > 0 && onSuccess) await onSuccess();
         return;
       }
       toast.success(

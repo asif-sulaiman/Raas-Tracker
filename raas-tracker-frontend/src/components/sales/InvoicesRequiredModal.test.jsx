@@ -3,6 +3,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import React from 'react';
 import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
+import { toast } from 'sonner';
 import { AuthProvider } from '../../context/AuthContext';
 import InvoicesRequiredModal from './InvoicesRequiredModal';
 
@@ -25,16 +26,43 @@ const PIS = [
   { id: 22, pi_number: 'PI-22' },
 ];
 
+// Per-sale budgets, keyed by sale id, as `/api/sales/<id>/invoice-lines`
+// answers them. Only `remaining` and `sale_item_id` are read here: the barrier
+// invoices the whole remainder, it does not re-derive quantities.
+function budgetFor(saleId) {
+  if (saleId === 11) {
+    return {
+      lines: [
+        { sale_item_id: 201, product_name: 'Cotton', unit: 'KG', remaining: 5 },
+        { sale_item_id: 202, product_name: 'Soda', unit: 'KG', remaining: 0 },
+      ],
+      has_line_less_invoices: false,
+    };
+  }
+  return {
+    lines: [{ sale_item_id: 301, product_name: 'Resin', unit: 'KG', remaining: 2.5 }],
+    has_line_less_invoices: false,
+  };
+}
+
 function jsonResponse(data, ok = true, status = 200) {
   return { ok, status, json: async () => data, headers: { get: () => null } };
 }
 
-function installFetch(posts, { failWith = null } = {}) {
+function installFetch(posts, { failWith = null, budgets = {}, budgetFails = false } = {}) {
+  const budgetReads = [];
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
     const u = String(url);
     const method = options?.method || 'GET';
     if (u.includes('/api/auth/me')) {
       return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
+    }
+    const budgetMatch = u.match(/\/api\/sales\/(\d+)\/invoice-lines/);
+    if (budgetMatch && method === 'GET') {
+      const saleId = Number(budgetMatch[1]);
+      budgetReads.push(saleId);
+      if (budgetFails) return jsonResponse({ error: 'Sale not found' }, false, 404);
+      return jsonResponse(budgets[saleId] || budgetFor(saleId));
     }
     if (u.includes('/invoices') && method === 'POST') {
       posts.push({ url: u, body: JSON.parse(options.body) });
@@ -46,6 +74,7 @@ function installFetch(posts, { failWith = null } = {}) {
     }
     return jsonResponse({});
   }));
+  return { budgetReads };
 }
 
 function openModal(props = {}) {
@@ -74,7 +103,7 @@ describe('InvoicesRequiredModal (LC barrier, one-or-many invoices)', () => {
     expect(screen.getByText(/PI-22/)).toBeTruthy();
   });
 
-  it('POSTs each filled row to its own PI id (never null)', async () => {
+  it('POSTs each filled row to its own PI with a date and its remaining lines', async () => {
     const posts = [];
     installFetch(posts);
     openModal();
@@ -83,6 +112,7 @@ describe('InvoicesRequiredModal (LC barrier, one-or-many invoices)', () => {
     fireEvent.change(inputs[0], { target: { value: 'INV-A' } });
     fireEvent.change(inputs[1], { target: { value: 'INV-B' } });
     fireEvent.click(screen.getByRole('button', { name: /create invoices?/i }));
+
     await waitFor(() => {
       expect(posts).toHaveLength(2);
     });
@@ -90,7 +120,17 @@ describe('InvoicesRequiredModal (LC barrier, one-or-many invoices)', () => {
     expect(urls.some((u) => u.includes('/api/sales/11/invoices'))).toBe(true);
     expect(urls.some((u) => u.includes('/api/sales/22/invoices'))).toBe(true);
     expect(urls.some((u) => u.includes('null'))).toBe(false);
-    expect(posts[0].body).toEqual({ invoice_number: 'INV-A' });
+
+    // A line-less create is refused by the API (400: lines required), and the
+    // barrier must invoice what is left instead of inheriting it server-side.
+    const first = posts.find((p) => p.url.includes('/api/sales/11/invoices'));
+    expect(first.body).toEqual({
+      invoice_number: 'INV-A',
+      invoice_date: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/),
+      lines: [{ sale_item_id: 201, quantity: 5 }],
+    });
+    const second = posts.find((p) => p.url.includes('/api/sales/22/invoices'));
+    expect(second.body.lines).toEqual([{ sale_item_id: 301, quantity: 2.5 }]);
   });
 
   it('creates a single invoice when only one row is filled', async () => {
@@ -130,6 +170,63 @@ describe('InvoicesRequiredModal (LC barrier, one-or-many invoices)', () => {
     await waitFor(() => {
       expect(screen.getByText(/duplicate invoice number/i)).toBeTruthy();
     });
+    expect(onSuccess).not.toHaveBeenCalled();
+  });
+
+  it('refuses a row whose PI has nothing left instead of posting a zero line', async () => {
+    // The row the operator filled is already fully invoiced. Posting the
+    // remainder would send quantity 0, which the writer rejects; dropping the
+    // row silently would discard the typed number without saying so.
+    const posts = [];
+    installFetch(posts, {
+      budgets: { 11: { lines: [{ sale_item_id: 201, remaining: 0 }], has_line_less_invoices: false } },
+    });
+    const { onSuccess } = openModal();
+    const inputs = screen.getAllByPlaceholderText(/INV-/i);
+    fireEvent.change(inputs[0], { target: { value: 'INV-EMPTY' } });
+    fireEvent.click(screen.getByRole('button', { name: /create invoices?/i }));
+
+    expect(await screen.findByText(/nothing left to invoice on this pi/i)).toBeTruthy();
+    expect(posts).toHaveLength(0);
+    expect(onSuccess).not.toHaveBeenCalled();
+  });
+
+  it('never toasts success when no invoice was created', async () => {
+    // Every filled PI is exhausted: the LC barrier would still be unsatisfied,
+    // so claiming success and closing the modal sends the user straight back
+    // into the same refusal.
+    const posts = [];
+    installFetch(posts, {
+      budgets: {
+        11: { lines: [{ sale_item_id: 201, remaining: 0 }], has_line_less_invoices: false },
+        22: { lines: [{ sale_item_id: 301, remaining: 0 }], has_line_less_invoices: false },
+      },
+    });
+    const { onSuccess, onClose } = openModal();
+    const inputs = screen.getAllByPlaceholderText(/INV-/i);
+    fireEvent.change(inputs[0], { target: { value: 'INV-X' } });
+    fireEvent.change(inputs[1], { target: { value: 'INV-Y' } });
+    fireEvent.click(screen.getByRole('button', { name: /create invoices?/i }));
+
+    await waitFor(() => {
+      expect(screen.getAllByText(/nothing left to invoice on this pi/i)).toHaveLength(2);
+    });
+    expect(posts).toHaveLength(0);
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(onSuccess).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it('reports a failed budget read per row and creates nothing', async () => {
+    const posts = [];
+    installFetch(posts, { budgetFails: true });
+    const { onSuccess } = openModal();
+    const inputs = screen.getAllByPlaceholderText(/INV-/i);
+    fireEvent.change(inputs[0], { target: { value: 'INV-A' } });
+    fireEvent.click(screen.getByRole('button', { name: /create invoices?/i }));
+
+    expect(await screen.findByText(/sale not found/i)).toBeTruthy();
+    expect(posts).toHaveLength(0);
     expect(onSuccess).not.toHaveBeenCalled();
   });
 });

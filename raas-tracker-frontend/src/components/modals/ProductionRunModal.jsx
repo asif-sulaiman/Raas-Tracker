@@ -4,7 +4,7 @@ import Modal from './Modal';
 import Button from '../ui/Button';
 import { useAuth } from '../../context/AuthContext';
 import { toast } from 'sonner';
-import { formatNumber } from '../../utils/format';
+import { formatNumber, todayLocalISO } from '../../utils/format';
 
 const inputCls =
   'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
@@ -207,19 +207,39 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
 
     setSaving(true);
     // A typed invoice number is free text until it exists as a row: create it
-    // first so produce can link the run via invoice_ids. The create body carries
-    // the number only — the server derives the amount from the remaining
-    // uninvoiced PI lines and returns it. A failed create (400 over total, 409
-    // duplicate) blocks the run — the error shows inline.
+    // first so produce can link the run via invoice_ids. The create states its
+    // own lines — the API refuses an invoice without them — taken from this
+    // PI's remaining quantities, so the amount stays server-derived. A failed
+    // create (400 over total, 409 duplicate) blocks the run — the error shows
+    // inline.
     let createdInvoiceId = null;
     let invoiceNumber;
     let invoicedAmount = null;
     if (isNewInvoice) {
       try {
+        const budgetRes = await apiFetch(
+          `/api/sales/${encodeURIComponent(saleId)}/invoice-lines`,
+        );
+        const budget = await budgetRes.json();
+        const lines = (Array.isArray(budget?.lines) ? budget.lines : [])
+          .filter((line) => Number(line?.remaining) > 0)
+          .map((line) => ({
+            sale_item_id: line.sale_item_id,
+            quantity: Number(line.remaining),
+          }));
+        if (lines.length === 0) {
+          setError('Nothing left to invoice on this PI — pick an existing invoice or none.');
+          setSaving(false);
+          return;
+        }
         const invRes = await apiFetch(`/api/sales/${encodeURIComponent(saleId)}/invoices`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ invoice_number: trimmedNewNumber }),
+          body: JSON.stringify({
+            invoice_number: trimmedNewNumber,
+            invoice_date: todayLocalISO(),
+            lines,
+          }),
         });
         const created = await invRes.json();
         createdInvoiceId = created?.invoice_id ?? created?.id ?? null;
@@ -449,8 +469,8 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
                 className={inputCls}
               />
               <p className="mt-1 text-[11px] text-slate-400 dark:text-slate-500">
-                The amount is derived from this PI&apos;s lines that are not yet invoiced — to
-                invoice less, add fewer lines in the invoice line editor on the sale.
+                The invoice covers every line of this PI that is not yet invoiced. To invoice
+                less, create the invoice from the sale instead and link it here.
               </p>
             </div>
           )}

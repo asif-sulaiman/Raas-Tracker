@@ -37,8 +37,12 @@ const SALES = [
 ];
 const PRODUCTS = [{ product_name: 'Cleaner', quantity: 5000, unit: 'KG', item_no: '1001001' }];
 const INVOICES = [{ invoice_id: 31, invoice_number: 'INV-31', status: 'issued' }];
+const BUDGET = {
+  lines: [{ sale_item_id: 501, product_name: 'Cleaner', unit: 'KG', remaining: 5000 }],
+  has_line_less_invoices: false,
+};
 
-function installFetch({ companies = COMPANIES, companiesFailTimes = 0, companiesError = 'Companies service unavailable', produceStatus = 201, produceBody = { runs: [] }, invoices = INVOICES, sales = SALES, invoiceStatus = 201, invoiceBody = null } = {}) {
+function installFetch({ companies = COMPANIES, companiesFailTimes = 0, companiesError = 'Companies service unavailable', produceStatus = 201, produceBody = { runs: [] }, invoices = INVOICES, sales = SALES, invoiceStatus = 201, invoiceBody = null, invoiceLines = BUDGET } = {}) {
   const posts = [];
   const invoicePosts = [];
   const invoiceDeletes = [];
@@ -67,6 +71,7 @@ function installFetch({ companies = COMPANIES, companiesFailTimes = 0, companies
     }
     if (u.includes('/api/recipes')) return jsonResponse(RECIPES);
     if (u.includes('/api/production-source')) return jsonResponse({ sale_id: 5, products: PRODUCTS });
+    if (u.includes('/invoice-lines')) return jsonResponse(invoiceLines);
     if (u.includes('/invoices') && method === 'POST') {
       const body = options?.body ? JSON.parse(options.body) : null;
       invoicePosts.push({ url: u, body });
@@ -190,9 +195,13 @@ describe('ProductionRunModal', () => {
     await waitFor(() => expect(posts).toHaveLength(1));
     expect(posts.invoicePosts).toHaveLength(1);
     expect(posts.invoicePosts[0].url).toContain('/api/sales/5/invoices');
-    // Money is server-derived from the remaining uninvoiced PI lines — the
-    // create body must never carry an amount.
-    expect(posts.invoicePosts[0].body).toEqual({ invoice_number: 'INV-NEW-7' });
+    // Money is server-derived from the lines, and the lines are stated here:
+    // the API refuses an invoice without them, so there is no blind create.
+    expect(posts.invoicePosts[0].body).toEqual({
+      invoice_number: 'INV-NEW-7',
+      invoice_date: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/),
+      lines: [{ sale_item_id: 501, quantity: 5000 }],
+    });
     expect(posts.invoicePosts[0].body).not.toHaveProperty('amount');
     // The invoice POST ran before the produce POST.
     const invIdx = posts.calls.findIndex((c) => c.url.endsWith('/api/sales/5/invoices') && c.method === 'POST');
@@ -224,8 +233,31 @@ describe('ProductionRunModal', () => {
     expect(screen.queryByLabelText('Amount')).toBeNull();
     expect(screen.queryByLabelText('Payment amount')).toBeNull();
     expect(
-      screen.getByText(/derived from this PI's lines that are not yet invoiced/i)
+      screen.getByText(/every line of this pi that is not yet invoiced/i)
     ).toBeTruthy();
+  });
+
+  it('refuses to create an invoice when the PI has nothing left to invoice', async () => {
+    // The run can still link an existing invoice, but "new" has no lines to
+    // carry — the API would 400, and a blind create used to mint a zero-amount
+    // row. Say so before producing so the run is not left half-done.
+    const posts = installFetch({
+      invoiceLines: {
+        lines: [{ sale_item_id: 501, product_name: 'Cleaner', unit: 'KG', remaining: 0 }],
+        has_line_less_invoices: false,
+      },
+    });
+    renderModal();
+
+    await pickCompanyAndPi();
+    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
+    fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-EMPTY' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
+
+    expect(await screen.findByText(/nothing left to invoice on this pi/i)).toBeTruthy();
+    expect(posts.invoicePosts).toHaveLength(0);
+    expect(posts).toHaveLength(0);
+    expect(toast.success).not.toHaveBeenCalled();
   });
 
   it('omits the amount from the create body for a sale with no invoices', async () => {
@@ -239,7 +271,11 @@ describe('ProductionRunModal', () => {
 
     await waitFor(() => expect(posts).toHaveLength(1));
     expect(posts.invoicePosts).toHaveLength(1);
-    expect(posts.invoicePosts[0].body).toEqual({ invoice_number: 'INV-FIRST' });
+    expect(posts.invoicePosts[0].body).toEqual({
+      invoice_number: 'INV-FIRST',
+      invoice_date: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/),
+      lines: [{ sale_item_id: 501, quantity: 5000 }],
+    });
     expect(posts[0].body.invoice_ids).toEqual([42]);
   });
 
