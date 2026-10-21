@@ -815,23 +815,30 @@ and the whole group passes when run together (`24 passed`), so this is worker
 starvation, not behaviour. Judge the suite by whether the failures move and
 reproduce alone, not by one red line on a loaded machine.
 
-### Deployment reconciliation finding (open)
+### Deployment reconciliation finding (closed 2026-10-21)
 
-Production (`njanawhckyhyaduxcodr`, the same database as the app DSN) is **one
-schema version behind `main`**:
+Production (`njanawhckyhyaduxcodr`, the same database as the app DSN) was **one
+schema version behind `main`** at the start of the overhaul:
 
-- `app_settings.raas_schema_version` = **`5`**; `raas_tracker/db.py:141` is at **`6`**.
-- `public.invoices` has **no `invoice_date` column** — the v6 migration
-  (`710e36f`) has never run there.
-- `raas_schema_sig` is present (7,642 chars), but `_version_is_current("5")` is
+- `app_settings.raas_schema_version` was **`5`**; `raas_tracker/db.py:141` is at **`6`**.
+- `public.invoices` had **no `invoice_date` column** — the v6 migration
+  (`710e36f`) had never run there.
+- `raas_schema_sig` was present (7,642 chars), but `_version_is_current("5")` was
   `False` and `_schema_current()` requires it (`db.py:309`), so `_create_tables()`
-  and `_run_migration()` execute on **every** connection. (Until Phase 2,
-  `backfill_invoice_lines` ran there too.) Harmless today because the tables are
-  empty: `invoices` 0, `invoice_items` 0, `sale_items` 1, `sales` 1,
-  `recipe_items` 0, `production_runs` 0.
-- Consequence: deploying `main` applies the v6 DDL on first boot. That is
-  intended, but it must be **observed, not assumed** — after the deploy, re-read
-  `raas_schema_version` (expect `6`) and confirm `invoices.invoice_date` exists.
+  and `_run_migration()` executed on **every** connection. (Until Phase 2,
+  `backfill_invoice_lines` ran there too.)
+
+**Observed after deploying `35a9426` (the completed overhaul):**
+
+| Check | Result |
+|---|---|
+| `app_settings.raas_schema_version` | **`6`** |
+| `invoices.invoice_date` exists | **yes** |
+| Row counts | `sales` 1, `sale_items` 1, `invoices` 0 (unchanged) |
+
+So the v6 DDL ran on first boot exactly as intended, and `_create_tables()` is
+back on its fast path. The check was observed, not assumed.
+
 
 ### Phase 1 — writer lock discipline (no production code change)
 

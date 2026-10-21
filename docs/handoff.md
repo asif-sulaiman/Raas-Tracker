@@ -41,11 +41,12 @@
   calling it early would advance an LC whose PI still has none.
 
 ### What remains + next steps
-1. **Production deploy check (open since Phase 0):** prod is at
-   `raas_schema_version` 5 with no `invoices.invoice_date`. After deploying,
-   re-read the version (expect 6) and confirm the column exists — observed, not
-   assumed.
-2. **Push:** 26 commits ahead of `origin/main`, unpushed by request.
+1. **Production schema check: closed.** Deploying `35a9426` applied the v6 DDL on
+   first boot — re-read `raas_schema_version` = **`6`** and `invoices.invoice_date`
+   exists (row counts unchanged: 1 sale, 1 sale_item, 0 invoices). `_create_tables()`
+   is back on its fast path.
+2. **Pushed:** `main` is level with `origin/main` at `35a9426`. CI: frontend green,
+   Supabase preview green, backend running at the time of the push.
 3. **`fetchSaleInvoiceLines.js`** is still untracked (user's file; nothing
    imports it, and its docstring names the two deleted components). Delete when
    convenient.
