@@ -449,6 +449,7 @@ the operator types quantity only. Executed in gated phases, one at a time.
 | 5 | `InvoiceEditor` + rewritten `InvoiceLineComposer` | ✅ spec-first | ✅ 2026-10-21 — editor + hook + `code` on 404 landed (`f6c7fe4`, `23b8743`); the composer was deleted in Phase 6 instead of rewritten |
 | 6 | Swap call sites, delete the legacy files | ✅ | ✅ 2026-10-21 (`d016093`, `96c2520`, `925a814`, review fixes `a1d272a`) |
 | 7 | Docs close-out | ✅ | ✅ 2026-10-21 (`7db063e`, `bbde7e7`, `35a9426`, `0cacef3`) |
+| 8 | Composer column model: open quantity, live Remaining, read-only Total | ✅ | ✅ 2026-10-22 (`10f9759`) |
 
 ### Phase 1 finding: the batch race was already closed (2026-10-21)
 
@@ -621,11 +622,14 @@ shipment barrier demands).
 - Unit price is a **read-only `<input>`** (asserted, not incidental) sourced
   from the payload and **never** put in a request body.
 
-**Hard stop, not advertised headroom.** The row shows PI qty, invoiced and
-remaining. It does **not** advertise a ceiling. The ceiling is still enforced
-from the payload's absolute `ceiling` (never recomputed as `pi * 1.05`: with
-`quantity` stored as REAL the two disagree, e.g. PI `0.56` → server `0.588000`
-vs recomputed `0.5880000025`):
+**Hard stop, not advertised headroom.** Since Phase 8 the row is
+`Product | PI qty | Invoice qty | Unit price | Total price`: one open quantity
+input, a live `Remaining` subline under the PI qty (`max(server remaining −
+typed, 0)`; the server already nets out every prior invoice), and a read-only
+`Total price` (`lineTotal(quantity, unit_price)`). It does **not** advertise a
+ceiling. The ceiling is still enforced from the payload's absolute `ceiling`
+(never recomputed as `pi * 1.05`: with `quantity` stored as REAL the two
+disagree, e.g. PI `0.56` → server `0.588000` vs recomputed `0.5880000025`):
 
 - over-limit when `typed > 0 && invoiced_quantity + typed > ceiling + 1e-9`;
   the `typed > 0` term keeps a pre-existing over-ceiling row (only reachable via
@@ -633,8 +637,8 @@ vs recomputed `0.5880000025`):
 - Save stays enabled while every row is at or under the limit, including a
   quantity above `remaining` but within the ceiling — that is the
   shipment-advantage case;
-- over-limit rows show the correctable number
-  (`maximum you can still add is X`) and disable Save.
+- over-limit rows show the correctable number (`this line can add at most X`)
+  and disable Save. The copy names no percentage: the cap is the payload's.
 
 The `1e-9` allowance is one-directional: an input in that band is accepted by
 the UI and refused by the writer, where the `409` resync is the backstop. It is
@@ -786,6 +790,39 @@ Frontend: `oxlint` 0 errors, 7 warnings; `vite build` ok; full `npm test`
 **335/335**. The documented worker-starvation flake appeared once mid-phase
 (4 failures in `MultiPICreateModal` and `Reports`, 13/13 when run together).
 
+
+### Phase 8: Composer column model (2026-10-22)
+
+The composer restated quantity twice — an `Invoiced`/`Remaining` column pair
+beside an input that already carried the only quantity the operator chooses.
+The row is now `Product | PI qty | Invoice qty | Unit price | Total price`:
+
+- one open quantity input per line, empty on load, no placeholder, no pre-fill
+  and no subtraction printed beside it;
+- `Remaining {X} {unit}` sits under the PI qty and updates on every keystroke:
+  `max(server remaining − typed, 0)`, where the server's `remaining` already
+  nets out every invoice of the sale. A fresh 100 KG PI reads
+  `Remaining 100.00 KG`; typing 30 reads `Remaining 70.00 KG`. It is PI-based,
+  not ceiling-based: the +5% is a hidden cap, surfaced only in the over-limit
+  message, never as headroom;
+- `Total price` is read-only and computed in integer cents
+  (`lineTotal(typed, unit_price)`), `$0.00` before input; the old
+  "Line total $" helper is gone;
+- `Invoiced` is not rendered at all (explicit operator request). `Remaining`
+  still accounts for it, so a second invoice draws from the same figure and
+  nothing is double-counted. `has_line_less_invoices` remains the warning for
+  legacy header-only invoices, whose money the budget cannot see.
+
+The over-limit copy no longer hardcodes the percentage or the word "still add"
+(which read as headroom next to a `Remaining 0.00` subline): it now reads
+`Over the invoicing limit — this line can add at most X`. The number is still
+the payload's `ceiling − invoiced`, so a tolerance change needs no UI edit.
+
+**Validation.** `InvoiceEditor.test.jsx` 15 → 18 (live remaining, computed
+total, floored remaining with slack still usable; the over-limit test now also
+pins `Remaining 0.00 KG` and `$43.00`); `InvoicePanel.test.jsx` asserts the
+subline updates as the operator types. Full suite **338/338** across 40 files;
+`oxlint` 0 errors / 7 warnings; `vite build` ok.
 
 ### Phase 0 baseline (HEAD `8a35c2f`, clean tree)
 

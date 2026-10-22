@@ -1183,7 +1183,7 @@ than removed.
 
 ### Frontend (Vitest)
 - **Environment**: jsdom
-- **Coverage**: 40 test files, 335 tests (utils, components, contexts, pages) - includes `InvoiceEditor.test.jsx` (the one composer, both modes: hard stop from the payload's `ceiling`, structural 409/400/404 handling, per-row reporting on partial success) and `InvoicePanel.test.jsx`
+- **Coverage**: 40 test files, 338 tests (utils, components, contexts, pages) - includes `InvoiceEditor.test.jsx` (the one composer, both modes: open quantity input with live `Remaining` under PI qty, read-only computed Total price, hard stop from the payload's `ceiling`, structural 409/400/404 handling, per-row reporting on partial success) and `InvoicePanel.test.jsx`
 - **Lint**: oxlint (0 errors, 7 pre-existing warnings)
 
 ### CI (`.github/workflows/ci.yml`)

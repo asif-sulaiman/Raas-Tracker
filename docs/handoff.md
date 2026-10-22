@@ -5,6 +5,51 @@
 
 ---
 
+## 2026-10-22 — Invoice composer column model
+
+### What was completed
+- **`InvoiceEditor` row** (`10f9759`): `Product | PI qty | Invoice qty | Unit
+  price | Total price`. One open quantity input (empty on load, no placeholder),
+  live `Remaining` under the PI qty, read-only computed `Total price`.
+- **`Remaining`** is `max(server remaining − typed, 0)` and updates on every
+  keystroke; the server's figure already nets out every invoice, so a later
+  invoice draws from the same number. It is **PI-based**: the +5% ceiling is a
+  hidden cap, not headroom.
+- **`Invoiced` is no longer rendered** (operator request). `Remaining` still
+  accounts for prior invoices, so nothing is double-counted; the
+  `has_line_less_invoices` banner still warns about legacy header-only money.
+- **`Total price`** is `lineTotal(typed, unit_price)` in integer cents,
+  `$0.00` before input; the old "Line total $" helper is gone.
+- **Over-limit copy** is `Over the invoicing limit — this line can add at most
+  X` — no hardcoded percentage, no "still add" that read as headroom beside a
+  `Remaining 0.00` row.
+
+### Decisions made & why
+- **Remaining is PI-based, not ceiling-based.** The +5% is an exception the
+  operator discovers by typing, not a budget advertised under the PI qty
+  (confirmed by the operator).
+- **The quantity box is deliberately empty on load.** Auto-seeding `remaining`
+  was the original complaint; the operator types the number.
+- **`Invoiced` is hidden, `Remaining` is kept** — the hider request targeted the
+  figure that looked copied from the PI, while the live leftover is what the
+  next invoice draws from.
+- **Backend untouched.** `check_invoice_tolerance` already enforces the
+  cumulative `PI × 1.05` cap; the payload's `ceiling` remains the only source.
+
+### Gates
+- Oracle gate 1: **approve with non-blocking**; remediation folded into the same
+  commit (subline contrast + `aria-live`, `remainingAfter()`/`readOnlyCls`
+  extraction, tighter tests).
+- Full frontend suite **338/338** across 40 files; `oxlint` 0 errors / 7
+  pre-existing warnings; `vite build` ok. Backend untouched.
+
+### Next steps
+- Optional: add `pool: 'vmThreads'` to the vitest config (jsdom is created 40
+  times, ~76% of suite time); delete the untracked
+  `src/components/sales/fetchSaleInvoiceLines.js` (nothing imports it).
+
+---
+
 ## 2026-10-21 — Invoice overhaul Phases 6–7 (all call sites on `InvoiceEditor`)
 
 ### What was completed
