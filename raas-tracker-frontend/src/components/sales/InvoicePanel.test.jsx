@@ -263,12 +263,18 @@ describe('InvoicePanel', () => {
   it('shows Remaining per PI line and stops advertising the ceiling', async () => {
     renderPanel();
     fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
-    // 100 proposed, 60 invoiced -> 40 remaining.
+    // 100 proposed, 60 invoiced -> 40 remaining, under the PI qty cell.
     const cottonRow = (await screen.findByText('Cotton')).closest('tr');
-    expect(cottonRow.textContent).toContain('40.00 KG');
+    expect(cottonRow.textContent).toContain('Remaining 40.00 KG');
     // Line 2: 3,000 proposed, 3,000 invoiced -> nothing remains.
     const andromaRow = screen.getByText('Androma LO2').closest('tr');
-    expect(andromaRow.textContent).toContain('0.00 KG');
+    expect(andromaRow.textContent).toContain('Remaining 0.00 KG');
+    // Typing subtracts from the server's remaining (40 - 25), not from the PI
+    // quantity: the subline stays live while the input is open.
+    fireEvent.change(screen.getByLabelText(/invoice qty for Cotton/i), {
+      target: { value: '25' },
+    });
+    expect(cottonRow.textContent).toContain('Remaining 15.00 KG');
     // No variance wording, and no ceiling headroom offered as a target: the
     // ceiling is a server-enforced hard stop, surfaced only when crossed.
     expect(screen.queryByText(/under PI|over PI|matches PI|ceiling/i)).toBeNull();
@@ -322,7 +328,7 @@ describe('InvoicePanel', () => {
 
     // 105 ceiling - 100 invoiced leaves 5, so 25 is now refused in the form.
     expect(
-      await screen.findByText(/maximum you can still add is 5\.00/i),
+      await screen.findByText(/this line can add at most 5\.00/i),
     ).toBeTruthy();
     expect(posts).toHaveLength(1);
     expect(posts.budgetReads()).toBeGreaterThanOrEqual(2);

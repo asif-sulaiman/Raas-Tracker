@@ -9,6 +9,9 @@ import useInvoiceBudget from './useInvoiceBudget';
 const inputCls =
   'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
 
+const readOnlyCls =
+  `${inputCls} w-28 text-right bg-slate-100 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400 cursor-not-allowed`;
+
 // One-directional slack so a quantity typed exactly at the boundary (already a
 // float by the time it leaves the input) is not refused by a rounding hair.
 const EPSILON = 1e-9;
@@ -21,6 +24,16 @@ function overflow(line, typed) {
 }
 
 /**
+ * What is left of the PI line once the quantity staged here is counted. The
+ * server's remaining already nets out every prior invoice; this only subtracts
+ * the open input, and a non-positive or non-finite entry counts as zero.
+ */
+function remainingAfter(line, typed) {
+  const typedSafe = Number.isFinite(typed) && typed > 0 ? typed : 0;
+  return Math.max(0, Number(line.remaining || 0) - typedSafe);
+}
+
+/**
  * The single invoice composer: create an invoice for a sale, or add one line to
  * an open one.
  *
@@ -29,6 +42,11 @@ function overflow(line, typed) {
  * quantities. A quantity above the PI remaining is allowed (shipment
  * advantage) up to the server-provided ceiling, which is enforced here as a
  * hard stop rather than advertised as headroom.
+ *
+ * Each row carries one open quantity input. The live remaining (the server's
+ * figure minus what is typed here) sits under the PI quantity, and the total
+ * price is a read-only computed column restated by the server on save. Nothing
+ * restates what is already invoiced: that column was noise beside the input.
  *
  * mode="create": invoice number + date + rows -> POST /api/sales/<id>/invoices
  * mode="add-line": rows only -> POST /api/invoices/<targetInvoiceId>/items
@@ -64,7 +82,12 @@ export default function InvoiceEditor({
   const rows = useMemo(
     () => lines.map((l) => {
       const typed = Number(qtys[l.sale_item_id] || '');
-      return { line: l, typed, over: overflow(l, typed) };
+      return {
+        line: l,
+        typed,
+        over: overflow(l, typed),
+        left: remainingAfter(l, typed),
+      };
     }),
     [lines, qtys],
   );
@@ -252,36 +275,25 @@ export default function InvoiceEditor({
             <tr className="bg-slate-50 dark:bg-slate-800/60 text-slate-500 uppercase tracking-wider">
               <th className="px-2 py-1 text-left">Product</th>
               <th className="px-2 py-1 text-right">PI qty</th>
-              <th className="px-2 py-1 text-right">Invoiced</th>
-              <th className="px-2 py-1 text-right">Remaining</th>
-              <th className="px-2 py-1 text-right">Unit price</th>
               <th className="px-2 py-1 text-right">Invoice qty</th>
+              <th className="px-2 py-1 text-right">Unit price</th>
+              <th className="px-2 py-1 text-right">Total price</th>
             </tr>
           </thead>
           <tbody>
-            {rows.map(({ line, typed, over }) => {
+            {rows.map(({ line, typed, over, left }) => {
               const unit = line.unit || 'KG';
               return (
                 <tr key={line.sale_item_id} className="border-b border-slate-100 dark:border-slate-800">
                   <td className="px-2 py-1 text-left text-sm">{line.product_name}</td>
                   <td className="px-2 py-1 text-right text-slate-600 dark:text-slate-400">
                     {formatNumber(line.pi_quantity)} {unit}
-                  </td>
-                  <td className="px-2 py-1 text-right text-slate-600 dark:text-slate-400">
-                    {formatNumber(line.invoiced_quantity)} {unit}
-                  </td>
-                  <td className="px-2 py-1 text-right text-sm font-medium">
-                    {formatNumber(line.remaining)} {unit}
-                  </td>
-                  <td className="px-2 py-1 text-right">
-                    <input
-                      aria-label={`Unit price for ${line.product_name}`}
-                      value={`$${formatNumber(line.unit_price)}`}
-                      readOnly
-                      tabIndex={-1}
-                      title="Set by the PI line on the server — read-only"
-                      className={`${inputCls} w-28 text-right bg-slate-100 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400 cursor-not-allowed`}
-                    />
+                    <p
+                      aria-live="polite"
+                      className="mt-0.5 text-xs text-slate-500 dark:text-slate-400"
+                    >
+                      Remaining {formatNumber(left)} {unit}
+                    </p>
                   </td>
                   <td className="px-2 py-1 text-right">
                     <input
@@ -291,20 +303,34 @@ export default function InvoiceEditor({
                       min="0"
                       value={qtys[line.sale_item_id] || ''}
                       onChange={(e) => setQty(line.sale_item_id, e.target.value)}
-                      placeholder="0"
                       className={`${inputCls} w-24 text-right`}
                     />
                     {over !== null && (
                       <p className="mt-0.5 text-[10px] text-rose-600 dark:text-rose-400">
-                        Above the 5% over-invoice limit — maximum you can still add
-                        is {formatNumber(over)} {unit}
+                        Over the invoicing limit — this line can add at most
+                        {' '}{formatNumber(over)} {unit}
                       </p>
                     )}
-                    {typed > 0 && over === null && (
-                      <p className="mt-0.5 text-[10px] text-slate-400 dark:text-slate-500">
-                        Line total ${formatNumber(lineTotal(typed, line.unit_price))}
-                      </p>
-                    )}
+                  </td>
+                  <td className="px-2 py-1 text-right">
+                    <input
+                      aria-label={`Unit price for ${line.product_name}`}
+                      value={`$${formatNumber(line.unit_price)}`}
+                      readOnly
+                      tabIndex={-1}
+                      title="Set by the PI line on the server — read-only"
+                      className={readOnlyCls}
+                    />
+                  </td>
+                  <td className="px-2 py-1 text-right">
+                    <input
+                      aria-label={`Total price for ${line.product_name}`}
+                      value={`$${formatNumber(typed > 0 ? lineTotal(typed, line.unit_price) : 0)}`}
+                      readOnly
+                      tabIndex={-1}
+                      title="Invoiced quantity x unit price - restated by the server on save"
+                      className={readOnlyCls}
+                    />
                   </td>
                 </tr>
               );

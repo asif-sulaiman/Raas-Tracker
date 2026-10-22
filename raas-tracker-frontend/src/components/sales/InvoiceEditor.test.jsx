@@ -113,6 +113,8 @@ const qtyFor = (product) =>
   screen.getByLabelText(`Invoice qty for ${product}`);
 const priceFor = (product) =>
   screen.getByLabelText(`Unit price for ${product}`);
+const totalFor = (product) =>
+  screen.getByLabelText(`Total price for ${product}`);
 const saveButton = () => screen.getByRole('button', { name: /save invoice/i });
 
 beforeEach(() => {
@@ -132,6 +134,60 @@ describe('InvoiceEditor — create mode', () => {
     expect(priceFor('Alpha').readOnly).toBe(true);
     // The ceiling is a hard stop, not advertised headroom.
     expect(screen.queryByText(/ceiling/i)).toBeNull();
+  });
+
+  it('shows the live remaining under PI qty and no invoiced column', async () => {
+    installFetch();
+    renderEditor();
+    await screen.findByText('Alpha');
+
+    const alphaRow = screen.getByText('Alpha').closest('tr');
+    // PI 10 with 2 invoiced: the server's remaining is what the row reports.
+    expect(alphaRow.textContent).toContain('10.00 KG');
+    expect(alphaRow.textContent).toContain('Remaining 8.00 KG');
+    expect(alphaRow.textContent).not.toMatch(/Invoiced/);
+
+    fireEvent.change(qtyFor('Alpha'), { target: { value: '3' } });
+    expect(alphaRow.textContent).toContain('Remaining 5.00 KG');
+
+    fireEvent.change(qtyFor('Alpha'), { target: { value: '' } });
+    expect(alphaRow.textContent).toContain('Remaining 8.00 KG');
+
+    // The column model no longer restates what is already invoiced.
+    expect(screen.queryByRole('columnheader', { name: /invoiced/i })).toBeNull();
+    expect(screen.queryByRole('columnheader', { name: /remaining/i })).toBeNull();
+  });
+
+  it('prices the line as quantity times unit price', async () => {
+    installFetch();
+    renderEditor();
+    await screen.findByText('Alpha');
+
+    expect(totalFor('Alpha').value).toBe('$0.00');
+    expect(totalFor('Alpha').readOnly).toBe(true);
+
+    fireEvent.change(qtyFor('Alpha'), { target: { value: '3' } });
+    expect(totalFor('Alpha').value).toBe('$15.00'); // unit price 5
+
+    fireEvent.change(qtyFor('Alpha'), { target: { value: '' } });
+    expect(totalFor('Alpha').value).toBe('$0.00');
+  });
+
+  it('floors remaining at zero while the 5% slack stays usable', async () => {
+    installFetch();
+    renderEditor();
+    await screen.findByText('Alpha');
+
+    const betaRow = screen.getByText('Beta').closest('tr'); // PI 4, 4 invoiced
+    expect(betaRow.textContent).toContain('Remaining 0.00 KG');
+
+    fireEvent.change(qtyFor('Beta'), { target: { value: '0.2' } }); // inside ceiling 4.2
+    expect(betaRow.textContent).toContain('Remaining 0.00 KG');
+
+    fireEvent.change(screen.getByLabelText('Invoice number'), {
+      target: { value: 'INV-1' },
+    });
+    expect(saveButton().disabled).toBe(false);
   });
 
   it('keeps Save disabled until a number and one quantity exist', async () => {
@@ -179,7 +235,12 @@ describe('InvoiceEditor — create mode', () => {
     });
     fireEvent.change(qtyFor('Alpha'), { target: { value: '8.6' } }); // 2 + 8.6 > 10.5
 
-    expect(screen.getByText(/maximum you can still add is 8\.50/i)).toBeTruthy();
+    expect(screen.getByText(/this line can add at most 8\.50/i)).toBeTruthy();
+    // The over-limit row still reports the money it would commit and floors
+    // the PI remaining; only Save refuses it.
+    const alphaRow = screen.getByText('Alpha').closest('tr');
+    expect(alphaRow.textContent).toContain('Remaining 0.00 KG');
+    expect(totalFor('Alpha').value).toBe('$43.00');
     expect(saveButton().disabled).toBe(true);
     fireEvent.click(saveButton());
     expect(calls.creates).toHaveLength(0);
@@ -272,7 +333,7 @@ describe('InvoiceEditor — create mode', () => {
     await waitFor(() => expect(calls.budgets).toBeGreaterThanOrEqual(2));
     // The reloaded figures are the ones that count: 6 invoiced leaves 4.5.
     expect(
-      await screen.findByText(/maximum you can still add is 4\.50/i),
+      await screen.findByText(/this line can add at most 4\.50/i),
     ).toBeTruthy();
     expect(saveButton().disabled).toBe(true);
     expect(screen.getByLabelText('Invoice number').value).toBe('INV-409');
@@ -318,6 +379,8 @@ describe('InvoiceEditor — add-line mode', () => {
 
     expect(screen.queryByLabelText('Invoice number')).toBeNull();
     fireEvent.change(qtyFor('Alpha'), { target: { value: '1.5' } });
+    // The same computed column is available in add-line mode.
+    expect(totalFor('Alpha').value).toBe('$7.50');
     fireEvent.click(screen.getByRole('button', { name: /add line/i }));
 
     await waitFor(() => expect(calls.adds).toHaveLength(1));
@@ -380,7 +443,7 @@ describe('InvoiceEditor — add-line mode', () => {
     await waitFor(() => expect(calls.adds).toHaveLength(1));
     expect(calls.budgets).toBeGreaterThanOrEqual(2);
     expect(
-      await screen.findByText(/maximum you can still add is 2\.50/i),
+      await screen.findByText(/this line can add at most 2\.50/i),
     ).toBeTruthy();
     expect(qtyFor('Alpha').value).toBe('4');
   });
