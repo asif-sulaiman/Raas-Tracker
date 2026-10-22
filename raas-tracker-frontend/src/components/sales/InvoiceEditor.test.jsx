@@ -142,6 +142,12 @@ describe('InvoiceEditor — create mode', () => {
     await screen.findByText('Alpha');
 
     const alphaRow = screen.getByText('Alpha').closest('tr');
+    // Column order is part of the contract; the input is the only quantity.
+    expect(
+      screen.getAllByRole('columnheader').map((h) => h.textContent.trim()),
+    ).toEqual(['Product', 'PI qty', 'Invoice qty', 'Unit price', 'Total price']);
+    expect(qtyFor('Alpha').value).toBe('');
+    expect(qtyFor('Alpha').getAttribute('placeholder')).toBeNull();
     // PI 10 with 2 invoiced: the server's remaining is what the row reports.
     expect(alphaRow.textContent).toContain('10.00 KG');
     expect(alphaRow.textContent).toContain('Remaining 8.00 KG');
@@ -235,7 +241,7 @@ describe('InvoiceEditor — create mode', () => {
     });
     fireEvent.change(qtyFor('Alpha'), { target: { value: '8.6' } }); // 2 + 8.6 > 10.5
 
-    expect(screen.getByText(/this line can add at most 8\.50/i)).toBeTruthy();
+    expect(screen.getByText(/over the invoicing limit — this line can add at most 8\.50/i)).toBeTruthy();
     // The over-limit row still reports the money it would commit and floors
     // the PI remaining; only Save refuses it.
     const alphaRow = screen.getByText('Alpha').closest('tr');
@@ -256,6 +262,8 @@ describe('InvoiceEditor — create mode', () => {
     });
     fireEvent.change(qtyFor('Alpha'), { target: { value: '8.4' } }); // > 8, <= 8.5
 
+    // Above the PI remaining but inside the +5% cap: no refusal copy.
+    expect(screen.queryByText(/over the invoicing limit/i)).toBeNull();
     expect(saveButton().disabled).toBe(false);
     fireEvent.click(saveButton());
     await waitFor(() => expect(calls.creates).toHaveLength(1));
