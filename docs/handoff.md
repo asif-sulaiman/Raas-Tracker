@@ -15,9 +15,12 @@
   keystroke; the server's figure already nets out every invoice, so a later
   invoice draws from the same number. It is **PI-based**: the +5% ceiling is a
   hidden cap, not headroom.
-- **`Invoiced` is no longer rendered** (operator request). `Remaining` still
-  accounts for prior invoices, so nothing is double-counted; the
-  `has_line_less_invoices` banner still warns about legacy header-only money.
+- **`Invoiced` is no longer rendered in the row** — no column, no
+  already-invoiced figure (operator request). The create-success toast still
+  says `Invoiced $X`; that is the new invoice's amount, not this column.
+  `Remaining` still accounts for prior invoices, so nothing is double-counted;
+  the `has_line_less_invoices` banner still warns about legacy header-only
+  money.
 - **`Total price`** is `lineTotal(typed, unit_price)` in integer cents,
   `$0.00` before input; the old "Line total $" helper is gone.
 - **Over-limit copy** is `Over the invoicing limit — this line can add at most
@@ -30,9 +33,9 @@
   (confirmed by the operator).
 - **The quantity box is deliberately empty on load.** Auto-seeding `remaining`
   was the original complaint; the operator types the number.
-- **`Invoiced` is hidden, `Remaining` is kept** — the hider request targeted the
-  figure that looked copied from the PI, while the live leftover is what the
-  next invoice draws from.
+- **`Invoiced` is hidden, `Remaining` is kept** — the request to hide it
+  targeted the figure that looked copied from the PI, while the live leftover is
+  what the next invoice draws from.
 - **Backend untouched.** `check_invoice_tolerance` already enforces the
   cumulative `PI × 1.05` cap; the payload's `ceiling` remains the only source.
 

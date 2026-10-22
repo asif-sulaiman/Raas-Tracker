@@ -432,7 +432,7 @@ while later products are still unbuilt.
 
 ---
 
-## 🧾 Phase INV-UNIFY: PI-faithful invoice editor (In progress)
+## 🧾 Phase INV-UNIFY: PI-faithful invoice editor (completed 2026-10-22)
 
 One invoice-entry surface instead of two divergent ones (`InvoiceCreateForm`
 vs `InvoiceLineEditor` + `InvoiceLineComposer`). The invoice mirrors the PI:
@@ -683,8 +683,10 @@ is **done** (`flask_app.py:3927-3960`, pinned by
 7. the offered maximum comes from the payload, not `pi * 1.05` (fixture where
    `ceiling !== pi_quantity * 1.05`).
 8. add-line POSTs `/api/invoices/<id>/items` with `{sale_item_id, quantity}`.
-9. create 409 → budget reloaded, the *reloaded* invoiced/max-add figures are
-   rendered, Save is now disabled, and number/date/quantities are preserved.
+9. create 409 → budget reloaded, the reloaded max-add figure is rendered, Save
+   is now disabled, and number/date/quantities are preserved. The reloaded
+   `invoiced_quantity` is only the input to that figure — the row does not
+   render it.
 10. create 400 → vanished product name appears in the amber "no longer on this
     PI" notice and the header is preserved.
 11. success → `onDone` receives the created invoice.
@@ -798,7 +800,8 @@ beside an input that already carried the only quantity the operator chooses.
 The row is now `Product | PI qty | Invoice qty | Unit price | Total price`:
 
 - one open quantity input per line, empty on load, no placeholder, no pre-fill
-  and no subtraction printed beside it;
+  and no leftover figure beside the input; the live `Remaining` sits under the
+  PI qty;
 - `Remaining {X} {unit}` sits under the PI qty and updates on every keystroke:
   `max(server remaining − typed, 0)`, where the server's `remaining` already
   nets out every invoice of the sale. A fresh 100 KG PI reads
@@ -808,10 +811,12 @@ The row is now `Product | PI qty | Invoice qty | Unit price | Total price`:
 - `Total price` is read-only and computed in integer cents
   (`lineTotal(typed, unit_price)`), `$0.00` before input; the old
   "Line total $" helper is gone;
-- `Invoiced` is not rendered at all (explicit operator request). `Remaining`
-  still accounts for it, so a second invoice draws from the same figure and
-  nothing is double-counted. `has_line_less_invoices` remains the warning for
-  legacy header-only invoices, whose money the budget cannot see.
+- `Invoiced` is not rendered in the row — no column and no already-invoiced
+  figure (explicit operator request). The create-success toast still says
+  `Invoiced $X`; that is the new invoice's amount, not this figure. `Remaining`
+  still accounts for prior invoices, so a second invoice draws from the same
+  figure and nothing is double-counted. `has_line_less_invoices` remains the
+  warning for legacy header-only invoices, whose money the budget cannot see.
 
 The over-limit copy no longer hardcodes the percentage or the word "still add"
 (which read as headroom next to a `Remaining 0.00` subline): it now reads
