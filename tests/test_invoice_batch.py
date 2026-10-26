@@ -1,9 +1,12 @@
 """Multi-invoice batch creation (POST /api/sales/<id>/invoices/batch).
 
 Mirrors the /api/sales/batch atomicity contract: N invoices in one
-transaction, explicit per-line allocation, header == sum(lines) always,
-over-allocation rejected with 400 and nothing written.
+transaction, explicit per-line allocation, header == sum(lines) always.
+Quantities are free relative to the PI, so over-allocation is accepted; a
+batch that fails any guard still writes nothing.
 """
+
+import pytest
 
 
 def _company(admin_client, db, name="BatchCo"):
@@ -72,15 +75,8 @@ def test_batch_two_invoices_split_by_line_allocation(admin_client, db):
     assert sorted(float(r[2]) for r in invs) == [20.0, 130.0]
 
 
-def test_batch_over_allocation_rejected_and_atomic(admin_client, db):
-    """8 + 5 against a PI of 10 breaches the 5% ceiling -> refused, atomically.
-
-    The status changed 400 -> 409 in Phase 4-A: a breach conflicts with what
-    the sale has already been invoiced for, so retrying the identical body can
-    never succeed (RFC 9110 §15.5.10), and `POST /api/invoices/<id>/items`
-    already answered 409 for the same refusal. Only the status assertion moved;
-    the atomicity assertion below is unchanged and is what this test is for.
-    """
+def test_batch_accepts_allocations_above_pi(admin_client, db):
+    """8 + 5 against a PI of 10 is fine: there is no quantity ceiling."""
     cid = _company(admin_client, db, name="BatchCo2")
     sid = _sale_two_items(admin_client, cid, "PI-BATCH-2")
     a, b = _item_ids(db, sid)
@@ -88,12 +84,38 @@ def test_batch_over_allocation_rejected_and_atomic(admin_client, db):
         {"invoice_number": "INV-B2-A", "invoice_date": "2026-01-15",
          "lines": [{"sale_item_id": a, "quantity": 8}]},
         {"invoice_number": "INV-B2-B", "invoice_date": "2026-01-16",
-         "lines": [{"sale_item_id": a, "quantity": 5}]},  # 8+5 > 10
+         "lines": [{"sale_item_id": b, "quantity": 10},
+                   {"sale_item_id": a, "quantity": 5}]},  # 8+5 > 10
     ]}
     r = admin_client.post(f"/api/sales/{sid}/invoices/batch", json=payload)
-    assert r.status_code == 409, r.get_json()
-    assert r.get_json()["error"] == (
-        f"PI line {a}: invoiced 13.0 exceeds 10.500000 (PI qty 10.0 + 5%)")
+    assert r.status_code == 201, r.get_json()
+
+    invs = _invoice_rows(db, sid)
+    assert len(invs) == 2
+    # header == sum(lines) for each invoice
+    for inv_id, _num, hdr in invs:
+        assert float(hdr) == _lines_sum(db, inv_id)
+    # A = 8*5=40; B = 10*10 + 5*5=125
+    assert sorted(float(row[2]) for row in invs) == [40.0, 125.0]
+
+
+def test_batch_failure_writes_no_invoice(admin_client, db):
+    """A refused batch writes nothing, even when its earlier entries are valid.
+
+    Duplicate numbers inside one batch are a guard failure, so this pins the
+    all-or-nothing contract without relying on the removed ceiling.
+    """
+    cid = _company(admin_client, db, name="BatchCo2b")
+    sid = _sale_two_items(admin_client, cid, "PI-BATCH-2B")
+    a, b = _item_ids(db, sid)
+    payload = {"invoices": [
+        {"invoice_number": "INV-B2-OK", "invoice_date": "2026-01-15",
+         "lines": [{"sale_item_id": a, "quantity": 1}]},
+        {"invoice_number": "INV-B2-OK", "invoice_date": "2026-01-16",
+         "lines": [{"sale_item_id": b, "quantity": 1}]},
+    ]}
+    r = admin_client.post(f"/api/sales/{sid}/invoices/batch", json=payload)
+    assert r.status_code == 400, r.get_json()
     assert _invoice_rows(db, sid) == []
 
 
@@ -131,3 +153,17 @@ def test_batch_empty_invoice_lines_rejected(admin_client, db):
                              "invoice_date": "2026-01-15", "lines": []}]}
     r = admin_client.post(f"/api/sales/{sid}/invoices/batch", json=payload)
     assert r.status_code == 400
+
+
+def test_invoice_batch_line_model_gt_zero():
+    """InvoiceBatchLineIn rejects quantity <= 0."""
+    from flask_app import InvoiceBatchLineIn
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        InvoiceBatchLineIn.model_validate({"sale_item_id": 1, "quantity": 0})
+    with pytest.raises(ValidationError):
+        InvoiceBatchLineIn.model_validate({"sale_item_id": 1, "quantity": -1})
+
+    line = InvoiceBatchLineIn.model_validate({"sale_item_id": 1, "quantity": 0.5})
+    assert line.quantity == 0.5

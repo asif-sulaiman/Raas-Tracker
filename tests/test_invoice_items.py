@@ -49,8 +49,7 @@ def _invoice(conn, sale_id, number=None):
 
     An invoice can no longer be created without lines (the header-only seam is
     gone), so the baseline of one unit keeps the invoice real while these tests
-    own the quantities they add via create_invoice_item under the shared 5%
-    aggregate ceiling.
+    own the quantities they add via create_invoice_item.
     """
     number = number or f"INV-{_tag()}"
     si_id, _, _ = _sale_item(conn, sale_id)
@@ -90,52 +89,35 @@ def test_price_locked_to_sale_item(db):
 
 
 def test_over_qty_allowed(db):
-    """Invoice quantities can exceed PI quantities up to 5% tolerance (shipment advantage)."""
+    """Invoice quantities may exceed PI quantities; there is no cap."""
     co = _company(db)
     sid = _sale(db, co, qty=10, price=5)
     si_id, _, _ = _sale_item(db, sid)
     inv = _invoice(db, sid)
-    # PI qty = 10, ceiling = 10.5 (5% tolerance); the baseline line uses 1
-    # First added line: 6 (total 7, within PI qty)
+    # Baseline line uses 1; 6 + 50 takes the invoice far past the PI's 10.
     salesmod.create_invoice_item(db, inv, si_id, 6)
-    # Second added line: 3.5 (total 10.5 = ceiling) - allowed at ceiling
-    salesmod.create_invoice_item(db, inv, si_id, 3.5)
+    salesmod.create_invoice_item(db, inv, si_id, 50)
     db.commit()
     items = salesmod.list_invoice_items(db, inv)
-    assert [i["quantity"] for i in items] == [1, 6, 3.5]
-
-
-def test_over_qty_rejected_at_ceiling(db):
-    """Invoice quantities exceeding 5% tolerance are rejected."""
-    co = _company(db)
-    sid = _sale(db, co, qty=10, price=5)
-    si_id, _, _ = _sale_item(db, sid)
-    inv = _invoice(db, sid)
-    # PI qty = 10, ceiling = 10.5
-    salesmod.create_invoice_item(db, inv, si_id, 6)
-    salesmod.create_invoice_item(db, inv, si_id, 3.5)  # total = 10.5 (at ceiling)
-    # Adding more should be rejected
-    with pytest.raises(ValueError, match="exceeds 10.5"):
-        salesmod.create_invoice_item(db, inv, si_id, 0.1)
-    db.rollback()
+    assert [i["quantity"] for i in items] == [1, 6, 50]
 
 
 def test_remaining_qty_math(db):
-    """Quantities can exceed PI remaining up to 5% tolerance ceiling."""
+    """Remaining is informational and floors at 0 once the PI is covered."""
     co = _company(db)
     sid = _sale(db, co, qty=10, price=4)
     si_id, _, _ = _sale_item(db, sid)
     inv = _invoice(db, sid)
     salesmod.create_invoice_item(db, inv, si_id, 3)
     salesmod.create_invoice_item(db, inv, si_id, 4)
-    # 8 used of 10; exact fill with 2 OK (total 10)
-    salesmod.create_invoice_item(db, inv, si_id, 2)
-    # Now 10 used, 0 remain - can add up to 0.5 more (5% tolerance)
-    salesmod.create_invoice_item(db, inv, si_id, 0.5)
+    salesmod.create_invoice_item(db, inv, si_id, 2)   # exactly covered (total 10)
+    salesmod.create_invoice_item(db, inv, si_id, 5)   # past the PI
     db.commit()
     items = salesmod.list_invoice_items(db, inv)
-    assert len(items) == 5
-    assert items[4]["quantity"] == 0.5  # 5% tolerance allowance
+    assert [i["quantity"] for i in items] == [1, 3, 4, 2, 5]
+    line = salesmod.list_sale_invoice_lines(db, sid)["lines"][0]
+    assert line["invoiced_quantity"] == pytest.approx(15.0)
+    assert line["remaining"] == 0.0
 
 
 def test_quantity_must_be_finite_and_positive(db):
@@ -263,7 +245,7 @@ def test_shipment_ready_both(db):
 # Oracle gate 2 remediation: B7 / P1 / P2
 # --------------------------------------------------------------------------- #
 def test_sequential_double_create_boundary_allowed(db):
-    """B7: remaining exactly consumed, additional items allowed up to 5% tolerance."""
+    """B7: reaching the PI quantity does not close the line."""
     co = _company(db)
     sid = _sale(db, co, qty=10, price=5)
     si_id, _, _ = _sale_item(db, sid)
@@ -271,12 +253,11 @@ def test_sequential_double_create_boundary_allowed(db):
     salesmod.create_invoice_item(db, inv, si_id, 6)
     salesmod.create_invoice_item(db, inv, si_id, 3)  # exactly consumed (total 10)
     assert len(salesmod.list_invoice_items(db, inv)) == 3
-    # Now we can add up to 0.5 more (5% tolerance ceiling = 10.5)
-    salesmod.create_invoice_item(db, inv, si_id, 0.5)
+    salesmod.create_invoice_item(db, inv, si_id, 5)  # over the PI, still accepted
     db.commit()
     items = salesmod.list_invoice_items(db, inv)
     assert len(items) == 4
-    assert items[3]["quantity"] == 0.5
+    assert items[3]["quantity"] == 5
 
 
 def test_invoice_amount_derived_cache(db):

@@ -602,9 +602,8 @@ def test_awkward_money_header_stays_exactly_its_lines(admin_client, db):
     2.5 x 33.33 = 83.325 and 1.5 x 11.11 = 16.665, so per-line 2dp rounding
     gives 83.33 + 16.67 = 100.00 against a PI total of 99.99. The old
     money-derived create absorbed the cent (a budget cap trimmed the last
-    line); the explicit-lines contract has no money cap — the only ceiling is
-    the 5% quantity tolerance — so the cent stays on the stated lines and the
-    header must be exactly their sum.
+    line); the explicit-lines contract has no money or quantity cap, so the
+    cent stays on the stated lines and the header must be exactly their sum.
     """
     cid = _company(admin_client, db, name="IntCap")
     sid = _sale_lines(admin_client, cid, "PI-INT-CAP", [
@@ -812,18 +811,15 @@ def test_bulk_update_removing_invoiced_pi_line_refused_with_409(admin_client, db
     assert _header(db, inv) == before_amount
 
 
-def test_concurrent_creates_cannot_over_invoice_the_sale(admin_client, db, pg_dsn):
-    """Best-effort invariant check under real concurrency, NOT a race reproducer.
+def test_concurrent_creates_all_succeed_and_headers_match_their_lines(
+        admin_client, db, pg_dsn):
+    """Four concurrent creates all commit; the sale-level lock serialises them.
 
-    `log_audit_action` defaults to atomic=True, which COMMITs. A commit inside
-    the create's line loop therefore dropped the sales and sale_items locks
-    before the remaining lines were inserted; a concurrent create could then
-    state the same quantities and the sale was invoiced to 162% of its PI.
-    Whether the interleaving happens depends on timing, so this asserts the
-    invariant the lock + 5% ceiling exist to protect - the sale is never billed
-    past its PI and no invoice header disagrees with its own lines - while
-    `test_line_audit_never_commits_mid_create` is the deterministic guard that
-    actually pins the cause.
+    Quantities are free relative to the PI, so the four full-PI invoices are
+    all accepted. The lock still matters: it keeps each create's header, line,
+    and audit writes in one transaction. Whether the creates interleave is
+    timing-dependent; `test_line_audit_never_commits_mid_create` is the
+    deterministic guard that the line audit never commits mid-create.
     """
     import threading
 
@@ -840,7 +836,7 @@ def test_concurrent_creates_cannot_over_invoice_the_sale(admin_client, db, pg_ds
     pi_total = _pi_total(db, sid)
     assert pi_total == Decimal("544.98")   # 125 + 120 + 100 + 199.98
 
-    # Every thread states the SAME full-PI lines: only one may get through.
+    # Every thread states the SAME full-PI lines; all four are accepted.
     full_lines = [{"sale_item_id": r[0], "quantity": float(r[1])}
                   for r in db.execute(
                       "SELECT id, quantity FROM sale_items "
@@ -864,19 +860,21 @@ def test_concurrent_creates_cannot_over_invoice_the_sale(admin_client, db, pg_ds
     for t in threads:
         t.join()
 
-    # Whatever interleaving occurred, the sale can never be billed past its PI,
-    # and every created invoice is fully backed by its own lines.
+    assert not errors, f"creates must not fail: {errors}"
+
+    # Four identical invoices, and every one is fully backed by its own lines.
     billed = db.execute(
         "SELECT COALESCE(SUM(line_total), 0) FROM invoice_items ii "
         "JOIN invoices i ON i.id = ii.invoice_id WHERE i.sale_id = %s",
         (sid,)).fetchone()[0]
-    assert billed <= pi_total, f"over-invoiced: billed {billed} > PI {pi_total}"
+    assert Decimal(str(billed)) == pi_total * 4, (
+        f"billed {billed} != 4 x PI {pi_total}")
 
     rows = db.execute(
         "SELECT i.id, i.amount, "
         "  (SELECT COALESCE(SUM(line_total), 0) FROM invoice_items WHERE invoice_id = i.id) "
         "FROM invoices i WHERE i.sale_id = %s", (sid,)).fetchall()
-    assert rows, "at least one invoice must have been created"
+    assert len(rows) == 4, f"all four invoices must exist, got {rows}"
     for invoice_id, amount, lines in rows:
         assert Decimal(str(amount or 0)) == Decimal(str(lines)), (
             f"invoice {invoice_id} header {amount} != its lines {lines}")
@@ -887,10 +885,10 @@ def test_line_audit_never_commits_mid_create(admin_client, db, monkeypatch):
 
     `log_audit_action` commits when `atomic=True`. A commit inside the create's
     line loop releases the `sales` and `sale_items` row locks the create depends
-    on, so a concurrent create states the same quantities and bills the sale
-    twice - and a mid-create failure would persist a header that no line backs.
-    Asserting the call is non-atomic is deterministic; provoking the race is
-    not.
+    on, so a concurrent create can interleave its own lines and audits with
+    this one - and a mid-create failure would persist a header that no line
+    backs. Asserting the call is non-atomic is deterministic; provoking the
+    race is not.
     """
     from raas_tracker import sales as salesmod
 

@@ -23,19 +23,19 @@ afterEach(() => {
 const SALE_ID = 7;
 const INVOICE_ID = 55;
 
-// Line 101: PI 10, 2 already invoiced -> remaining 8, ceiling 10.5 (max add 8.5).
-// Line 102: fully invoiced -> remaining 0, still listed.
+// Line 101: PI 10, 2 already invoiced -> remaining 8.
+// Line 102: fully invoiced -> remaining 0, still listed and still invoiceable.
 function budget(overrides = {}) {
   return {
     lines: [
       {
         sale_id: SALE_ID, sale_item_id: 101, product_name: 'Alpha', unit: 'KG',
-        pi_quantity: 10, invoiced_quantity: 2, remaining: 8, ceiling: 10.5,
+        pi_quantity: 10, invoiced_quantity: 2, remaining: 8,
         unit_price: 5, invoice_ids: [5],
       },
       {
         sale_id: SALE_ID, sale_item_id: 102, product_name: 'Beta', unit: 'KG',
-        pi_quantity: 4, invoiced_quantity: 4, remaining: 0, ceiling: 4.2,
+        pi_quantity: 4, invoiced_quantity: 4, remaining: 0,
         unit_price: 3, invoice_ids: [5],
       },
     ],
@@ -51,7 +51,7 @@ function jsonResponse(data, ok = true, status = 200) {
 /**
  * Stubs the API surface the editor talks to.
  * `createReply`/`addReply` let a test fail a write once and answer the next
- * budget read with changed figures (the 409 resync contract).
+ * budget read with changed figures (the refusal/resync contract).
  */
 function installFetch({
   budgets = [budget()],
@@ -132,7 +132,7 @@ describe('InvoiceEditor — create mode', () => {
     expect(screen.getByLabelText('Invoice date').value).toMatch(/^\d{4}-\d{2}-\d{2}$/);
     expect(priceFor('Alpha').value).toContain('5');
     expect(priceFor('Alpha').readOnly).toBe(true);
-    // The ceiling is a hard stop, not advertised headroom.
+    // The payload carries no cap, and the UI advertises none.
     expect(screen.queryByText(/ceiling/i)).toBeNull();
   });
 
@@ -179,21 +179,26 @@ describe('InvoiceEditor — create mode', () => {
     expect(totalFor('Alpha').value).toBe('$0.00');
   });
 
-  it('floors remaining at zero while the 5% slack stays usable', async () => {
-    installFetch();
+  it('keeps Remaining at zero and still accepts a quantity far above the PI', async () => {
+    const calls = installFetch();
     renderEditor();
     await screen.findByText('Alpha');
 
     const betaRow = screen.getByText('Beta').closest('tr'); // PI 4, 4 invoiced
     expect(betaRow.textContent).toContain('Remaining 0.00 KG');
 
-    fireEvent.change(qtyFor('Beta'), { target: { value: '0.2' } }); // inside ceiling 4.2
+    fireEvent.change(qtyFor('Beta'), { target: { value: '100' } });
     expect(betaRow.textContent).toContain('Remaining 0.00 KG');
+    expect(screen.queryByText(/over the invoicing limit/i)).toBeNull();
 
     fireEvent.change(screen.getByLabelText('Invoice number'), {
       target: { value: 'INV-1' },
     });
     expect(saveButton().disabled).toBe(false);
+    fireEvent.click(saveButton());
+
+    await waitFor(() => expect(calls.creates).toHaveLength(1));
+    expect(calls.creates[0].lines).toEqual([{ sale_item_id: 102, quantity: 100 }]);
   });
 
   it('keeps Save disabled until a number and one quantity exist', async () => {
@@ -229,123 +234,6 @@ describe('InvoiceEditor — create mode', () => {
     expect(JSON.stringify(body)).not.toContain('unit_price');
     await waitFor(() => expect(onDone).toHaveBeenCalled());
     expect(onDone.mock.calls[0][0].invoice_id).toBe(900);
-  });
-
-  it('stops at the 5% ceiling before posting', async () => {
-    const calls = installFetch();
-    renderEditor();
-    await screen.findByText('Alpha');
-
-    fireEvent.change(screen.getByLabelText('Invoice number'), {
-      target: { value: 'INV-1' },
-    });
-    fireEvent.change(qtyFor('Alpha'), { target: { value: '8.6' } }); // 2 + 8.6 > 10.5
-
-    expect(screen.getByText(/over the invoicing limit — this line can add at most 8\.50/i)).toBeTruthy();
-    // The over-limit row still reports the money it would commit and floors
-    // the PI remaining; only Save refuses it.
-    const alphaRow = screen.getByText('Alpha').closest('tr');
-    expect(alphaRow.textContent).toContain('Remaining 0.00 KG');
-    expect(totalFor('Alpha').value).toBe('$43.00');
-    expect(saveButton().disabled).toBe(true);
-    fireEvent.click(saveButton());
-    expect(calls.creates).toHaveLength(0);
-  });
-
-  it('allows a quantity above remaining while it stays under the ceiling', async () => {
-    const calls = installFetch();
-    renderEditor();
-    await screen.findByText('Alpha');
-
-    fireEvent.change(screen.getByLabelText('Invoice number'), {
-      target: { value: 'INV-1' },
-    });
-    fireEvent.change(qtyFor('Alpha'), { target: { value: '8.4' } }); // > 8, <= 8.5
-
-    // Above the PI remaining but inside the +5% cap: no refusal copy.
-    expect(screen.queryByText(/over the invoicing limit/i)).toBeNull();
-    expect(saveButton().disabled).toBe(false);
-    fireEvent.click(saveButton());
-    await waitFor(() => expect(calls.creates).toHaveLength(1));
-  });
-
-  it('accepts a quantity exactly at the ceiling', async () => {
-    const calls = installFetch();
-    renderEditor();
-    await screen.findByText('Alpha');
-
-    fireEvent.change(screen.getByLabelText('Invoice number'), {
-      target: { value: 'INV-1' },
-    });
-    fireEvent.change(qtyFor('Alpha'), { target: { value: '8.5' } }); // 2 + 8.5 === 10.5
-
-    expect(saveButton().disabled).toBe(false);
-    fireEvent.click(saveButton());
-    await waitFor(() => expect(calls.creates).toHaveLength(1));
-  });
-
-  it('takes the maximum from the payload, not from pi * 1.05', async () => {
-    // A future tolerance change must reach the UI without a code edit. If the
-    // editor recomputed pi * 1.05 it would cap at 10.5 and refuse 11 here.
-    const calls = installFetch({
-      budgets: [{
-        lines: [{
-          sale_id: SALE_ID, sale_item_id: 101, product_name: 'Alpha', unit: 'KG',
-          pi_quantity: 10, invoiced_quantity: 0, remaining: 10, ceiling: 12,
-          unit_price: 5, invoice_ids: [],
-        }],
-        has_line_less_invoices: false,
-      }],
-    });
-    renderEditor();
-    await screen.findByText('Alpha');
-
-    fireEvent.change(screen.getByLabelText('Invoice number'), {
-      target: { value: 'INV-1' },
-    });
-    fireEvent.change(qtyFor('Alpha'), { target: { value: '11' } });
-
-    expect(saveButton().disabled).toBe(false);
-    fireEvent.click(saveButton());
-    await waitFor(() => expect(calls.creates).toHaveLength(1));
-  });
-
-  it('resyncs and preserves the form on a 409', async () => {
-    // Second read reports more invoiced, so the same quantity is now over.
-    const calls = installFetch({
-      budgets: [
-        budget(),
-        budget({
-          lines: [
-            { ...budget().lines[0], invoiced_quantity: 6, remaining: 4, ceiling: 10.5 },
-            budget().lines[1],
-          ],
-        }),
-      ],
-      createReply: () => jsonResponse(
-        { error: 'PI line 101: invoiced 12 exceeds 10.5 (PI qty 10 + 5%)' },
-        false, 409,
-      ),
-    });
-    renderEditor();
-    await screen.findByText('Alpha');
-
-    fireEvent.change(screen.getByLabelText('Invoice number'), {
-      target: { value: 'INV-409' },
-    });
-    // Locally fine against the stale budget (2 invoiced, 8.5 still addable)
-    // but over once the server reports 6 invoiced: the write is refused.
-    fireEvent.change(qtyFor('Alpha'), { target: { value: '6' } });
-    fireEvent.click(saveButton());
-
-    await waitFor(() => expect(calls.budgets).toBeGreaterThanOrEqual(2));
-    // The reloaded figures are the ones that count: 6 invoiced leaves 4.5.
-    expect(
-      await screen.findByText(/this line can add at most 4\.50/i),
-    ).toBeTruthy();
-    expect(saveButton().disabled).toBe(true);
-    expect(screen.getByLabelText('Invoice number').value).toBe('INV-409');
-    expect(qtyFor('Alpha').value).toBe('6');
   });
 
   it('marks a vanished PI line superseded on a 400 and keeps the header', async () => {
@@ -421,41 +309,6 @@ describe('InvoiceEditor — add-line mode', () => {
     await waitFor(() => expect(onDone).toHaveBeenCalledTimes(1));
   });
 
-  it('flags the failing line on a 409, resyncs and keeps its quantity', async () => {
-    const calls = installFetch({
-      budgets: [
-        budget(),
-        // A concurrent add landed: 8 invoiced now, so 8 + 4 > 10.5.
-        budget({
-          lines: [
-            { ...budget().lines[0], invoiced_quantity: 8, remaining: 2 },
-            budget().lines[1],
-          ],
-        }),
-      ],
-      addReply: () => jsonResponse(
-        { error: 'PI line 101: invoiced 12 exceeds 10.5 (PI qty 10 + 5%)' },
-        false, 409,
-      ),
-    });
-    renderEditor({
-      mode: 'add-line',
-      targetInvoiceId: INVOICE_ID,
-      invoiceLabel: 'INV-55',
-    });
-    await screen.findByText('Alpha');
-
-    fireEvent.change(qtyFor('Alpha'), { target: { value: '4' } });
-    fireEvent.click(screen.getByRole('button', { name: /add line/i }));
-
-    await waitFor(() => expect(calls.adds).toHaveLength(1));
-    expect(calls.budgets).toBeGreaterThanOrEqual(2);
-    expect(
-      await screen.findByText(/this line can add at most 2\.50/i),
-    ).toBeTruthy();
-    expect(qtyFor('Alpha').value).toBe('4');
-  });
-
   it('marks the target superseded when the invoice itself is gone', async () => {
     installFetch({
       addReply: () => jsonResponse(
@@ -499,8 +352,7 @@ describe('InvoiceEditor — add-line mode', () => {
           );
         }
         return jsonResponse(
-          { error: 'PI line 102: invoiced 4.2 exceeds 4.2 (PI qty 4 + 5%)' },
-          false, 409,
+          { error: 'cannot modify a booked invoice' }, false, 400,
         );
       },
     });
@@ -511,18 +363,18 @@ describe('InvoiceEditor — add-line mode', () => {
     });
     await screen.findByText('Alpha');
 
-    // Beta is fully invoiced, so only the 0.2 left inside its 5% ceiling is
-    // submittable - anything more would be blocked by the hard stop, not the
-    // server, and this test is about a refusal that arrives mid-sequence.
+    // Beta is fully invoiced and still submittable: the server refuses the
+    // second request for its own reason, mid-sequence.
     fireEvent.change(qtyFor('Alpha'), { target: { value: '2' } });
-    fireEvent.change(qtyFor('Beta'), { target: { value: '0.2' } });
+    fireEvent.change(qtyFor('Beta'), { target: { value: '100' } });
     fireEvent.click(screen.getByRole('button', { name: /add line/i }));
 
     await waitFor(() => expect(calls.adds).toHaveLength(2));
     await waitFor(() => expect(onDone).toHaveBeenCalledTimes(1));
     // The landed row is cleared; the refused one keeps what was typed.
     await waitFor(() => expect(qtyFor('Alpha').value).toBe(''));
-    expect(qtyFor('Beta').value).toBe('0.2');
+    expect(qtyFor('Beta').value).toBe('100');
+    expect(await screen.findByText(/cannot modify a booked invoice/i)).toBeTruthy();
   });
 
   it('drops a PI line that vanished under add-line and says so', async () => {
@@ -551,7 +403,7 @@ describe('InvoiceEditor — add-line mode', () => {
     await screen.findByText('Alpha');
 
     fireEvent.change(qtyFor('Alpha'), { target: { value: '1' } });
-    fireEvent.change(qtyFor('Beta'), { target: { value: '0.2' } });
+    fireEvent.change(qtyFor('Beta'), { target: { value: '100' } });
     fireEvent.click(screen.getByRole('button', { name: /add line/i }));
 
     await waitFor(() => expect(calls.adds).toHaveLength(2));

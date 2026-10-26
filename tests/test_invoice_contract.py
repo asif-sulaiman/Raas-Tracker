@@ -17,7 +17,7 @@ import uuid
 import pytest
 
 from raas_tracker import sales as salesmod
-from raas_tracker._exceptions import ServiceError, ToleranceExceeded
+from raas_tracker._exceptions import ServiceError
 from raas_tracker.db import _SCHEMA_VERSION, _table_columns
 
 INVOICE_DATE = "2026-01-15"
@@ -223,10 +223,10 @@ def test_schema_v6_has_invoices_invoice_date(db):
 #
 # The composer needs one row per PI line with what is already invoiced against
 # it, so the N+1 (`/api/sales/<id>` then `/api/invoices/<id>/items` per invoice)
-# can go. The numbers must match the writer exactly: `remaining` is what the UI
-# offers, `ceiling` is what `check_invoice_tolerance` will accept.
+# can go. `invoiced_quantity` and `remaining` are informational: they never cap
+# what a writer may state.
 # --------------------------------------------------------------------------- #
-def test_sale_invoice_lines_reports_remaining_and_ceiling(db):
+def test_sale_invoice_lines_reports_invoiced_and_remaining(db):
     co = _company(db)
     sid = salesmod.add_sale(
         db,
@@ -250,14 +250,14 @@ def test_sale_invoice_lines_reports_remaining_and_ceiling(db):
     assert alpha == {
         "sale_id": sid, "sale_item_id": alpha_id, "product_name": "Alpha",
         "unit": "KG", "pi_quantity": 100.0, "invoiced_quantity": 40.0,
-        "remaining": 60.0, "ceiling": 105.0, "unit_price": 2.0,
+        "remaining": 60.0, "unit_price": 2.0,
         "invoice_ids": [inv["invoice_id"]],
     }
     assert beta["sale_item_id"] == beta_id
     assert beta["unit"] == "L"
     assert beta["invoiced_quantity"] == 0.0
     assert beta["remaining"] == 10.0
-    assert beta["ceiling"] == pytest.approx(10.5)
+    assert "ceiling" not in beta
     assert beta["invoice_ids"] == []
 
 
@@ -329,7 +329,7 @@ def test_api_sale_invoice_lines_returns_the_budget(admin_client, db):
     assert line["pi_quantity"] == 10.0
     assert line["invoiced_quantity"] == 4.0
     assert line["remaining"] == 6.0
-    assert line["ceiling"] == pytest.approx(10.5)
+    assert "ceiling" not in line
 
 
 def test_api_sale_invoice_lines_404s_for_an_unknown_sale(admin_client):
@@ -343,7 +343,7 @@ def test_api_sale_invoice_lines_requires_auth(client):
 
 
 # --------------------------------------------------------------------------- #
-# 7. server-owned price, audit shape, and endpoint/writer ceiling parity
+# 7. server-owned price, audit shape, and free quantities above the PI
 # --------------------------------------------------------------------------- #
 def test_create_invoice_ignores_a_forged_unit_price(admin_client, db):
     """The price is resolved from the PI line, so a client-stated price is inert.
@@ -386,32 +386,26 @@ def test_validate_invoice_lines_ignores_a_forged_unit_price(db):
     assert validated[0]["line_total"] == 15.0
 
 
-def test_endpoint_ceiling_is_exactly_what_the_writer_accepts(db):
-    """The 6 dp ceiling the UI offers must be a quantity the writer takes.
+def test_over_pi_quantity_is_accepted_and_the_payload_has_no_ceiling(db):
+    """The endpoint reports information, not a budget: 5.0 against a PI of 3.7.
 
-    ``list_sale_invoice_lines`` and ``check_invoice_tolerance`` compute the
-    ceiling with the same ``Decimal(str(...)) * 1.05`` expression precisely so
-    this boundary holds; a float-converted ceiling that rounded the wrong way
-    would make the UI refuse a legal invoice or offer an illegal one.
+    The writer takes the free quantity, and ``remaining`` floors at 0 while the
+    payload exposes no cap for the composer to enforce.
     """
     co = _company(db)
-    sid = _sale(db, co, product="CeilingParity", qty=3.7, price=2)
+    sid = _sale(db, co, product="FreeQty", qty=3.7, price=2)
     si = _sale_item_id(db, sid)
 
-    ceiling = salesmod.list_sale_invoice_lines(db, sid)["lines"][0]["ceiling"]
-    assert ceiling == 3.885
-
     created = salesmod.create_invoice(
-        db, sid, f"INV-{_tag()}", lines=[_line(si, ceiling)],
+        db, sid, f"INV-{_tag()}", lines=[_line(si, 5.0)],
         invoice_date=INVOICE_DATE)
     assert created["status"] == "planned"
-
-    with pytest.raises(ToleranceExceeded):
-        salesmod.create_invoice_item(db, created["invoice_id"], si, 0.000001)
+    assert created["amount"] == pytest.approx(10.0)
 
     done = salesmod.list_sale_invoice_lines(db, sid)["lines"][0]
-    assert done["invoiced_quantity"] == pytest.approx(3.885)
+    assert done["invoiced_quantity"] == pytest.approx(5.0)
     assert done["remaining"] == 0.0
+    assert "ceiling" not in done
 
 
 def test_create_invoice_audits_each_line_then_the_header(admin_client, db,

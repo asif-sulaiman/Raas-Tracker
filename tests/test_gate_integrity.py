@@ -365,14 +365,13 @@ def test_create_invoice_item_on_planned_invoice_allowed(db):
     sid = _sale(db, co)
     items = _get_sale_items(db, sid)
     sale_item_id = items[0][0]
-    # Born with its baseline line (1 unit); the ceiling allows 10.5
+    # Born with its baseline line (1 unit); quantities are uncapped.
     from raas_tracker.sales import create_invoice
     result = create_invoice(
         db, sid, "INV-PLANNED",
         lines=[{"sale_item_id": sale_item_id, "quantity": 1}],
         invoice_date="2026-01-15")
     inv_id = result["invoice_id"]
-    # Should succeed - 1 + 5 is within 5% ceiling (PI qty=10, ceiling=10.5)
     line = create_invoice_item(db, inv_id, sale_item_id, 5.0)
     assert line["quantity"] == 5.0
 

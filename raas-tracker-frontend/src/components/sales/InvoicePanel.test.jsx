@@ -48,17 +48,16 @@ const INVOICES = [
 ];
 
 // PI lines the sale proposes, as `/api/sales/<id>/invoice-lines` returns them:
-// `invoiced_quantity` is what is already invoiced across every invoice of the
-// sale, and `ceiling` is the server's PI x 1.05 at 6 dp (not recomputed here).
+// `invoiced_quantity` and `remaining` are informational and never cap a write.
 const PI_LINES = [
   {
     sale_item_id: 1, product_name: 'Cotton', unit: 'KG',
-    pi_quantity: 100, invoiced_quantity: 60, remaining: 40, ceiling: 105,
+    pi_quantity: 100, invoiced_quantity: 60, remaining: 40,
     unit_price: 2.5,
   },
   {
     sale_item_id: 2, product_name: 'Androma LO2', unit: 'KG',
-    pi_quantity: 3000, invoiced_quantity: 3000, remaining: 0, ceiling: 3150,
+    pi_quantity: 3000, invoiced_quantity: 3000, remaining: 0,
     unit_price: 0.56,
   },
 ];
@@ -67,14 +66,12 @@ function jsonResponse(data, ok = true, status = 200) {
   return { ok, status, json: async () => data, headers: { get: () => null } };
 }
 
-function installFetch({ invoices = INVOICES, posts = [], completion, completionStatus = 200, payStatus = 'paid', deleteStatus = 200, deleteBody = null, failInvoicesAfterPost = false, failInvoicesAlways = false, createAmount = 2400, createStatus = 201, createBody = null, piLines = PI_LINES, piLinesAfterPost = null, hasLineLess = false } = {}) {
+function installFetch({ invoices = INVOICES, posts = [], completion, completionStatus = 200, payStatus = 'paid', deleteStatus = 200, deleteBody = null, failInvoicesAfterPost = false, failInvoicesAlways = false, createAmount = 2400, piLines = PI_LINES, hasLineLess = false } = {}) {
   const deletes = [];
   let invoiceReadsFail = failInvoicesAfterPost || failInvoicesAlways;
   // Lets a test flip the invoice read back to healthy to exercise a retry.
   posts.failInvoices = (on) => { invoiceReadsFail = on; };
   posts.deletes = deletes;
-  let budgetReads = 0;
-  posts.budgetReads = () => budgetReads;
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
     const u = String(url);
     const method = options?.method || 'GET';
@@ -82,11 +79,8 @@ function installFetch({ invoices = INVOICES, posts = [], completion, completionS
       return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
     }
     if (u.includes('/invoice-lines') && method === 'GET') {
-      // One row per PI line, ceiling included: the editor must trust these
-      // figures rather than recompute pi * 1.05 in the browser.
-      budgetReads += 1;
-      const served = posts.length > 0 && piLinesAfterPost ? piLinesAfterPost : piLines;
-      return jsonResponse({ lines: served, has_line_less_invoices: hasLineLess });
+      // One row per PI line; the figures are informational only.
+      return jsonResponse({ lines: piLines, has_line_less_invoices: hasLineLess });
     }
     if (u.includes('/invoices') && method === 'DELETE') {
       deletes.push({ url: u });
@@ -100,9 +94,6 @@ function installFetch({ invoices = INVOICES, posts = [], completion, completionS
       if (u.endsWith('/book')) return jsonResponse({ success: true, status: 'booked' });
       if (u.endsWith('/ship')) return jsonResponse({ invoice_id: 7, shipment_id: 3, status: 'shipped' }, true, 201);
       if (u.endsWith('/pay')) return jsonResponse({ payment_id: 4, status: payStatus }, true, 201);
-      if (createStatus >= 400) {
-        return jsonResponse(createBody || { error: 'Could not create invoice' }, false, createStatus);
-      }
       return jsonResponse({ invoice_id: 10, invoice_number: 'NEW', status: 'planned', amount: createAmount }, true, 201);
     }
     if (u.includes('/completion')) {
@@ -234,7 +225,7 @@ describe('InvoicePanel', () => {
     expect(post.body).not.toHaveProperty('amount');
   });
 
-  it('posts several lines at once', async () => {
+  it('posts several lines whose quantities exceed what remains', async () => {
     const posts = [];
     renderPanel({ posts });
     fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
@@ -242,25 +233,24 @@ describe('InvoicePanel', () => {
       target: { value: 'INV-4' },
     });
 
-    // Both quantities sit exactly on their ceiling (105 - 60 and 3150 - 3000),
-    // which is allowed: the hard stop is "above", not "at".
+    // 100 against 40 remaining and 250 against 0 remaining: no cap stops them.
     fireEvent.change(screen.getByLabelText(/invoice qty for Cotton/i), {
-      target: { value: '45' },
+      target: { value: '100' },
     });
     fireEvent.change(screen.getByLabelText(/invoice qty for Androma LO2/i), {
-      target: { value: '150' },
+      target: { value: '250' },
     });
 
     fireEvent.click(screen.getByRole('button', { name: 'Save invoice' }));
     await waitFor(() => expect(posts.filter((p) => p.body && p.body.invoice_number === 'INV-4')).toHaveLength(1));
     const post = posts.find((p) => p.body && p.body.invoice_number === 'INV-4');
     expect(post.body.lines).toEqual([
-      { sale_item_id: 1, quantity: 45 },
-      { sale_item_id: 2, quantity: 150 },
+      { sale_item_id: 1, quantity: 100 },
+      { sale_item_id: 2, quantity: 250 },
     ]);
   });
 
-  it('shows Remaining per PI line and stops advertising the ceiling', async () => {
+  it('shows Remaining as information only', async () => {
     renderPanel();
     fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
     // 100 proposed, 60 invoiced -> 40 remaining, under the PI qty cell.
@@ -275,8 +265,7 @@ describe('InvoicePanel', () => {
       target: { value: '25' },
     });
     expect(cottonRow.textContent).toContain('Remaining 15.00 KG');
-    // No variance wording, and no ceiling headroom offered as a target: the
-    // ceiling is a server-enforced hard stop, surfaced only when crossed.
+    // No variance wording, and no cap offered as a target.
     expect(screen.queryByText(/under PI|over PI|matches PI|ceiling/i)).toBeNull();
   });
 
@@ -299,41 +288,6 @@ describe('InvoicePanel', () => {
     const post = posts.find((p) => p.body && p.body.invoice_number === 'INV-3');
     expect(post.body.invoice_date).toBe(expected);
     expect(post.body.lines).toEqual([{ sale_item_id: 1, quantity: 25 }]);
-  });
-
-  it('resyncs on a 409 instead of echoing the server prose', async () => {
-    // Another operator invoiced the same PI line between load and submit. The
-    // refusal is classified by status only: the budget is refetched, and the
-    // RELOADED figures decide whether the typed quantity is still allowed.
-    const posts = [];
-    renderPanel({
-      posts,
-      createStatus: 409,
-      createBody: { error: 'PI line 1: invoiced 106.00 exceeds 105.00 (PI qty 100.00 + 5%)' },
-      piLinesAfterPost: [
-        { ...PI_LINES[0], invoiced_quantity: 100, remaining: 0 },
-        PI_LINES[1],
-      ],
-    });
-    fireEvent.click(await screen.findByRole('button', { name: 'Add invoice' }));
-    fireEvent.change(await screen.findByLabelText('Invoice number'), {
-      target: { value: 'INV-3' },
-    });
-    fireEvent.change(screen.getByLabelText(/invoice qty for Cotton/i), {
-      target: { value: '25' },
-    });
-    const save = screen.getByRole('button', { name: 'Save invoice' });
-    await waitFor(() => expect(save.disabled).toBe(false));
-    fireEvent.click(save);
-
-    // 105 ceiling - 100 invoiced leaves 5, so 25 is now refused in the form.
-    expect(
-      await screen.findByText(/this line can add at most 5\.00/i),
-    ).toBeTruthy();
-    expect(posts).toHaveLength(1);
-    expect(posts.budgetReads()).toBeGreaterThanOrEqual(2);
-    // The server's message is not the contract: never render it verbatim.
-    expect(screen.queryByText(/exceeds/i)).toBeNull();
   });
 
   it('keeps Book visible but disabled, with a reason, until produced', async () => {

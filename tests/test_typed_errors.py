@@ -31,9 +31,10 @@ Those tests pin the status to the TYPE:
 
 The remediation pass that followed the Oracle gate closed three gaps in the
 above: the 5% tolerance breach answered 400 on two of its three routes and
-409 on the third; ``sales.InvoicedLineConflict`` claimed a 409 in its
-docstring while sitting outside the hierarchy, kept there only by three
-handwritten handlers; and two docstrings justified the hierarchy by
+409 on the third (that tolerance system was later removed entirely; quantity
+is now free relative to the PI); ``sales.InvoicedLineConflict`` claimed a 409
+in its docstring while sitting outside the hierarchy, kept there only by
+three handwritten handlers; and two docstrings justified the hierarchy by
 requirements that do not exist yet.
 """
 
@@ -56,7 +57,6 @@ from raas_tracker._exceptions import (
     LinkedSaleNotFound,
     SaleItemNotFound,
     ServiceError,
-    ToleranceExceeded,
     status_for,
 )
 from raas_tracker.sales import InvoicedLineConflict
@@ -66,7 +66,6 @@ from raas_tracker.sales import InvoicedLineConflict
 _TYPED = [
     (InvoiceAlreadyAdvanced, 409),
     (InvoiceNotProduced, 409),
-    (ToleranceExceeded, 409),
     (InvoicedLineConflict, 409),
     (InvoiceNotFound, 404),
     (LinkedSaleNotFound, 404),
@@ -444,66 +443,6 @@ def test_ship_route_409_for_terminal_invoice(admin_client, db):
                           json={"actual_ship_date": "2026-11-02"})
     assert r.status_code == 409, r.get_json()
     assert r.get_json()["error"] == "invoice already paid"
-
-
-def test_invoice_item_route_409_over_tolerance(admin_client, db):
-    """sales.py:1733 — beyond the 5% over-invoice ceiling is a 409."""
-    cid = _company(admin_client, db, "TypedTolCo")
-    sid = _sale(admin_client, cid, "PI-TT-1", "TypedTolProd")
-    item_id = _sale_item_id(db, sid)
-    inv = _invoice(admin_client, db, sid, "INV-TT-1")
-
-    r = admin_client.post(f"/api/invoices/{inv}/items",
-                          json={"sale_item_id": item_id, "quantity": 11})
-    assert r.status_code == 409, r.get_json()
-    # Seeded invoice already carries the PI line's full 10, so the add brings
-    # the cumulative to 21 against a 10.5 ceiling.
-    assert r.get_json()["error"] == (
-        f"PI line {item_id}: invoiced 21.0 exceeds 10.500000 "
-        "(PI qty 10.0 + 5%)")
-
-
-def test_tolerance_breach_is_409_on_every_invoice_write_route(admin_client, db):
-    """ONE condition -> ONE status, on all three writers of an invoice line.
-
-    `ToleranceExceeded` is a conflict with what the sale has already been
-    invoiced for, so it is a 409 (RFC 9110: retrying the identical body will
-    never succeed). `POST /api/invoices/<id>/items` already answered 409; the
-    invoice-create and invoices-batch routes hardcoded 400 for the *same*
-    refusal, so a client could not tell a fixable payload error from an
-    unfixable state conflict — it depended on which door it came in by.
-    """
-    cid = _company(admin_client, db, "TypedTol3Co")
-    sid = _sale(admin_client, cid, "PI-TT3-1", "TypedTol3Prod")
-    item_id = _sale_item_id(db, sid)
-    # The seeded invoice already carries the PI line's full 10, so every
-    # request below trips the same 10.5 ceiling.
-    inv = _invoice(admin_client, db, sid, "INV-TT3-SEED")
-
-    r_create = admin_client.post(f"/api/sales/{sid}/invoices", json={
-        "invoice_number": "INV-TT3-A",
-        "invoice_date": "2026-01-15",
-        "lines": [{"sale_item_id": item_id, "quantity": 1}]})
-    r_batch = admin_client.post(f"/api/sales/{sid}/invoices/batch", json={
-        "invoices": [{"invoice_number": "INV-TT3-B",
-                      "invoice_date": "2026-01-15",
-                      "lines": [{"sale_item_id": item_id, "quantity": 1}]}]})
-    r_item = admin_client.post(f"/api/invoices/{inv}/items",
-                               json={"sale_item_id": item_id, "quantity": 1})
-
-    assert [r_create.status_code, r_batch.status_code, r_item.status_code] == [
-        409, 409, 409], [r_create.get_json(), r_batch.get_json(),
-                         r_item.get_json()]
-    # Same refusal text on all three, so the status is the only thing that
-    # could differ between them.
-    for r in (r_create, r_batch, r_item):
-        assert r.get_json()["error"].startswith(
-            f"PI line {item_id}: invoiced 11.0 exceeds 10.500000"), r.get_json()
-
-    # The refusals rolled back: neither create left a header behind.
-    assert {row[0] for row in db.execute(
-        "SELECT invoice_number FROM invoices WHERE sale_id = %s",
-        (sid,)).fetchall()} == {"INV-TT3-SEED"}
 
 
 def test_invoice_item_route_404_missing_sale_item(admin_client, db):
