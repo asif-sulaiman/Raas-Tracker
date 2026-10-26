@@ -1,17 +1,14 @@
-"""Phase 1 gate contract tests.
+"""Pipeline gate contract tests.
 
-Barrier 1 (``lc_received -> shipment_ongoing``) requires only that at least
-one invoice exists. Previously it also required every product to have a
-recipe, so an invoice would not unlock production.
+``lc_received -> shipment_ongoing`` requires no invoice: invoices are created
+*in* Shipment Ongoing, from the PI lines (one or many, partial quantities).
 
-Barrier 2 (``shipment_ongoing -> payment_due``) requires, for every distinct
+``shipment_ongoing -> payment_due`` still requires, for every distinct
 invoiced product, both:
   * a company recipe for that product_name, and
   * an invoice-linked production run for that recipe.
 """
 import uuid
-
-import pytest
 
 from chem_stock import add_recipe, add_sale
 from raas_tracker.sales import create_invoice
@@ -67,9 +64,9 @@ def _mk_lc(admin_client, company_id, lc_number, **kw):
 
 
 # --------------------------------------------------------------------------- #
-# Barrier 1: shipment_ongoing needs an invoice, nothing else
+# Shipment entry: no invoice required
 # --------------------------------------------------------------------------- #
-def test_shipment_ongoing_blocked_without_invoice(admin_client, db):
+def test_shipment_ongoing_allowed_without_invoice(admin_client, db):
     tag = _tag()
     co = _company(db, f"G1 {tag}")
     lc = _mk_lc(admin_client, co, f"LC-G1-{tag}")
@@ -80,12 +77,12 @@ def test_shipment_ongoing_blocked_without_invoice(admin_client, db):
 
     r = admin_client.post(f"/api/lcs/{lc['id']}/move",
                           json={"new_stage": "shipment_ongoing"})
-    assert r.status_code == 409, r.get_json()
-    body = r.get_json()
-    assert "invoice" in str(body["missing"])
-    assert any("invoice" in str(m).lower() for m in body["missing"])
+    assert r.status_code == 200, r.get_json()
     assert admin_client.get(
-        f"/api/lcs/{lc['id']}").get_json()["stage"] == "lc_received"
+        f"/api/lcs/{lc['id']}").get_json()["stage"] == "shipment_ongoing"
+    assert db.execute(
+        "SELECT stage FROM sales WHERE id = %s", (sid,)).fetchone()[0] == (
+            "shipment_ongoing")
 
 
 def test_shipment_ongoing_passes_with_invoice_only(admin_client, db):
@@ -223,7 +220,7 @@ def test_payment_due_passes_with_invoice_linked_run(admin_client, db):
     assert r.status_code == 200, r.get_json()
 
 
-def test_direct_jump_from_lc_received_to_payment_due_requires_both_gates(admin_client, db):
+def test_direct_jump_from_lc_received_to_payment_due_requires_production(admin_client, db):
     tag = _tag()
     co = _company(db, f"G7 {tag}")
     lc = _mk_lc(admin_client, co, f"LC-G7-{tag}")
@@ -232,14 +229,19 @@ def test_direct_jump_from_lc_received_to_payment_due_requires_both_gates(admin_c
     assert admin_client.post(
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
+    _invoice(db, sid, f"INV-G7-{tag}")
+    assert add_recipe(db, f"R-G7-{tag}", 100, 0, co, product) is not False
 
-    # No invoice, no recipe, no run: invoice barrier blocks first.
+    # A direct overshoot to payment_due still has to clear the production
+    # gate; the removed invoice gate no longer runs first.
     r = admin_client.post(f"/api/lcs/{lc['id']}/move",
                           json={"new_stage": "payment_due"})
     assert r.status_code == 409, r.get_json()
     body = r.get_json()
     missing = body["missing"]
-    assert any("invoices" in str(m).lower() for m in missing)
+    assert any("production" in str(m).lower() for m in missing)
+    assert admin_client.get(
+        f"/api/lcs/{lc['id']}").get_json()["stage"] == "lc_received"
 
 
 def test_readiness_endpoint_reports_barrier_state(admin_client, db):
@@ -252,7 +254,8 @@ def test_readiness_endpoint_reports_barrier_state(admin_client, db):
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
 
-    # Nothing yet: invoices_ok False, both production checks vacuous-truth.
+    # Nothing yet: invoices_ok is informational only, and both production
+    # checks are vacuous-truth.
     r = admin_client.get(f"/api/lcs/{lc['id']}/readiness")
     assert r.status_code == 200, r.get_json()
     out = r.get_json()
@@ -260,16 +263,10 @@ def test_readiness_endpoint_reports_barrier_state(admin_client, db):
     assert out["recipes_ok"] is True
     assert out["produced_ok"] is True
     assert out["pis"][0]["id"] == sid
-    # The invoice-draft view exposes the PI's remaining lines.
-    drafts = out["invoice_drafts"]
-    assert drafts[0]["sale_id"] == sid
-    assert drafts[0]["items"][0]["product_name"] == product
-    assert drafts[0]["items"][0]["remaining"] == pytest.approx(10)
+    # The barrier-only invoice-draft payload is gone with the invoice gate.
+    assert "invoice_drafts" not in out
 
-    # After invoicing, the invoice barrier clears and the draft empties.
+    # After invoicing, the informational flag flips.
     _invoice(db, sid, f"INV-G8-{tag}")
     out = admin_client.get(f"/api/lcs/{lc['id']}/readiness").get_json()
     assert out["invoices_ok"] is True
-    # Seeded invoice consumed the remaining qty, so the draft is empty now.
-    assert admin_client.get(
-        f"/api/lcs/{lc['id']}/readiness").get_json()["invoice_drafts"][0]["items"] == []

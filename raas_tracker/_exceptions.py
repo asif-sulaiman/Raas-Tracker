@@ -146,20 +146,11 @@ class LcNumberAlreadyExists(LifecycleConflict):
     """
 
 
-class LcNotReadyForShipment(LifecycleConflict):
-    """409 — the LC cannot cross into ``shipment_ongoing`` yet.
-
-    Replaces ``ValueError("LC is not ready for shipment: invoices: ...")``.
-    """
-
-
 class LcNotReadyPastShipment(LifecycleConflict):
     """409 — the LC cannot cross into ``payment_due`` yet.
 
-    Replaces ``ValueError("LC is not ready to go past shipment: ...")``. Kept
-    separate from :class:`LcNotReadyForShipment` because the two gates carry
-    different detail in their messages, and the readiness response the client
-    renders is built from that message.
+    Replaces ``ValueError("LC is not ready to go past shipment: ...")``. The
+    readiness response the client renders is built from that message.
     """
 
 

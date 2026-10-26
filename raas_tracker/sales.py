@@ -272,7 +272,8 @@ def move_sale_to_stage(conn: psycopg.Connection, sale_id: int, new_stage: str,
     ``_complete_if_paid``) stays allowed.
 
     Phase 3-A barriers:
-    - lc_received -> shipment_ongoing: requires at least one non-void invoice
+    - lc_received -> shipment_ongoing: no invoice required (invoices are
+      created in Shipment Ongoing)
     - shipment_ongoing -> payment_due: requires every invoiced product has
       a company recipe AND an invoice-linked production run
     """
@@ -284,12 +285,6 @@ def move_sale_to_stage(conn: psycopg.Connection, sale_id: int, new_stage: str,
         return False
     if new_stage == "shipment_ongoing" and not via_lc and lc_id is not None:
         return False
-
-    # Phase 3-A: Barrier 1 - lc_received -> shipment_ongoing requires at least one non-void invoice
-    if new_stage == "shipment_ongoing" and current == "lc_received":
-        ready = invoice_readiness(conn, [sale_id])
-        if not ready["invoices_ok"]:
-            return False
 
     # Phase 3-A: Barrier 2 - shipment_ongoing -> payment_due requires recipe + production for every invoiced product
     if new_stage == "payment_due" and current == "shipment_ongoing":
@@ -2724,11 +2719,11 @@ def invoice_production_readiness(conn: psycopg.Connection, company_id: int,
 
 def check_lc_shipment_ready(conn: psycopg.Connection,
                             lc_id: int) -> Dict[str, Any]:
-    """Gate for ``lc_received -> shipment_ongoing``.
+    """Readiness snapshot for an LC.
 
-    Returns both barriers from one snapshot so the route can report the full
-    picture in a single 409 payload, while the move primitive only enforces the
-    barrier(s) actually crossed by the target stage.
+    ``invoices_ok`` is informational only — entering Shipment Ongoing no
+    longer requires an invoice. ``recipes_ok``/``produced_ok`` are the
+    ``shipment_ongoing -> payment_due`` production gate.
     """
     lc = conn.execute(
         "SELECT id, company_id FROM letters_of_credit WHERE id = %s",

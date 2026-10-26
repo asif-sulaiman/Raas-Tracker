@@ -285,22 +285,40 @@ def test_move_happy_skips_gate_for_other_stages(admin_client, db):
         f"/api/lcs/{lc['id']}").get_json()["stage"] == "payment_due"
 
 
-def test_move_409_gate_names_missing_preconditions(admin_client, db):
+def test_move_to_shipment_without_invoice_succeeds_then_payment_gated(admin_client, db):
     tag = _tag()
     co = _company(db, f"LC G {_tag()}")
     lc = _mk_lc(admin_client, co, f"LC-G-{tag}")
-    sid = _sale(db, f"PI-G-{tag}", company_id=co, product=f"GProd-{tag}")
+    product = f"GProd-{tag}"
+    sid = _sale(db, f"PI-G-{tag}", company_id=co, product=product)
     assert admin_client.post(
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
+    # The shipment crossing needs no invoice.
     r = admin_client.post(f"/api/lcs/{lc['id']}/move",
                           json={"new_stage": "shipment_ongoing"})
+    assert r.status_code == 200, r.get_json()
+    assert admin_client.get(
+        f"/api/lcs/{lc['id']}").get_json()["stage"] == "shipment_ongoing"
+
+    # Invoicing in Shipment Ongoing does not clear the production gate.
+    assert add_recipe(db, f"R-G-{tag}", 100, 0, co, product) is not False
+    sale_item_id = db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id LIMIT 1",
+        (sid,)).fetchone()[0]
+    create_invoice(
+        db, sid, f"INV-G-{tag}",
+        lines=[{"sale_item_id": sale_item_id, "quantity": 10}],
+        invoice_date="2026-01-15")
+    r = admin_client.post(f"/api/lcs/{lc['id']}/move",
+                          json={"new_stage": "payment_due"})
     assert r.status_code == 409, r.get_json()
     body = r.get_json()
     assert "missing" in body and len(body["missing"]) > 0
+    assert any("production" in str(m).lower() for m in body["missing"])
     # stage must not have moved
     assert admin_client.get(
-        f"/api/lcs/{lc['id']}").get_json()["stage"] == "lc_received"
+        f"/api/lcs/{lc['id']}").get_json()["stage"] == "shipment_ongoing"
 
 
 def test_move_passes_gate_with_recipe_and_invoice(admin_client, db):
@@ -526,8 +544,8 @@ def test_lc_delete_with_attached_pis_409(admin_client, db):
     assert r.status_code == 409, r.get_json()
 
 
-def test_move_direct_jump_gated_409(admin_client, db):
-    """B4+B6 route: pi_issued LC jumping to shipment_ongoing is 409'd."""
+def test_move_direct_jump_to_shipment_without_invoice_succeeds(admin_client, db):
+    """B4+B6 route: pi_issued LC jumping to shipment_ongoing needs no invoice."""
     tag = _tag()
     co = _company(db, f"LC DJ {tag}")
     lc = _mk_lc(admin_client, co, f"LC-DJ-{tag}")
@@ -540,8 +558,9 @@ def test_move_direct_jump_gated_409(admin_client, db):
     db.commit()
     r = admin_client.post(f"/api/lcs/{lc['id']}/move",
                           json={"new_stage": "shipment_ongoing"})
-    assert r.status_code == 409, r.get_json()
-    assert "missing" in r.get_json()
+    assert r.status_code == 200, r.get_json()
+    assert admin_client.get(
+        f"/api/lcs/{lc['id']}").get_json()["stage"] == "shipment_ongoing"
 
 
 def test_legacy_gate_passes_move(admin_client, db):

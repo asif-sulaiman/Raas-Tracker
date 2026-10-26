@@ -23,11 +23,10 @@ still map to 400.
 
 import psycopg
 from datetime import datetime as _dt, timezone
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 
 from ._exceptions import (
     LcNotFound,
-    LcNotReadyForShipment,
     LcNotReadyPastShipment,
     LcNumberAlreadyExists,
     LcSaleNotFound,
@@ -291,25 +290,24 @@ def move_lc_stage(conn: psycopg.Connection, lc_id: int, new_stage: str,
     Locks the LC row AND each child sale row (``SELECT ... FOR UPDATE``,
     children in id order) before writing anything, so concurrent moves
     serialize instead of interleaving. Validates ``new_stage`` against
-    ``SALE_STAGE_ORDER`` (``ValueError`` otherwise). When the move carries the
-    LC into ``shipment_ongoing`` the gate requires merely that at least one
-    invoice exists. When it carries the LC into ``payment_due`` the gate
-    additionally requires progress from every invoiced product through a
-    company recipe verified by an invoice-linked production run.
+    ``SALE_STAGE_ORDER`` (``ValueError`` otherwise). Crossing into
+    ``shipment_ongoing`` requires no invoice: invoices are created in Shipment
+    Ongoing. When the move carries the LC into ``payment_due`` the gate
+    requires progress from every invoiced product through a company recipe
+    verified by an invoice-linked production run.
 
-    Each gate raises its own typed refusal at the point the message is
-    built — ``LcNotReadyForShipment`` / ``LcNotReadyPastShipment``, both 409,
-    text unchanged. The route used to recover the status by scanning the text
-    for ``"not ready for shipment"`` / ``"recipes:"`` / ``"invoices:"`` /
-    ``"production:"``, three of which are vocabulary shared with the readiness
-    payload the message is itself assembled from, so any rewording (or any
-    new colon in those words) silently changed the HTTP status. Propagates
-    ``sales.stage`` + ``sales_stage_history`` + ``SALE_MOVE`` audit per child
-    (``via_lc=True``: linked PIs only travel via this path). Returns False
-    when the LC does not exist.
+    That refusal is typed at the point the message is built —
+    ``LcNotReadyPastShipment``, 409, text unchanged. The route used to
+    recover the status by scanning the text for ``"recipes:"`` /
+    ``"invoices:"`` / ``"production:"``, three of which are vocabulary shared
+    with the readiness payload the message is itself assembled from, so any
+    rewording (or any new colon in those words) silently changed the HTTP
+    status. Propagates ``sales.stage`` + ``sales_stage_history`` + ``SALE_MOVE``
+    audit per child (``via_lc=True``: linked PIs only travel via this path).
+    Returns False when the LC does not exist.
     """
     from .audit import log_audit_action
-    from .sales import SALE_STAGE_ORDER, invoice_readiness, production_readiness
+    from .sales import SALE_STAGE_ORDER, production_readiness
 
     if new_stage not in SALE_STAGE_ORDER:
         raise ValueError(f"invalid stage: {new_stage}")
@@ -329,10 +327,9 @@ def move_lc_stage(conn: psycopg.Connection, lc_id: int, new_stage: str,
             "SELECT id, stage FROM sales WHERE lc_id = %s ORDER BY id FOR UPDATE",
             (lc_id,)).fetchall()
         # Gate inside the txn: which barrier(s) apply depends on how far this
-        # stage move carries the LC. Crossing into ``shipment_ongoing`` means at
-        # least one invoice exists. Crossing into ``payment_due`` means every
-        # product on those invoices has a recipe AND an invoice-linked
-        # production run. Jumps directly to either stage trigger both.
+        # stage move carries the LC. Crossing into ``payment_due`` means every
+        # product on the LC's invoices has a recipe AND an invoice-linked
+        # production run. Shipment entry is ungated.
         try:
             tgt_idx = SALE_STAGE_ORDER.index(new_stage)
         except ValueError:
@@ -341,20 +338,8 @@ def move_lc_stage(conn: psycopg.Connection, lc_id: int, new_stage: str,
             cur_idx = SALE_STAGE_ORDER.index(lc_stage)
         except ValueError:
             cur_idx = -1
-        ship_idx = SALE_STAGE_ORDER.index("shipment_ongoing")
         pay_idx = SALE_STAGE_ORDER.index("payment_due")
         sale_ids = [c[0] for c in children]
-
-        if tgt_idx >= ship_idx > cur_idx:
-            inv = invoice_readiness(conn, sale_ids)
-            if not inv["invoices_ok"]:
-                msg = ("LC is not ready for shipment: "
-                       "invoices: at least one invoice required")
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                raise LcNotReadyForShipment(msg)
 
         if tgt_idx >= pay_idx > cur_idx:
             prod = production_readiness(conn, lc_company, sale_ids)
