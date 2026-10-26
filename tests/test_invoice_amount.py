@@ -149,6 +149,19 @@ def _status(db, invoice_id):
         "SELECT status FROM invoices WHERE id = %s", (invoice_id,)).fetchone()[0]
 
 
+def _ship_direct(db, invoice_id):
+    """Stand an invoice at 'shipped' without driving production/booking.
+
+    Book -> Ship -> Pay is enforced in tests/test_invoice_order.py; the money
+    tests here only need the one lifecycle state that may accept a payment.
+    """
+    db.execute(
+        "UPDATE invoices SET status = 'shipped', actual_ship_date = %s "
+        "WHERE id = %s AND status NOT IN ('shipped', 'paid')",
+        ("2026-11-01", invoice_id))
+    db.commit()
+
+
 # ---------- 1. create: money is derived, never stated ----------
 
 def test_create_invoice_ignores_stated_amount_and_derives_from_pi(admin_client, db):
@@ -198,14 +211,15 @@ def test_partial_payment_keeps_status_and_reports_paid_amount(admin_client, db):
     cid = _company(admin_client, db, name="AmtPartial")
     sid = _sale(admin_client, cid, "PI-AMT-4", qty=20)  # 20 x 5 = 100
     inv = _invoice(admin_client, db, sid, "INV-AMT-4")
+    _ship_direct(db, inv)
 
     _pay(admin_client, sid, inv, 40)
 
-    assert _status(db, inv) == "planned"
+    assert _status(db, inv) == "shipped"
     row = _row(admin_client, sid, inv)
     assert row["amount"] == pytest.approx(100.0)
     assert row["paid_amount"] == pytest.approx(40.0)
-    assert row["status"] == "planned"
+    assert row["status"] == "shipped"
 
 
 # ---------- 3. reaching the amount flips status to 'paid' ----------
@@ -214,9 +228,10 @@ def test_full_payment_flips_status_to_paid(admin_client, db):
     cid = _company(admin_client, db, name="AmtFull")
     sid = _sale(admin_client, cid, "PI-AMT-5", qty=20)  # 20 x 5 = 100
     inv = _invoice(admin_client, db, sid, "INV-AMT-5")
+    _ship_direct(db, inv)
 
     _pay(admin_client, sid, inv, 60)
-    assert _status(db, inv) == "planned", "partial coverage must not flip"
+    assert _status(db, inv) == "shipped", "partial coverage must not flip"
 
     _pay(admin_client, sid, inv, 40)  # 100 >= 100
     assert _status(db, inv) == "paid"
@@ -311,6 +326,7 @@ def test_legacy_null_amount_payment_marks_paid(admin_client, db):
     # NULL amount with NO payment -> old rule does not fire
     assert _status(db, unpaid_inv) == "planned"
 
+    _ship_direct(db, paid_inv)
     _pay(admin_client, sid, paid_inv, 10)
     assert _status(db, paid_inv) == "paid", "legacy NULL amount: any payment pays"
 
@@ -328,6 +344,7 @@ def test_paid_status_never_downgrades(admin_client, db):
     # (a) fully covered invoice -> the guarded UPDATE must not re-fire.
     sid = _sale(admin_client, cid, "PI-AMT-9", qty=20)  # 20 x 5 = 100
     inv = _invoice(admin_client, db, sid, "INV-AMT-9")
+    _ship_direct(db, inv)
     _pay(admin_client, sid, inv, 100)
     assert _status(db, inv) == "paid"
     assert _sync_invoice_paid_status(db, inv) is False
@@ -367,6 +384,8 @@ def test_completion_carries_total_amount_and_paid_amount(admin_client, db):
     db.execute("UPDATE invoices SET amount = NULL WHERE id = %s", (c,))
     db.commit()
 
+    for inv_id in (a, b, c):
+        _ship_direct(db, inv_id)
     _pay(admin_client, sid, a, 100)   # paid
     _pay(admin_client, sid, b, 20)    # partial
     _pay(admin_client, sid, c, 30)    # legacy NULL -> paid by any payment
@@ -404,11 +423,12 @@ def test_list_rows_carry_amount_and_paid_amount(admin_client, db):
     assert rows[0]["amount"] == pytest.approx(75.0)
     assert rows[0]["paid_amount"] == pytest.approx(0.0)
 
+    _ship_direct(db, inv)
     _pay(admin_client, sid, inv, 25.5)
     row = _row(admin_client, sid, inv)
     assert row["amount"] == pytest.approx(75.0)
     assert row["paid_amount"] == pytest.approx(25.5)
-    assert row["status"] == "planned"
+    assert row["status"] == "shipped"
 
 
 # ---------- 9. integrity: forward-only, sale scoping, derived money, void ----------
@@ -428,20 +448,30 @@ def _payments(db, sale_id):
     return db.execute("SELECT COUNT(*) FROM sale_payments WHERE sale_id = %s", (sale_id,)).fetchone()[0]
 
 
-def test_ship_on_paid_refused_without_phantom_shipment(admin_client, db):
+def test_ship_on_paid_refused_without_phantom_shipment(admin_client, db, produce_for):
     cid = _company(admin_client, db, name="IntShipPaid")
     sid = _sale(admin_client, cid, "PI-INT-1")  # 10 x 5 = 50
     inv = _invoice(admin_client, db, sid, "INV-INT-1")
+
+    # Pay is only reachable after Book -> Ship, so drive the real order first.
+    produce_for(cid, sid, inv, "IntShipPaid", "ProdAmt")
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
+                          json={"approx_ship_date": "2026-11-01"})
+    assert r.status_code == 200, r.get_json()
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/ship",
+                          json={"actual_ship_date": "2026-11-05"})
+    assert r.status_code == 201, r.get_json()
     _pay(admin_client, sid, inv, 50)
     assert _status(db, inv) == "paid"
 
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/ship",
-                          json={"actual_ship_date": "2026-11-05"})
+                          json={"actual_ship_date": "2026-11-06"})
     assert r.status_code == 409, r.get_json()
     assert "invoice already paid" in r.get_json()["error"]
 
     assert _status(db, inv) == "paid"
-    assert _shipments(db, sid) == 0, "refused ship must not leave a shipment row"
+    assert _shipments(db, sid) == 1, (
+        "refused re-ship must not leave a phantom shipment row")
 
 
 def test_book_ship_pay_delete_reject_cross_sale_invoice(admin_client, db):
@@ -494,51 +524,50 @@ def test_partial_pay_returns_actual_status(admin_client, db, produce_for):
     sid = _sale(admin_client, cid, "PI-INT-H", qty=40)  # 40 x 5 = 200
     inv = _invoice(admin_client, db, sid, "INV-INT-H")
 
-    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/pay",
-                          json={"payment_amount": 50, "payment_date": "2026-11-04"})
-    assert r.status_code == 201, r.get_json()
-    assert r.get_json()["status"] == "planned"
-    assert _status(db, inv) == "planned"
-
-    db.execute("UPDATE invoices SET status = 'produced' WHERE id = %s", (inv,))
-    db.commit()
-    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/pay",
-                          json={"payment_amount": 50, "payment_date": "2026-11-05"})
-    assert r.status_code == 201, r.get_json()
-    assert r.get_json()["status"] == "produced"
-    assert _status(db, inv) == "produced"
-
-# Booking requires real production, not just the status flag flipped above.
     produce_for(cid, sid, inv, "Int", "ProdAmt")
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
                           json={"approx_ship_date": "2026-11-10"})
     assert r.status_code == 200, r.get_json()
-    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/pay",
-                          json={"payment_amount": 50, "payment_date": "2026-11-06"})
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/ship",
+                          json={"actual_ship_date": "2026-11-11"})
     assert r.status_code == 201, r.get_json()
-    assert r.get_json()["status"] == "booked"
-    assert _status(db, inv) == "booked"
+
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/pay",
+                          json={"payment_amount": 50, "payment_date": "2026-11-12"})
+    assert r.status_code == 201, r.get_json()
+    assert r.get_json()["status"] == "shipped"
+    assert _status(db, inv) == "shipped"
+
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/pay",
+                          json={"payment_amount": 100, "payment_date": "2026-11-13"})
+    assert r.status_code == 201, r.get_json()
+    assert r.get_json()["status"] == "shipped"
+    assert _status(db, inv) == "shipped"
 
     # Full coverage flips and reports paid.
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/pay",
-                          json={"payment_amount": 50, "payment_date": "2026-11-07"})
+                          json={"payment_amount": 50, "payment_date": "2026-11-14"})
     assert r.status_code == 201, r.get_json()
     assert r.get_json()["status"] == "paid"
     assert _status(db, inv) == "paid"
 
 
-def test_book_on_shipped_refused_and_sale_untouched(admin_client, db):
+def test_book_on_shipped_refused_and_sale_untouched(admin_client, db, produce_for):
     cid = _company(admin_client, db, name="IntBookShip")
     sid = _sale(admin_client, cid, "PI-INT-BS")
     inv = _invoice(admin_client, db, sid, "INV-INT-BS")
 
+    produce_for(cid, sid, inv, "IntBookShip", "ProdAmt")
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
+                          json={"approx_ship_date": "2026-11-08"})
+    assert r.status_code == 200, r.get_json()
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/ship",
-                          json={"actual_ship_date": "2026-11-08"})
+                          json={"actual_ship_date": "2026-11-09"})
     assert r.status_code == 201, r.get_json()
     before = _detail(admin_client, sid)["shipment_status"]
 
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
-                          json={"approx_ship_date": "2026-11-09"})
+                          json={"approx_ship_date": "2026-11-10"})
     assert r.status_code == 409, r.get_json()
     assert "invoice already shipped" in r.get_json()["error"]
 
@@ -546,24 +575,22 @@ def test_book_on_shipped_refused_and_sale_untouched(admin_client, db):
     assert _detail(admin_client, sid)["shipment_status"] == before
 
 
-def test_produce_on_paid_refused(admin_client, db):
+def test_produce_on_paid_refused(admin_client, db, produce_for):
     cid = _company(admin_client, db, name="IntProdPaid")
     sid = _sale(admin_client, cid, "PI-INT-PP")
-    r = admin_client.post("/api/chemicals",
-                          json={"name": "Chem-IntPP", "qty": 500, "unit": "KG"})
-    assert r.status_code == 200, r.get_json()
-    r = admin_client.post("/api/recipes", json={
-        "name": "Recipe-IntPP", "yield": 100, "company_id": cid,
-        "product_name": "ProdAmt"})
-    assert r.status_code == 201, r.get_json()
-    r = admin_client.post("/api/recipes/Recipe-IntPP/items", json={
-        "chemical": "Chem-IntPP", "percentage": 40, "company_id": cid})
-    assert r.status_code == 200, r.get_json()
     inv = _invoice(admin_client, db, sid, "INV-INT-PP")
+
+    produce_for(cid, sid, inv, "IntProdPaid", "ProdAmt")
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
+                          json={"approx_ship_date": "2026-11-01"})
+    assert r.status_code == 200, r.get_json()
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/ship",
+                          json={"actual_ship_date": "2026-11-02"})
+    assert r.status_code == 201, r.get_json()
     _pay(admin_client, sid, inv, 50)
     assert _status(db, inv) == "paid"
 
-    r = admin_client.post("/api/recipes/Recipe-IntPP/produce", json={
+    r = admin_client.post("/api/recipes/GateRecipe-IntProdPaid/produce", json={
         "production_qty": 5, "company_id": cid,
         "sale_ids": [sid], "invoice_ids": [inv]})
     assert r.status_code == 409, r.get_json()
@@ -649,6 +676,7 @@ def test_void_paid_invoice_keeps_sale_payment_truth(admin_client, db):
     cid = _company(admin_client, db, name="IntVoid")
     sid = _sale(admin_client, cid, "PI-INT-V")  # 10 x 5 = 50
     inv = _invoice(admin_client, db, sid, "INV-INT-V")
+    _ship_direct(db, inv)
     _pay(admin_client, sid, inv, 50)
     assert _status(db, inv) == "paid"
 
@@ -681,9 +709,10 @@ def test_double_pay_sums_without_loss(admin_client, db):
     cid = _company(admin_client, db, name="IntDoublePay")
     sid = _sale(admin_client, cid, "PI-INT-DP", qty=40)  # 40 x 5 = 200
     inv = _invoice(admin_client, db, sid, "INV-INT-DP")
+    _ship_direct(db, inv)
 
     _pay(admin_client, sid, inv, 120)
-    assert _status(db, inv) == "planned"
+    assert _status(db, inv) == "shipped"
     _pay(admin_client, sid, inv, 80)
     assert _status(db, inv) == "paid"
 

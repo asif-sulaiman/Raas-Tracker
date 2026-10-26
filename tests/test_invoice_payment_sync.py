@@ -44,6 +44,19 @@ def _status(db, invoice_id):
         "SELECT status FROM invoices WHERE id = %s", (invoice_id,)).fetchone()[0]
 
 
+def _ship(db, invoice_id):
+    """Shipped is the only status a payment may be recorded from (Phase 2).
+
+    These tests are about payment-sync status derivation, not the shipping
+    gate, so the state is set directly rather than driving production/booking.
+    """
+    db.execute(
+        "UPDATE invoices SET status = 'shipped', actual_ship_date = %s,"
+        " approx_ship_date = COALESCE(approx_ship_date, %s) WHERE id = %s",
+        ("2026-10-20", "2026-10-15", invoice_id))
+    db.commit()
+
+
 def _paid_amount(db, invoice_id):
     return round(float(db.execute(
         "SELECT COALESCE(ROUND(SUM(payment_amount)::numeric, 2)::float8, 0) "
@@ -72,6 +85,7 @@ def _pay_row(db, sale_id, invoice_id, amount):
 def test_deleting_full_payment_unpays_invoice(db):
     sid = _sale(db, "PI-SYNC-DEL")
     inv = _invoice(db, sid, "INV-SYNC-DEL")
+    _ship(db, inv)
 
     out = mark_invoice_paid(db, inv, 100, "2026-10-30")
     assert out["status"] == "paid"
@@ -90,6 +104,7 @@ def test_deleting_partial_payment_keeps_paid_invoice(db):
     """Two payments, one covering the invoice: deleting the other keeps 'paid'."""
     sid = _sale(db, "PI-SYNC-DEL2", total=200)
     inv = _invoice(db, sid, "INV-SYNC-DEL2", amount=100)
+    _ship(db, inv)
 
     mark_invoice_paid(db, inv, 100, "2026-10-30")   # covers the invoice
     extra = record_sale_payment(db, sid, "2026-10-31", 25)["payment_id"]
@@ -105,6 +120,7 @@ def test_deleting_partial_payment_keeps_paid_invoice(db):
 def test_editing_payment_down_unpays_invoice(db):
     sid = _sale(db, "PI-SYNC-EDIT")
     inv = _invoice(db, sid, "INV-SYNC-EDIT")
+    _ship(db, inv)
 
     out = mark_invoice_paid(db, inv, 100, "2026-10-30")
     assert _status(db, inv) == "paid"
@@ -119,10 +135,11 @@ def test_editing_payment_down_unpays_invoice(db):
 def test_editing_payment_up_pays_invoice(db):
     sid = _sale(db, "PI-SYNC-EDIT2")
     inv = _invoice(db, sid, "INV-SYNC-EDIT2")
+    _ship(db, inv)
 
     out = mark_invoice_paid(db, inv, 40, "2026-10-30")
-    assert out["status"] == "planned"
-    assert _status(db, inv) == "planned"
+    assert out["status"] == "shipped"
+    assert _status(db, inv) == "shipped"
 
     assert update_sale_payment_record(db, sid, out["payment_id"], payment_amount=100) is True
 
@@ -136,6 +153,7 @@ def test_sale_level_payment_leaves_invoices_alone(db):
     """A payment with no invoice_id must not touch any invoice status."""
     sid = _sale(db, "PI-SYNC-NONE", total=300)
     inv = _invoice(db, sid, "INV-SYNC-NONE", amount=100)
+    _ship(db, inv)
     mark_invoice_paid(db, inv, 100, "2026-10-30")
     assert _status(db, inv) == "paid"
 
@@ -158,6 +176,7 @@ def test_legacy_null_amount_invoice_unpays_when_payment_removed(db):
     inv = _invoice(db, sid, "INV-SYNC-LEG", amount=100)
     db.execute("UPDATE invoices SET amount = NULL WHERE id = %s", (inv,))
     db.commit()
+    _ship(db, inv)
 
     out = mark_invoice_paid(db, inv, 5, "2026-10-30")
     assert out["status"] == "paid"

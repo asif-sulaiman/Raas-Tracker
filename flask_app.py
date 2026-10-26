@@ -3011,6 +3011,7 @@ def api_delete_sale(sale_id):
 
 @app.route("/api/sales/<int:sale_id>/move", methods=["POST"])
 @admin_required
+@limited()
 def api_move_sale(sale_id):
     data = request.get_json() or {}
     notes = data.get("notes")
@@ -3019,7 +3020,12 @@ def api_move_sale(sale_id):
         if not conn.execute("SELECT 1 FROM sales WHERE id = %s",
                             (sale_id,)).fetchone():
             return jsonify({"error": "Sale not found"}), 404
-        new_stage = advance_sale(conn, sale_id, notes)
+        try:
+            new_stage = advance_sale(conn, sale_id, notes)
+        except ValueError as e:
+            # Typed gate refusals carry their own status (e.g. the booked-
+            # invoice barrier is a 409); plain validation stays 400.
+            return jsonify({"error": str(e)}), status_for(e)
         if not new_stage:
             return jsonify({"error": "Cannot advance sale"}), 400
         return jsonify({"new_stage": new_stage, "message": f"Moved to {new_stage}"})
@@ -3388,11 +3394,13 @@ def _lc_delete_guarded(conn, lc_id):
 
 
 def _shipment_missing_names(readiness):
-    """Named missing preconditions for the payment_due production gate (permanent
+    """Named missing preconditions for the payment_due gate (permanent
     route-level helper supporting both the top-level missing list and
     the detail/missing_recipes shape)."""
     if readiness.get("missing"):
         return list(readiness["missing"])
+    if not readiness.get("booked_ok"):
+        return ["invoices: at least one booked invoice required"]
     detail = readiness.get("detail") or {}
     names = [f"recipes: {p}"
              for p in detail.get("missing_recipes", [])]
@@ -3544,6 +3552,7 @@ def api_lc_readiness(lc_id):
         "invoices_ok": readiness.get("invoices_ok"),
         "recipes_ok": readiness.get("recipes_ok"),
         "produced_ok": readiness.get("produced_ok"),
+        "booked_ok": readiness.get("booked_ok"),
         "detail": readiness.get("detail"),
         "pis": [{"id": p["id"], "pi_number": p.get("pi_number"), "stage": p.get("stage")}
                 for p in (lc.get("pis") or [])],
@@ -3573,8 +3582,8 @@ def api_invoice_readiness(invoice_id):
         can_book = status in ("planned", "produced") and ready["ok"]
         # Shipping: can ship if status is booked
         can_ship = status == "booked"
-        # Payment: can pay if status is shipped or booked (partial payment allowed)
-        can_pay = status in ("booked", "shipped")
+        # Payment: only a shipped invoice may take money (Phase 2 order)
+        can_pay = status == "shipped"
         return jsonify({
             "invoice_id": invoice_id,
             "status": status,
@@ -3751,8 +3760,7 @@ def api_move_lc(lc_id):
             except LookupError as e:
                 _rollback_close(conn)
                 return jsonify({"error": str(e)}), 404
-            if not (readiness.get("recipes_ok")
-                    and readiness.get("produced_ok")):
+            if not readiness.get("booked_ok"):
                 missing = _shipment_missing_names(readiness)
                 conn.close()
                 return jsonify({
@@ -3762,6 +3770,7 @@ def api_move_lc(lc_id):
                     "recipes_ok": readiness.get("recipes_ok"),
                     "invoices_ok": readiness.get("invoices_ok"),
                     "produced_ok": readiness.get("produced_ok"),
+                    "booked_ok": readiness.get("booked_ok"),
                 }), 409
         try:
             ok = move_lc_stage(conn, lc_id, payload.new_stage,
@@ -3784,11 +3793,13 @@ def api_move_lc(lc_id):
                     recipes_ok = readiness.get("recipes_ok")
                     invoices_ok = readiness.get("invoices_ok")
                     produced_ok = readiness.get("produced_ok")
+                    booked_ok = readiness.get("booked_ok")
                 except Exception:
                     missing = [msg]
                     recipes_ok = False
                     invoices_ok = False
                     produced_ok = False
+                    booked_ok = False
             finally:
                 rconn.close()
             return jsonify({
@@ -3797,6 +3808,7 @@ def api_move_lc(lc_id):
                 "recipes_ok": recipes_ok,
                 "invoices_ok": invoices_ok,
                 "produced_ok": produced_ok,
+                "booked_ok": booked_ok,
             }), 409
         except ValueError as e:
             # Plain refusal (e.g. "invalid stage: x") — status from the type,

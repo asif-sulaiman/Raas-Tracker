@@ -181,9 +181,11 @@ def test_book_requires_approx_date_and_sets_ship_booked(admin_client, db):
 # ---------- 4. ship ----------
 
 def test_ship_creates_shipment_row_and_marks_shipped(admin_client, db):
-    cid = _company(admin_client, db, name="ShipCo")
-    sid = _sale(admin_client, cid, "PI-SH-1")
-    inv = _invoice(admin_client, db, sid, "INV-SH-1")
+    cid, sid, inv = _production_setup(admin_client, db, "Ship")
+    _produce(admin_client, cid, "Recipe-Ship", sid, inv)
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
+                          json={"approx_ship_date": "2026-10-15"})
+    assert r.status_code == 200, r.get_json()
 
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/ship",
                           json={"actual_ship_date": "2026-10-20"})
@@ -204,9 +206,14 @@ def test_ship_creates_shipment_row_and_marks_shipped(admin_client, db):
 # ---------- 5. pay ----------
 
 def test_pay_records_payment_and_syncs_sale_totals(admin_client, db):
-    cid = _company(admin_client, db, name="PayCo")
-    sid = _sale(admin_client, cid, "PI-PAY-1")  # 10 x 5 = 50
-    inv = _invoice(admin_client, db, sid, "INV-PAY-1")
+    cid, sid, inv = _production_setup(admin_client, db, "Pay")  # 10 x 5 = 50
+    _produce(admin_client, cid, "Recipe-Pay", sid, inv)
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
+                          json={"approx_ship_date": "2026-10-15"})
+    assert r.status_code == 200, r.get_json()
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/ship",
+                          json={"actual_ship_date": "2026-10-20"})
+    assert r.status_code == 201, r.get_json()
 
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/pay",
                           json={"payment_amount": 25.5,
@@ -216,7 +223,7 @@ def test_pay_records_payment_and_syncs_sale_totals(admin_client, db):
     assert body["payment_id"]
     # Partial coverage (25.5 < 50) must report the ACTUAL post-sync status,
     # not a hardcoded "paid".
-    assert body["status"] == "planned"
+    assert body["status"] == "shipped"
 
     rows = db.execute(
         "SELECT invoice_id, payment_amount FROM sale_payments "

@@ -394,6 +394,9 @@ VOLUME_BOUNDED_ROUTES = OPERATOR_ROUTES + [
     ("POST", "/api/sales/<int:sale_id>/invoices/<int:invoice_id>/ship"),
     ("POST", "/api/sales/<int:sale_id>/invoices/<int:invoice_id>/pay"),
     ("DELETE", "/api/sales/<int:sale_id>/invoices/<int:invoice_id>"),
+    # A stage move fans out to every invoice of the sale through the Payment Due
+    # gate (readiness reads all of them under lock), so it joins the writes above.
+    ("POST", "/api/sales/<int:sale_id>/move"),
     # Admin writes with row fan-out. Oracle (P1-B gate) flagged all three as
     # *unthrottled* while carrying an unbounded list — the higher-amplification
     # half of the surface, which the first draft of P1-B had left at 300/min.

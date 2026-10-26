@@ -15,9 +15,30 @@ from chem_stock import (
 )
 
 
+from raas_tracker.sales import create_invoice
+
+
 def _sale(db, total=100.0):
     return add_sale(db, {"pi_number": "PI-T1", "client_name": "T Co"},
                     [{"product_name": "W", "quantity": 10, "unit_price": total / 10}])
+
+
+def _book_invoice(db, sale_id, number="INV-T1"):
+    """Put a booked invoice on the sale so it may enter Payment Due.
+
+    These payment tests are not about booking's production gate; they only
+    need the sale to have crossed the booked-invoice barrier.
+    """
+    lines = [{"sale_item_id": r[0], "quantity": float(r[1])}
+             for r in db.execute(
+                 "SELECT id, quantity FROM sale_items WHERE sale_id = %s "
+                 "ORDER BY id", (sale_id,)).fetchall()]
+    inv = create_invoice(db, sale_id, number, lines=lines,
+                         invoice_date="2026-01-15")["invoice_id"]
+    db.execute("UPDATE invoices SET status = 'booked', approx_ship_date = %s"
+               " WHERE id = %s", ("2026-11-01", inv))
+    db.commit()
+    return inv
 
 
 def test_payment_audit_trail_contents(db):
@@ -50,6 +71,7 @@ def test_partial_payment_totals(db):
 
 def test_full_payment_auto_completes(db):
     sid = _sale(db)
+    _book_invoice(db, sid)
     move_sale_to_stage(db, sid, "payment_due", "test")
     out = record_sale_payment(db, sid, "2026-09-02", 100.0)
     assert out["stage"] == "completed"
@@ -58,6 +80,7 @@ def test_full_payment_auto_completes(db):
 
 def test_partial_payment_does_not_complete(db):
     sid = _sale(db)
+    _book_invoice(db, sid)
     move_sale_to_stage(db, sid, "payment_due", "test")
     out = record_sale_payment(db, sid, "2026-09-02", 99.99)
     assert out["stage"] == "payment_due"

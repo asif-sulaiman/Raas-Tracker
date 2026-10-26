@@ -15,9 +15,12 @@ from ._numeric import finite_values as _finite
 from ._exceptions import (
     InvoiceAlreadyAdvanced,
     InvoiceNotFound,
+    InvoiceNotBooked,
     InvoiceNotProduced,
+    InvoiceNotShipped,
     LifecycleConflict,
     SaleItemNotFound,
+    SaleNotReadyPastShipment,
     ServiceError,
 )
 
@@ -271,28 +274,31 @@ def move_sale_to_stage(conn: psycopg.Connection, sale_id: int, new_stage: str,
     travel via the LC endpoints. ``payment_due -> completed`` (incl.
     ``_complete_if_paid``) stays allowed.
 
-    Phase 3-A barriers:
+    Phase 2 barriers:
     - lc_received -> shipment_ongoing: no invoice required (invoices are
       created in Shipment Ongoing)
-    - shipment_ongoing -> payment_due: requires every invoiced product has
-      a company recipe AND an invoice-linked production run
+    - any earlier stage -> payment_due: at least one non-void invoice must be
+      booked (booked/shipped/paid). Booking is the per-invoice proof that
+      production finished; siblings still planned or produced stay behind.
     """
-    row = conn.execute("SELECT stage, client_name, lc_id, company_id FROM sales WHERE id = %s", (sale_id,)).fetchone()
+    row = conn.execute("SELECT stage, client_name, lc_id FROM sales WHERE id = %s", (sale_id,)).fetchone()
     if not row:
         return False
-    current, client_name, lc_id, company_id = row[0], row[1] or f"#{sale_id}", row[2], row[3]
+    current, client_name, lc_id = row[0], row[1] or f"#{sale_id}", row[2]
     if new_stage not in SALE_STAGE_ORDER:
         return False
     if new_stage == "shipment_ongoing" and not via_lc and lc_id is not None:
         return False
 
-    # Phase 3-A: Barrier 2 - shipment_ongoing -> payment_due requires recipe + production for every invoiced product
-    if new_stage == "payment_due" and current == "shipment_ongoing":
-        if company_id is None:
-            return False
-        ready = production_readiness(conn, company_id, [sale_id])
-        if not ready["produced_ok"]:
-            return False
+    # Phase 2: Barrier 2 - entering payment_due requires a booked invoice.
+    if (SALE_STAGE_ORDER.index(current) < SALE_STAGE_ORDER.index("payment_due")
+            and new_stage == "payment_due"):
+        ready = booked_invoice_readiness(conn, [sale_id])
+        if not ready["booked_ok"]:
+            conn.rollback()
+            raise SaleNotReadyPastShipment(
+                "Sale is not ready to move to Payment Due: "
+                "at least one booked invoice required")
 
     if new_stage == "shipment_ongoing":
         # Entering production/shipment: mark the sale as running unless it
@@ -2067,9 +2073,14 @@ def ship_invoice(conn: psycopg.Connection, invoice_id: int, actual_ship_date: st
                  created_by: Optional[int] = None) -> Dict[str, Any]:
     """Mark an invoice as shipped - creates shipment record and updates invoice.
 
+    Phase 2 order: only a ``booked`` invoice may ship. Booking is where
+    production was proven, so a planned or merely produced invoice is refused
+    (``InvoiceNotBooked``) before any row is written.
+
     Forward-only: the invoice row is locked (``FOR UPDATE``) and its status
     checked BEFORE any shipment row is written, so a refused transition
-    (terminal 'shipped'/'paid') never leaves a phantom shipment behind.
+    (terminal 'shipped'/'paid', or un-booked) never leaves a phantom shipment
+    behind. The shipment carries the invoice's own ``invoice_date``.
     """
     if not actual_ship_date or not actual_ship_date.strip():
         raise ValueError("actual_ship_date is required for shipping")
@@ -2077,15 +2088,20 @@ def ship_invoice(conn: psycopg.Connection, invoice_id: int, actual_ship_date: st
 
     # Lock first; refuse terminal states before any mutation.
     invoice = conn.execute(
-        "SELECT id, sale_id, invoice_number, status FROM invoices WHERE id = %s FOR UPDATE",
+        "SELECT id, sale_id, invoice_number, status, invoice_date "
+        "FROM invoices WHERE id = %s FOR UPDATE",
         (invoice_id,)
     ).fetchone()
     if not invoice:
         raise InvoiceNotFound("Invoice not found")
-    _, sale_id, db_number, current = invoice
+    _, sale_id, db_number, current, invoice_date = invoice
     if current in ("shipped", "paid"):
         conn.rollback()
         raise InvoiceAlreadyAdvanced(f"invoice already {current}")
+    if current != "booked":
+        conn.rollback()
+        raise InvoiceNotBooked(
+            f"invoice must be booked before shipping (current status: {current})")
 
     # Shipment insert is inlined (not via add_shipment, which COMMITs) so the
     # lock is held until the guarded status flip below commits atomically.
@@ -2093,7 +2109,7 @@ def ship_invoice(conn: psycopg.Connection, invoice_id: int, actual_ship_date: st
         """INSERT INTO shipments (sale_id, ship_date, invoice_number, invoice_date, notes)
            VALUES (%s, %s, %s, %s, %s) RETURNING id""",
         (sale_id, actual_ship_date, (invoice_number or "").strip() or db_number,
-         None, "Shipped via production run")
+         invoice_date, "Shipped via production run")
     ).fetchone()
     shipment_id = ship_row[0]
 
@@ -2227,10 +2243,15 @@ def mark_invoice_paid(conn: psycopg.Connection, invoice_id: int,
                       notes: Optional[str] = None, created_by: Optional[int] = None) -> Dict[str, Any]:
     """Record a payment for an invoice (partial or full).
 
+    Phase 2 order: only a ``shipped`` invoice may take money. A planned,
+    produced or booked invoice is refused (``InvoiceNotShipped``) before the
+    payment row is written; a terminal ``paid`` invoice raises
+    ``InvoiceAlreadyAdvanced``.
+
     The invoice row is locked (``FOR UPDATE``) before the payment INSERT so
     concurrent pays serialize inside one transaction; coverage is computed
     after the insert and the response ``status`` is the ACTUAL post-sync
-    invoice status (partial payments keep e.g. 'planned', they do NOT report
+    invoice status (partial payments keep e.g. 'shipped', they do NOT report
     'paid'). Overpayments are accepted without error: the full payment row is
     recorded and the invoice flips to 'paid' (money received is truth; no
     amount cap here by design).
@@ -2241,11 +2262,18 @@ def mark_invoice_paid(conn: psycopg.Connection, invoice_id: int,
         raise ValueError("payment_amount must be positive")
 
     invoice = conn.execute(
-        "SELECT sale_id FROM invoices WHERE id = %s FOR UPDATE", (invoice_id,)
+        "SELECT sale_id, status FROM invoices WHERE id = %s FOR UPDATE", (invoice_id,)
     ).fetchone()
     if not invoice:
         raise InvoiceNotFound("Invoice not found")
-    sale_id = invoice[0]
+    sale_id, current = invoice
+    if current == "paid":
+        conn.rollback()
+        raise InvoiceAlreadyAdvanced("invoice already paid")
+    if current != "shipped":
+        conn.rollback()
+        raise InvoiceNotShipped(
+            f"invoice must be shipped before payment (current status: {current})")
 
     cursor = conn.execute(
         """INSERT INTO sale_payments (sale_id, payment_date, payment_amount, notes, invoice_id)
@@ -2607,6 +2635,37 @@ def invoice_readiness(conn: psycopg.Connection,
     }
 
 
+def booked_invoice_readiness(conn: psycopg.Connection,
+                             sale_ids: List[int]) -> Dict[str, Any]:
+    """Gate core for entering ``payment_due``.
+
+    Phase 2 moved the sale-level barrier from "every product was produced" to
+    "at least one invoice is booked". ``booked``/``shipped``/``paid`` are all
+    past booking, and booking is the per-invoice proof that production
+    finished. One invoice on its way is enough: siblings still planned or
+    produced stay behind and advance on their own.
+    """
+    invoice_count = 0
+    booked_count = 0
+    if sale_ids:
+        row = conn.execute(
+            """SELECT COUNT(*),
+                      COUNT(*) FILTER (
+                          WHERE status IN ('booked', 'shipped', 'paid'))
+                 FROM invoices
+                WHERE sale_id = ANY(%s) AND status != 'void'""",
+            (sale_ids,)).fetchone()
+        invoice_count, booked_count = int(row[0]), int(row[1])
+    return {
+        "booked_ok": booked_count >= 1,
+        "detail": {
+            "sale_count": len(sale_ids),
+            "invoice_count": invoice_count,
+            "booked_count": booked_count,
+        },
+    }
+
+
 def production_readiness(conn: psycopg.Connection, company_id: int,
                          sale_ids: List[int]) -> Dict[str, Any]:
     """Gate core for ``shipment_ongoing -> payment_due``.
@@ -2722,8 +2781,9 @@ def check_lc_shipment_ready(conn: psycopg.Connection,
     """Readiness snapshot for an LC.
 
     ``invoices_ok`` is informational only — entering Shipment Ongoing no
-    longer requires an invoice. ``recipes_ok``/``produced_ok`` are the
-    ``shipment_ongoing -> payment_due`` production gate.
+    longer requires an invoice. ``booked_ok`` is the
+    ``shipment_ongoing -> payment_due`` gate; ``recipes_ok``/``produced_ok``
+    stay informational for the production form.
     """
     lc = conn.execute(
         "SELECT id, company_id FROM letters_of_credit WHERE id = %s",
@@ -2736,13 +2796,16 @@ def check_lc_shipment_ready(conn: psycopg.Connection,
     sale_ids = [r[0] for r in sale_rows]
     invoice = invoice_readiness(conn, sale_ids)
     production = production_readiness(conn, company_id, sale_ids)
+    booked = booked_invoice_readiness(conn, sale_ids)
     return {
         "recipes_ok": production["recipes_ok"],
         "invoices_ok": invoice["invoices_ok"],
         "produced_ok": production["produced_ok"],
+        "booked_ok": booked["booked_ok"],
         "detail": {
             "sale_count": invoice["detail"]["sale_count"],
             "invoice_count": invoice["detail"]["invoice_count"],
+            "booked_count": booked["detail"]["booked_count"],
             "products": production["detail"]["products"],
             "missing_recipes": production["detail"]["missing_recipes"],
             "missing_production": production["detail"]["missing_production"],

@@ -45,8 +45,10 @@ import pytest
 
 from raas_tracker._exceptions import (
     InvoiceAlreadyAdvanced,
+    InvoiceNotBooked,
     InvoiceNotFound,
     InvoiceNotProduced,
+    InvoiceNotShipped,
     LcNotFound,
     LcNotReadyPastShipment,
     LcNumberAlreadyExists,
@@ -55,6 +57,7 @@ from raas_tracker._exceptions import (
     LinkedInvoiceNotFound,
     LinkedSaleNotFound,
     SaleItemNotFound,
+    SaleNotReadyPastShipment,
     ServiceError,
     status_for,
 )
@@ -65,6 +68,9 @@ from raas_tracker.sales import InvoicedLineConflict
 _TYPED = [
     (InvoiceAlreadyAdvanced, 409),
     (InvoiceNotProduced, 409),
+    (InvoiceNotBooked, 409),
+    (InvoiceNotShipped, 409),
+    (SaleNotReadyPastShipment, 409),
     (InvoicedLineConflict, 409),
     (InvoiceNotFound, 404),
     (LinkedSaleNotFound, 404),
@@ -362,17 +368,21 @@ def test_no_bespoke_invoiced_line_conflict_handler_remains_in_flask_app():
 # ---------- 4. real HTTP routes ----------
 
 
-def test_produce_route_409_for_terminal_invoice(admin_client, db):
+def test_produce_route_409_for_terminal_invoice(admin_client, db, produce_for):
     """recipes.py:703 — producing against a shipped invoice is a 409."""
     cid = _company(admin_client, db, "TypedProdCo")
     sid = _sale(admin_client, cid, "PI-TP-1", "TypedProd")
-    _recipe(admin_client, cid, "TypedProd", "TypedRecipe", "TypedChem")
     inv = _invoice(admin_client, db, sid, "INV-TP-1")
+    # Booking requires production, and shipping requires booking.
+    produce_for(cid, sid, inv, "TypedProd", "TypedProd")
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
+                          json={"approx_ship_date": "2026-10-15"})
+    assert r.status_code == 200, r.get_json()
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/ship",
                           json={"actual_ship_date": "2026-10-20"})
     assert r.status_code == 201, r.get_json()
 
-    r = admin_client.post("/api/recipes/TypedRecipe/produce", json={
+    r = admin_client.post("/api/recipes/GateRecipe-TypedProd/produce", json={
         "production_qty": 10, "company_id": cid,
         "sale_ids": [sid], "invoice_ids": [inv]})
     assert r.status_code == 409, r.get_json()
@@ -428,11 +438,18 @@ def test_book_route_409_when_not_produced(admin_client, db):
     assert _invoice_status(db, inv) == "planned"
 
 
-def test_ship_route_409_for_terminal_invoice(admin_client, db):
+def test_ship_route_409_for_terminal_invoice(admin_client, db, produce_for):
     """sales.py:2224 — shipping an already-paid invoice is a 409."""
     cid = _company(admin_client, db, "TypedShipCo")
     sid = _sale(admin_client, cid, "PI-TS-1", "TypedShipProd")
     inv = _invoice(admin_client, db, sid, "INV-TS-1")
+    produce_for(cid, sid, inv, "TypedShip", "TypedShipProd")
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
+                          json={"approx_ship_date": "2026-10-15"})
+    assert r.status_code == 200, r.get_json()
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/ship",
+                          json={"actual_ship_date": "2026-10-20"})
+    assert r.status_code == 201, r.get_json()
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/pay",
                           json={"payment_amount": 50, "payment_date": "2026-10-25"})
     assert r.status_code == 201, r.get_json()
@@ -441,6 +458,20 @@ def test_ship_route_409_for_terminal_invoice(admin_client, db):
                           json={"actual_ship_date": "2026-11-02"})
     assert r.status_code == 409, r.get_json()
     assert r.get_json()["error"] == "invoice already paid"
+
+
+def test_move_sale_route_409_without_a_booked_invoice(admin_client, db):
+    """Payment Due requires a booked invoice, and the refusal is a 409."""
+    cid = _company(admin_client, db, "TypedMoveCo")
+    sid = _sale(admin_client, cid, "PI-TM-1", "TypedMoveProd")
+    assert admin_client.post(f"/api/sales/{sid}/move", json={}).status_code == 200
+    assert admin_client.post(f"/api/sales/{sid}/move", json={}).status_code == 200
+
+    r = admin_client.post(f"/api/sales/{sid}/move", json={})
+    assert r.status_code == 409, r.get_json()
+    assert "booked invoice" in r.get_json()["error"]
+    assert db.execute("SELECT stage FROM sales WHERE id = %s",
+                      (sid,)).fetchone()[0] == "shipment_ongoing"
 
 
 def test_invoice_item_route_404_missing_sale_item(admin_client, db):
@@ -612,7 +643,7 @@ def _raiser(exc):
 # `move_lc_stage` is actually reached instead of the route's own pre-check
 # short-circuiting first.
 _ALL_READY = {"invoices_ok": True, "recipes_ok": True, "produced_ok": True,
-              "detail": {}}
+              "booked_ok": True, "detail": {}}
 
 
 # ---------- 6a. real routes, real service refusals ----------
@@ -778,10 +809,11 @@ def test_route_400_survives_a_reworded_plain_refusal(admin_client, db,
 
 
 def test_move_lc_stage_payment_gate_is_typed(admin_client, db):
-    """lcs.py:347 — invoiced but never produced: the other half of the 409.
+    """lcs.py:347 — invoiced but never booked: the other half of the 409.
 
     The old route matched this on "recipes:" / "production:" — bare vocabulary
-    shared with half the readiness payload.
+    shared with half the readiness payload. The gate now asks for a booked
+    invoice (booking itself proves production), and the refusal is still typed.
     """
     from raas_tracker import lcs as lcsmod
 

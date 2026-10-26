@@ -95,6 +95,33 @@ class InvoiceNotProduced(LifecycleConflict):
     """
 
 
+class InvoiceNotBooked(LifecycleConflict):
+    """409 — shipping an invoice that was never booked.
+
+    Phase 2 makes the order strict: ``booked -> shipped -> paid``. A planned or
+    merely produced invoice has no booking behind it, so there is nothing to
+    ship; the state has to move first (produce + book).
+    """
+
+
+class InvoiceNotShipped(LifecycleConflict):
+    """409 — recording money against an invoice that has not shipped.
+
+    Payment is the last step. A planned, produced or booked invoice is not yet
+    out the door, so accepting money for it would report a receivable as
+    collected before the goods moved.
+    """
+
+
+class SaleNotReadyPastShipment(LifecycleConflict):
+    """409 — a sale cannot enter Payment Due without one booked invoice.
+
+    Replaces the old "produced_ok" barrier. Booking is the invoice-level proof
+    that production finished, so the sale-level gate asks the invoice rows
+    instead of re-deriving production for every product.
+    """
+
+
 # --------------------------------------------------------------------------- #
 # 404 conditions
 # --------------------------------------------------------------------------- #

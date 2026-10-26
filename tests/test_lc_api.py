@@ -14,7 +14,7 @@ import uuid
 import pytest
 
 from chem_stock import add_recipe, add_sale
-from raas_tracker.sales import create_invoice
+from raas_tracker.sales import book_invoice, create_invoice
 
 
 def _tag() -> str:
@@ -278,6 +278,7 @@ def test_move_happy_skips_gate_for_other_stages(admin_client, db):
     db.execute("INSERT INTO production_run_links (run_id, sale_id, invoice_id) VALUES (%s, %s, %s)",
                (run_id, sid, inv_id))
     db.commit()
+    assert book_invoice(db, inv_id, "2026-11-01") is True
     r = admin_client.post(f"/api/lcs/{lc['id']}/move",
                           json={"new_stage": "payment_due"})
     assert r.status_code == 200, r.get_json()
@@ -301,7 +302,7 @@ def test_move_to_shipment_without_invoice_succeeds_then_payment_gated(admin_clie
     assert admin_client.get(
         f"/api/lcs/{lc['id']}").get_json()["stage"] == "shipment_ongoing"
 
-    # Invoicing in Shipment Ongoing does not clear the production gate.
+    # Invoicing in Shipment Ongoing does not clear the booking gate.
     assert add_recipe(db, f"R-G-{tag}", 100, 0, co, product) is not False
     sale_item_id = db.execute(
         "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id LIMIT 1",
@@ -314,8 +315,9 @@ def test_move_to_shipment_without_invoice_succeeds_then_payment_gated(admin_clie
                           json={"new_stage": "payment_due"})
     assert r.status_code == 409, r.get_json()
     body = r.get_json()
+    assert body["booked_ok"] is False
     assert "missing" in body and len(body["missing"]) > 0
-    assert any("production" in str(m).lower() for m in body["missing"])
+    assert any("booked" in str(m).lower() for m in body["missing"])
     # stage must not have moved
     assert admin_client.get(
         f"/api/lcs/{lc['id']}").get_json()["stage"] == "shipment_ongoing"

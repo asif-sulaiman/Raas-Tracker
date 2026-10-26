@@ -74,8 +74,8 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 ### Flow 3: Sales Pipeline Advance (LC-driven)
 1. `pi_issued` → **Link PIs to LC** (the LC record carries the number, dates, bank ref) → the LC and all its PIs move to `lc_received`
 2. `lc_received → shipment_ongoing` is **not gated on invoices**: the LC enters Shipment Ongoing with zero invoices. Invoices are created **in Shipment Ongoing**, one or many, from the PI's products and quantities (see Flow 6); product, unit and unit price stay fixed to the PI, while the invoiced quantity is free
-3. `shipment_ongoing → payment_due` is **gated**: refused unless **every distinct product in the LC's invoice lines** has a corresponding company recipe **and** an invoice-linked production run (a production run linked via `production_run_links.invoice_id` to one of that sale's invoices, with a recipe matching the product). The refusal names each missing product's missing recipe or missing production run.
-4. `shipment_ongoing` → invoices advance individually (book → ship → pay) → the sale/LC settles → `completed`
+3. `shipment_ongoing → payment_due` is **gated**: refused unless **at least one non-void invoice** on the LC's PIs is past booking (`booked`, `shipped`, or `paid`). Booking is the per-invoice proof that production finished, so unready siblings stay in their own statuses and do not block the ready invoice. The refusal names the missing booked invoice.
+4. `shipment_ongoing` → invoices advance individually and **strictly in order** (book → ship → pay) → the sale/LC settles → `completed`
 5. All PIs under one LC progress together — the pipeline board shows one LC card with its PIs nested
 
 ### Flow 4: Recipe/Production Reports
@@ -96,7 +96,10 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 5. **Multi-invoice creation:** Use `POST /api/sales/<id>/invoices/batch` to create N invoices in one atomic transaction. Body: `{invoices:[{invoice_number, lines:[{sale_item_id, quantity}]}]}`. Each invoice gets ≥1 line; headers are restated as `SUM(invoice_items.line_total)`; atomic (one commit or full rollback). Both paths validate against the same contract: per-line quantity is **free relative to the PI** (equal, more, or less) and the only rule is finite and > 0 — there is no tolerance or ceiling (2026-10-25).
 6. Recipes → detail → **Go for Production** → company → sale/PI → invoice → material number (auto-filled from item no.), packing, batch, date, quantity, optional multi-recipe rows → production run created and linked
 7. Linked invoices advance `planned → produced`; pipeline card shows the shipment sub-step badge (Production running → Production done → Ship booked)
-8. Per invoice: **Book** (approx. ship date) → `booked`; **Ship** (actual date) → `shipped` + shipment record; **Pay** → `paid` once payments cover the amount — `paid` never reverts
+8. Per invoice, **strict order** — an invoice can never skip a step:
+   - **Book** (approx. ship date) → `booked`
+   - **Ship** (actual date) → `shipped` + shipment record carrying the invoice's own `invoice_date`. Shipping a `planned` or `produced` invoice is refused (**409**, "book first").
+   - **Pay** → `paid` once payments cover the amount — `paid` never reverts, and a payment on a `paid` invoice is refused (**409**). Partial payments keep the invoice `shipped` until covered. Paying a `planned`, `produced`, or `booked` invoice is refused (**409**, "ship first").
    - **Production before booking:** `Book` is refused (409) until every product on the invoice has a company recipe **and** a production run made from the **recipe page** and linked to **that** invoice. Booking commits to a real shipment, so an unproduced invoice cannot be booked.
    - The check is **per invoice**, so sibling invoices proceed independently — one being produced neither blocks nor unlocks another.
    - It is re-checked at both `planned` and `produced`, because the `produced` flag alone is set by the *first* linked run and would read satisfied on a multi-product invoice whose later products are still unbuilt. The panel therefore renders `Book` from the server's `can_book` / `book_blocked_reason` (`GET /api/sales/<id>/invoices`) rather than from the status, so a disabled button and a server refusal always agree.
