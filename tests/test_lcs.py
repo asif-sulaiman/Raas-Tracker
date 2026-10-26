@@ -322,6 +322,21 @@ def test_move_lc_stage_propagates(db):
         assert audit >= 1
 
 
+def _book_invoice_direct(conn, sale_id, number):
+    """Create an invoice and mark it booked directly.
+
+    Stage-propagation tests below are not about booking's own gate (production
+    is covered in test_invoices_production.py and the order in
+    test_invoice_order.py); they only need the invoice at ``booked``.
+    """
+    inv_id = _invoice(conn, sale_id, number)["invoice_id"]
+    conn.execute(
+        "UPDATE invoices SET status = 'booked', approx_ship_date = %s"
+        " WHERE id = %s", ("2026-11-01", inv_id))
+    conn.commit()
+    return inv_id
+
+
 def test_move_lc_stage_sequential_double_move(db):
     """Concurrent-ish: two moves in sequence, last write wins, history kept."""
     co = _company(db)
@@ -335,9 +350,8 @@ def test_move_lc_stage_sequential_double_move(db):
     )
     db.commit()
     _invoice(db, s1, f"INV-SEQ-{_tag()}")
-    # P1-14: reaching payment_due is a SECOND barrier. It needs a production
-    # run linked to the invoice line, not merely a recipe, so the
-    # single-barrier setup this test carried could no longer finish the move.
+    # P1-14: reaching payment_due is a SECOND barrier. It needs a booked
+    # invoice; booking is what proves the product was produced.
     recipe_id = db.execute(
         "SELECT id FROM recipes WHERE company_id = %s AND product_name = %s",
         (co, "PSeq")).fetchone()[0]
@@ -355,6 +369,7 @@ def test_move_lc_stage_sequential_double_move(db):
         "INSERT INTO production_run_links (run_id, sale_id, invoice_id) "
         "VALUES (%s, %s, %s)", (run_id, s1, inv_id))
     db.commit()
+    assert salesmod.book_invoice(db, inv_id, "2026-11-01") is True
     assert lcsmod.move_lc_stage(db, lc["id"], "shipment_ongoing") is True
     assert lcsmod.move_lc_stage(db, lc["id"], "payment_due") is True
     assert lcsmod.get_lc(db, lc["id"])["stage"] == "payment_due"
@@ -465,8 +480,8 @@ def _lc_ready_setup(db, co, product, with_recipe=True, with_invoice=True):
     return lc["id"], sid
 
 
-def test_move_lc_stage_shipment_needs_no_invoice_but_payment_needs_production(db):
-    """Shipment entry is ungated; Payment Due still needs production."""
+def test_move_lc_stage_shipment_needs_no_invoice_but_payment_needs_booking(db):
+    """Shipment entry is ungated; Payment Due needs a booked invoice."""
     co = _company(db)
     tag = _tag()
     lc_id, sid = _lc_ready_setup(db, co, f"GateUn-{tag}",
@@ -474,7 +489,7 @@ def test_move_lc_stage_shipment_needs_no_invoice_but_payment_needs_production(db
     # No invoice is required to start the shipment.
     assert lcsmod.move_lc_stage(db, lc_id, "shipment_ongoing") is True
     assert lcsmod.get_lc(db, lc_id)["stage"] == "shipment_ongoing"
-    # Invoicing alone does not clear the production barrier.
+    # Invoicing alone does not clear the booking barrier.
     _invoice(db, sid, f"INV-{_tag()}")
     with pytest.raises(ValueError, match="not ready to go past shipment"):
         lcsmod.move_lc_stage(db, lc_id, "payment_due")
@@ -511,14 +526,14 @@ def test_move_lc_stage_direct_jump_to_shipment_allowed_without_invoice(db):
     assert lcsmod.get_lc(db, lc_id)["stage"] == "shipment_ongoing"
 
 
-def test_move_lc_stage_overshoot_to_payment_still_requires_production(db):
+def test_move_lc_stage_overshoot_to_payment_still_requires_booking(db):
     """Gate 2 re-review: lc_received -> payment_due jumping OVER
-    shipment_ongoing is still production-gated."""
+    shipment_ongoing still needs a booked invoice."""
     co = _company(db)
     tag = _tag()
-    lc_id, _ = _lc_ready_setup(db, co, f"GateOver-{tag}",
-                               with_recipe=True, with_invoice=True)
-    # Recipe exists, but no production run is linked to the invoice.
+    lc_id, sid = _lc_ready_setup(db, co, f"GateOver-{tag}",
+                                 with_recipe=True, with_invoice=True)
+    # Recipe and invoice exist, but the invoice was never booked.
     with pytest.raises(ValueError, match="not ready to go past shipment"):
         lcsmod.move_lc_stage(db, lc_id, "payment_due")
     db.rollback()
@@ -562,6 +577,9 @@ def test_linked_sale_autocomplete_unaffected(db):
     lc = lcsmod.create_lc(db, co, f"LC-AC-{_tag()}")
     sid = _sale(db, co, qty=10, price=10)
     lcsmod.attach_pis(db, lc["id"], [sid])
+    # Payment Due requires a booked invoice; completion after full payment is
+    # the behaviour under test, not the booking gate.
+    _book_invoice_direct(db, sid, f"INV-AC-{_tag()}")
     assert salesmod.move_sale_to_stage(db, sid, "payment_due") is True
     out = _pay(db, sid, "2026-09-02", 100.0)
     assert out["stage"] == "completed"

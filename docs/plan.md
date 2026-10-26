@@ -432,6 +432,34 @@ while later products are still unbuilt.
 
 ---
 
+## 🚢 Phase SHIP-FIRST: Shipment-first invoicing (in progress, started 2026-10-26)
+
+Invoices are created **in Shipment Ongoing**, not at LC Received. Each invoice
+matures independently and strictly: `planned → produced → booked → shipped →
+paid`. Booking is the per-invoice proof of production, so the sale/LC Payment
+Due gate asks for **one booked invoice**, not every product produced.
+
+| # | Phase | Scope | State |
+|---|---|---|---|
+| 1 | **Start shipment without an invoice** | `lc_received → shipment_ongoing` needs no invoice (sale + LC + readiness + Sales UI barrier/modal removed); Payment Due gate deliberately left as the old production gate | ✅ 2026-10-26 (`eb18d5e`) |
+| 2 | **Strict Book → Ship → Pay** | `ship_invoice` requires `booked` (and stamps the invoice's `invoice_date` on the shipment); `mark_invoice_paid` requires `shipped`; typed `InvoiceNotBooked` / `InvoiceNotShipped` / `SaleNotReadyPastShipment`; `booked_invoice_readiness` powers both the sale and LC Payment Due gates; LC readiness gains `booked_ok`; `POST /api/sales/<id>/move` is rate-limited and returns typed 409s; invoice readiness `can_pay` only for `shipped` | ✅ 2026-10-26 |
+| 3 | **Completion on invoice totals** | Complete only when ≥ 1 non-void invoice and every non-void invoice is `paid`; amount compared is `SUM(invoice_items.line_total)`, never the PI; reopen on unpaid/payment edit/void | ⬜ pending |
+| 4 | **Report: live PI fallback + completed retention** | Fresh PIs appear immediately (per PI line, `is_provisional`), invoiced lines take over, completed rows stay | ⬜ pending |
+| 5 | **Frontend board / panel / report editor** | 4-column board, “Move to Payment Due”, Pay only for `shipped`, completed read-only editor from the report | ⬜ pending |
+| 6 | **Docs** | PRD/SPEC completion and report contract; handoff | ⬜ pending |
+| 7 | **Verification** | Full pytest/ruff/pyright/vitest/oxlint/build + isolated-Postgres E2E | ⬜ pending |
+
+**Locked decisions:** stage is a rollup, invoice status is the source of truth;
+one booked invoice is enough to enter Payment Due; unready siblings stay behind;
+completion is invoice-defined; report is per PI line with PI fallback; report
+rows open the existing editor; strict Book → Ship → Pay.
+
+**Constraints:** no new tables/columns, no `_SCHEMA_VERSION` bump; parameterized
+SQL; typed refusals are 409; every mutating route stays admin-only and
+rate-limited; `chem_stock.py` compatibility imports kept in sync.
+
+---
+
 ## 🧾 Phase INV-UNIFY: PI-faithful invoice editor (completed 2026-10-22)
 
 One invoice-entry surface instead of two divergent ones (`InvoiceCreateForm`

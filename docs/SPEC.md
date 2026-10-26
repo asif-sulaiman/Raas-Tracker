@@ -675,15 +675,15 @@ future call sites are covered without opting in:
 | DELETE | `/api/lcs/<id>` | Admin (15/min) | Delete — **409 while PIs are attached** (locked count + FK backstop) |
 | POST | `/api/lcs/<id>/pis` | Admin (15/min) | Attach `{sale_ids:[...]}` — every PI must share the LC's company (400 otherwise); mirrors `lc_number`/`lc_date` onto the PIs; every attached PI still at `pi_issued` advances to `lc_received` (history + `SALE_MOVE` audit, same transaction; later-stage PIs untouched, never downgraded) |
 | DELETE | `/api/lcs/<id>/pis/<sale_id>` | Admin (15/min) | Detach one PI (clears `lc_id` + mirrors) |
-| POST | `/api/lcs/<id>/move` | Admin (15/min) | Move the LC stage; **one barrier** — crossing into `payment_due` requires **every invoiced product to have a company recipe AND an invoice-linked production run**. Crossing into `shipment_ongoing` requires **no invoice** (2026-10-26: invoices are created in Shipment Ongoing). Barrier enforced under row locks; stage propagated to all child PIs in one transaction |
-| GET | `/api/lcs/<id>/readiness` | Session/Key | Readiness snapshot — `invoices_ok` is **informational** (shipment entry needs no invoice), `recipes_ok`, `produced_ok`, `detail` with `missing_recipes` and `missing_production`, plus the linked `pis` |
+| POST | `/api/lcs/<id>/move` | Admin (15/min) | Move the LC stage; **one barrier** — crossing into `payment_due` requires **at least one non-void invoice past booking** (`booked`/`shipped`/`paid`) across the LC's child PIs. Crossing into `shipment_ongoing` requires **no invoice** (2026-10-26: invoices are created in Shipment Ongoing). Barrier enforced under row locks; stage propagated to all child PIs in one transaction |
+| GET | `/api/lcs/<id>/readiness` | Session/Key | Readiness snapshot — `invoices_ok` is **informational** (shipment entry needs no invoice); `booked_ok` is the Payment Due gate; `recipes_ok`/`produced_ok` stay informational, `detail` carries `booked_count` + `missing_recipes`/`missing_production`, plus the linked `pis` |
 
 ### Invoice Lines
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/api/invoices/<id>/items` | Session/Key | Invoice lines (product, quantity, unit_price, line_total) |
 | POST | `/api/invoices/<id>/items` | Admin (15/min) | Add a line `{sale_item_id, quantity}` — **unit_price is resolved server-side from the PI line**, never accepted from the client; quantity must be finite and > 0, and **may equal, exceed, or fall below the PI line quantity** — there is no ceiling (2026-10-25). Recomputes `invoices.amount` from its lines in the same transaction. A **404** carries a `code` so the two causes stay distinguishable without parsing prose: `{"error": ..., "code": "invoice_gone"}` when the invoice disappeared, `{"error": ..., "code": "pi_line_gone"}` when the PI line is no longer on the sale (the client drops/keeps the row accordingly) |
-| GET | `/api/invoices/<id>/readiness` | Session/Key | Per-invoice readiness — `status`, `can_book`/`can_ship`/`can_pay`, `book_blocked_reason`, `recipes_ok`, `produced_ok`, `detail` (products needing a recipe or an invoice-linked production run). Production is evaluated for **this invoice only** (a sibling's production neither blocks nor unlocks it) |
+| GET | `/api/invoices/<id>/readiness` | Session/Key | Per-invoice readiness — `status`, `can_book`/`can_ship`/`can_pay`, `book_blocked_reason`, `recipes_ok`, `produced_ok`, `detail` (products needing a recipe or an invoice-linked production run). Production is evaluated for **this invoice only** (a sibling's production neither blocks nor unlocks it). `can_ship` is true only for `booked`; `can_pay` is true **only for `shipped`** (strict order) |
 
 ### Sales Invoices
 | Method | Path | Auth | Description |
@@ -693,8 +693,8 @@ future call sites are covered without opting in:
 | POST | `/api/sales/<id>/invoices` | Admin | Create (`invoice_number` required; `lines:[{sale_item_id, quantity}]` is **required**, ≥ 1 entry; `invoice_date` required — the UI defaults it to today). **No `amount` is accepted** — money is always derived. Quantities are validated (finite and > 0; they may equal, exceed, or fall below the PI line; unit price resolved from the PI) and the header is restated as `SUM(invoice_items.line_total)`. A create is born `planned`, never `paid` (INV-REVISION). 400 on duplicate number; sets sale `shipment_status='production_running'` (COALESCE, never downgrades) |
 | POST | `/api/sales/<id>/invoices/batch` | Admin (15/min) | Create N invoices in ONE transaction: body `{invoices:[{invoice_number, invoice_date, lines:[{sale_item_id, quantity}]}]}` — each invoice gets ≥1 line and its own `invoice_date`; headers restated as `SUM(line_total)`; atomic (one commit or full rollback). Quantities are free relative to the PI |
 | POST | `/api/sales/<id>/invoices/<iid>/book` | Admin | Book (`approx_ship_date` required) → `booked`; sale → `ship_booked` (advance-only CASE). **Gated on production (PBB):** refused with **409** `invoice not produced yet` unless every product on the invoice has a company recipe and an invoice-linked production run, re-checked at both `planned` and `produced` (fail-closed; `invoices.status` alone is not trusted) |
-| POST | `/api/sales/<id>/invoices/<iid>/ship` | Admin | Ship (`actual_ship_date` required) → `shipped` + creates a `shipments` row |
-| POST | `/api/sales/<id>/invoices/<iid>/pay` | Admin | Record payment (`payment_amount>0`, `payment_date`); flips invoice to `paid` when covered |
+| POST | `/api/sales/<id>/invoices/<iid>/ship` | Admin | Ship (`actual_ship_date` required) → `shipped` + creates a `shipments` row that carries the invoice's own `invoice_date`. **Requires `booked`:** a `planned`/`produced` invoice is refused with **409** (`InvoiceNotBooked`) before any shipment row is written; `shipped`/`paid` → **409** `invoice already <status>` |
+| POST | `/api/sales/<id>/invoices/<iid>/pay` | Admin | Record payment (`payment_amount>0`, `payment_date`) → flips invoice to `paid` when covered. **Requires `shipped`:** a `planned`/`produced`/`booked` invoice is refused with **409** (`InvoiceNotShipped`); `paid` → **409** `invoice already paid`. Partial payments keep the invoice `shipped` |
 | GET | `/api/sales/<id>/completion` | Session/Key | `status` none/partial/full + `paid`/`total` counts; `total_amount`/`paid_amount` when ≥ 1 invoice |
 
 ### Unit Conversions
@@ -711,22 +711,23 @@ future call sites are covered without opting in:
 
 ### Invoice Lifecycle & Shipment Sub-steps
 - **Per-invoice statuses:** `planned → produced → booked → shipped → paid`, tracked independently — one sale may hold several invoices at different steps.
+- **Strict order (2026-10-26):** Ship requires `booked`; Pay requires `shipped`. A skipped step is a **409**, not a silent jump, and a refused transition writes nothing (no shipment row, no payment row). `paid` is terminal.
 - **Auto-advances (all advance-only; `paid` is terminal — book/ship/produce can never downgrade it):**
   - invoice create → sale `shipment_status = 'production_running'` (`COALESCE`, never overwrites a later value)
   - production run linked to invoices → those invoices `'produced'` (guarded `status <> 'paid'`) + sale `'production_done'` (CASE: only from NULL/`production_running`)
   - book (requires `approx_ship_date`) → `'booked'`; sale → `'ship_booked'` (advance-only CASE). **Production-gated (PBB):** an invoice whose products are not all produced (recipe + invoice-linked run) is refused with **409**, re-checked at `planned` and `produced`
-  - ship (requires `actual_ship_date`) → `'shipped'` + `shipments` row
-  - pay → `'paid'` when `paid_amount >= amount`; a create-time `amount = 0` is **no longer** born paid (INV-REVISION — only a payment record sets `paid`); `amount IS NULL` (legacy) → any payment marks it paid
+  - ship (requires `actual_ship_date`) → `'shipped'` + `shipments` row (carrying the invoice's `invoice_date`); refused with **409** unless the invoice is `booked`
+  - pay → `'paid'` when `paid_amount >= amount`; refused with **409** unless the invoice is `shipped`; a create-time `amount = 0` is **no longer** born paid (INV-REVISION — only a payment record sets `paid`); `amount IS NULL` (legacy) → any payment marks it paid. Partial payments report the actual `shipped` status
 - **Sale `shipment_status` sub-steps** (surfaced as SaleCard badges in `shipment_ongoing`): `production_running` → `production_done` → `ship_booked`.
 - **Stage hook:** `lc_received → shipment_ongoing` sets `shipment_status = 'production_running'`; the SaleCard badge then shows the shipment sub-step. The move needs no invoice and the UI no longer probes for one or warns after moving.
 - **LC Stage Gates:**
   - **Shipment entry (`lc_received → shipment_ongoing`):** no invoice required (2026-10-26). The LC advances with zero invoices; invoices are created once it is in Shipment Ongoing, from the PI's products, unit price and chosen quantities.
-  - **Barrier 2 (`shipment_ongoing → payment_due`):** requires that **every distinct `invoice_items.product_name` across the LC's invoices** has (a) a company recipe, **and** (b) an invoice-linked production run (`production_run_links.invoice_id` points to one of that sale's invoices). This remains the production gate for now; the booked-invoice gate is the next phase.
-  - **Readiness endpoint:** `GET /api/lcs/<id>/readiness` returns `{invoices_ok, recipes_ok, produced_ok, detail{missing_recipes, missing_production}}` so the UI can render the correct form before the user attempts a move. `invoices_ok` is informational.
+  - **Barrier 2 (any earlier stage → `payment_due`):** requires **at least one non-void invoice past booking** (`booked`/`shipped`/`paid`) across the LC's child PIs (`booked_invoice_readiness`). A zero-invoice sale/LC cannot reach Payment Due. Unready sibling invoices stay behind and do not block the ready one. The refusal is `SaleNotReadyPastShipment` / `LcNotReadyPastShipment`, **409**.
+  - **Readiness endpoint:** `GET /api/lcs/<id>/readiness` returns `{invoices_ok, booked_ok, recipes_ok, produced_ok, detail{booked_count, missing_recipes, missing_production}}` so the UI can render the correct form before the user attempts a move. `invoices_ok`/`recipes_ok`/`produced_ok` are informational; `booked_ok` is the gate.
 - **New invariant:** a sale cannot advance to `lc_received` (or beyond) while its `lc_id` is NULL — the move is refused until an LC is attached.
 
 ### Readiness Endpoint
-- `GET /api/lcs/<id>/readiness` — Session/Key; returns `{lc_id, stage, invoices_ok, recipes_ok, produced_ok, detail:{missing_recipes, missing_production, invoice_count, sale_count}, pis}` so the UI can render the correct barrier form before the user attempts a move. `invoices_ok` is informational — shipment entry no longer requires an invoice.
+- `GET /api/lcs/<id>/readiness` — Session/Key; returns `{lc_id, stage, invoices_ok, booked_ok, recipes_ok, produced_ok, detail:{booked_count, missing_recipes, missing_production, invoice_count, sale_count}, pis}` so the UI can render the correct barrier form before the user attempts a move. `invoices_ok` is informational — shipment entry no longer requires an invoice; `booked_ok` is the Payment Due gate.
 
 ## 5. Authentication & Authorization
 

@@ -90,9 +90,32 @@ def _invoice(db, sale_id, number):
                           invoice_date="2026-01-15")
 
 
+def _book_invoice_direct(db, sale_id, number):
+    """Create and book an invoice without the production dance.
+
+    Payment Due (Phase 2) needs a booked invoice. These tests are about numeric
+    guards, not the booking gate, so the status is set directly.
+    """
+    inv = _invoice(db, sale_id, number)["invoice_id"]
+    db.execute("UPDATE invoices SET status = 'booked', approx_ship_date = %s"
+               " WHERE id = %s", ("2026-11-01", inv))
+    db.commit()
+    return inv
+
+
+def _ship_invoice_direct(db, sale_id, number):
+    """A shipped invoice — the only status from which a payment is accepted."""
+    inv = _book_invoice_direct(db, sale_id, number)
+    db.execute("UPDATE invoices SET status = 'shipped', actual_ship_date = %s"
+               " WHERE id = %s", ("2026-10-20", inv))
+    db.commit()
+    return inv
+
+
 def _sale_at_payment_due(db):
     """A sale parked in ``payment_due`` — the state the cascade completes FROM."""
     sid = _sale(db)
+    _book_invoice_direct(db, sid, "INV-DUE")
     move_sale_to_stage(db, sid, "payment_due", "test")
     return sid
 
@@ -218,9 +241,9 @@ def test_record_sale_payment_still_accepts_finite_amounts(db):
 @NON_FINITE
 def test_mark_invoice_paid_rejects_non_finite_and_writes_nothing(db, bad):
     sid = _sale(db)
-    inv = _invoice(db, sid, "INV-MIP")["invoice_id"]
+    inv = _ship_invoice_direct(db, sid, "INV-MIP")
     before = db.execute("SELECT status FROM invoices WHERE id = %s", (inv,)).fetchone()[0]
-    assert before != "paid"
+    assert before == "shipped"
 
     with pytest.raises(ValueError):
         mark_invoice_paid(db, inv, bad, "2026-10-30")
@@ -234,7 +257,7 @@ def test_mark_invoice_paid_rejects_non_finite_and_writes_nothing(db, bad):
 
 def test_mark_invoice_paid_still_rejects_zero_and_negative(db):
     sid = _sale(db)
-    inv = _invoice(db, sid, "INV-ZERO")["invoice_id"]
+    inv = _ship_invoice_direct(db, sid, "INV-ZERO")
     for bad in (0, 0.0, -1):
         with pytest.raises(ValueError):
             mark_invoice_paid(db, inv, bad, "2026-10-30")
@@ -245,8 +268,8 @@ def test_mark_invoice_paid_still_accepts_partial_and_overpayment(db):
     """Overpayment is accepted by design ("money received is truth"). A
     finiteness guard must not quietly become an amount cap."""
     sid = _sale(db)
-    inv = _invoice(db, sid, "INV-OK")["invoice_id"]
-    assert mark_invoice_paid(db, inv, 40, "2026-10-30")["status"] != "paid"
+    inv = _ship_invoice_direct(db, sid, "INV-OK")
+    assert mark_invoice_paid(db, inv, 40, "2026-10-30")["status"] == "shipped"
     assert mark_invoice_paid(db, inv, 1e6, "2026-10-31")["status"] == "paid"
     assert _payment_count(db, sid) == 2
 

@@ -9,6 +9,21 @@ from raas_tracker.notifications import (
     notify, list_notifications_for, unread_count, mark_read, mark_read_all_for,
     notify_reorder_status,
 )
+from raas_tracker.sales import create_invoice
+
+
+def _book_invoice(db, sale_id, number):
+    """A booked invoice is the entry ticket to Payment Due (Phase 2)."""
+    lines = [{"sale_item_id": r[0], "quantity": float(r[1])}
+             for r in db.execute(
+                 "SELECT id, quantity FROM sale_items WHERE sale_id = %s "
+                 "ORDER BY id", (sale_id,)).fetchall()]
+    inv = create_invoice(db, sale_id, number, lines=lines,
+                         invoice_date="2026-01-15")["invoice_id"]
+    db.execute("UPDATE invoices SET status = 'booked', approx_ship_date = %s"
+               " WHERE id = %s", ("2026-11-01", inv))
+    db.commit()
+    return inv
 
 
 def _seed(db):
@@ -109,6 +124,7 @@ def test_sale_stage_due_completed_and_revert_clears(db):
     move_sale_to_stage(db, sid, "lc_received")
     assert "sale_payment_due" not in _types(db)
     move_sale_to_stage(db, sid, "shipment_ongoing")
+    _book_invoice(db, sid, "INV-NOTIF-1")
     move_sale_to_stage(db, sid, "payment_due")
     assert "sale_payment_due" in _types(db)
     move_sale_to_stage(db, sid, "payment_due")  # dedupe on same stage re-entry
@@ -119,6 +135,7 @@ def test_sale_stage_due_completed_and_revert_clears(db):
 
     sid2 = add_sale(db, {"client_name": "BetaCo", "pi_number": "PI-2", "company_id": cid},
                     [{"product_name": "Y", "quantity": 2, "unit_price": 5}])
+    _book_invoice(db, sid2, "INV-NOTIF-2")
     for stage in ("lc_received", "shipment_ongoing", "payment_due"):
         move_sale_to_stage(db, sid2, stage)
     assert "sale_payment_due" in _types(db)

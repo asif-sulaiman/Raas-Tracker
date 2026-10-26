@@ -267,7 +267,19 @@ def test_book_invoice_refused_transition_does_not_move_sale(admin_client, db):
     """Book refused (409) after a ship: the sale badge must not advance."""
     cid = _company(admin_client, db, "Book409Co")
     sid = _sale(admin_client, cid, "PI-BOOK409-1", "Book409Prod")
+    _chemical(admin_client, "Book409Chem", 100)
+    _recipe_with_items(admin_client, cid, "Book409Prod", "Book409Recipe",
+                       [("Book409Chem", 10)])
     inv = _invoice(admin_client, db, sid, "INV-BOOK409-1")
+
+    # Booking requires production and shipping requires booking (Phase 2).
+    r = admin_client.post("/api/recipes/Book409Recipe/produce", json={
+        "production_qty": 5, "company_id": cid,
+        "sale_ids": [sid], "invoice_ids": [inv]})
+    assert r.status_code == 201, r.get_json()
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
+                          json={"approx_ship_date": "2026-10-15"})
+    assert r.status_code == 200, r.get_json()
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/ship",
                           json={"actual_ship_date": "2026-10-20"})
     assert r.status_code == 201, r.get_json()
@@ -320,6 +332,17 @@ def test_produce_does_not_downgrade_paid_invoice(admin_client, db):
     _recipe_with_items(admin_client, cid, "PaidProd", "PaidRecipe",
                        [("PaidChem-1", 10)])
     inv = _invoice(admin_client, db, sid, "INV-PAID-1")
+    # Phase 2 order: production -> booking -> shipping -> payment.
+    r = admin_client.post("/api/recipes/PaidRecipe/produce", json={
+        "production_qty": 10, "company_id": cid,
+        "sale_ids": [sid], "invoice_ids": [inv]})
+    assert r.status_code == 201, r.get_json()
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
+                          json={"approx_ship_date": "2026-10-20"})
+    assert r.status_code == 200, r.get_json()
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/ship",
+                          json={"actual_ship_date": "2026-10-21"})
+    assert r.status_code == 201, r.get_json()
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/pay",
                           json={"payment_amount": 50, "payment_date": "2026-10-25"})
     assert r.status_code == 201, r.get_json()
@@ -349,6 +372,14 @@ def test_produce_never_downgrades_shipped_invoice_or_ship_booked_sale(admin_clie
 
     # (a) shipped invoice -> refused, nothing moves
     inv_ship = _invoice(admin_client, db, sid, "INV-FWD-SHIPPED")
+    # Phase 2 order: production -> booking -> shipping.
+    r = admin_client.post("/api/recipes/FwdRecipe/produce", json={
+        "production_qty": 10, "company_id": cid,
+        "sale_ids": [sid], "invoice_ids": [inv_ship]})
+    assert r.status_code == 201, r.get_json()
+    r = admin_client.post(f"/api/sales/{sid}/invoices/{inv_ship}/book",
+                          json={"approx_ship_date": "2026-10-15"})
+    assert r.status_code == 200, r.get_json()
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv_ship}/ship",
                           json={"actual_ship_date": "2026-10-20"})
     assert r.status_code == 201, r.get_json()

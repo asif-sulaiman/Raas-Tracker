@@ -3,15 +3,15 @@
 ``lc_received -> shipment_ongoing`` requires no invoice: invoices are created
 *in* Shipment Ongoing, from the PI lines (one or many, partial quantities).
 
-``shipment_ongoing -> payment_due`` still requires, for every distinct
-invoiced product, both:
-  * a company recipe for that product_name, and
-  * an invoice-linked production run for that recipe.
+``shipment_ongoing -> payment_due`` requires at least one invoice that has been
+**booked** (or already shipped/paid). Booking is the gate that proves the
+invoice's product was produced, so the payment gate no longer re-derives
+production from recipe/run content.
 """
 import uuid
 
 from chem_stock import add_recipe, add_sale
-from raas_tracker.sales import create_invoice
+from raas_tracker.sales import book_invoice, create_invoice
 from raas_tracker.recipes import create_production_run
 
 
@@ -106,9 +106,9 @@ def test_shipment_ongoing_passes_with_invoice_only(admin_client, db):
 
 
 # --------------------------------------------------------------------------- #
-# Barrier 2: payment_due needs product recipe + matching invoice-run
+# Barrier 2: payment_due needs a booked invoice
 # --------------------------------------------------------------------------- #
-def test_payment_due_blocked_without_recipe_or_run(admin_client, db):
+def test_payment_due_blocked_without_a_booked_invoice(admin_client, db):
     tag = _tag()
     co = _company(db, f"G3 {tag}")
     lc = _mk_lc(admin_client, co, f"LC-G3-{tag}")
@@ -118,7 +118,7 @@ def test_payment_due_blocked_without_recipe_or_run(admin_client, db):
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
     _invoice(db, sid, f"INV-G3-{tag}")
-    # No recipe and no production yet. Move to shipment_ongoing first.
+    # An invoice exists but is only 'planned'. Move to shipment_ongoing first.
     r = admin_client.post(f"/api/lcs/{lc['id']}/move",
                           json={"new_stage": "shipment_ongoing"})
     assert r.status_code == 200, r.get_json()
@@ -127,12 +127,11 @@ def test_payment_due_blocked_without_recipe_or_run(admin_client, db):
                           json={"new_stage": "payment_due"})
     assert r.status_code == 409, r.get_json()
     body = r.get_json()
-    missing = body["missing"]
-    assert any("recipe" in str(m).lower() for m in missing) or any(
-        "production" in str(m).lower() for m in missing)
+    assert body["booked_ok"] is False
+    assert any("booked" in str(m).lower() for m in body["missing"])
 
 
-def test_payment_due_blocked_with_recipe_but_no_run(admin_client, db):
+def test_payment_due_blocked_with_recipe_but_no_booked_invoice(admin_client, db):
     tag = _tag()
     co = _company(db, f"G4 {tag}")
     lc = _mk_lc(admin_client, co, f"LC-G4-{tag}")
@@ -151,10 +150,11 @@ def test_payment_due_blocked_with_recipe_but_no_run(admin_client, db):
                           json={"new_stage": "payment_due"})
     assert r.status_code == 409, r.get_json()
     body = r.get_json()
-    assert any("production" in str(m).lower() for m in body["missing"])
+    assert any("booked" in str(m).lower() for m in body["missing"])
 
 
-def test_payment_due_blocked_when_run_linked_only_to_sale_not_invoice(admin_client, db):
+def test_payment_due_ignores_a_sale_linked_run_that_never_booked(admin_client, db):
+    """Production alone is not enough any more: the invoice must be booked."""
     tag = _tag()
     co = _company(db, f"G5 {tag}")
     lc = _mk_lc(admin_client, co, f"LC-G5-{tag}")
@@ -186,7 +186,7 @@ def test_payment_due_blocked_when_run_linked_only_to_sale_not_invoice(admin_clie
     assert r.status_code == 409, r.get_json()
 
 
-def test_payment_due_passes_with_invoice_linked_run(admin_client, db):
+def test_payment_due_passes_with_a_booked_invoice(admin_client, db):
     tag = _tag()
     co = _company(db, f"G6 {tag}")
     lc = _mk_lc(admin_client, co, f"LC-G6-{tag}")
@@ -212,6 +212,7 @@ def test_payment_due_passes_with_invoice_linked_run(admin_client, db):
         "INSERT INTO production_run_links (run_id, sale_id, invoice_id) VALUES (%s, %s, %s)",
         (run_id, sid, inv_id))
     db.commit()
+    assert book_invoice(db, inv_id, "2026-11-01") is True
     assert admin_client.post(f"/api/lcs/{lc['id']}/move",
                              json={"new_stage": "shipment_ongoing"}).status_code == 200
 
@@ -220,7 +221,8 @@ def test_payment_due_passes_with_invoice_linked_run(admin_client, db):
     assert r.status_code == 200, r.get_json()
 
 
-def test_direct_jump_from_lc_received_to_payment_due_requires_production(admin_client, db):
+def test_direct_jump_from_lc_received_to_payment_due_requires_a_booked_invoice(
+        admin_client, db):
     tag = _tag()
     co = _company(db, f"G7 {tag}")
     lc = _mk_lc(admin_client, co, f"LC-G7-{tag}")
@@ -232,19 +234,17 @@ def test_direct_jump_from_lc_received_to_payment_due_requires_production(admin_c
     _invoice(db, sid, f"INV-G7-{tag}")
     assert add_recipe(db, f"R-G7-{tag}", 100, 0, co, product) is not False
 
-    # A direct overshoot to payment_due still has to clear the production
-    # gate; the removed invoice gate no longer runs first.
+    # A direct overshoot to payment_due still has to clear the booked gate.
     r = admin_client.post(f"/api/lcs/{lc['id']}/move",
                           json={"new_stage": "payment_due"})
     assert r.status_code == 409, r.get_json()
     body = r.get_json()
-    missing = body["missing"]
-    assert any("production" in str(m).lower() for m in missing)
+    assert any("booked" in str(m).lower() for m in body["missing"])
     assert admin_client.get(
         f"/api/lcs/{lc['id']}").get_json()["stage"] == "lc_received"
 
 
-def test_readiness_endpoint_reports_barrier_state(admin_client, db):
+def test_readiness_endpoint_reports_booked_state(admin_client, db):
     tag = _tag()
     co = _company(db, f"G8 {tag}")
     lc = _mk_lc(admin_client, co, f"LC-G8-{tag}")
@@ -254,19 +254,22 @@ def test_readiness_endpoint_reports_barrier_state(admin_client, db):
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
 
-    # Nothing yet: invoices_ok is informational only, and both production
-    # checks are vacuous-truth.
+    # Nothing yet: invoices_ok/booked_ok are false; production checks are
+    # vacuous-truth and informational only.
     r = admin_client.get(f"/api/lcs/{lc['id']}/readiness")
     assert r.status_code == 200, r.get_json()
     out = r.get_json()
     assert out["invoices_ok"] is False
+    assert out["booked_ok"] is False
     assert out["recipes_ok"] is True
     assert out["produced_ok"] is True
     assert out["pis"][0]["id"] == sid
     # The barrier-only invoice-draft payload is gone with the invoice gate.
     assert "invoice_drafts" not in out
 
-    # After invoicing, the informational flag flips.
+    # After invoicing, the informational flag flips...
     _invoice(db, sid, f"INV-G8-{tag}")
     out = admin_client.get(f"/api/lcs/{lc['id']}/readiness").get_json()
     assert out["invoices_ok"] is True
+    # ...but the payment barrier still wants a booked invoice.
+    assert out["booked_ok"] is False
