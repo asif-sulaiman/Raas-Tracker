@@ -538,11 +538,14 @@ line-less invoices = 0 before trusting its commercial report.
 | Field | Rule |
 |---|---|
 | `pi_quantity`, `unit_price` | from `sale_items`; `unit` falls back to `'KG'` when blank |
-| `invoiced_quantity` | `SUM(invoice_items.quantity)` across **every** invoice of the sale, no status filter — identical to `check_invoice_tolerance` |
-| `remaining` | `max(0, PI − invoiced)`; fully invoiced lines are still returned |
-| `ceiling` | `PI × 1.05` quantized to 6 dp with the writer's own `Decimal(str(...))` expression |
+| `invoiced_quantity` | `SUM(invoice_items.quantity)` across **every** invoice of the sale, no status filter |
+| `remaining` | `max(0, PI − invoiced)`; informational — a fully invoiced line is still returned and still invoiceable |
 | `invoice_ids` | `array_agg(DISTINCT …)` of the invoices holding lines for that PI line |
-| `has_line_less_invoices` | `true` when a legacy invoice has header money no line backs; `remaining` overstates the budget in that case |
+| `has_line_less_invoices` | `true` when a legacy invoice has header money no line backs; `remaining` overstates what was billed in that case |
+
+**Updated 2026-10-25:** the `ceiling` field and the whole tolerance system were
+removed. Quantity is free relative to the PI; `remaining` is informational. See
+the 2026-10-25 row in "Public contract changes".
 
 404 on an unknown sale; `{lines: [], has_line_less_invoices: false}` for a sale
 with no PI lines. 8 tests in `tests/test_invoice_contract.py` §6, including a
@@ -566,12 +569,13 @@ than restating `test_invoice_tolerance.py` / `test_invoice_amount.py`:
 |---|---|
 | Forged `unit_price`/`line_total` in the POST body is inert: 201, stored price = PI price | `test_create_invoice_ignores_a_forged_unit_price` |
 | Same at the service seam (`validate_invoice_lines` rebuilds the price from `sale_items`) | `test_validate_invoice_lines_ignores_a_forged_unit_price` |
-| The Phase 3 endpoint's 6 dp `ceiling` is accepted verbatim by the writer; `ceiling + 1e-6` is `ToleranceExceeded` | `test_endpoint_ceiling_is_exactly_what_the_writer_accepts` |
+| The Phase 3 endpoint's 6 dp `ceiling` was accepted verbatim by the writer; `ceiling + 1e-6` was `ToleranceExceeded` *(removed 2026-10-25 with the ceiling)* | `test_endpoint_ceiling_is_exactly_what_the_writer_accepts` |
 | One `INVOICE_CREATE` per invoice, one `INVOICE_ITEM_ADD` per line, header audited **last** | `test_create_invoice_audits_each_line_then_the_header` |
 | Non-finite PI data → named `ValueError`, no invoice written (the `remaining_invoice_money` call that is otherwise value-unused) | `test_create_invoice_refuses_a_non_finite_pi_total_before_writing` |
 
 Already covered, not duplicated: ceiling boundaries for all three writers
-(`test_invoice_tolerance.py`), atomicity of a failed batch
+(`test_invoice_tolerance.py`, deleted with the tolerance on 2026-10-25),
+atomicity of a failed batch
 (`test_batch_over_allocation_rejected_and_atomic`), create-vs-create race
 (`test_concurrent_creates_cannot_over_invoice_the_sale`), the line-loop audit
 never committing (`test_line_audit_never_commits_mid_create`), and Phase 1's
@@ -622,45 +626,27 @@ shipment barrier demands).
 - Unit price is a **read-only `<input>`** (asserted, not incidental) sourced
   from the payload and **never** put in a request body.
 
-**Hard stop, not advertised headroom.** Since Phase 8 the row is
+**Row and figures (2026-10-25: no cap).** The row is
 `Product | PI qty | Invoice qty | Unit price | Total price`: one open quantity
 input, a live `Remaining` subline under the PI qty (`max(server remaining −
 typed, 0)`; the server already nets out every prior invoice), and a read-only
-`Total price` (`lineTotal(quantity, unit_price)`). It does **not** advertise a
-ceiling. The ceiling is still enforced from the payload's absolute `ceiling`
-(never recomputed as `pi * 1.05`: with `quantity` stored as REAL the two
-disagree, e.g. PI `0.56` → server `0.588000` vs recomputed `0.5880000025`):
+`Total price` (`lineTotal(quantity, unit_price)`). Quantity is free relative to
+the PI — equal, more, or less — and `Remaining` is informational. The old
+`ceiling`-based hard stop and its `1e-9` boundary allowance were removed with
+the tolerance system; see the 2026-10-25 contract row.
 
-- over-limit when `typed > 0 && invoiced_quantity + typed > ceiling + 1e-9`;
-  the `typed > 0` term keeps a pre-existing over-ceiling row (only reachable via
-  the Phase-1 tracked race) from poisoning the whole sale;
-- Save stays enabled while every row is at or under the limit, including a
-  quantity above `remaining` but within the ceiling — that is the
-  shipment-advantage case;
-- over-limit rows show the correctable number (`this line can add at most X`)
-  and disable Save. The copy names no percentage: the cap is the payload's.
+**400 handling (create).** Classification is **structural**, never by parsing
+the server's prose. Create is atomic, so a refusal writes nothing:
 
-The `1e-9` allowance is one-directional: an input in that band is accepted by
-the UI and refused by the writer, where the `409` resync is the backstop. It is
-not a promise that UI and server agree bit-for-bit.
-
-**409 / 400 handling (create).** Classification is **structural**, never by
-parsing the server's prose: the server's only contract is the status code and
-the reloaded budget. Create is atomic, so a refusal writes nothing:
-
-1. `409` (`ToleranceExceeded`) → reload, keep number, date and every typed
-   quantity, then mark whichever rows the *reloaded* figures put over the limit
-   as `over-budget` (rose).
-2. `400` (a PI line deleted between load and submit) → reload; the staged
+1. `400` (a PI line deleted between load and submit) → reload; the staged
    entries whose `sale_item_id` is gone are dropped and listed by product name
    in one form-level amber notice (`N PI line(s) are no longer on this PI —
    review and resubmit`). A dropped row cannot carry its own mark, so the
    notice is the mark.
-3. anything else → generic rose error; staged state untouched.
+2. anything else → generic rose error; staged state untouched.
 
-**409 / 404 handling (add-line).** A `409` flags the row and **resyncs** (the
-reloaded figures are what decide whether it is still over). A `404` is
-genuinely ambiguous server-side — either the invoice is gone or the PI line is
+**404 handling (add-line).** A `404` is genuinely ambiguous server-side —
+either the invoice is gone or the PI line is
 (`sales.py:2512-2524`, both mapped to 404) — so the add-line response body
 carries a `code` field (`invoice_gone` | `pi_line_gone`); the editor marks the
 target `superseded` and disables Save only for `invoice_gone`. The backend half
@@ -676,20 +662,13 @@ is **done** (`flask_app.py:3927-3960`, pinned by
 2. Save disabled until a number and at least one quantity > 0 exist.
 3. create POST body is exactly `{invoice_number, invoice_date,
    lines:[{sale_item_id, quantity}]}` — no `unit_price` key anywhere.
-4. a quantity above `ceiling - invoiced` shows the over-limit message and
-   disables Save without POSTing.
-5. a quantity exactly at `ceiling - invoiced` is accepted and POSTs.
-6. a quantity above `remaining` but within the ceiling stays submittable.
-7. the offered maximum comes from the payload, not `pi * 1.05` (fixture where
-   `ceiling !== pi_quantity * 1.05`).
-8. add-line POSTs `/api/invoices/<id>/items` with `{sale_item_id, quantity}`.
-9. create 409 → budget reloaded, the reloaded max-add figure is rendered, Save
-   is now disabled, and number/date/quantities are preserved. The reloaded
-   `invoiced_quantity` is only the input to that figure — the row does not
-   render it.
-10. create 400 → vanished product name appears in the amber "no longer on this
-    PI" notice and the header is preserved.
-11. success → `onDone` receives the created invoice.
+4. a quantity far above the PI (a fully invoiced row) stays submittable and
+   POSTs; no over-limit copy is rendered.
+5. no `ceiling` is read from the payload or advertised anywhere.
+6. add-line POSTs `/api/invoices/<id>/items` with `{sale_item_id, quantity}`.
+7. create 400 → vanished product name appears in the amber "no longer on this
+   PI" notice and the header is preserved.
+8. success → `onDone` receives the created invoice.
 
 `InvoicesRequiredModal.test.jsx` (rewrite, not delete): each POST carries
 `invoice_date` and a `lines` array covering that PI's remaining quantity; a PI
@@ -769,6 +748,10 @@ remainder would bill the same goods twice. The composer warns
 
 **Test premises corrected while swapping** (none weakened a guarantee):
 
+> **2026-10-25:** the ceiling was removed, so the over-ceiling/at-ceiling
+> premises below are historical. `InvoicePanel` now types quantities far above
+> the PI (100/250) and `InvoiceEditor`'s partial-success row uses `100`.
+
 - `SaleDetailModal` F10 pinned one `GET /api/invoices/<id>/items` per invoice.
   The wiring is now a single `/api/sales/<id>/invoice-lines` read, so F10 asserts
   the new source and that its `404` surfaces inline instead of rendering as "no
@@ -782,8 +765,8 @@ remainder would bill the same goods twice. The composer warns
   block the sequence before the refusal this test is about.
 
 **`api_list_invoices` deliberately does _not_ get `@limited()`.** It is a read,
-it already runs under the 300/min default, and the editor reloads its budget
-after every `409` — a 15/min stamp would break the recovery path rather than
+it already runs under the 300/min default, and the editor reloads its figures
+after a refusal — a 15/min stamp would break the recovery path rather than
 protect it.
 
 **Gates.** Backend: no Python file changed between `f6c7fe4` and `a1d272a`
@@ -805,9 +788,8 @@ The row is now `Product | PI qty | Invoice qty | Unit price | Total price`:
 - `Remaining {X} {unit}` sits under the PI qty and updates on every keystroke:
   `max(server remaining − typed, 0)`, where the server's `remaining` already
   nets out every invoice of the sale. A fresh 100 KG PI reads
-  `Remaining 100.00 KG`; typing 30 reads `Remaining 70.00 KG`. It is PI-based,
-  not ceiling-based: the +5% is a hidden cap, surfaced only in the over-limit
-  message, never as headroom;
+  `Remaining 100.00 KG`; typing 30 reads `Remaining 70.00 KG`. It is PI-based
+  and informational: quantities are free relative to the PI (2026-10-25);
 - `Total price` is read-only and computed in integer cents
   (`lineTotal(typed, unit_price)`), `$0.00` before input; the old
   "Line total $" helper is gone;
@@ -818,10 +800,9 @@ The row is now `Product | PI qty | Invoice qty | Unit price | Total price`:
   figure and nothing is double-counted. `has_line_less_invoices` remains the
   warning for legacy header-only invoices, whose money the budget cannot see.
 
-The over-limit copy no longer hardcodes the percentage or the word "still add"
-(which read as headroom next to a `Remaining 0.00` subline): it now reads
-`Over the invoicing limit — this line can add at most X`. The number is still
-the payload's `ceiling − invoiced`, so a tolerance change needs no UI edit.
+**2026-10-25:** the over-limit copy and the payload's `ceiling − invoiced`
+figure were removed with the tolerance system. `Remaining` is the only quantity
+figure beside the input.
 
 **Validation.** `InvoiceEditor.test.jsx` 15 → 18 (live remaining, computed
 total, floored remaining with slack still usable; the over-limit test now also
@@ -884,6 +865,12 @@ back on its fast path. The check was observed, not assumed.
 
 ### Phase 1 — writer lock discipline (no production code change)
 
+> **Superseded 2026-10-25 — the tolerance system is gone.** The locks below
+> still exist, but they no longer guard a quantity ceiling; they serialise an
+> invoice's header, line, and audit writes. `tests/test_invoice_writer_locks.py`
+> keeps the batch pre-lock pin; the joint-outcome test was deleted with the
+> ceiling it measured.
+
 **Finding: the race this phase was meant to close is already closed.** All three
 invoice writers take the PI-line lock *before* they decide tolerance:
 
@@ -923,8 +910,9 @@ this is where to look.
 
 | Date | Change | Routes affected | Rationale |
 |---|---|---|---|
-| 2026-10-15 | **A 5% over-invoice tolerance breach answers `409`, not `400`.** `ToleranceExceeded` (`raas_tracker/_exceptions.py`) is a conflict with what the sale has already been invoiced for — retrying the identical body will never succeed — so it is RFC 9110 §15.5.10. `POST /api/invoices/<id>/items` already returned 409; `POST /api/sales/<id>/invoices` and `POST /api/sales/<id>/invoices/batch` **hardcoded 400** for the same refusal, so the status depended on which door the request came in by. Both now go through `status_for(e)`. **Not a bug** — `tests/test_typed_errors.py::test_tolerance_breach_is_409_on_every_invoice_write_route` pins all three at once | `POST /api/sales/<id>/invoices`, `POST /api/sales/<id>/invoices/batch` (400 → 409) | One condition must yield one status; the phase's whole purpose. `POST /api/invoices/<id>/items` is unchanged |
+| 2026-10-15 | **Superseded 2026-10-25 — the tolerance was removed; no quantity answers 409 any more.** Originally: **A 5% over-invoice tolerance breach answers `409`, not `400`.** `ToleranceExceeded` (`raas_tracker/_exceptions.py`) is a conflict with what the sale has already been invoiced for — retrying the identical body will never succeed — so it is RFC 9110 §15.5.10. `POST /api/invoices/<id>/items` already returned 409; `POST /api/sales/<id>/invoices` and `POST /api/sales/<id>/invoices/batch` **hardcoded 400** for the same refusal, so the status depended on which door the request came in by. Both now go through `status_for(e)`. **Not a bug** — `tests/test_typed_errors.py::test_tolerance_breach_is_409_on_every_invoice_write_route` pins all three at once | `POST /api/sales/<id>/invoices`, `POST /api/sales/<id>/invoices/batch` (400 → 409) | One condition must yield one status; the phase's whole purpose. `POST /api/invoices/<id>/items` is unchanged |
 | 2026-10-17 | **A wrong or absent request `Content-Type` answers `415`, not `500`.** `request.get_json()` raises Werkzeug's `UnsupportedMediaType`, which had no handler, so Flask's lookup fell through to the catch-all `Exception` handler. A client that posted a JSON body as `text/plain` (or with no type at all) was told *"internal server error"* — a retry instruction for a fault that is permanently its own. `@app.errorhandler(415)` now answers `{"error": "unsupported media type (expected application/json)"}` | every JSON route (`request.get_json() or {}`) whose `Content-Type` is not JSON (500 → 415) | 415 is RFC 9110 §15.5.16 for exactly this, and it is the only honest answer: the body will never parse until the header changes. **Not authenticated-only** — an earlier draft of this row claimed it was. The three `_PUBLIC_API` routes `/api/auth/login`, `/api/auth/forgot-password` and `/api/auth/reset-password` take `_gate_api`'s `None` path and parse the body before any credential exists, so each went from an unauthenticated **500** to a 415: the change improves the unauthenticated surface rather than leaving it untouched. Pinned by `tests/test_edge_hardening.py::test_a_public_route_answers_415_unauthenticated` |
+| 2026-10-25 | **Invoice quantities are uncapped; the 5% tolerance and its `ceiling` field are gone.** `OVER_INVOICE_TOLERANCE`, `check_invoice_tolerance`, `ToleranceExceeded` and the `GET /api/sales/<id>/invoice-lines` `ceiling` field were removed. A quantity may equal, exceed, or fall below the PI line; writes accept anything finite and > 0. No invoice-write route returns 409 for a quantity. | `POST /api/invoices/<id>/items`, `POST /api/sales/<id>/invoices`, `POST /api/sales/<id>/invoices/batch` (no quantity 409; responses otherwise unchanged), `GET /api/sales/<id>/invoice-lines` (`ceiling` removed) | The operator manages over-invoicing manually (operator decision, 2026-10-25). A hard cap that refused a fully invoiced line was a UI blocker, not a commercial control; the writer still derives price and money server-side |
 
 Also documented in `docs/SPEC.md` §4 ("Sales Invoices", "Invoice Items"), §6 and §6.3.
 

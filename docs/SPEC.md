@@ -552,7 +552,7 @@ CREATE TABLE app_settings (
 - **One source of truth:** because the row grain is the PI line while the money is `invoice_items`, a PI line that already has invoice lines can be neither deleted nor re-based. `DELETE /api/sales/<id>/items/<item_id>`, `PUT /api/sales/<id>/items/<item_id>` (quantity/price) and the bulk `PUT /api/sales/<id>` (both `removedIds` **and** an `items[].id` rewrite that changes quantity/price) all return **409** (`InvoicedLineConflict`) rather than silently desynchronising the money. `product_name`/`unit` and no-op writes stay editable — they are descriptive only.
 - A legacy invoice with no lines is **not** reconciled. Nothing seeds lines for it: the invoice stays line-less, contributes nothing to `sale_total`, and a sale whose only invoice is line-less therefore reports `gross_sales = 0`, `due_amount = 0` and `payment_status = "Paid"` (`sales.py:1203-1206`, `:1240-1242`, `:1045-1046`). That is deliberate — synthesising lines from a header amount fabricates a receivable — and every deployment must verify the state is empty (`SELECT count(*) FROM invoices i WHERE NOT EXISTS (SELECT 1 FROM invoice_items ii WHERE ii.invoice_id = i.id)` = 0) rather than repair it silently.
 - The create path is **one transaction**: the `sales` row and the PI lines are locked `FOR UPDATE` and held to commit; the caller must supply at least one line (`flask_app.py:2383`, `sales.py:1817-1818`), so there is no seeding step and no derived remainder.
-- Quantities are validated against the PI line with a 5% ceiling (`OVER_INVOICE_TOLERANCE = 1.05`); the ceiling is computed server-side at 6 decimal places (`ROUND_HALF_EVEN`) and money is always exact to the cent (`ROUND(..., 2)`).
+- Quantities are free relative to the PI line: they may equal, exceed, or fall below it. The only rule is finite and > 0. Money is always exact to the cent (`ROUND(..., 2)`).
 
 ### Audit & Notifications
 | Method | Path | Auth | Description |
@@ -682,16 +682,16 @@ future call sites are covered without opting in:
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/api/invoices/<id>/items` | Session/Key | Invoice lines (product, quantity, unit_price, line_total) |
-| POST | `/api/invoices/<id>/items` | Admin (15/min) | Add a line `{sale_item_id, quantity}` — **unit_price is resolved server-side from the PI line**, never accepted from the client; quantity must be finite and > 0, and **may exceed the PI line quantity** (shipment advantage, INV-REVISION — no ceiling). Recomputes `invoices.amount` from its lines in the same transaction. Exceeding the 5% over-invoice ceiling (`check_invoice_tolerance`) is **409** `ToleranceExceeded`. A **404** carries a `code` so the two causes stay distinguishable without parsing prose: `{"error": ..., "code": "invoice_gone"}` when the invoice disappeared, `{"error": ..., "code": "pi_line_gone"}` when the PI line is no longer on the sale (the client drops/keeps the row accordingly) |
+| POST | `/api/invoices/<id>/items` | Admin (15/min) | Add a line `{sale_item_id, quantity}` — **unit_price is resolved server-side from the PI line**, never accepted from the client; quantity must be finite and > 0, and **may equal, exceed, or fall below the PI line quantity** — there is no ceiling (2026-10-25). Recomputes `invoices.amount` from its lines in the same transaction. A **404** carries a `code` so the two causes stay distinguishable without parsing prose: `{"error": ..., "code": "invoice_gone"}` when the invoice disappeared, `{"error": ..., "code": "pi_line_gone"}` when the PI line is no longer on the sale (the client drops/keeps the row accordingly) |
 | GET | `/api/invoices/<id>/readiness` | Session/Key | Per-invoice readiness — `status`, `can_book`/`can_ship`/`can_pay`, `book_blocked_reason`, `recipes_ok`, `produced_ok`, `detail` (products needing a recipe or an invoice-linked production run). Production is evaluated for **this invoice only** (a sibling's production neither blocks nor unlocks it) |
 
 ### Sales Invoices
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/api/sales/<id>/invoices` | Session/Key | List invoices with `amount` + `paid_amount` each, plus `can_book` + `book_blocked_reason` (PBB) so the panel renders Book from server truth. `book_blocked_reason` is `null` whenever the invoice is not bookable, including for closed (`booked`/`shipped`/`paid`) rows — `can_book` alone carries "past booking" |
-| GET | `/api/sales/<id>/invoice-lines` | Session/Key (300/min) | One row per PI line: `pi_quantity`, `invoiced_quantity` (summed across every invoice of the sale, **no status filter** — the same arithmetic as `check_invoice_tolerance`), `remaining` (floored at 0, never filtered out), `ceiling` (PI × 1.05 at 6 dp, computed with the writer's own Decimal expression), `unit_price`, `invoice_ids`. Top-level `has_line_less_invoices` warns that a legacy header-only invoice makes `remaining` overstate the budget. 404 on an unknown sale; `{"lines": [], "has_line_less_invoices": false}` for a sale with no PI lines |
-| POST | `/api/sales/<id>/invoices` | Admin | Create (`invoice_number` required; `lines:[{sale_item_id, quantity}]` is **required**, ≥ 1 entry; `invoice_date` required — the UI defaults it to today). **No `amount` is accepted** — money is always derived. Quantities are validated (may exceed the PI line up to the 5% ceiling; unit price resolved from the PI) and the header is restated as `SUM(invoice_items.line_total)`. A create is born `planned`, never `paid` (INV-REVISION). 400 on duplicate number; **409** on a 5% tolerance breach (Phase 4-A change, was 400 — see below); sets sale `shipment_status='production_running'` (COALESCE, never downgrades) |
-| POST | `/api/sales/<id>/invoices/batch` | Admin (15/min) | Create N invoices in ONE transaction: body `{invoices:[{invoice_number, invoice_date, lines:[{sale_item_id, quantity}]}]}` — each invoice gets ≥1 line and its own `invoice_date`; headers restated as `SUM(line_total)`; atomic (one commit or full rollback). **409** on a 5% tolerance breach, checked across the whole batch (Phase 4-A change, was 400 — see below) |
+| GET | `/api/sales/<id>/invoice-lines` | Session/Key (300/min) | One row per PI line: `pi_quantity`, `invoiced_quantity` (summed across every invoice of the sale, **no status filter**), `remaining` (floored at 0, never filtered out; informational — quantities are free relative to the PI), `unit_price`, `invoice_ids`. Top-level `has_line_less_invoices` warns that a legacy header-only invoice makes `remaining` overstate what was billed. 404 on an unknown sale; `{"lines": [], "has_line_less_invoices": false}` for a sale with no PI lines |
+| POST | `/api/sales/<id>/invoices` | Admin | Create (`invoice_number` required; `lines:[{sale_item_id, quantity}]` is **required**, ≥ 1 entry; `invoice_date` required — the UI defaults it to today). **No `amount` is accepted** — money is always derived. Quantities are validated (finite and > 0; they may equal, exceed, or fall below the PI line; unit price resolved from the PI) and the header is restated as `SUM(invoice_items.line_total)`. A create is born `planned`, never `paid` (INV-REVISION). 400 on duplicate number; sets sale `shipment_status='production_running'` (COALESCE, never downgrades) |
+| POST | `/api/sales/<id>/invoices/batch` | Admin (15/min) | Create N invoices in ONE transaction: body `{invoices:[{invoice_number, invoice_date, lines:[{sale_item_id, quantity}]}]}` — each invoice gets ≥1 line and its own `invoice_date`; headers restated as `SUM(line_total)`; atomic (one commit or full rollback). Quantities are free relative to the PI |
 | POST | `/api/sales/<id>/invoices/<iid>/book` | Admin | Book (`approx_ship_date` required) → `booked`; sale → `ship_booked` (advance-only CASE). **Gated on production (PBB):** refused with **409** `invoice not produced yet` unless every product on the invoice has a company recipe and an invoice-linked production run, re-checked at both `planned` and `produced` (fail-closed; `invoices.status` alone is not trusted) |
 | POST | `/api/sales/<id>/invoices/<iid>/ship` | Admin | Ship (`actual_ship_date` required) → `shipped` + creates a `shipments` row |
 | POST | `/api/sales/<id>/invoices/<iid>/pay` | Admin | Record payment (`payment_amount>0`, `payment_date`); flips invoice to `paid` when covered |
@@ -972,17 +972,13 @@ deleted. A route now calls `status_for(e)`, which reads the **type**:
 | `ResourceMissing` | 404 | no such resource, **or not this caller's** — the two are deliberately indistinguishable |
 | `sales.InvoicedLineConflict` | 409 | a PI line `invoice_items` already point at cannot be re-based or deleted |
 
-**Public contract change — the 5% over-invoice tolerance breach is a 409
-everywhere (2026-10-15).** `check_invoice_tolerance` raises `ToleranceExceeded`
-from all three writers of an invoice line. `POST /api/invoices/<id>/items`
-answered 409; `POST /api/sales/<id>/invoices` and
-`POST /api/sales/<id>/invoices/batch` **hardcoded 400** for the same refusal, so
-the same condition returned two different statuses depending on the route.
-Rationale: a breach conflicts with what the sale has already been invoiced for,
-so retrying the identical body will never succeed — RFC 9110 §15.5.10, not a
-malformed request. Both create routes now use `status_for(e)`; the add-line
-route is unchanged. A client that branched on 400 for "bad payload, let the
-user fix it" must now branch on 400 **or** 409 for the invoice-write routes.
+**Superseded (2026-10-25) — the 5% over-invoice tolerance was removed
+entirely.** `check_invoice_tolerance`, `ToleranceExceeded` and the payload's
+`ceiling` no longer exist. An invoice quantity may equal, exceed, or fall below
+the PI line quantity; the only rule is finite and > 0 (over-invoicing is
+managed manually). What remains from the change above is the typed-status rule
+itself: routes call `status_for(e)` and never match message words. No
+invoice-write route returns 409 for a quantity.
 
 ### 6.3 The outermost boundary: edge headers + 415 (Phase 4-B)
 
@@ -1179,11 +1175,11 @@ than removed.
 - **Fixtures**: `db` (clean conn), `client` (Flask test client), `admin_client`, `user_client`
 - **Bcrypt**: Rounds=4 in tests (vs 13 prod) for speed
 - **Rate Limits**: `RAAS_RATE_LIMITS=off` globally; targeted tests re-enable
-- **Coverage**: **1228 passed / 8 skipped** as of Phase 4-B (auth, stock, upload, sales, invoices, production, LC, rate limits, PI parse, notifications, schema migration, upload-limit config) — includes `tests/test_invoices_production.py`, `tests/test_invoice_items.py`, `tests/test_schema_migration.py`, `tests/test_numeric_integrity.py`, `tests/test_qty_validation.py`, `tests/test_authorization_roles.py` (P1-A role classification + P1-B volume limits and payload caps), `tests/test_typed_errors.py` (Phase 4-A: every refusal's status is asserted to come from the exception type, not its message), and `tests/test_edge_hardening.py` (Phase 4-B: the `vercel.json` header block, that no header `source` captures any `/api/` route or the cron path, that the edge CSP carries the recomputed theme-bootstrap digest and is byte-identical to Flask's copy, that `style-src` keeps its deliberate exception, that 415 is registered by code without shadowing the existing handlers, and that a wrong `Content-Type` answers 415 rather than 500 — unauthenticated as well as authenticated).
+- **Coverage**: **1237 passed / 8 skipped** as of 2026-10-25 (auth, stock, upload, sales, invoices, production, LC, rate limits, PI parse, notifications, schema migration, upload-limit config) — includes `tests/test_invoices_production.py`, `tests/test_invoice_items.py`, `tests/test_schema_migration.py`, `tests/test_numeric_integrity.py`, `tests/test_qty_validation.py`, `tests/test_authorization_roles.py` (P1-A role classification + P1-B volume limits and payload caps), `tests/test_typed_errors.py` (Phase 4-A: every refusal's status is asserted to come from the exception type, not its message), and `tests/test_edge_hardening.py` (Phase 4-B: the `vercel.json` header block, that no header `source` captures any `/api/` route or the cron path, that the edge CSP carries the recomputed theme-bootstrap digest and is byte-identical to Flask's copy, that `style-src` keeps its deliberate exception, that 415 is registered by code without shadowing the existing handlers, and that a wrong `Content-Type` answers 415 rather than 500 — unauthenticated as well as authenticated).
 
 ### Frontend (Vitest)
 - **Environment**: jsdom
-- **Coverage**: 40 test files, 338 tests (utils, components, contexts, pages) - includes `InvoiceEditor.test.jsx` (the one composer, both modes: open quantity input with live `Remaining` under PI qty, read-only computed Total price, hard stop from the payload's `ceiling`, structural 409/400/404 handling, per-row reporting on partial success) and `InvoicePanel.test.jsx`
+- **Coverage**: 40 test files, 331 tests (utils, components, contexts, pages) - includes `InvoiceEditor.test.jsx` (the one composer, both modes: open quantity input with live `Remaining` under PI qty, read-only computed Total price, no cap — quantities are free relative to the PI, structural 400/404 handling, per-row reporting on partial success) and `InvoicePanel.test.jsx`
 - **Lint**: oxlint (0 errors, 7 pre-existing warnings)
 
 ### CI (`.github/workflows/ci.yml`)

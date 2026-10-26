@@ -5,6 +5,40 @@
 
 ---
 
+## 2026-10-25 — Uncapped invoice quantities
+
+### What was completed
+- **Tolerance removed end to end.** `OVER_INVOICE_TOLERANCE`,
+  `check_invoice_tolerance`, `ToleranceExceeded` and the `/invoice-lines`
+  `ceiling` field are gone from all three writers and the endpoint. Quantity
+  may equal, exceed, or fall below the PI line; the only rule is finite and > 0.
+- **Composer no longer caps a write.** `EPSILON`, `overflow()`, `overRows`, the
+  over-limit copy and the create-mode 409 branch are gone. `Remaining` stays,
+  live and informational under PI qty. Save needs a number + one staged row in
+  create mode, and one staged row in add-line mode.
+- **Locks kept.** Batch still locks every PI line up front; create and add-line
+  locks stay as write serialisation. `tests/test_invoice_writer_locks.py`
+  replaces the deleted `tests/test_invoice_tolerance.py`.
+- **Tests/docs:** over-PI writes now assert 201 and `"ceiling" not in payload`;
+  SPEC/PRD/plan updated; old ceiling bullets marked superseded.
+
+### Gates
+- Full backend: **1237 passed, 8 skipped** (`pytest tests/ -q`, 20:49).
+- Full frontend: **331 tests across 40 files**; `oxlint` 0 errors / 7
+  pre-existing warnings; `vite build` ok.
+- Ruff: no new findings on the changed files (the 19 reported are pre-existing
+  at HEAD and fixed by the main tree's uncommitted work).
+- Pyright: no new errors from this change (HEAD has 6 pre-existing errors in
+  `audit.py` / `uploads.py`, fixed by the main tree's uncommitted work).
+
+### Next steps
+- Merge `feat/invoice-uncapped-quantities` (worktree); push/deploy left to the
+  owner.
+- Ship backend and rebuilt `react_frontend/` together: an old cached SPA
+  expects `ceiling` and would refuse every quantity.
+
+---
+
 ## 2026-10-22 — Invoice composer column model
 
 ### What was completed
@@ -14,7 +48,8 @@
 - **`Remaining`** is `max(server remaining − typed, 0)` and updates on every
   keystroke; the server's figure already nets out every invoice, so a later
   invoice draws from the same number. It is **PI-based**: the +5% ceiling is a
-  hidden cap, not headroom.
+  hidden cap, not headroom. *(Superseded 2026-10-25: the ceiling was removed;
+  `Remaining` is informational.)*
 - **`Invoiced` is no longer rendered in the row** — no column, no
   already-invoiced figure (operator request). The create-success toast still
   says `Invoiced $X`; that is the new invoice's amount, not this column.
@@ -25,19 +60,19 @@
   `$0.00` before input; the old "Line total $" helper is gone.
 - **Over-limit copy** is `Over the invoicing limit — this line can add at most
   X` — no hardcoded percentage, no "still add" that read as headroom beside a
-  `Remaining 0.00` row.
+  `Remaining 0.00` row. *(Superseded 2026-10-25: the message is gone.)*
 
 ### Decisions made & why
-- **Remaining is PI-based, not ceiling-based.** The +5% is an exception the
-  operator discovers by typing, not a budget advertised under the PI qty
-  (confirmed by the operator).
+- **Remaining is PI-based and informational.** The removed +5% ceiling was an
+  exception the operator discovered by typing; since 2026-10-25 there is no
+  cap.
 - **The quantity box is deliberately empty on load.** Auto-seeding `remaining`
   was the original complaint; the operator types the number.
 - **`Invoiced` is hidden, `Remaining` is kept** — the request to hide it
   targeted the figure that looked copied from the PI, while the live leftover is
   what the next invoice draws from.
-- **Backend untouched.** `check_invoice_tolerance` already enforces the
-  cumulative `PI × 1.05` cap; the payload's `ceiling` remains the only source.
+- **Backend untouched then; superseded 2026-10-25** — the tolerance and the
+  payload's `ceiling` were removed in the uncapped-quantity change.
 
 ### Gates
 - Oracle gate 1: **approve with non-blocking**; remediation folded into the same
@@ -118,14 +153,16 @@
 - **Phase 3** (`866e870`, `c2b45a5`): `list_sale_invoice_lines` +
   `GET /api/sales/<id>/invoice-lines`; 8 contract tests.
 - **Phase 4** (`d79cab6`, `e27dfdb`): 5 characterisation pins (forged price,
-  endpoint/writer ceiling parity, audit shape, non-finite guard).
+  endpoint/writer ceiling parity *(removed 2026-10-25 with the ceiling)*, audit
+  shape, non-finite guard).
 - **Phase 5** (`f6c7fe4`, `23b8743`): `InvoiceEditor` (create | add-line) +
   `useInvoiceBudget` + 12 tests; `code` on the add-line 404
   (`invoice_gone` | `pi_line_gone`); `ApiError.code`.
 
 ### Decisions made & why
-- **The ceiling is a hard stop, not advertised headroom.** Over-limit is
-  `typed > 0 && invoiced + typed > ceiling + 1e-9`; the maximum comes from the
+- **The ceiling is a hard stop, not advertised headroom.** *(Superseded
+  2026-10-25: the ceiling was removed.)* Over-limit was
+  `typed > 0 && invoiced + typed > ceiling + 1e-9`; the maximum came from the
   payload's absolute `ceiling`, never `pi * 1.05`.
 - **Refusals are classified structurally** — status code plus the reloaded
   budget, plus `code` for the ambiguous 404. No message parsing anywhere.
