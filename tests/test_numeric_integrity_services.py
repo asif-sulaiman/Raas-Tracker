@@ -51,7 +51,7 @@ from raas_tracker.sales import (
     add_sale_item,
     create_invoice,
     get_sale_by_id,
-    get_sale_invoice_total,
+    get_sale_pi_total,
     get_sale_total_paid,
     mark_invoice_paid,
     move_sale_to_stage,
@@ -162,8 +162,8 @@ def test_record_sale_payment_rejects_non_finite_and_writes_nothing(db, bad):
 def test_record_sale_payment_infinity_cannot_complete_the_sale(db):
     """The headline forgery: ``inf >= invoice_total`` used to auto-complete it.
 
-    ``record_sale_payment`` -> ``_complete_if_paid`` sees ``inf >= 100`` and
-    moves the sale to ``completed``. Money is marked received that never
+    ``record_sale_payment`` -> ``_sync_sale_completion`` sees ``inf >= 100``
+    and moves the sale to ``completed``. Money is marked received that never
     arrived, and ``sales.stage`` drives the whole pipeline.
     """
     sid = _sale_at_payment_due(db)
@@ -231,8 +231,13 @@ def test_record_sale_payment_still_accepts_finite_amounts(db):
     # Big-but-finite: finite AND storable in a REAL (float4) column.
     assert record_sale_payment(db, sid, "2026-10-31", 1e30)["total_paid"] == 1e30
     assert _payment_count(db, sid) == 2
-    # ...and the guard does not stop the legitimate full-payment completion.
-    record_sale_payment(db, sid, "2026-11-01", 99.99)
+    # ...and the guard does not stop invoice-defined completion.
+    inv = db.execute("SELECT id FROM invoices WHERE sale_id = %s",
+                     (sid,)).fetchone()[0]
+    db.execute("UPDATE invoices SET status = 'shipped', actual_ship_date = %s"
+               " WHERE id = %s", ("2026-10-20", inv))
+    db.commit()
+    mark_invoice_paid(db, inv, 100, "2026-11-01")
     assert _sale_row(db, sid)[0] == "completed"
 
 
@@ -504,7 +509,7 @@ def test_update_sale_full_rejects_zero_and_still_accepts_finite(db):
                          [{"id": item_id, "product_name": "W",
                            "quantity": 0, "unit_price": 0},
                           {"product_name": "X", "quantity": 3, "unit_price": 2.5}], [])
-    assert get_sale_invoice_total(db, sid) == 100.0, "the rejected batch still wrote"
+    assert get_sale_pi_total(db, sid) == 100.0, "the rejected batch still wrote"
 
     out = update_sale_full(db, sid, {"pi_number": "PI-FULL-OK2"},
                            [{"id": item_id, "product_name": "W",
@@ -513,7 +518,7 @@ def test_update_sale_full_rejects_zero_and_still_accepts_finite(db):
     assert out is not None
     # 0.001 x 0.01 = 0.00001, which ::numeric(2) rounds away, so the derived
     # total is 7.50 exactly — the rounding is the point, not an accident.
-    assert get_sale_invoice_total(db, sid) == pytest.approx(7.5)
+    assert get_sale_pi_total(db, sid) == pytest.approx(7.5)
 
 
 @NON_FINITE

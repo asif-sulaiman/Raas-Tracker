@@ -370,6 +370,71 @@ def test_move_validation_400_shape(admin_client, db):
     assert isinstance(r.get_json().get("details"), list)
 
 
+def _lc_and_booked_invoice(admin_client, db, tag):
+    """An LC with one attached sale carrying a booked invoice (total 50)."""
+    co = _company(db, f"LC DONE {tag}")
+    lc = _mk_lc(admin_client, co, f"LC-DONE-{tag}")
+    sid = _sale(db, f"PI-DONE-{tag}", company_id=co)
+    assert admin_client.post(f"/api/lcs/{lc['id']}/pis",
+                             json={"sale_ids": [sid]}).status_code == 200
+    inv = create_invoice(
+        db, sid, f"INV-DONE-{tag}",
+        lines=[{"sale_item_id": _sale_item_id(db, sid), "quantity": 10}],
+        invoice_date="2026-01-15")["invoice_id"]
+    # Booking's production gate is not under test here; the invoice only needs
+    # to stand booked for Payment Due to accept the LC.
+    db.execute("UPDATE invoices SET status = 'booked', approx_ship_date = %s"
+               " WHERE id = %s", ("2026-11-01", inv))
+    db.commit()
+    return lc, sid, inv
+
+
+def test_move_to_completed_409_while_a_child_invoice_is_unpaid(admin_client, db):
+    """Phase 3: an LC completes only once every child invoice is settled."""
+    tag = _tag()
+    lc, sid, _inv = _lc_and_booked_invoice(admin_client, db, tag)
+    for stage in ("shipment_ongoing", "payment_due"):
+        r = admin_client.post(f"/api/lcs/{lc['id']}/move",
+                              json={"new_stage": stage})
+        assert r.status_code == 200, r.get_json()
+
+    r = admin_client.post(f"/api/lcs/{lc['id']}/move",
+                          json={"new_stage": "completed"})
+    assert r.status_code == 409, r.get_json()
+    assert "not ready to complete" in r.get_json()["error"]
+    assert "1 sale(s)" in r.get_json()["error"]
+    assert admin_client.get(
+        f"/api/lcs/{lc['id']}").get_json()["stage"] == "payment_due"
+
+
+def test_move_to_completed_accepts_settled_children(admin_client, db):
+    """A child paid while still shipping is settled but not completed — the
+    LC must still be able to close the group."""
+    tag = _tag()
+    lc, sid, inv = _lc_and_booked_invoice(admin_client, db, tag)
+    assert admin_client.post(f"/api/lcs/{lc['id']}/move",
+                             json={"new_stage": "shipment_ongoing"}
+                             ).status_code == 200
+    assert admin_client.post(f"/api/sales/{sid}/invoices/{inv}/ship",
+                             json={"actual_ship_date": "2026-10-20"}
+                             ).status_code == 201
+    assert admin_client.post(f"/api/sales/{sid}/invoices/{inv}/pay",
+                             json={"payment_amount": 50,
+                                   "payment_date": "2026-10-25"}
+                             ).status_code == 201
+    assert admin_client.get(
+        f"/api/lcs/{lc['id']}").get_json()["stage"] == "shipment_ongoing"
+
+    for stage in ("payment_due", "completed"):
+        r = admin_client.post(f"/api/lcs/{lc['id']}/move",
+                              json={"new_stage": stage})
+        assert r.status_code == 200, r.get_json()
+    assert admin_client.get(
+        f"/api/lcs/{lc['id']}").get_json()["stage"] == "completed"
+    assert db.execute("SELECT stage FROM sales WHERE id = %s",
+                      (sid,)).fetchone()[0] == "completed"
+
+
 # --------------------------------------------------------------------------- #
 # batch create (ONE transaction)
 # --------------------------------------------------------------------------- #

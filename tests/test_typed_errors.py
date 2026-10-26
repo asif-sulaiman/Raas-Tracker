@@ -50,6 +50,7 @@ from raas_tracker._exceptions import (
     InvoiceNotProduced,
     InvoiceNotShipped,
     LcNotFound,
+    LcNotReadyForCompletion,
     LcNotReadyPastShipment,
     LcNumberAlreadyExists,
     LcSaleNotFound,
@@ -57,6 +58,7 @@ from raas_tracker._exceptions import (
     LinkedInvoiceNotFound,
     LinkedSaleNotFound,
     SaleItemNotFound,
+    SaleNotReadyForCompletion,
     SaleNotReadyPastShipment,
     ServiceError,
     status_for,
@@ -71,6 +73,7 @@ _TYPED = [
     (InvoiceNotBooked, 409),
     (InvoiceNotShipped, 409),
     (SaleNotReadyPastShipment, 409),
+    (SaleNotReadyForCompletion, 409),
     (InvoicedLineConflict, 409),
     (InvoiceNotFound, 404),
     (LinkedSaleNotFound, 404),
@@ -78,6 +81,7 @@ _TYPED = [
     (SaleItemNotFound, 404),
     (LcNumberAlreadyExists, 409),
     (LcNotReadyPastShipment, 409),
+    (LcNotReadyForCompletion, 409),
     (LcNotFound, 404),
     (LcSaleNotFound, 404),
 ]
@@ -472,6 +476,31 @@ def test_move_sale_route_409_without_a_booked_invoice(admin_client, db):
     assert "booked invoice" in r.get_json()["error"]
     assert db.execute("SELECT stage FROM sales WHERE id = %s",
                       (sid,)).fetchone()[0] == "shipment_ongoing"
+
+
+def test_move_sale_route_409_when_invoices_are_still_open(admin_client, db):
+    """Phase 3: completion is invoice-defined, and the refusal is a 409.
+
+    A sale may not jump to ``completed`` while any of its invoices is unpaid.
+    The route maps ``SaleNotReadyForCompletion`` through ``status_for``.
+    """
+    cid = _company(admin_client, db, "TypedDoneCo")
+    sid = _sale(admin_client, cid, "PI-TD-1", "TypedDoneProd")
+    assert admin_client.post(f"/api/sales/{sid}/move", json={}).status_code == 200
+    assert admin_client.post(f"/api/sales/{sid}/move", json={}).status_code == 200
+    inv = _invoice(admin_client, db, sid, "INV-TD-1")
+    # Booking's production gate is not under test; the invoice only needs to
+    # stand booked so Payment Due accepts the sale.
+    db.execute("UPDATE invoices SET status = 'booked', approx_ship_date = %s"
+               " WHERE id = %s", ("2026-11-01", inv))
+    db.commit()
+    assert admin_client.post(f"/api/sales/{sid}/move", json={}).status_code == 200
+
+    r = admin_client.post(f"/api/sales/{sid}/move", json={})
+    assert r.status_code == 409, r.get_json()
+    assert "1 invoice(s) still open" in r.get_json()["error"]
+    assert db.execute("SELECT stage FROM sales WHERE id = %s",
+                      (sid,)).fetchone()[0] == "payment_due"
 
 
 def test_invoice_item_route_404_missing_sale_item(admin_client, db):

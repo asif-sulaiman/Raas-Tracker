@@ -20,6 +20,7 @@ from ._exceptions import (
     InvoiceNotShipped,
     LifecycleConflict,
     SaleItemNotFound,
+    SaleNotReadyForCompletion,
     SaleNotReadyPastShipment,
     ServiceError,
 )
@@ -254,10 +255,9 @@ def get_sale_by_id(conn: psycopg.Connection, sale_id: int) -> Optional[Dict[str,
         ).fetchall()
     ]
     sale["invoices"] = list_invoices(conn, sale_id)
-    # Same SQL-rounded helpers the payment paths use, so the displayed balance
-    # can never drift from what record_sale_payment / update_sale_payment_record
-    # report (Python float multiplication used to be unrounded here).
-    sale["invoice_total"] = get_sale_invoice_total(conn, sale_id)
+    # Invoice money is the receivable (2026-10-26): the modal's total is the
+    # sum of the invoice lines, not the PI proposal.
+    sale["invoice_total"] = get_sale_invoiced_total(conn, sale_id)
     sale["total_paid"] = get_sale_total_paid(conn, sale_id)
     sale["balance"] = sale["invoice_total"] - sale["total_paid"]
     sale["shipments"] = list_shipments(conn, sale_id)
@@ -271,8 +271,7 @@ def move_sale_to_stage(conn: psycopg.Connection, sale_id: int, new_stage: str,
     ``via_lc`` marks LC-driven propagation (``move_lc_stage``): a directly
     invoked move (``via_lc=False``) on a sale linked via ``sales.lc_id``
     into ``shipment_ongoing`` is refused (returns False) — linked PIs only
-    travel via the LC endpoints. ``payment_due -> completed`` (incl.
-    ``_complete_if_paid``) stays allowed.
+    travel via the LC endpoints. ``payment_due -> completed`` stays allowed.
 
     Phase 2 barriers:
     - lc_received -> shipment_ongoing: no invoice required (invoices are
@@ -280,6 +279,14 @@ def move_sale_to_stage(conn: psycopg.Connection, sale_id: int, new_stage: str,
     - any earlier stage -> payment_due: at least one non-void invoice must be
       booked (booked/shipped/paid). Booking is the per-invoice proof that
       production finished; siblings still planned or produced stay behind.
+
+    Phase 3 barriers:
+    - any earlier stage -> completed: at least one invoice must exist and every
+      invoice must be ``paid`` (``SaleNotReadyForCompletion`` otherwise). The
+      PI proposal is not a receivable.
+    - entering payment_due re-evaluates completion, so a sale whose invoices
+      were all paid before the stage caught up closes in the same call.
+    - completed/reopened moves reconcile the parent LC (``_sync_lc_completion``).
     """
     row = conn.execute("SELECT stage, client_name, lc_id FROM sales WHERE id = %s", (sale_id,)).fetchone()
     if not row:
@@ -299,6 +306,19 @@ def move_sale_to_stage(conn: psycopg.Connection, sale_id: int, new_stage: str,
             raise SaleNotReadyPastShipment(
                 "Sale is not ready to move to Payment Due: "
                 "at least one booked invoice required")
+
+    # Phase 3: completion is defined by the invoices, never by the PI proposal.
+    if new_stage == "completed" and current != "completed":
+        settlement = invoice_settlement(conn, sale_id)
+        if not settlement["settled"]:
+            conn.rollback()
+            if settlement["invoice_count"] == 0:
+                raise SaleNotReadyForCompletion(
+                    "Sale is not ready to complete: no invoices — "
+                    "invoice the shipment first")
+            raise SaleNotReadyForCompletion(
+                "Sale is not ready to complete: "
+                f"{settlement['open_count']} invoice(s) still open")
 
     if new_stage == "shipment_ongoing":
         # Entering production/shipment: mark the sale as running unless it
@@ -325,6 +345,12 @@ def move_sale_to_stage(conn: psycopg.Connection, sale_id: int, new_stage: str,
                      old_value=current, new_value=new_stage)
     conn.commit()
     notify_sale_stage(conn, sale_id, client_name, current, new_stage)
+    if lc_id is not None and new_stage in ("completed", "payment_due"):
+        _sync_lc_completion(conn, lc_id)
+    if new_stage == "payment_due":
+        # The invoices may already be settled (paid while the sale was still in
+        # Shipment Ongoing): close the sale in the same call.
+        _sync_sale_completion(conn, sale_id)
     return True
 
 
@@ -434,13 +460,60 @@ def get_register_products(conn: psycopg.Connection,
     ]
 
 
-def get_sale_invoice_total(conn: psycopg.Connection, sale_id: int) -> float:
-    """Sum of quantity * unit_price over all line items of a sale."""
+def get_sale_pi_total(conn: psycopg.Connection, sale_id: int) -> float:
+    """The PI proposal total: quantity * unit_price over the sale's PI lines.
+
+    An offer, not a receivable (2026-10-26). Invoice money comes from
+    ``get_sale_invoiced_total`` / ``invoice_settlement``.
+    """
     row = conn.execute(
         "SELECT COALESCE(ROUND(SUM(quantity * unit_price)::numeric, 2)::float8, 0) FROM sale_items WHERE sale_id = %s",
         (sale_id,)
     ).fetchone()
     return row[0] if row else 0
+
+
+def get_sale_invoiced_total(conn: psycopg.Connection, sale_id: int) -> float:
+    """Sum of ``invoice_items.line_total`` over the sale's invoices.
+
+    The invoice is the receivable, so this is the money figure the sale header
+    and its payments are measured against.
+    """
+    row = conn.execute(
+        """SELECT COALESCE(ROUND(SUM(ii.line_total)::numeric, 2)::float8, 0)
+           FROM invoice_items ii
+           JOIN invoices i ON i.id = ii.invoice_id
+           WHERE i.sale_id = %s""",
+        (sale_id,)
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def invoice_settlement(conn: psycopg.Connection, sale_id: int) -> Dict[str, Any]:
+    """How close a sale is to invoice-defined completion.
+
+    ``settled`` is the completion predicate: at least one invoice exists and
+    every one of them is ``paid``. ``all_paid`` alone is vacuously true for a
+    sale with no invoices, which is why the gate asks ``settled``.
+
+    ``amount`` is the invoiced money (the sum of the invoice lines), not the PI
+    proposal.
+    """
+    row = conn.execute(
+        """SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 'paid')
+             FROM invoices WHERE sale_id = %s""",
+        (sale_id,)
+    ).fetchone()
+    invoice_count, paid_count = int(row[0]), int(row[1])
+    all_paid = paid_count == invoice_count
+    return {
+        "invoice_count": invoice_count,
+        "paid_count": paid_count,
+        "open_count": invoice_count - paid_count,
+        "amount": get_sale_invoiced_total(conn, sale_id),
+        "all_paid": all_paid,
+        "settled": invoice_count >= 1 and all_paid,
+    }
 
 
 def get_sale_total_paid(conn: psycopg.Connection, sale_id: int) -> float:
@@ -469,9 +542,13 @@ def _sync_sale_payment_totals(conn: psycopg.Connection, sale_id: int) -> None:
 def record_sale_payment(conn: psycopg.Connection, sale_id: int, payment_date: str,
                         payment_amount: float, notes: Optional[str] = None,
                         maturity_date: Optional[str] = None) -> Dict[str, Any]:
-    """Append a (possibly partial) payment. Auto-completes from payment_due
-    when total paid reaches the invoice total. Returns totals + stage.
-    
+    """Append a (possibly partial) payment. Reconciles the sale's stage with
+    its invoices' settlement. Returns totals + stage.
+
+    The balance is measured against the invoiced money (``invoice_settlement``),
+    not the PI proposal. Sale-level payments do not mark an invoice paid, so
+    completion still waits for the invoice payments.
+
     If maturity_date is provided and non-empty, updates the sale's maturity_date
     when it is NULL or different from the provided value.
     Clears maturity notification dedupe keys when the sale becomes fully paid.
@@ -500,22 +577,24 @@ def record_sale_payment(conn: psycopg.Connection, sale_id: int, payment_date: st
     _sync_sale_payment_totals(conn, sale_id)
     _resync_invoice_payment_status(conn, payment_invoice_id)
     total_paid = get_sale_total_paid(conn, sale_id)
-    invoice_total = get_sale_invoice_total(conn, sale_id)
+    settlement = invoice_settlement(conn, sale_id)
+    invoice_total = settlement["amount"]
     old_balance = invoice_total - (total_paid - payment_amount)
     new_balance = invoice_total - total_paid
     log_audit_action(conn, "SALE_PAYMENT", "sale", sale_id,
                      old_value=f"balance={old_balance:g}",
                      new_value=f"paid={payment_amount:g} balance={new_balance:g} "
                                f"invoice_total={invoice_total:g}")
-    row = conn.execute("SELECT stage FROM sales WHERE id = %s", (sale_id,)).fetchone()
-    stage = row[0] if row else None
-    was_completed = _complete_if_paid(conn, sale_id, stage, total_paid, invoice_total)
-    if was_completed:
-        stage = "completed"
+    _sync_sale_completion(conn, sale_id)
+    stage = conn.execute(
+        "SELECT stage FROM sales WHERE id = %s", (sale_id,)).fetchone()[0]
     
-    # Clear maturity notification dedupe keys when sale becomes fully paid
-    # (regardless of stage transition)
-    if total_paid >= invoice_total and invoice_total > 0:
+    # Clear maturity notification dedupe keys when sale becomes fully paid.
+    # Reminders track payment against the receivable — the invoiced total once
+    # invoices exist, the PI proposal for a legacy sale that has none.
+    covered = (settlement["amount"] if settlement["invoice_count"]
+               else get_sale_pi_total(conn, sale_id))
+    if covered > 0 and total_paid >= covered:
         clear_maturity_dedupe(conn, sale_id)
     
     conn.commit()
@@ -523,14 +602,70 @@ def record_sale_payment(conn: psycopg.Connection, sale_id: int, payment_date: st
             "balance": invoice_total - total_paid, "stage": stage}
 
 
-def _complete_if_paid(conn: psycopg.Connection, sale_id: int, stage: Optional[str],
-                      total_paid: float, invoice_total: float) -> bool:
-    """Move a payment_due sale to completed once payments cover the invoice."""
-    if stage == "payment_due" and total_paid >= invoice_total:
-        move_sale_to_stage(conn, sale_id, "completed",
-                           f"Paid in full (${total_paid})")
+def _sync_sale_completion(conn: psycopg.Connection, sale_id: int) -> bool:
+    """Reconcile a sale's stage with its invoices' settlement.
+
+    Completion is invoice-defined, so every payment write calls this instead of
+    comparing a paid total against the PI proposal. Only ``payment_due`` and
+    ``completed`` are in scope: an invoice paid while the sale is still in
+    Shipment Ongoing must not drag the stage forward — the stage move
+    re-evaluates it (see ``move_sale_to_stage``).
+
+    ``move_sale_to_stage`` reconciles the parent LC on both crossings, so this
+    helper needs no LC import (``lcs`` imports ``sales``, never the reverse).
+    Returns True when the stage changed.
+    """
+    row = conn.execute(
+        "SELECT stage FROM sales WHERE id = %s", (sale_id,)).fetchone()
+    if not row:
+        return False
+    stage = row[0]
+    if stage not in ("payment_due", "completed"):
+        return False
+    settled = invoice_settlement(conn, sale_id)["settled"]
+    if stage == "payment_due" and settled:
+        move_sale_to_stage(conn, sale_id, "completed", "All invoices paid")
+        return True
+    if stage == "completed" and not settled:
+        move_sale_to_stage(conn, sale_id, "payment_due",
+                           "Invoice no longer settled — reopened")
         return True
     return False
+
+
+def _sync_lc_completion(conn: psycopg.Connection, lc_id: int) -> bool:
+    """Close or reopen an LC from its children's stages.
+
+    Auto-completion is a direct write, not ``move_lc_stage``: the route gate
+    (``LcNotReadyForCompletion``) exists for operator-initiated moves, while a
+    settlement-driven close already knows every child is completed. An LC in
+    ``payment_due`` completes when every child sale is completed; a completed
+    LC reverts when any child reopens. The audit action is the shared
+    ``LC_MOVE``. Returns True when the LC stage changed.
+    """
+    row = conn.execute(
+        "SELECT stage FROM letters_of_credit WHERE id = %s", (lc_id,)).fetchone()
+    if not row or row[0] not in ("payment_due", "completed"):
+        return False
+    stage = row[0]
+    children = conn.execute(
+        "SELECT stage FROM sales WHERE lc_id = %s", (lc_id,)).fetchall()
+    if not children:
+        return False
+    all_done = all(r[0] == "completed" for r in children)
+    if stage == "payment_due" and all_done:
+        new_stage = "completed"
+    elif stage == "completed" and not all_done:
+        new_stage = "payment_due"
+    else:
+        return False
+    conn.execute(
+        "UPDATE letters_of_credit SET stage = %s, updated_at = %s WHERE id = %s",
+        (new_stage, _now_str(), lc_id))
+    log_audit_action(conn, "LC_MOVE", "lc", lc_id,
+                     old_value=stage, new_value=new_stage, atomic=False)
+    conn.commit()
+    return True
 
 
 def update_sale_payment(conn: psycopg.Connection, sale_id: int, payment_date: str,
@@ -544,9 +679,10 @@ def update_sale_payment_record(conn: psycopg.Connection, sale_id: int, payment_i
                                payment_date: Optional[str] = None,
                                payment_amount: Optional[float] = None,
                                notes: Optional[str] = None) -> bool:
-    """Edit a payment record. Reverts a completed sale to payment_due
-    if the new total no longer covers the invoice, and re-derives the linked
-    invoice's paid status.
+    """Edit a payment record and re-derive the linked invoice's paid status.
+
+    The sale's stage then follows its invoices: an edit that leaves an invoice
+    uncovered reopens a completed sale (``_sync_sale_completion``).
 
     `sale_id` binds the payment to the sale named in the request URL: a
     payment may only be edited through the sale it belongs to, closing an
@@ -580,7 +716,7 @@ def update_sale_payment_record(conn: psycopg.Connection, sale_id: int, payment_i
     _sync_sale_payment_totals(conn, sale_id)
     _resync_invoice_payment_status(conn, invoice_id)
     total_paid = get_sale_total_paid(conn, sale_id)
-    invoice_total = get_sale_invoice_total(conn, sale_id)
+    invoice_total = get_sale_invoiced_total(conn, sale_id)
     new_amount = payment_amount if payment_amount is not None else old_amount
     old_balance = invoice_total - (total_paid - new_amount + old_amount)
     new_balance = invoice_total - total_paid
@@ -588,10 +724,7 @@ def update_sale_payment_record(conn: psycopg.Connection, sale_id: int, payment_i
                      old_value=f"amount={old_amount:g} balance={old_balance:g}",
                      new_value=f"amount={new_amount:g} balance={new_balance:g} "
                                f"invoice_total={invoice_total:g}")
-    row = conn.execute("SELECT stage FROM sales WHERE id = %s", (sale_id,)).fetchone()
-    stage = row[0] if row else None
-    _complete_if_paid(conn, sale_id, stage, total_paid, invoice_total)
-    _revert_if_unpaid(conn, sale_id)
+    _sync_sale_completion(conn, sale_id)
     conn.commit()
     return True
 
@@ -599,6 +732,9 @@ def update_sale_payment_record(conn: psycopg.Connection, sale_id: int, payment_i
 def delete_sale_payment_record(conn: psycopg.Connection, sale_id: int, payment_id: int) -> bool:
     """Delete a payment record, re-sync totals, and re-derive the linked
     invoice's paid status (the invoice may no longer be covered).
+
+    The sale then follows its invoices through ``_sync_sale_completion``: a
+    completed sale whose last covering payment is gone reopens.
 
     `sale_id` binds the payment to the sale named in the request URL: a
     payment may only be deleted through the sale it belongs to, closing an
@@ -617,24 +753,15 @@ def delete_sale_payment_record(conn: psycopg.Connection, sale_id: int, payment_i
     _sync_sale_payment_totals(conn, sale_id)
     _resync_invoice_payment_status(conn, invoice_id)
     total_paid = get_sale_total_paid(conn, sale_id)
-    invoice_total = get_sale_invoice_total(conn, sale_id)
+    invoice_total = get_sale_invoiced_total(conn, sale_id)
     old_balance = invoice_total - (total_paid + row[1])
     new_balance = invoice_total - total_paid
     log_audit_action(conn, "SALE_PAYMENT_DELETE", "sale", sale_id,
                      old_value=f"amount={row[1]:g} balance={old_balance:g}",
                      new_value=f"balance={new_balance:g} invoice_total={invoice_total:g}")
-    _revert_if_unpaid(conn, sale_id)
+    _sync_sale_completion(conn, sale_id)
     conn.commit()
     return True
-
-
-def _revert_if_unpaid(conn: psycopg.Connection, sale_id: int) -> None:
-    """Move a completed sale back to payment_due if payments no longer cover it."""
-    row = conn.execute("SELECT stage FROM sales WHERE id = %s", (sale_id,)).fetchone()
-    if row and row[0] == "completed":
-        if get_sale_total_paid(conn, sale_id) < get_sale_invoice_total(conn, sale_id):
-            move_sale_to_stage(conn, sale_id, "payment_due",
-                               "Payment edited/deleted — balance outstanding")
 
 
 def add_sale_item(conn: psycopg.Connection, sale_id: int, product_name: str,
@@ -1647,7 +1774,7 @@ def remaining_invoice_money(conn: psycopg.Connection, sale_id: int) -> Decimal:
     in the money math, surfacing as a generic 500. It is bad input data, so
     it raises ``ValueError`` (mapped to 400 by the routes) naming the cause.
     """
-    raw_total = get_sale_invoice_total(conn, sale_id) or 0
+    raw_total = get_sale_pi_total(conn, sale_id) or 0
     if isinstance(raw_total, float) and not math.isfinite(raw_total):
         raise ValueError(
             "sale has a non-finite line total "
@@ -1663,7 +1790,7 @@ def pi_proposal_vs_invoiced(conn: psycopg.Connection, sale_id: int) -> Decimal:
     Used for variance reporting: shows how much invoiced amounts deviate
     from the PI proposal. Positive = invoiced less than PI; negative = invoiced more.
     """
-    raw_total = get_sale_invoice_total(conn, sale_id) or 0
+    raw_total = get_sale_pi_total(conn, sale_id) or 0
     if isinstance(raw_total, float) and not math.isfinite(raw_total):
         raise ValueError(
             "sale has a non-finite line total "
@@ -2254,7 +2381,8 @@ def mark_invoice_paid(conn: psycopg.Connection, invoice_id: int,
     invoice status (partial payments keep e.g. 'shipped', they do NOT report
     'paid'). Overpayments are accepted without error: the full payment row is
     recorded and the invoice flips to 'paid' (money received is truth; no
-    amount cap here by design).
+    amount cap here by design). Paying the last open invoice completes the
+    sale when it is in Payment Due (``_sync_sale_completion``).
     """
     # Phase 2-B. Before the SELECT ... FOR UPDATE, so a rejection takes no lock.
     _finite(payment_amount)
@@ -2288,6 +2416,9 @@ def mark_invoice_paid(conn: psycopg.Connection, invoice_id: int,
     ).fetchone()[0]
     log_audit_action(conn, "INVOICE_PAYMENT", "invoice", invoice_id,
                      new_value=f"amount={payment_amount:g} date={payment_date}")
+    # Completion is invoice-defined: paying the last open invoice closes the
+    # sale (and may close its LC) in this same call.
+    _sync_sale_completion(conn, sale_id)
     conn.commit()
     return {"payment_id": payment_id, "status": actual_status}
 
@@ -2300,7 +2431,9 @@ def void_invoice(conn: psycopg.Connection, sale_id: int, invoice_id: int) -> boo
     is the remediation path for bad transitions. Payments detach via the
     existing ``ON DELETE SET NULL`` FK and stay counted in the sale-level
     totals (payments remain sale-level truth), so sale payment totals are
-    intentionally left unchanged.
+    intentionally left unchanged — but completion is not: the remaining
+    invoices decide, and a completed sale with no invoice left reopens
+    (``_sync_sale_completion``).
     """
     row = conn.execute(
         "SELECT sale_id FROM invoices WHERE id = %s", (invoice_id,)
@@ -2313,6 +2446,7 @@ def void_invoice(conn: psycopg.Connection, sale_id: int, invoice_id: int) -> boo
     # a silent discrepancy between the ledger and the books.
     log_audit_action(conn, "INVOICE_VOID", "invoice", invoice_id,
                      new_value=f"voided from sale {sale_id}", atomic=False)
+    _sync_sale_completion(conn, sale_id)
     conn.commit()
     return True
 

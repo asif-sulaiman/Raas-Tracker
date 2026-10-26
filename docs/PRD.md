@@ -75,7 +75,7 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 1. `pi_issued` → **Link PIs to LC** (the LC record carries the number, dates, bank ref) → the LC and all its PIs move to `lc_received`
 2. `lc_received → shipment_ongoing` is **not gated on invoices**: the LC enters Shipment Ongoing with zero invoices. Invoices are created **in Shipment Ongoing**, one or many, from the PI's products and quantities (see Flow 6); product, unit and unit price stay fixed to the PI, while the invoiced quantity is free
 3. `shipment_ongoing → payment_due` is **gated**: refused unless **at least one non-void invoice** on the LC's PIs is past booking (`booked`, `shipped`, or `paid`). Booking is the per-invoice proof that production finished, so unready siblings stay in their own statuses and do not block the ready invoice. The refusal names the missing booked invoice.
-4. `shipment_ongoing` → invoices advance individually and **strictly in order** (book → ship → pay) → the sale/LC settles → `completed`
+4. `shipment_ongoing` → invoices advance individually and **strictly in order** (book → ship → pay). **Completion is invoice-defined** (see Flow 6, step 9): a sale completes once it has at least one invoice and every invoice is `paid`, measured on invoice lines rather than the PI. The parent LC completes with its last settled child and reopens if any child reopens.
 5. All PIs under one LC progress together — the pipeline board shows one LC card with its PIs nested
 
 ### Flow 4: Recipe/Production Reports
@@ -103,6 +103,9 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
    - **Production before booking:** `Book` is refused (409) until every product on the invoice has a company recipe **and** a production run made from the **recipe page** and linked to **that** invoice. Booking commits to a real shipment, so an unproduced invoice cannot be booked.
    - The check is **per invoice**, so sibling invoices proceed independently — one being produced neither blocks nor unlocks another.
    - It is re-checked at both `planned` and `produced`, because the `produced` flag alone is set by the *first* linked run and would read satisfied on a multi-product invoice whose later products are still unbuilt. The panel therefore renders `Book` from the server's `can_book` / `book_blocked_reason` (`GET /api/sales/<id>/invoices`) rather than from the status, so a disabled button and a server refusal always agree.
+9. **Completion is defined by invoices, not the PI.** A sale in Payment Due completes the moment it has at least one invoice and every one of them is `paid`; the money compared is `SUM(invoice_items.line_total)`, so an invoice set that bills less than the PI still settles the sale. A payment edit, a payment delete, or an invoice void that leaves an invoice unpaid reopens the completed sale to Payment Due. A sale with no invoices cannot complete (**409**, "no invoices").
+   - An LC follows its children: it completes automatically with its last completed child and reverts to Payment Due when a child reopens. An operator moving an LC to `completed` by hand is refused (**409**) while any child invoice is unsettled.
+   - The sale header and its payments read the **invoiced** total; the PI total remains available as the offer (`get_sale_pi_total`) for the report's per-line fallback and maturity fallback.
 
 ### Flow 7: Commercial Report (invoice-driven)
 - One row per **PI line** (unchanged grain), same columns as before

@@ -129,9 +129,8 @@ from raas_tracker.recipes import (
 
 from raas_tracker.sales import (
     SALE_STAGE_ORDER,
-    _complete_if_paid,
     _next_stage,
-    _revert_if_unpaid,
+    _sync_sale_completion,
     _sync_sale_payment_totals,
     add_sale,
     add_sale_item,
@@ -144,7 +143,7 @@ from raas_tracker.sales import (
     get_all_sales,
     get_register_products,
     get_sale_by_id,
-    get_sale_invoice_total,
+    get_sale_pi_total,
     get_sale_total_paid,
     get_sales_summary,
     get_commercial_report,
