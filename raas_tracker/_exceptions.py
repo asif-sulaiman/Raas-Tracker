@@ -95,14 +95,6 @@ class InvoiceNotProduced(LifecycleConflict):
     """
 
 
-class ToleranceExceeded(LifecycleConflict):
-    """An invoice line would exceed the PI quantity ceiling.
-
-    Replaces the ``"exceed" in msg`` branch of ``_invoice_item_error``. The
-    request conflicts with an agreed commercial limit.
-    """
-
-
 # --------------------------------------------------------------------------- #
 # 404 conditions
 # --------------------------------------------------------------------------- #

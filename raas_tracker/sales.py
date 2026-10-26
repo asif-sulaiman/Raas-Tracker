@@ -19,12 +19,7 @@ from ._exceptions import (
     LifecycleConflict,
     SaleItemNotFound,
     ServiceError,
-    ToleranceExceeded,
 )
-
-
-# Phase 3-C: 5% over-invoice tolerance (global constant, multiplier)
-OVER_INVOICE_TOLERANCE = Decimal("1.05")
 
 
 def _now_str() -> str:
@@ -1732,50 +1727,6 @@ def validate_invoice_lines(conn: psycopg.Connection, sale_id: int,
     return validated
 
 
-def check_invoice_tolerance(conn: psycopg.Connection, sale_id: int,
-                            lines: List[Dict[str, Any]]) -> None:
-    """Enforce 5% over-invoice ceiling per PI line.
-
-    Args:
-        conn: DB connection
-        sale_id: Sale ID
-        lines: List of {"sale_item_id": int, "quantity": float}
-               These are the NEW lines being added.
-
-    Raises:
-        ValueError: If any PI line's total invoiced qty (existing + new) > PI_qty * 1.05
-    """
-    from collections import defaultdict
-
-    # Aggregate new quantities by sale_item_id
-    qty_by_item = defaultdict(Decimal)
-    for line in lines:
-        qty_by_item[line["sale_item_id"]] += Decimal(str(line["quantity"]))
-
-    # Fetch PI line quantities AND existing invoiced quantities
-    placeholders = ",".join(["%s"] * len(qty_by_item))
-    rows = conn.execute(
-        f"""SELECT si.id, si.quantity,
-                  COALESCE(SUM(ii.quantity)::numeric, 0) AS already_invoiced
-           FROM sale_items si
-           LEFT JOIN invoice_items ii ON ii.sale_item_id = si.id
-           LEFT JOIN invoices i ON i.id = ii.invoice_id
-           WHERE si.id IN ({placeholders})
-           GROUP BY si.id, si.quantity""",
-        tuple(qty_by_item.keys())
-    ).fetchall()
-
-    for item_id, pi_qty, already_invoiced in rows:
-        invoiced = qty_by_item[item_id] + Decimal(str(already_invoiced or 0))
-        pi_qty_dec = Decimal(str(pi_qty))
-        ceiling = (pi_qty_dec * OVER_INVOICE_TOLERANCE).quantize(Decimal("0.000001"))
-        if invoiced > ceiling:
-            raise ToleranceExceeded(
-                f"PI line {item_id}: invoiced {invoiced:g} "
-                f"exceeds {ceiling:g} (PI qty {pi_qty_dec:g} + 5%)"
-            )
-
-
 def _assert_invoice_mutable(conn: psycopg.Connection, invoice_id: int) -> None:
     """Raise InvoiceNotFound if the invoice is gone, ValueError if frozen."""
     row = conn.execute(
@@ -1795,8 +1746,8 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
 
     This is the only create mode. ``lines`` is required and non-empty
     (``[{"sale_item_id": int, "quantity": float}, ...]``):
-    - Quantities may exceed PI quantities (shipment advantage; the 5% ceiling
-      in ``check_invoice_tolerance`` still applies).
+    - Quantities are free relative to the PI: they may equal, exceed, or fall
+      below the PI quantities. Only finite and > 0 is enforced.
     - Unit price is always inherited from the PI line (server-enforced).
     - ``invoice_date`` is required and stored as given (stripped).
 
@@ -1823,9 +1774,9 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
     ).fetchone()
     if dup:
         raise ValueError(f"Invoice number '{invoice_number}' already exists for this sale")
-    # Serialise invoice creation per sale BEFORE validating the lines. Without
-    # this lock two concurrent creates could both pass the tolerance check
-    # against the same pre-existing total and each write the full ceiling.
+    # Serialise invoice creation per sale before validating the lines. There is
+    # no quantity ceiling to protect any more; the lock keeps one create's
+    # header, line, and audit writes from interleaving with another's.
     if not conn.execute("SELECT id FROM sales WHERE id = %s FOR UPDATE",
                         (sale_id,)).fetchone():
         raise ValueError("sale not found")
@@ -1833,12 +1784,11 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
     # Non-finite guard: the VALUE is intentionally unused now that no remainder
     # is billed, but the call must stay. A NaN/Inf REAL in a PI line (or a
     # legacy line_total) would otherwise poison Decimal arithmetic inside
-    # validate/tolerance and surface as a generic 500 instead of this named 400.
+    # validate/amount arithmetic and surface as a generic 500 instead of this
+    # named 400.
     remaining_invoice_money(conn, sale_id)
 
     validated_lines = validate_invoice_lines(conn, sale_id, lines)
-    # Phase 3-C: Enforce 5% over-invoice tolerance (aggregate with existing lines)
-    check_invoice_tolerance(conn, sale_id, validated_lines)
     amount = _money(sum(l["line_total"] for l in validated_lines))
     # INV-REVISION: a create NEVER births 'paid'. 'paid' asserts money was
     # received, so only a payment record can set it (_sync_invoice_paid_status).
@@ -1919,10 +1869,10 @@ def create_invoices_batch(conn: psycopg.Connection, sale_id: int,
     ``invoices.amount`` is always the real line sum and never a typed figure.
 
     Guards: every invoice needs ≥1 line and its own ``invoice_date``; each line
-    quantity finite and > 0; each ``sale_item_id`` belongs to this sale; Σ per
-    sale item across the batch never exceeds what is still uninvoiced; no
-    duplicate invoice number within the batch or against the sale. The caller
-    owns no separate commit — this function commits once, atomically.
+    quantity finite and > 0; each ``sale_item_id`` belongs to this sale; no
+    duplicate invoice number within the batch or against the sale. Quantities
+    are free relative to the PI — there is no ceiling. The caller owns no
+    separate commit — this function commits once, atomically.
     """
     if not invoices:
         raise ValueError("at least one invoice required")
@@ -1937,7 +1887,6 @@ def create_invoices_batch(conn: psycopg.Connection, sale_id: int,
         "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id", (sale_id,)).fetchall()}
 
     # Validate the whole batch BEFORE any write.
-    batch_qty: Dict[int, Decimal] = {}
     for inv in invoices:
         num = (inv.get("invoice_number") or "").strip()
         if not num:
@@ -1960,10 +1909,6 @@ def create_invoices_batch(conn: psycopg.Connection, sale_id: int,
                 raise ValueError("quantity must be a number")
             if not qty.is_finite() or qty <= 0:
                 raise ValueError("quantity must be finite and > 0")
-            batch_qty[sid_i] = batch_qty.get(sid_i, Decimal("0")) + qty
-    # Phase 3-C: The 5% tolerance check (check_invoice_tolerance) replaces the old
-    # "remaining" check. It accounts for existing invoiced quantities and allows
-    # up to PI_qty * 1.05 total, instead of strictly PI_qty.
     seen_nums: set = set()
     for inv in invoices:
         num = inv["invoice_number"].strip()
@@ -1975,14 +1920,6 @@ def create_invoices_batch(conn: psycopg.Connection, sale_id: int,
             (sale_id, num)).fetchone():
             raise ValueError(
                 f"Invoice number '{num}' already exists for this sale")
-
-    # Phase 3-C: Enforce 5% over-invoice tolerance across the entire batch
-    # Aggregate all lines from all invoices in the batch
-    all_lines = []
-    for inv in invoices:
-        for ln in inv["lines"]:
-            all_lines.append({"sale_item_id": ln["sale_item_id"], "quantity": float(ln["quantity"])})
-    check_invoice_tolerance(conn, sale_id, all_lines)
 
     results = []
     for inv in invoices:
@@ -2525,8 +2462,6 @@ def create_invoice_item(conn: psycopg.Connection, invoice_id: int,
         if si[1] != sale_id:
             conn.rollback()
             raise ValueError("sale item does not belong to this invoice's sale")
-        # Phase 3-C: Enforce 5% over-invoice tolerance (aggregate with existing lines)
-        check_invoice_tolerance(conn, sale_id, [{"sale_item_id": sale_item_id, "quantity": qty}])
         # Unit price inherited from PI line (server-enforced)
         unit_price = float(si[5] or 0)
         line_total = round(qty * unit_price, 2)
@@ -2595,22 +2530,15 @@ def list_sale_invoice_lines(conn: psycopg.Connection,
     """PI lines of a sale with what has been invoiced against each.
 
     One row per ``sale_items`` line, aggregated across **every** invoice of the
-    sale, exactly as ``check_invoice_tolerance`` counts them (no status filter),
-    so the budget the UI shows and the refusal the writer raises cannot
-    disagree.
+    sale (no status filter).
 
     ``remaining`` is quantity only (``PI - invoiced``), floored at zero for
-    display. A fully invoiced line is still returned: it does not disappear from
-    the composer just because it has no budget left.
-
-    ``ceiling`` is ``PI * OVER_INVOICE_TOLERANCE`` at 6 dp, computed with the
-    same ``Decimal(str(...))`` expression as ``check_invoice_tolerance`` so a
-    quantity the UI offers is exactly a quantity the writer accepts.
+    display. It is informational: quantity is free relative to the PI, so a
+    fully invoiced line is still returned and can still be invoiced again.
 
     ``has_line_less_invoices`` warns that a legacy invoice carries header money
-    that no line backs. Its quantity contributes 0 here, so ``remaining`` would
-    overstate the budget; callers must not treat it as authoritative in that
-    case.
+    that no line backs. Its quantity contributes 0 here, so ``remaining``
+    overstates what was billed; the figure is informational either way.
     """
     rows = conn.execute(
         """SELECT si.id, si.product_name, si.unit, si.quantity, si.unit_price,
@@ -2630,7 +2558,6 @@ def list_sale_invoice_lines(conn: psycopg.Connection,
     for item_id, product_name, unit, pi_qty, unit_price, invoiced, invoice_ids in rows:
         pi = Decimal(str(pi_qty or 0))
         done = Decimal(str(invoiced or 0))
-        ceiling = (pi * OVER_INVOICE_TOLERANCE).quantize(Decimal("0.000001"))
         lines.append({
             "sale_id": sale_id,
             "sale_item_id": item_id,
@@ -2639,7 +2566,6 @@ def list_sale_invoice_lines(conn: psycopg.Connection,
             "pi_quantity": float(pi),
             "invoiced_quantity": float(done),
             "remaining": float(max(pi - done, Decimal("0"))),
-            "ceiling": float(ceiling),
             "unit_price": float(unit_price or 0),
             "invoice_ids": sorted(invoice_ids),
         })

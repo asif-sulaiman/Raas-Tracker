@@ -2,18 +2,18 @@ import { useCallback, useEffect, useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
 
 /**
- * The invoice budget of one sale: every PI line plus what has already been
+ * The invoice figures of one sale: every PI line plus what has already been
  * invoiced against it, from `GET /api/sales/<id>/invoice-lines`.
  *
  * One request replaces the old N+1 (sale detail, then one items call per
- * invoice) and it is the same arithmetic the writers enforce, so the composer
- * can refuse a quantity before the server has to.
+ * invoice). The figures are informational: quantity is free relative to the
+ * PI, so nothing here caps a write.
  *
  * Returns:
  *   lines: [{sale_item_id, product_name, unit, pi_quantity,
- *            invoiced_quantity, remaining, ceiling, unit_price}]
+ *            invoiced_quantity, remaining, unit_price}]
  *   hasLineLessInvoices: a legacy invoice carries money no line backs, so
- *            `remaining` overstates the budget and is not authoritative.
+ *            `remaining` overstates what was billed; informational only.
  *   reload(): refetch and return the fresh `{lines, hasLineLessInvoices}`.
  */
 export default function useInvoiceBudget(saleId) {

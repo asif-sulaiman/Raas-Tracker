@@ -2368,7 +2368,8 @@ def api_get_production_run(name, run_id):
 
 class InvoiceBatchLineIn(_FiniteModel):
     sale_item_id: int
-    # Phase 3-C: gt=0 enforced at model boundary (complements service-layer tolerance)
+    # gt=0 is enforced at the model boundary; the service repeats it for
+    # callers that bypass the HTTP layer.
     quantity: float = Field(gt=0, allow_inf_nan=False)
 
 
@@ -2454,11 +2455,9 @@ def api_create_invoice(sale_id):
         )
     except ValueError as e:
         _rollback_close(conn)
-        # Phase 4-A contract change: a 5%-tolerance breach is a 409 (it
-        # conflicts with what this sale has already been invoiced for), not a
-        # 400. `POST /api/invoices/<id>/items` already answered 409 for the
-        # same refusal; this route used to hardcode 400. One condition, one
-        # status. See docs/SPEC.md "Sales Invoices".
+        # Status comes from the exception type (raas_tracker._exceptions):
+        # lifecycle conflicts -> 409, missing rows -> 404, validation -> 400.
+        # Never from the message text. See docs/SPEC.md "Sales Invoices".
         return jsonify({"error": str(e)}), status_for(e)
     except Exception:
         _rollback_close(conn)
@@ -2485,8 +2484,7 @@ def api_create_invoices_batch(sale_id):
         result = create_invoices_batch(conn, sale_id, [i.model_dump() for i in payload.invoices])
     except ValueError as e:
         _rollback_close(conn)
-        # Same Phase 4-A contract change as the single-invoice route above: a
-        # 5%-tolerance breach is a 409 on the batch route too.
+        # Same typed mapping as the single-invoice route above.
         return jsonify({"error": str(e)}), status_for(e)
     except Exception:
         _rollback_close(conn)
@@ -2509,11 +2507,11 @@ def api_list_invoices(sale_id):
 @app.route("/api/sales/<int:sale_id>/invoice-lines")
 @limited()
 def api_list_sale_invoice_lines(sale_id):
-    """PI lines with their invoice budget: invoiced, remaining, ceiling.
+    """PI lines with what has been invoiced against each.
 
-    One request replaces the N+1 (sale detail, then one items call per invoice)
-    and exposes the 6 dp ceiling the writer enforces, so the composer can stop
-    the operator before the server has to.
+    One request replaces the N+1 (sale detail, then one items call per invoice).
+    The figures are informational: quantities are free relative to the PI, so
+    nothing in this payload caps a write.
     """
     conn = get_db()
     if not conn.execute("SELECT 1 FROM sales WHERE id = %s",
@@ -3931,7 +3929,7 @@ def api_create_sales_batch():
 @limited()
 def api_create_invoice_item(invoice_id):
     """Add an invoice line. unit_price is inherited server-side from the PI
-    line; quantities beyond the PI remainder are refused with 409."""
+    line; quantity only has to be finite and > 0."""
     try:
         payload = InvoiceItemCreateIn.model_validate(request.get_json() or {})
     except ValidationError as e:
@@ -3954,7 +3952,7 @@ def api_create_invoice_item(invoice_id):
     except ValueError as e:
         _rollback_close(conn)
         # Status comes from the exception TYPE (raas_tracker._exceptions):
-        # over-tolerance -> 409, missing invoice/sale item -> 404, and any
+        # lifecycle conflicts -> 409, missing invoice/sale item -> 404, and any
         # remaining validation refusal -> 400. Never from the message text.
         # Both 404 causes need a `code`: the client cannot tell them apart, and
         # they recover differently (drop the target vs pick another line).

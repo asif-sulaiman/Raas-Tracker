@@ -12,17 +12,6 @@ const inputCls =
 const readOnlyCls =
   `${inputCls} w-28 text-right bg-slate-100 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400 cursor-not-allowed`;
 
-// One-directional slack so a quantity typed exactly at the boundary (already a
-// float by the time it leaves the input) is not refused by a rounding hair.
-const EPSILON = 1e-9;
-
-/** How much this row may still add, or null when the typed quantity is fine. */
-function overflow(line, typed) {
-  if (!(typed > 0)) return null;
-  const limit = Number(line.ceiling || 0) - Number(line.invoiced_quantity || 0);
-  return typed > limit + EPSILON ? Math.max(0, limit) : null;
-}
-
 /**
  * What is left of the PI line once the quantity staged here is counted. The
  * server's remaining already nets out every prior invoice; this only subtracts
@@ -39,9 +28,8 @@ function remainingAfter(line, typed) {
  *
  * The product and the unit price come from the PI line and are server-owned -
  * the price is shown read-only and never posted. The operator only decides
- * quantities. A quantity above the PI remaining is allowed (shipment
- * advantage) up to the server-provided ceiling, which is enforced here as a
- * hard stop rather than advertised as headroom.
+ * quantities, and they are free relative to the PI: equal, more, or less.
+ * `Remaining` is informational; nothing here caps a write.
  *
  * Each row carries one open quantity input. The live remaining (the server's
  * figure minus what is typed here) sits under the PI quantity, and the total
@@ -52,10 +40,10 @@ function remainingAfter(line, typed) {
  * mode="add-line": rows only -> POST /api/invoices/<targetInvoiceId>/items
  *
  * A refusal is classified structurally, never by parsing the server's prose:
- * 409 means the budget moved, so reload and let the fresh figures mark the
- * rows; create-mode 400 means a PI line vanished, so reload and name the
- * product; add-line 404 carries code="invoice_gone" (the target is gone) or
+ * create-mode 400 means a PI line vanished, so reload and name the product;
+ * add-line 404 carries code="invoice_gone" (the target is gone) or
  * "pi_line_gone" (the line is gone — drop it and say so, same as the 400).
+ * Anything else reloads the figures and shows the server's message.
  */
 export default function InvoiceEditor({
   mode = 'create',
@@ -85,7 +73,6 @@ export default function InvoiceEditor({
       return {
         line: l,
         typed,
-        over: overflow(l, typed),
         left: remainingAfter(l, typed),
       };
     }),
@@ -93,11 +80,9 @@ export default function InvoiceEditor({
   );
 
   const staged = rows.filter((r) => r.typed > 0);
-  const overRows = rows.filter((r) => r.over !== null);
   const ready = !saving
     && !targetGone
     && staged.length > 0
-    && overRows.length === 0
     && (!isCreate || (invoiceNumber.trim() !== '' && invoiceDate !== ''));
 
   const setQty = (id, value) => {
@@ -124,10 +109,6 @@ export default function InvoiceEditor({
   };
 
   const handleRefusal = async (err) => {
-    if (err?.status === 409) {
-      await reload();
-      return;
-    }
     if (err?.status === 400 && await resyncDropping()) return;
     if (err?.status === 404) {
       if (err?.code === 'invoice_gone') {
@@ -176,7 +157,7 @@ export default function InvoiceEditor({
         // One request per staged row: the endpoint takes a single line, and a
         // partial success is real (each POST is its own transaction). Clearing
         // a row as it lands means a mid-sequence refusal leaves exactly the
-        // unposted rows on screen, with the reloaded budget marking them.
+        // unposted rows on screen, with the reloaded figures beside them.
         let landed = 0;
         let result = null;
         try {
@@ -281,7 +262,7 @@ export default function InvoiceEditor({
             </tr>
           </thead>
           <tbody>
-            {rows.map(({ line, typed, over, left }) => {
+            {rows.map(({ line, typed, left }) => {
               const unit = line.unit || 'KG';
               return (
                 <tr key={line.sale_item_id} className="border-b border-slate-100 dark:border-slate-800">
@@ -305,12 +286,6 @@ export default function InvoiceEditor({
                       onChange={(e) => setQty(line.sale_item_id, e.target.value)}
                       className={`${inputCls} w-24 text-right`}
                     />
-                    {over !== null && (
-                      <p className="mt-0.5 text-[10px] text-rose-600 dark:text-rose-400">
-                        Over the invoicing limit — this line can add at most
-                        {' '}{formatNumber(over)} {unit}
-                      </p>
-                    )}
                   </td>
                   <td className="px-2 py-1 text-right">
                     <input
