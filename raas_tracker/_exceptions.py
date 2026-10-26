@@ -122,6 +122,24 @@ class SaleNotReadyPastShipment(LifecycleConflict):
     """
 
 
+class SaleNotReadyForCompletion(LifecycleConflict):
+    """409 — a sale cannot complete while an invoice is uninvoiced or unpaid.
+
+    Completion is invoice-defined: at least one invoice must exist and every
+    one of them must be ``paid``. The PI proposal is not a receivable, so a
+    fully-paid PI with an open invoice is still open.
+    """
+
+
+class LcNotReadyForCompletion(LifecycleConflict):
+    """409 — an LC cannot complete while any child sale is unsettled.
+
+    The LC is a group of PIs; it closes only when every child sale has at least
+    one invoice and all of them are paid. The auto-completion path uses the
+    same settlement rule but moves the LC directly (no route gate).
+    """
+
+
 # --------------------------------------------------------------------------- #
 # 404 conditions
 # --------------------------------------------------------------------------- #

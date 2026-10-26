@@ -9,7 +9,7 @@ from raas_tracker.notifications import (
     notify, list_notifications_for, unread_count, mark_read, mark_read_all_for,
     notify_reorder_status,
 )
-from raas_tracker.sales import create_invoice
+from raas_tracker.sales import create_invoice, mark_invoice_paid
 
 
 def _book_invoice(db, sale_id, number):
@@ -124,12 +124,16 @@ def test_sale_stage_due_completed_and_revert_clears(db):
     move_sale_to_stage(db, sid, "lc_received")
     assert "sale_payment_due" not in _types(db)
     move_sale_to_stage(db, sid, "shipment_ongoing")
-    _book_invoice(db, sid, "INV-NOTIF-1")
+    inv = _book_invoice(db, sid, "INV-NOTIF-1")
     move_sale_to_stage(db, sid, "payment_due")
     assert "sale_payment_due" in _types(db)
     move_sale_to_stage(db, sid, "payment_due")  # dedupe on same stage re-entry
     assert _types(db).count("sale_payment_due") == 1
-    move_sale_to_stage(db, sid, "completed")
+    # Completion is invoice-defined (Phase 3): the invoice must be paid first.
+    db.execute("UPDATE invoices SET status = 'shipped', actual_ship_date = %s"
+               " WHERE id = %s", ("2026-10-20", inv))
+    db.commit()
+    mark_invoice_paid(db, inv, 10, "2026-10-26")
     assert "sale_completed" in _types(db)
     assert "sale_payment_due" not in _types(db)  # cleared on completion
 

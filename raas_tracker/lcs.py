@@ -27,6 +27,7 @@ from typing import Optional, Dict, Any
 
 from ._exceptions import (
     LcNotFound,
+    LcNotReadyForCompletion,
     LcNotReadyPastShipment,
     LcNumberAlreadyExists,
     LcSaleNotFound,
@@ -295,11 +296,13 @@ def move_lc_stage(conn: psycopg.Connection, lc_id: int, new_stage: str,
     Ongoing. When the move carries the LC into ``payment_due`` the gate
     requires at least one non-void invoice past booking (booked/shipped/paid)
     across the LC's child PIs; booking is the per-invoice proof that
-    production finished.
+    production finished. Crossing into ``completed`` requires every child sale
+    to be settled (at least one invoice, all paid) — completion is
+    invoice-defined, so an open invoice refuses the move.
 
-    That refusal is typed at the point the message is built —
-    ``LcNotReadyPastShipment``, 409, text unchanged. The route used to
-    recover the status by scanning the text for ``"recipes:"`` /
+    Refusals are typed at the point the message is built —
+    ``LcNotReadyPastShipment`` / ``LcNotReadyForCompletion``, 409. The route
+    used to recover the status by scanning the text for ``"recipes:"`` /
     ``"invoices:"`` / ``"production:"``, three of which are vocabulary shared
     with the readiness payload the message is itself assembled from, so any
     rewording (or any new colon in those words) silently changed the HTTP
@@ -308,7 +311,11 @@ def move_lc_stage(conn: psycopg.Connection, lc_id: int, new_stage: str,
     Returns False when the LC does not exist.
     """
     from .audit import log_audit_action
-    from .sales import SALE_STAGE_ORDER, booked_invoice_readiness
+    from .sales import (
+        SALE_STAGE_ORDER,
+        booked_invoice_readiness,
+        invoice_settlement,
+    )
 
     if new_stage not in SALE_STAGE_ORDER:
         raise ValueError(f"invalid stage: {new_stage}")
@@ -352,6 +359,19 @@ def move_lc_stage(conn: psycopg.Connection, lc_id: int, new_stage: str,
                 except Exception:
                     pass
                 raise LcNotReadyPastShipment(msg)
+
+        comp_idx = SALE_STAGE_ORDER.index("completed")
+        if tgt_idx >= comp_idx > cur_idx:
+            open_sales = [sid for sid in sale_ids
+                          if not invoice_settlement(conn, sid)["settled"]]
+            if open_sales:
+                msg = ("LC is not ready to complete: "
+                       f"{len(open_sales)} sale(s) still have open invoices")
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise LcNotReadyForCompletion(msg)
         conn.execute(
             "UPDATE letters_of_credit SET stage = %s, updated_at = %s"
             " WHERE id = %s",

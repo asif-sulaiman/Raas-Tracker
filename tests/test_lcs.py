@@ -571,18 +571,24 @@ def test_linked_sale_via_lc_propagates(db):
 
 
 def test_linked_sale_autocomplete_unaffected(db):
-    """B5+M2: payment_due -> completed stays allowed for linked sales."""
-    from chem_stock import record_sale_payment as _pay
+    """B5+M2: payment_due -> completed stays allowed for linked sales.
+
+    Phase 3 defines completion by the invoice, so the sale closes when its
+    shipped invoice is paid — not when a sale-level payment reaches the PI.
+    """
+    tag = _tag()
     co = _company(db)
-    lc = lcsmod.create_lc(db, co, f"LC-AC-{_tag()}")
+    lc = lcsmod.create_lc(db, co, f"LC-AC-{tag}")
     sid = _sale(db, co, qty=10, price=10)
     lcsmod.attach_pis(db, lc["id"], [sid])
-    # Payment Due requires a booked invoice; completion after full payment is
-    # the behaviour under test, not the booking gate.
-    _book_invoice_direct(db, sid, f"INV-AC-{_tag()}")
+    inv = _book_invoice_direct(db, sid, f"INV-AC-{tag}")
     assert salesmod.move_sale_to_stage(db, sid, "payment_due") is True
-    out = _pay(db, sid, "2026-09-02", 100.0)
-    assert out["stage"] == "completed"
+    db.execute("UPDATE invoices SET status = 'shipped', actual_ship_date = %s"
+               " WHERE id = %s", ("2026-10-20", inv))
+    db.commit()
+    salesmod.mark_invoice_paid(db, inv, 100.0, "2026-09-02")
+    assert db.execute("SELECT stage FROM sales WHERE id = %s",
+                      (sid,)).fetchone()[0] == "completed"
 
 
 def test_relink_sale_company_helper(db):

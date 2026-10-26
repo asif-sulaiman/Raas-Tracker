@@ -2,11 +2,11 @@
 import pytest
 
 from chem_stock import (
-    _complete_if_paid,
+    _sync_sale_completion,
     add_sale,
     delete_sale_payment_record,
     get_sale_by_id,
-    get_sale_invoice_total,
+    get_sale_pi_total,
     get_sale_total_paid,
     move_sale_to_stage,
     record_sale_payment,
@@ -15,7 +15,7 @@ from chem_stock import (
 )
 
 
-from raas_tracker.sales import create_invoice
+from raas_tracker.sales import create_invoice, mark_invoice_paid
 
 
 def _sale(db, total=100.0):
@@ -41,9 +41,21 @@ def _book_invoice(db, sale_id, number="INV-T1"):
     return inv
 
 
+def _ship_invoice(db, invoice_id):
+    """Stand the invoice at 'shipped' so it may take money.
+
+    Shipping order is pinned in ``test_invoice_order.py``; these payment tests
+    only need the invoice past the ship barrier.
+    """
+    db.execute("UPDATE invoices SET status = 'shipped', actual_ship_date = %s"
+               " WHERE id = %s", ("2026-10-20", invoice_id))
+    db.commit()
+
+
 def test_payment_audit_trail_contents(db):
     sid = add_sale(db, {"pi_number": "PI-AUD", "client_name": "ACME"},
                    [{"product_name": "W", "quantity": 10, "unit_price": 10}])
+    _book_invoice(db, sid)
     out = record_sale_payment(db, sid, "2026-09-01", 40.0)
     update_sale_payment_record(db, sid, out["payment_id"], payment_amount=50.0)
     delete_sale_payment_record(db, sid, out["payment_id"])
@@ -62,47 +74,52 @@ def test_payment_audit_trail_contents(db):
 
 def test_partial_payment_totals(db):
     sid = _sale(db)
+    _book_invoice(db, sid)
     out = record_sale_payment(db, sid, "2026-09-01", 40.0)
     assert out["total_paid"] == 40.0
     assert out["balance"] == 60.0
     assert get_sale_total_paid(db, sid) == 40.0
-    assert get_sale_invoice_total(db, sid) == 100.0
+    assert get_sale_pi_total(db, sid) == 100.0
 
 
-def test_full_payment_auto_completes(db):
+def test_paying_every_invoice_auto_completes(db):
     sid = _sale(db)
-    _book_invoice(db, sid)
+    inv = _book_invoice(db, sid)
     move_sale_to_stage(db, sid, "payment_due", "test")
-    out = record_sale_payment(db, sid, "2026-09-02", 100.0)
-    assert out["stage"] == "completed"
+    _ship_invoice(db, inv)
+    mark_invoice_paid(db, inv, 100.0, "2026-09-02")
     assert get_sale_by_id(db, sid)["stage"] == "completed"
 
 
 def test_partial_payment_does_not_complete(db):
     sid = _sale(db)
-    _book_invoice(db, sid)
+    inv = _book_invoice(db, sid)
     move_sale_to_stage(db, sid, "payment_due", "test")
+    _ship_invoice(db, inv)
     out = record_sale_payment(db, sid, "2026-09-02", 99.99)
     assert out["stage"] == "payment_due"
 
 
-def test_complete_if_paid_only_from_payment_due(db):
-    sid = _sale(db)  # stage pi_issued
-    assert _complete_if_paid(db, sid, "pi_issued", 100.0, 100.0) is False
-    assert _complete_if_paid(db, sid, "payment_due", 50.0, 100.0) is False
-    assert _complete_if_paid(db, sid, "payment_due", 100.0, 100.0) is True
+def test_sync_sale_completion_only_acts_from_payment_due(db):
+    sid = _sale(db)
+    inv = _book_invoice(db, sid)
+    _ship_invoice(db, inv)
+    mark_invoice_paid(db, inv, 100.0, "2026-09-02")  # still lc_received
+    assert _sync_sale_completion(db, sid) is False
+    assert get_sale_by_id(db, sid)["stage"] != "completed"
 
 
 def test_money_sums_rounded_to_cents(db):
     sid = add_sale(db, {"pi_number": "PI-CENTS"},
                    [{"product_name": "A", "quantity": 3, "unit_price": 0.1},
                     {"product_name": "B", "quantity": 1, "unit_price": 19.99}])
-    assert get_sale_invoice_total(db, sid) == 20.29
+    _book_invoice(db, sid)
+    assert get_sale_pi_total(db, sid) == 20.29
     out = record_sale_payment(db, sid, "2026-09-02", 0.1)
     assert round(out["balance"], 2) == 20.19
     record_sale_payment(db, sid, "2026-09-03", 0.2)
     assert get_sale_total_paid(db, sid) == 0.3
-    assert round(get_sale_invoice_total(db, sid) - get_sale_total_paid(db, sid), 2) == 19.99
+    assert round(get_sale_pi_total(db, sid) - get_sale_total_paid(db, sid), 2) == 19.99
 
 
 def test_non_positive_payment_rejected(db):

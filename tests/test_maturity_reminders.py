@@ -6,7 +6,7 @@ from datetime import date, timedelta
 from raas_tracker.sales import (
     record_sale_payment,
     get_sale_by_id,
-    get_sale_invoice_total,
+    get_sale_pi_total,
     get_sale_total_paid,
 )
 from raas_tracker.notifications import (
