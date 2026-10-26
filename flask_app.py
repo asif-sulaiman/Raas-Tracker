@@ -3388,7 +3388,7 @@ def _lc_delete_guarded(conn, lc_id):
 
 
 def _shipment_missing_names(readiness):
-    """Named missing preconditions from the readiness payload (permanent
+    """Named missing preconditions for the payment_due production gate (permanent
     route-level helper supporting both the top-level missing list and
     the detail/missing_recipes shape)."""
     if readiness.get("missing"):
@@ -3398,8 +3398,6 @@ def _shipment_missing_names(readiness):
              for p in detail.get("missing_recipes", [])]
     names += [f"production: {p}"
               for p in detail.get("missing_production", [])]
-    if not readiness.get("invoices_ok"):
-        names.append("invoices: at least one invoice required")
     if (not readiness.get("produced_ok")
             and not detail.get("missing_production")):
         names.append("production: at least one invoice-linked run required")
@@ -3525,8 +3523,8 @@ def api_get_lc(lc_id):
 
 @app.route("/api/lcs/<int:lc_id>/readiness")
 def api_lc_readiness(lc_id):
-    """Barrier state for the LC, so the UI can render the right form before
-    attempting the move. Read-only; never mutates."""
+    """Gate state for the LC, so the UI can render the production form before
+    attempting the payment move. Read-only; never mutates."""
     conn = get_db()
     try:
         lc = get_lc(conn, lc_id)
@@ -3538,26 +3536,6 @@ def api_lc_readiness(lc_id):
         except LookupError as e:
             conn.close()
             return jsonify({"error": str(e)}), 404
-        sale_ids = [p["id"] for p in (lc.get("pis") or [])]
-        drafts = []
-        for sid in sale_ids:
-            rows = conn.execute(
-                """SELECT si.id, si.product_name, si.unit, si.unit_price,
-                          (si.quantity::numeric
-                           - COALESCE((SELECT SUM(ii.quantity)::numeric
-                                        FROM invoice_items ii
-                                       WHERE ii.sale_item_id = si.id), 0)) AS remaining
-                     FROM sale_items si WHERE si.sale_id = %s ORDER BY si.id""",
-                (sid,)).fetchall()
-            drafts.append({
-                "sale_id": sid,
-                "items": [
-                    {"sale_item_id": r[0], "product_name": r[1], "unit": r[2],
-                     "unit_price": float(r[3] or 0),
-                     "remaining": float(r[4]) if r[4] is not None else 0.0}
-                    for r in rows if r[4] is None or float(r[4]) > 0
-                ],
-            })
     finally:
         conn.close()
     return jsonify({
@@ -3569,7 +3547,6 @@ def api_lc_readiness(lc_id):
         "detail": readiness.get("detail"),
         "pis": [{"id": p["id"], "pi_number": p.get("pi_number"), "stage": p.get("stage")}
                 for p in (lc.get("pis") or [])],
-        "invoice_drafts": drafts,
     })
 
 
@@ -3766,27 +3743,20 @@ def api_move_lc(lc_id):
         except ValueError:
             cur_idx = -1
             tgt_idx = -1
-        ship_idx = _ORDER.index("shipment_ongoing")
         pay_idx = _ORDER.index("payment_due")
-        crossing_shipment = cur_idx < ship_idx <= tgt_idx
         crossing_payment = cur_idx < pay_idx <= tgt_idx
-        if crossing_shipment or crossing_payment:
+        if crossing_payment:
             try:
                 readiness = check_lc_shipment_ready(conn, lc_id)
             except LookupError as e:
                 _rollback_close(conn)
                 return jsonify({"error": str(e)}), 404
-            missing = _shipment_missing_names(readiness)
-            issues = []
-            if crossing_shipment and not readiness.get("invoices_ok"):
-                issues.append("LC is not ready for shipment:")
-            if crossing_payment and not (readiness.get("recipes_ok")
-                                         and readiness.get("produced_ok")):
-                issues.append("LC is not ready to go past shipment:")
-            if issues:
+            if not (readiness.get("recipes_ok")
+                    and readiness.get("produced_ok")):
+                missing = _shipment_missing_names(readiness)
                 conn.close()
                 return jsonify({
-                    "error": ("; ".join(issues[:1]) + " " if issues else "")
+                    "error": "LC is not ready to go past shipment: "
                              + "; ".join(str(m) for m in missing),
                     "missing": missing,
                     "recipes_ok": readiness.get("recipes_ok"),
@@ -3798,13 +3768,12 @@ def api_move_lc(lc_id):
                                notes=payload.notes)
         except LifecycleConflict as e:
             _rollback_close(conn)
-            # The readiness gates raise their own conflict type at the point
-            # the message is built (lcs.LcNotReadyForShipment /
-            # LcNotReadyPastShipment). This used to sniff the text for
-            # "not ready for shipment" / "recipes:" / "invoices:" /
-            # "production:" — three of which are vocabulary shared with the
-            # readiness payload the message is itself assembled from, so the
-            # status moved whenever the wording did.
+            # The readiness gate raises its own conflict type at the point
+            # the message is built (lcs.LcNotReadyPastShipment). This used to
+            # sniff the text for "not ready for shipment" / "recipes:" /
+            # "invoices:" / "production:" — three of which are vocabulary
+            # shared with the readiness payload the message is itself
+            # assembled from, so the status moved whenever the wording did.
             msg = str(e)
             # Recompute readiness for the structured 409 shape.
             rconn = get_db()

@@ -465,24 +465,22 @@ def _lc_ready_setup(db, co, product, with_recipe=True, with_invoice=True):
     return lc["id"], sid
 
 
-def test_move_lc_stage_gate_unready_raises(db):
-    """Two barriers: invoices gate reaching shipment_ongoing; recipes and
-    production gate reaching payment_due. P1-14: this asserted a single
-    combined "recipes:" gate that the two-barrier design replaced."""
+def test_move_lc_stage_shipment_needs_no_invoice_but_payment_needs_production(db):
+    """Shipment entry is ungated; Payment Due still needs production."""
     co = _company(db)
     tag = _tag()
     lc_id, sid = _lc_ready_setup(db, co, f"GateUn-{tag}",
                                  with_recipe=False, with_invoice=False)
-    # Barrier 1: no invoice at all.
-    with pytest.raises(ValueError, match="invoices:"):
-        lcsmod.move_lc_stage(db, lc_id, "shipment_ongoing")
-    db.rollback()
-    # stage must not have moved
-    assert lcsmod.get_lc(db, lc_id)["stage"] == "lc_received"
-    # An invoice alone satisfies barrier 1 - a recipe is NOT required to
-    # reach shipment_ongoing; it belongs to barrier 2.
-    _invoice(db, sid, f"INV-{_tag()}")
+    # No invoice is required to start the shipment.
     assert lcsmod.move_lc_stage(db, lc_id, "shipment_ongoing") is True
+    assert lcsmod.get_lc(db, lc_id)["stage"] == "shipment_ongoing"
+    # Invoicing alone does not clear the production barrier.
+    _invoice(db, sid, f"INV-{_tag()}")
+    with pytest.raises(ValueError, match="not ready to go past shipment"):
+        lcsmod.move_lc_stage(db, lc_id, "payment_due")
+    db.rollback()
+    # the failed payment move did not move the LC back
+    assert lcsmod.get_lc(db, lc_id)["stage"] == "shipment_ongoing"
 
 
 def test_move_lc_stage_gate_ready_passes(db):
@@ -499,8 +497,8 @@ def test_move_lc_stage_gate_ready_passes(db):
     ).fetchone()[0] == "shipment_ongoing"
 
 
-def test_move_lc_stage_direct_jump_gated(db):
-    """B4+B6: pi_issued -> shipment_ongoing direct jump is also gated."""
+def test_move_lc_stage_direct_jump_to_shipment_allowed_without_invoice(db):
+    """B4+B6: pi_issued -> shipment_ongoing no longer waits for an invoice."""
     co = _company(db)
     tag = _tag()
     prod = f"GateJump-{tag}"
@@ -509,24 +507,19 @@ def test_move_lc_stage_direct_jump_gated(db):
     db.execute("UPDATE letters_of_credit SET stage = 'pi_issued' WHERE id = %s",
                (lc_id,))
     db.commit()
-    # P1-14: barrier 1 (invoices) is what gates this jump; the old
-    # assertion expected a single combined "recipes:" gate.
-    with pytest.raises(ValueError, match="invoices:"):
-        lcsmod.move_lc_stage(db, lc_id, "shipment_ongoing")
-    db.rollback()
-    assert lcsmod.get_lc(db, lc_id)["stage"] == "pi_issued"
+    assert lcsmod.move_lc_stage(db, lc_id, "shipment_ongoing") is True
+    assert lcsmod.get_lc(db, lc_id)["stage"] == "shipment_ongoing"
 
 
-def test_move_lc_stage_overshoot_gated(db):
+def test_move_lc_stage_overshoot_to_payment_still_requires_production(db):
     """Gate 2 re-review: lc_received -> payment_due jumping OVER
-    shipment_ongoing is gated too."""
+    shipment_ongoing is still production-gated."""
     co = _company(db)
     tag = _tag()
     lc_id, _ = _lc_ready_setup(db, co, f"GateOver-{tag}",
-                               with_recipe=False, with_invoice=False)
-    # P1-14: payment_due is past shipment_ongoing, so barrier 1 (invoices)
-    # trips first. Recipes and production are barrier 2, never reached here.
-    with pytest.raises(ValueError, match="invoices:"):
+                               with_recipe=True, with_invoice=True)
+    # Recipe exists, but no production run is linked to the invoice.
+    with pytest.raises(ValueError, match="not ready to go past shipment"):
         lcsmod.move_lc_stage(db, lc_id, "payment_due")
     db.rollback()
     assert lcsmod.get_lc(db, lc_id)["stage"] == "lc_received"

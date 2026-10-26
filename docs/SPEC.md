@@ -675,8 +675,8 @@ future call sites are covered without opting in:
 | DELETE | `/api/lcs/<id>` | Admin (15/min) | Delete — **409 while PIs are attached** (locked count + FK backstop) |
 | POST | `/api/lcs/<id>/pis` | Admin (15/min) | Attach `{sale_ids:[...]}` — every PI must share the LC's company (400 otherwise); mirrors `lc_number`/`lc_date` onto the PIs; every attached PI still at `pi_issued` advances to `lc_received` (history + `SALE_MOVE` audit, same transaction; later-stage PIs untouched, never downgraded) |
 | DELETE | `/api/lcs/<id>/pis/<sale_id>` | Admin (15/min) | Detach one PI (clears `lc_id` + mirrors) |
-| POST | `/api/lcs/<id>/move` | Admin (15/min) | Move the LC stage; **two barriers** — crossing into `shipment_ongoing` requires **≥1 invoice** (recipes no longer required here); crossing into `payment_due` requires **every invoiced product to have a company recipe AND an invoice-linked production run**. Both barriers enforced under row locks; stage propagated to all child PIs in one transaction |
-| GET | `/api/lcs/<id>/readiness` | Session/Key | Readiness snapshot — `invoices_ok`, `recipes_ok`, `produced_ok`, `detail` with per-PI remaining uninvoiced lines, `missing_recipes`, `missing_production` |
+| POST | `/api/lcs/<id>/move` | Admin (15/min) | Move the LC stage; **one barrier** — crossing into `payment_due` requires **every invoiced product to have a company recipe AND an invoice-linked production run**. Crossing into `shipment_ongoing` requires **no invoice** (2026-10-26: invoices are created in Shipment Ongoing). Barrier enforced under row locks; stage propagated to all child PIs in one transaction |
+| GET | `/api/lcs/<id>/readiness` | Session/Key | Readiness snapshot — `invoices_ok` is **informational** (shipment entry needs no invoice), `recipes_ok`, `produced_ok`, `detail` with `missing_recipes` and `missing_production`, plus the linked `pis` |
 
 ### Invoice Lines
 | Method | Path | Auth | Description |
@@ -718,15 +718,15 @@ future call sites are covered without opting in:
   - ship (requires `actual_ship_date`) → `'shipped'` + `shipments` row
   - pay → `'paid'` when `paid_amount >= amount`; a create-time `amount = 0` is **no longer** born paid (INV-REVISION — only a payment record sets `paid`); `amount IS NULL` (legacy) → any payment marks it paid
 - **Sale `shipment_status` sub-steps** (surfaced as SaleCard badges in `shipment_ongoing`): `production_running` → `production_done` → `ship_booked`.
-- **Stage hook:** `lc_received → shipment_ongoing` sets `shipment_status = 'production_running'`; the frontend shows a non-blocking warning toast when the sale has 0 invoices.
+- **Stage hook:** `lc_received → shipment_ongoing` sets `shipment_status = 'production_running'`; the SaleCard badge then shows the shipment sub-step. The move needs no invoice and the UI no longer probes for one or warns after moving.
 - **LC Stage Gates:**
-  - **Barrier 1 (`lc_received → shipment_ongoing`):** requires **≥1 invoice** on the LC. Recipes are no longer required at this stage.
-  - **Barrier 2 (`shipment_ongoing → payment_due`):** requires that **every distinct `invoice_items.product_name` across the LC's invoices** has (a) a company recipe, **and** (b) an invoice-linked production run (`production_run_links.invoice_id` points to one of that sale's invoices).
-  - **Readiness endpoint:** `GET /api/lcs/<id>/readiness` returns `{invoices_ok, recipes_ok, produced_ok, detail{missing_recipes, missing_production, per-PI remaining lines}}` so the UI can render the correct form before the user attempts a move.
+  - **Shipment entry (`lc_received → shipment_ongoing`):** no invoice required (2026-10-26). The LC advances with zero invoices; invoices are created once it is in Shipment Ongoing, from the PI's products, unit price and chosen quantities.
+  - **Barrier 2 (`shipment_ongoing → payment_due`):** requires that **every distinct `invoice_items.product_name` across the LC's invoices** has (a) a company recipe, **and** (b) an invoice-linked production run (`production_run_links.invoice_id` points to one of that sale's invoices). This remains the production gate for now; the booked-invoice gate is the next phase.
+  - **Readiness endpoint:** `GET /api/lcs/<id>/readiness` returns `{invoices_ok, recipes_ok, produced_ok, detail{missing_recipes, missing_production}}` so the UI can render the correct form before the user attempts a move. `invoices_ok` is informational.
 - **New invariant:** a sale cannot advance to `lc_received` (or beyond) while its `lc_id` is NULL — the move is refused until an LC is attached.
 
 ### Readiness Endpoint
-- `GET /api/lcs/<id>/readiness` — Session/Key; returns `{invoices_ok, recipes_ok, produced_ok, detail:{missing_recipes, missing_production, per-PI remaining lines}}` so the UI can render the correct barrier form before the user attempts a move.
+- `GET /api/lcs/<id>/readiness` — Session/Key; returns `{lc_id, stage, invoices_ok, recipes_ok, produced_ok, detail:{missing_recipes, missing_production, invoice_count, sale_count}, pis}` so the UI can render the correct barrier form before the user attempts a move. `invoices_ok` is informational — shipment entry no longer requires an invoice.
 
 ## 5. Authentication & Authorization
 

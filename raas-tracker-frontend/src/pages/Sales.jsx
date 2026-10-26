@@ -11,7 +11,6 @@ import UploadPI from '../components/sales/UploadPI';
 import ReviewModal from '../components/sales/ReviewModal';
 import PaymentModal from '../components/sales/PaymentModal';
 import SaleDetailModal from '../components/sales/SaleDetailModal';
-import InvoicesRequiredModal from '../components/sales/InvoicesRequiredModal';
 import ProductionRequiredModal from '../components/sales/ProductionRequiredModal';
 import { STAGES, groupSalesByLc, lcGroupKey, nextStageFor } from '../utils/sales';
 import { formatNumber, toCents, fromCents } from '../utils/format';
@@ -50,15 +49,8 @@ export default function Sales() {
   const [page, setPage] = useState(1);
   const [totalSales, setTotalSales] = useState(0);
 
-  // Barrier modals
-  const [showInvoicesRequired, setShowInvoicesRequired] = useState(false);
+  // Barrier modal
   const [showProductionRequired, setShowProductionRequired] = useState(false);
-  const [barrierSaleId, setBarrierSaleId] = useState(null);
-  // PIs of the LC blocked on the invoice barrier (modal renders one row per
-  // PI so an LC can carry a single invoice or one per PI), plus the move to
-  // retry once the invoice(s) exist.
-  const [barrierPis, setBarrierPis] = useState([]);
-  const [barrierMove, setBarrierMove] = useState(null);
   const [barrierDetail, setBarrierDetail] = useState(null);
   const pageSize = 50;
 
@@ -141,9 +133,6 @@ export default function Sales() {
 
   const handleMove = async (sale, notes) => {
     const saleId = sale?.id ?? sale;
-    // Reminder target: the lc_received → shipment_ongoing hop is where an
-    // invoice number first becomes meaningful.
-    const enteringShipment = sale?.stage === 'lc_received';
     setMovingId(saleId);
     try {
       await apiFetch(`/api/sales/${saleId}/move`, {
@@ -152,18 +141,6 @@ export default function Sales() {
         body: JSON.stringify({ notes: notes || '' }),
       });
       toast.success('Sale moved to next stage');
-      if (enteringShipment) {
-        // Non-blocking reminder only — the move has already succeeded above.
-        try {
-          const res = await apiFetch(`/api/sales/${saleId}/invoices`);
-          const invoices = await res.json();
-          if (Array.isArray(invoices) && invoices.length === 0) {
-            toast.warning('No invoice yet — add an invoice number so production and shipping can be tracked.');
-          }
-        } catch {
-          // Best effort: never surface an error after a successful move.
-        }
-      }
     } catch (err) {
       toast.error(err.message || 'Could not move sale');
     } finally {
@@ -192,48 +169,27 @@ export default function Sales() {
   };
 
   // LC lane: one card per LC moves/unlinks as a unit; PIs always travel
-  // together. Before attempting a barriered move, probe readiness and, when
-  // blocked, do NOT POST — point the operator at the missing precondition
-  // (the missing products for recipe/production, or invoices for Barrier 1).
+  // together. Entering Shipment Ongoing needs no invoice, so that crossing
+  // posts straight through. The Payment Due crossing still probes readiness
+  // and points the operator at the missing recipes/production runs.
   const handleLcMove = async (lc) => {
     if (typeof lc?.id !== 'number') return;
     const next = nextStageFor(lc.stage);
     if (!next) return;
     setMovingId(`lc-${lc.id}`);
     try {
-      const res = await apiFetch(`/api/lcs/${lc.id}/readiness`);
-      const body = await res.json().catch(() => null);
-      if (!res.ok) {
-        toast.error(body?.error || 'Readiness check failed');
-        return;
-      }
-      const blocked =
-        next === 'shipment_ongoing' && !body.invoices_ok
-          ? { barrier: 'invoices' }
-          : (next === 'payment_due' && (!body.recipes_ok || !body.produced_ok))
-            ? { barrier: 'production', detail: body.detail }
-            : null;
-      if (blocked) {
-        if (blocked.barrier === 'invoices') {
-          const pis = (Array.isArray(lc.pis) ? lc.pis : [])
-            .filter((p) => p && typeof p.id === 'number')
-            .map((p) => ({ id: p.id, pi_number: p.pi_number }));
-          if (pis.length === 0) {
-            toast.error('No PIs are linked to this LC, so there is nothing to invoice.');
-            return;
-          }
-          setBarrierSaleId(null);
-          setBarrierPis(pis);
-          setBarrierMove({ lcId: lc.id, next });
-          setShowInvoicesRequired(true);
-        } else if (blocked.barrier === 'production') {
-          setBarrierSaleId(null);
-          setBarrierDetail(blocked.detail || {});
-          setShowProductionRequired(true);
-        } else if (blocked.barrier === 'error') {
-          toast.error(blocked.message);
+      if (next === 'payment_due') {
+        const res = await apiFetch(`/api/lcs/${lc.id}/readiness`);
+        const body = await res.json().catch(() => null);
+        if (!res.ok) {
+          toast.error(body?.error || 'Readiness check failed');
+          return;
         }
-        return;
+        if (!body.recipes_ok || !body.produced_ok) {
+          setBarrierDetail(body.detail || {});
+          setShowProductionRequired(true);
+          return;
+        }
       }
       await apiFetch(`/api/lcs/${lc.id}/move`, {
         method: 'POST',
@@ -245,37 +201,6 @@ export default function Sales() {
       toast.error(err.message || 'Could not move LC');
     } finally {
       setMovingId(null);
-      fetchData();
-    }
-  };
-
-  // The invoice barrier modal calls back here: the blocking invoice(s) now
-  // exist, so retry the move the operator originally asked for instead of
-  // leaving them to click Move a second time.
-  const handleBarrierInvoicesSuccess = async () => {
-    const move = barrierMove;
-    setShowInvoicesRequired(false);
-    setBarrierMove(null);
-    setBarrierPis([]);
-    if (!move || typeof move.lcId !== 'number' || !move.next) {
-      fetchData();
-      return;
-    }
-    setMovingId(`lc-${move.lcId}`);
-    try {
-      const lc = lcs.find((l) => l.id === move.lcId);
-      await apiFetch(`/api/lcs/${move.lcId}/move`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ new_stage: move.next }),
-      });
-      toast.success(`LC "${lc?.lc_number || move.lcId}" moved`);
-    } catch (err) {
-      toast.error(err.message || 'Could not move LC');
-    } finally {
-      setMovingId(null);
-      setBarrierSaleId(null);
-      setBarrierDetail({});
       fetchData();
     }
   };
@@ -474,8 +399,8 @@ export default function Sales() {
                   // LC's own stage column. A card rendered early (split LC,
                   // lagging PI) shows no move action — otherwise its button
                   // promises one move (e.g. "Enter LC") while handleLcMove
-                  // attempts another (e.g. the shipment barrier + invoice
-                  // modal) from the wrong column.
+                  // attempts another (e.g. the Payment Due production check)
+                  // from the wrong column.
                   const atOwnStage = st.key === group.lc.stage;
                   nodes.push(
                     <LcBoardCard
@@ -631,27 +556,12 @@ export default function Sales() {
         }}
       />
 
-      <InvoicesRequiredModal
-        isOpen={showInvoicesRequired}
-        onClose={() => {
-          setShowInvoicesRequired(false);
-          setBarrierSaleId(null);
-          setBarrierPis([]);
-          setBarrierMove(null);
-          setBarrierDetail({});
-        }}
-        pis={barrierPis}
-        onSuccess={handleBarrierInvoicesSuccess}
-      />
-
       <ProductionRequiredModal
         isOpen={showProductionRequired}
         onClose={() => {
           setShowProductionRequired(false);
-          setBarrierSaleId(null);
           setBarrierDetail({});
         }}
-        saleId={barrierSaleId}
         missingDetail={barrierDetail}
         onSuccess={() => {
           fetchData();

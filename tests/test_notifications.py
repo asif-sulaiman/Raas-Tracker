@@ -99,7 +99,12 @@ def test_reorder_low_needs_positive_level(db):
 
 
 def test_sale_stage_due_completed_and_revert_clears(db):
-    sid = add_sale(db, {"client_name": "ACME", "pi_number": "PI-1"},
+    # The (untouched) Payment Due production gate refuses a company-less sale.
+    cid = db.execute(
+        "INSERT INTO companies (name) VALUES ('Notify Co') RETURNING id"
+    ).fetchone()[0]
+    db.commit()
+    sid = add_sale(db, {"client_name": "ACME", "pi_number": "PI-1", "company_id": cid},
                    [{"product_name": "X", "quantity": 1, "unit_price": 10}])
     move_sale_to_stage(db, sid, "lc_received")
     assert "sale_payment_due" not in _types(db)
@@ -112,7 +117,7 @@ def test_sale_stage_due_completed_and_revert_clears(db):
     assert "sale_completed" in _types(db)
     assert "sale_payment_due" not in _types(db)  # cleared on completion
 
-    sid2 = add_sale(db, {"client_name": "BetaCo", "pi_number": "PI-2"},
+    sid2 = add_sale(db, {"client_name": "BetaCo", "pi_number": "PI-2", "company_id": cid},
                     [{"product_name": "Y", "quantity": 2, "unit_price": 5}])
     for stage in ("lc_received", "shipment_ongoing", "payment_due"):
         move_sale_to_stage(db, sid2, stage)

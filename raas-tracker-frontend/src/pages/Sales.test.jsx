@@ -6,6 +6,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { AuthProvider } from '../context/AuthContext';
 import { ConfirmProvider } from '../context/ConfirmContext';
 import Sales from './Sales';
+import { toast } from 'sonner';
 
 vi.mock('sonner', () => {
   const toastFn = Object.assign(vi.fn(), {
@@ -53,7 +54,7 @@ function lcMeta(overrides = {}) {
   };
 }
 
-function installFetch({ sales = [], lcs = [], readiness = null } = {}) {
+function installFetch({ sales = [], lcs = [], readiness = null, invoices = [] } = {}) {
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
     const u = String(url);
     const method = options?.method || 'GET';
@@ -69,11 +70,26 @@ function installFetch({ sales = [], lcs = [], readiness = null } = {}) {
     if (u.includes('/api/sales/summary')) {
       return jsonResponse({ total_pipeline_value: 0, total_sales: sales.length });
     }
+    if (u.includes('/invoices') && method === 'GET') {
+      return jsonResponse(invoices);
+    }
     if (u.includes('/api/sales') && method === 'GET') {
       return jsonResponse({ sales, total: sales.length });
     }
     return jsonResponse({});
   }));
+}
+
+function fetchCalls() {
+  return fetch.mock.calls.map(([url, options]) => ({
+    url: String(url),
+    method: options?.method || 'GET',
+    body: options?.body,
+  }));
+}
+
+function postTo(url) {
+  return fetchCalls().find((c) => c.method === 'POST' && c.url === url);
 }
 
 function renderPage() {
@@ -101,11 +117,10 @@ describe('Sales board LC action honesty (INV-link Phase B)', () => {
     expect(screen.queryByRole('button', { name: 'Start Shipment' })).toBeNull();
   });
 
-  it('keeps Start Shipment in LC Received and opens the invoice barrier when blocked', async () => {
+  it('starts an LC shipment directly, with no readiness probe or invoice barrier', async () => {
     installFetch({
       sales: [sale({ stage: 'lc_received' })],
       lcs: [lcMeta()],
-      readiness: { invoices_ok: false, recipes_ok: true, produced_ok: true, detail: {} },
     });
     renderPage();
     await waitFor(() => {
@@ -113,10 +128,55 @@ describe('Sales board LC action honesty (INV-link Phase B)', () => {
     });
     fireEvent.click(screen.getByRole('button', { name: 'Start Shipment' }));
     await waitFor(() => {
-      expect(screen.getByText('Invoices Required')).toBeTruthy();
+      expect(postTo('/api/lcs/10/move')).toBeTruthy();
     });
-    // PI-001 appears both on the board card and in the barrier modal row.
-    expect(screen.getAllByText(/PI-001/).length).toBeGreaterThanOrEqual(2);
+    expect(JSON.parse(postTo('/api/lcs/10/move').body)).toEqual({
+      new_stage: 'shipment_ongoing',
+    });
+    expect(fetchCalls().some((c) => c.url.includes('/api/lcs/10/readiness'))).toBe(false);
+    expect(screen.queryByText('Invoices Required')).toBeNull();
+  });
+
+  it('starts a standalone sale shipment without fetching invoices or warning about one', async () => {
+    installFetch({
+      sales: [sale({ id: 7, stage: 'lc_received', lc_id: null, lc_number: null })],
+      // The removed reminder probed this endpoint and warned on an empty list;
+      // keeping it empty makes a regression show up as the toast, not just a
+      // stray request.
+      invoices: [],
+    });
+    renderPage();
+    await waitFor(() => {
+      expect(screen.queryByText(/loading sales pipeline/i)).toBeNull();
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Start Shipment' }));
+    await waitFor(() => {
+      expect(postTo('/api/sales/7/move')).toBeTruthy();
+    });
+    expect(fetchCalls().some((c) => c.url === '/api/sales/7/invoices')).toBe(false);
+    expect(toast.warning).not.toHaveBeenCalled();
+  });
+
+  it('still blocks the LC Payment Due move on missing production', async () => {
+    installFetch({
+      sales: [sale({ stage: 'shipment_ongoing' })],
+      lcs: [lcMeta({ stage: 'shipment_ongoing' })],
+      readiness: {
+        invoices_ok: true,
+        recipes_ok: false,
+        produced_ok: false,
+        detail: { missing_recipes: ['Product A'], missing_production: [] },
+      },
+    });
+    renderPage();
+    await waitFor(() => {
+      expect(screen.queryByText(/loading sales pipeline/i)).toBeNull();
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Mark Shipped' }));
+    await waitFor(() => {
+      expect(screen.getByText('Production Required')).toBeTruthy();
+    });
+    expect(postTo('/api/lcs/10/move')).toBeFalsy();
   });
 
   it('keeps the shipment-column LC action intact', async () => {

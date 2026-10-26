@@ -5,7 +5,8 @@ Phase 3-B: Freeze invoice lines once invoice is booked/paid/shipped/void
 
 These tests verify:
 Phase 3-A:
-1. lc_received -> shipment_ongoing requires at least one invoice (non-void)
+1. lc_received -> shipment_ongoing requires no invoice (invoices are created
+   in Shipment Ongoing)
 2. shipment_ongoing -> payment_due requires every invoiced product has
    a company recipe AND an invoice-linked production run
 3. Direct move on LC-linked sale to shipment_ongoing is refused (via_lc=False)
@@ -118,18 +119,18 @@ def _get_sale_items(db, sale_id):
     ).fetchall()
 
 
-def test_move_to_shipment_ongoing_without_invoice_rejected(db):
-    """Sale at lc_received with no invoice cannot move to shipment_ongoing."""
+def test_move_to_shipment_ongoing_without_invoice_allowed(db):
+    """Sale at lc_received with no invoice can start the shipment."""
     co = _company(db)
     sid = _sale(db, co)
     # Move to lc_received first
     move_sale_to_stage(db, sid, "lc_received")
-    # Attempt to move to shipment_ongoing without invoice
+    # No invoice is needed to enter shipment_ongoing.
     result = move_sale_to_stage(db, sid, "shipment_ongoing")
-    assert result is False, "Should reject move without invoice"
-    # Stage should remain lc_received
+    assert result is True, "Should allow move without an invoice"
+    # Stage must have advanced
     stage = db.execute("SELECT stage FROM sales WHERE id = %s", (sid,)).fetchone()[0]
-    assert stage == "lc_received"
+    assert stage == "shipment_ongoing"
 
 
 def test_move_to_shipment_ongoing_with_invoice_allowed(db):
@@ -200,27 +201,11 @@ def test_direct_move_via_lc_true_allowed(db):
     lc_id = _lc(db, co)
     sid = _sale(db, co)
     _attach_pi(db, lc_id, [sid])
-    _invoice(db, sid)
-    # Move with via_lc=True should succeed (bypasses direct-move guard)
+    # No invoice is needed for the shipment hop.
     result = move_sale_to_stage(db, sid, "shipment_ongoing", via_lc=True)
     assert result is True, "Move via LC should be allowed"
     stage = db.execute("SELECT stage FROM sales WHERE id = %s", (sid,)).fetchone()[0]
     assert stage == "shipment_ongoing"
-
-
-def test_invoice_void_does_not_count(db):
-    """A void invoice should not satisfy the invoice barrier."""
-    co = _company(db)
-    sid = _sale(db, co)
-    move_sale_to_stage(db, sid, "lc_received")
-    inv_id = _invoice(db, sid)
-    # Void the invoice
-    _void_invoice(db, inv_id)
-    # Should still be rejected
-    result = move_sale_to_stage(db, sid, "shipment_ongoing")
-    assert result is False, "Void invoice should not count"
-    stage = db.execute("SELECT stage FROM sales WHERE id = %s", (sid,)).fetchone()[0]
-    assert stage == "lc_received"
 
 
 def test_multiple_products_all_need_production(db):
@@ -263,20 +248,19 @@ def test_multiple_products_all_need_production(db):
 
 
 def test_advance_sale_respects_barriers(db):
-    """advance_sale should also respect the new barriers."""
+    """advance_sale should respect the remaining payment barrier."""
     co = _company(db)
     sid = _sale(db, co)
     move_sale_to_stage(db, sid, "lc_received")
-    # advance_sale tries to go to shipment_ongoing - should fail without invoice
-    result = advance_sale(db, sid)
-    assert result is None, "advance_sale should return None when blocked"
-    stage = db.execute("SELECT stage FROM sales WHERE id = %s", (sid,)).fetchone()[0]
-    assert stage == "lc_received"
-    # With invoice, should succeed
-    _invoice(db, sid)
+    # No invoice is needed to start the shipment now.
     result = advance_sale(db, sid)
     assert result == "shipment_ongoing"
-    # Now try to advance to payment_due without production
+    stage = db.execute("SELECT stage FROM sales WHERE id = %s", (sid,)).fetchone()[0]
+    assert stage == "shipment_ongoing"
+    # Payment Due still requires production for the invoiced product. (The
+    # zero-invoice Payment Due gate lands in Phase 2; this test pins the
+    # existing production barrier, not the temporary vacuous pass.)
+    _invoice(db, sid)
     result = advance_sale(db, sid)
     assert result is None, "advance_sale should return None when blocked at payment_due"
     stage = db.execute("SELECT stage FROM sales WHERE id = %s", (sid,)).fetchone()[0]

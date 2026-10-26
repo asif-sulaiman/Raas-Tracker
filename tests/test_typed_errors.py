@@ -48,7 +48,6 @@ from raas_tracker._exceptions import (
     InvoiceNotFound,
     InvoiceNotProduced,
     LcNotFound,
-    LcNotReadyForShipment,
     LcNotReadyPastShipment,
     LcNumberAlreadyExists,
     LcSaleNotFound,
@@ -72,7 +71,6 @@ _TYPED = [
     (LinkedInvoiceNotFound, 404),
     (SaleItemNotFound, 404),
     (LcNumberAlreadyExists, 409),
-    (LcNotReadyForShipment, 409),
     (LcNotReadyPastShipment, 409),
     (LcNotFound, 404),
     (LcSaleNotFound, 404),
@@ -672,8 +670,8 @@ def test_lc_attach_route_400_for_plain_validation(admin_client, db):
     assert isinstance(r.get_json().get("details"), list)
 
 
-def test_lc_move_route_409_when_not_ready_for_shipment(admin_client, db):
-    """lcs.py:318 — crossing into shipment_ongoing with no invoice is a 409."""
+def test_lc_move_route_allows_shipment_without_invoice(admin_client, db):
+    """lcs.py — crossing into shipment_ongoing no longer asks for an invoice."""
     cid = _company(admin_client, db, "TypedLcShipCo")
     lc = _mk_lc(admin_client, cid, "LC-TLS-1")
     sid = _sale(admin_client, cid, "PI-TLS-1", "TypedLcShipProd")
@@ -682,14 +680,10 @@ def test_lc_move_route_409_when_not_ready_for_shipment(admin_client, db):
 
     r = admin_client.post(f"/api/lcs/{lc['id']}/move",
                           json={"new_stage": "shipment_ongoing"})
-    assert r.status_code == 409, r.get_json()
-    body = r.get_json()
-    assert body["error"].startswith("LC is not ready for shipment: ")
-    assert body["invoices_ok"] is False
-    assert body["missing"]
-    # the refusal moved nothing
+    assert r.status_code == 200, r.get_json()
+    # the move took effect
     assert admin_client.get(
-        f"/api/lcs/{lc['id']}").get_json()["stage"] == "lc_received"
+        f"/api/lcs/{lc['id']}").get_json()["stage"] == "shipment_ongoing"
 
 
 def test_lc_move_route_400_for_invalid_stage(admin_client, db):
@@ -740,8 +734,7 @@ def test_route_404_survives_a_reworded_attach_refusal(
     assert r.get_json()["error"] == _UNMATCHABLE
 
 
-@pytest.mark.parametrize("exc_cls", [LcNotReadyForShipment,
-                                     LcNotReadyPastShipment])
+@pytest.mark.parametrize("exc_cls", [LcNotReadyPastShipment])
 def test_route_409_survives_a_reworded_readiness_refusal(
         exc_cls, admin_client, db, monkeypatch):
     import flask_app
@@ -782,22 +775,6 @@ def test_route_400_survives_a_reworded_plain_refusal(admin_client, db,
 
 
 # ---------- 6c. the LC service gates carry their own status ----------
-
-
-def test_move_lc_stage_shipment_gate_is_typed(admin_client, db):
-    """lcs.py:324 — the readiness refusal is typed where it is constructed."""
-    from raas_tracker import lcs as lcsmod
-
-    cid = _company(admin_client, db, "TypedLcSvcShipCo")
-    lc = _mk_lc(admin_client, cid, "LC-SVC-SHIP-1")
-    sid = _sale(admin_client, cid, "PI-SVCS-1", "TypedLcSvcShipProd")
-    lcsmod.attach_pis(db, lc["id"], [sid])
-    db.commit()
-
-    with pytest.raises(LcNotReadyForShipment) as ei:
-        lcsmod.move_lc_stage(db, lc["id"], "shipment_ongoing")
-    assert str(ei.value).startswith("LC is not ready for shipment: ")
-    assert status_for(ei.value) == 409
 
 
 def test_move_lc_stage_payment_gate_is_typed(admin_client, db):
