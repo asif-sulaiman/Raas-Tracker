@@ -460,6 +460,33 @@ rate-limited; `chem_stock.py` compatibility imports kept in sync.
 
 ---
 
+## 🧾 Phase INVOICE-MATURITY: LC payment terms + per-invoice maturity (Phase 1 of 7, completed 2026-10-27)
+
+Invoices are USD receivables that mature under the LC's payment terms. Phase 1
+ships the data and the operator surface only; reminder delivery (bell + email to
+directors) is a later phase.
+
+| # | Slice | Scope | State |
+|---|---|---|---|
+| 1 | **Schema v7** | `letters_of_credit.payment_terms`/`tenor_days` + `invoices.maturity_date`; `_SCHEMA_VERSION` 6 → 7; additive guarded `ALTER TABLE`s, no backfill (NULL legacy reads at sight) | ✅ |
+| 2 | **LC terms service + API** | `create_lc` defaults `at_sight` and forces tenor NULL; `deferred` requires 1..720; `PUT /api/lcs/<id>` accepts terms, at-sight clears tenor; field-shaped **400** validation; list/detail rows expose terms | ✅ `tests/test_lc_terms.py` (11) |
+| 3 | **Ship-time maturity** | `invoice_terms_for_sale` + `resolve_invoice_maturity`; at sight = actual ship date, deferred = actual + tenor (leap-safe); optional `maturity_date` override must be ISO and ≥ actual; resolution before the shipment INSERT; audit names the maturity; ship/list/readiness payloads expose it | ✅ `tests/test_invoice_maturity.py` (8) |
+| 4 | **UI** | New-LC and LC-detail forms carry `Payment terms` + conditional `Tenor days`; the Ship form prefills an editable `Maturity date` from the row's terms and posts it; rows show `matures <date>` and an **Overdue** chip for past-due shipped invoices | ✅ LinkPIsModal / LcDetailModal / InvoicePanel tests (46 in the three files) |
+| 5 | **Docs** | PRD Flow 6 item 10 + data model, SPEC schema/API/maturity contract, this phase table, handoff | ✅ |
+| 6 | **Gate** | Full backend pytest, ruff, pyright, frontend vitest, oxlint, vite build | ✅ 2026-10-27 — backend **1302 passed / 8 skipped** (19 new tests in `test_lc_terms.py` + `test_invoice_maturity.py`); ruff 63 repo-wide findings, none in changed hunks; pyright 6 errors / 18 warnings = baseline; frontend **348/348** (39 files), oxlint 0/0, build OK |
+
+**Locked decisions:** terms live on the LC (one tenor per LC, not per invoice);
+maturity is computed at ship time, never at invoice creation; the operator
+override is allowed but cannot precede the actual ship date and is audited;
+legacy NULL terms are at sight with no backfill; all money stays USD; reminder
+email recipients will be the company's directors only, never clients.
+
+**Constraints:** parameterized SQL only; every mutating LC/invoice route stays
+admin-only and rate-limited; no auth/gate edits; the maturity computation is
+server-owned (the UI prefill is convenience, re-validated on POST).
+
+---
+
 ## 🧾 Phase INV-UNIFY: PI-faithful invoice editor (completed 2026-10-22)
 
 One invoice-entry surface instead of two divergent ones (`InvoiceCreateForm`
