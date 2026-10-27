@@ -23,6 +23,7 @@ import { toast } from 'sonner';
 import CommercialFilters from '../components/reports/CommercialFilters';
 import CommercialTable from '../components/reports/CommercialTable';
 import CommercialCalendarNavigator from '../components/reports/CommercialCalendarNavigator';
+import SaleDetailModal from '../components/sales/SaleDetailModal';
 
 /**
  * Commercial report rows are per sale-item.
@@ -88,6 +89,10 @@ export default function Reports() {
   const [companiesLoading, setCompaniesLoading] = useState(false);
   const [companiesError, setCompaniesError] = useState(null);
   const [companiesAttempt, setCompaniesAttempt] = useState(0);
+  // A report row is the practical way to correct a completed sale: it opens
+  // the same editor the board uses, and a save reloads the report so the row
+  // reflects the correction immediately.
+  const [editSaleId, setEditSaleId] = useState(null);
 
   useEffect(() => {
     (async () => {
@@ -236,6 +241,14 @@ export default function Reports() {
       setCommercialLoading(false);
     }
   }, [apiFetch, searchParams]);
+
+  // The editor's save lands outside the report's fetch effect, so the row (and
+  // its KPI summary) must be reloaded explicitly in whichever mode is shown.
+  const refreshCommercial = useCallback(() => {
+    const groupBy = searchParams.get('group_by') || 'none';
+    if (groupBy === 'none') fetchCommercialReport();
+    else fetchCommercialSummary();
+  }, [searchParams, fetchCommercialReport, fetchCommercialSummary]);
 
   // Fetch when filters change (searchParams changes). Filter writers
   // (CommercialFilters, CommercialCalendarNavigator) always reset page=1 in
@@ -554,7 +567,12 @@ export default function Reports() {
             currentPage={commercialPage}
             pageSize={PAGE_SIZE}
             totalRows={totalRows}
+            onEditSale={setEditSaleId}
           />
+          <p className="text-[11px] text-slate-400 dark:text-slate-500">
+            Provisional rows show PI quantities until an invoice line covers them.
+            Completed sales stay in the report and can be corrected from Actions.
+          </p>
         </div>
       );
     }
@@ -892,6 +910,12 @@ export default function Reports() {
 
       {/* Commercial Report Tab (admin only) */}
       {isAdmin && activeTab === 'commercial' && renderCommercialTab()}
+
+      <SaleDetailModal
+        saleId={editSaleId}
+        onClose={() => setEditSaleId(null)}
+        onSaved={refreshCommercial}
+      />
     </div>
   );
 }

@@ -1,5 +1,5 @@
 import { Fragment, useState } from 'react';
-import { ChevronDown, ChevronRight, ChevronLeft } from 'lucide-react';
+import { ChevronDown, ChevronRight, ChevronLeft, Pencil } from 'lucide-react';
 import { formatNumber, formatDate } from '../../utils/format';
 import Badge from '../ui/Badge';
 import Button from '../ui/Button';
@@ -79,12 +79,13 @@ function DetailSkeleton() {
               <th className={TH}>Due ($)</th>
               <th className={TH}>Status</th>
               <th className={TH}>Comment</th>
+              <th className={TH}>Actions</th>
             </tr>
           </thead>
           <tbody>
             {[...Array(5)].map((_, i) => (
               <tr key={i} className="animate-pulse">
-                {[...Array(19)].map((_, j) => (
+                {[...Array(20)].map((_, j) => (
                   <td key={j} className={TD}>
                     <div className="h-4 bg-slate-200 dark:bg-slate-700 rounded w-3/4" />
                   </td>
@@ -140,7 +141,7 @@ function EmptyState() {
   );
 }
 
-function DetailTable({ rows, currentPage, pageSize, totalRows, onPageChange }) {
+function DetailTable({ rows, currentPage, pageSize, totalRows, onPageChange, onEditSale }) {
   const paymentBadge = (status) => (
     <Badge variant={paymentBadgeVariant(status)} size="xs">
       {status || 'Pending'}
@@ -172,13 +173,21 @@ function DetailTable({ rows, currentPage, pageSize, totalRows, onPageChange }) {
               <th className={TH}>Due ($)</th>
               <th className={TH}>Status</th>
               <th className={TH}>Comment</th>
+              <th className={TH}>Actions</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-50 dark:divide-slate-800/50">
             {rows.map((row, idx) => (
               <tr key={row.sale_id != null ? `${row.sale_id}-${idx}` : idx} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40">
                 <td className={clsx(TD, 'font-medium text-slate-900 dark:text-white')}>{row.customer_name || '-'}</td>
-                <td className={TD}>{row.pi_number || '-'}</td>
+                <td className={TD}>
+                  <div className="flex items-center gap-1.5">
+                    <span>{row.pi_number || '-'}</span>
+                    {row.is_provisional && (
+                      <Badge variant="warning" size="xs">Provisional</Badge>
+                    )}
+                  </div>
+                </td>
                 <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.pi_date)}</td>
                 <td className={TD}>{row.lc_number || '-'}</td>
                 <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.lc_date)}</td>
@@ -199,6 +208,19 @@ function DetailTable({ rows, currentPage, pageSize, totalRows, onPageChange }) {
                 <td className={TD}>{paymentBadge(row.payment_status)}</td>
                 <td className="px-4 py-3 text-xs text-slate-500 dark:text-slate-400 max-w-[18rem]">
                   {row.payment_comment || '-'}
+                </td>
+                <td className={TD}>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    icon={Pencil}
+                    onClick={() => onEditSale?.(row.sale_id)}
+                    title="Edit sale"
+                    aria-label={`Edit sale ${row.pi_number || row.sale_id}`}
+                    className="!px-2"
+                  >
+                    {null}
+                  </Button>
                 </td>
               </tr>
             ))}
@@ -333,6 +355,7 @@ export default function CommercialTable({
   pageSize = 50,
   totalRows = 0,
   isLoading = false,
+  onEditSale,
 }) {
   // DETAIL MODE (groupBy === 'none')
   if (groupBy === 'none') {
@@ -353,6 +376,7 @@ export default function CommercialTable({
         pageSize={pageSize}
         totalRows={totalRows}
         onPageChange={onPageChange}
+        onEditSale={onEditSale}
       />
     );
   }

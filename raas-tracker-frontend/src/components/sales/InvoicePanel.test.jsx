@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import React from 'react';
-import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, cleanup, fireEvent, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { AuthProvider } from '../../context/AuthContext';
 import { ConfirmProvider } from '../../context/ConfirmContext';
@@ -66,7 +66,7 @@ function jsonResponse(data, ok = true, status = 200) {
   return { ok, status, json: async () => data, headers: { get: () => null } };
 }
 
-function installFetch({ invoices = INVOICES, posts = [], completion, completionStatus = 200, payStatus = 'paid', deleteStatus = 200, deleteBody = null, failInvoicesAfterPost = false, failInvoicesAlways = false, createAmount = 2400, piLines = PI_LINES, hasLineLess = false } = {}) {
+function installFetch({ invoices = INVOICES, posts = [], completion, completionStatus = 200, payStatus = 'paid', deleteStatus = 200, deleteBody = null, failInvoicesAfterPost = false, failInvoicesAlways = false, createAmount = 2400, piLines = PI_LINES, hasLineLess = false, postFail = null } = {}) {
   const deletes = [];
   let invoiceReadsFail = failInvoicesAfterPost || failInvoicesAlways;
   // Lets a test flip the invoice read back to healthy to exercise a retry.
@@ -90,6 +90,9 @@ function installFetch({ invoices = INVOICES, posts = [], completion, completionS
       return jsonResponse({ success: true });
     }
     if (u.includes('/invoices') && method === 'POST') {
+      if (postFail && u.includes(postFail.match)) {
+        return jsonResponse(postFail.body || { error: 'Refused' }, false, postFail.status || 409);
+      }
       posts.push({ url: u, body: JSON.parse(options.body) });
       if (u.endsWith('/book')) return jsonResponse({ success: true, status: 'booked' });
       if (u.endsWith('/ship')) return jsonResponse({ invoice_id: 7, shipment_id: 3, status: 'shipped' }, true, 201);
@@ -124,6 +127,7 @@ function renderPanel(opts = {}) {
           <InvoicePanel
             saleId={5}
             isAdmin={opts.isAdmin ?? true}
+            readOnly={opts.readOnly ?? false}
             onChanged={opts.onChanged || vi.fn()}
           />
         </ConfirmProvider>
@@ -593,5 +597,75 @@ describe('InvoicePanel', () => {
     await waitFor(() => expect(posts.filter((p) => p.url.includes('/pay'))).toHaveLength(1));
     // Money is exact — a raw float must never reach the API.
     expect(posts.find((p) => p.url.includes('/pay')).body.payment_amount).toBe(25.56);
+  });
+});
+
+describe('InvoicePanel lifecycle order and read-only mode', () => {
+  it('offers Ship only for a booked invoice and Pay only for a shipped one', async () => {
+    const invoices = [
+      {
+        invoice_id: 41, invoice_number: 'INV-B', status: 'booked',
+        approx_ship_date: '2026-09-20', actual_ship_date: null, notes: null,
+        created_at: '2026-09-01 10:00:00', amount: 100, paid_amount: 0,
+      },
+      {
+        invoice_id: 42, invoice_number: 'INV-S', status: 'shipped',
+        approx_ship_date: '2026-09-10', actual_ship_date: '2026-09-12', notes: null,
+        created_at: '2026-09-01 10:00:00', amount: 200, paid_amount: 50,
+      },
+      {
+        invoice_id: 43, invoice_number: 'INV-P', status: 'paid',
+        approx_ship_date: '2026-09-01', actual_ship_date: '2026-09-02', notes: null,
+        created_at: '2026-09-01 10:00:00', amount: 300, paid_amount: 300,
+      },
+    ];
+    renderPanel({ invoices });
+
+    await screen.findByText('INV-B');
+    // One Ship button (the booked row), one Record payment (the shipped row).
+    expect(screen.getAllByRole('button', { name: 'Ship' })).toHaveLength(1);
+    expect(screen.getAllByRole('button', { name: 'Record payment' })).toHaveLength(1);
+    // The booked row gets no Pay action: money cannot precede shipment.
+    const bookedRow = screen.getByText('INV-B').closest('div');
+    expect(within(bookedRow).queryByRole('button', { name: 'Record payment' })).toBeNull();
+    // The shipped row is not offered Ship again.
+    const shippedRow = screen.getByText('INV-S').closest('div');
+    expect(within(shippedRow).queryByRole('button', { name: 'Ship' })).toBeNull();
+  });
+
+  it('surfaces the server 409 message when a step is refused', async () => {
+    const invoices = [{
+      invoice_id: 51, invoice_number: 'INV-409', status: 'booked',
+      approx_ship_date: '2026-09-20', actual_ship_date: null, notes: null,
+      created_at: '2026-09-01 10:00:00', amount: 100, paid_amount: 0,
+    }];
+    renderPanel({
+      invoices,
+      postFail: { match: '/ship', status: 409, body: { error: 'Invoice must be booked before it can ship' } },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: 'Ship' }));
+    fireEvent.change(await screen.findByLabelText('Actual ship date'), {
+      target: { value: '2026-09-21' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save shipment' }));
+
+    // The typed refusal is shown verbatim, not collapsed into a generic error.
+    expect(await screen.findByText('Invoice must be booked before it can ship')).toBeTruthy();
+  });
+
+  it('hides every mutating control in read-only mode', async () => {
+    renderPanel({ readOnly: true });
+
+    expect(await screen.findByText('INV-1')).toBeTruthy();
+    expect(screen.getByText('INV-2')).toBeTruthy();
+    // Status and money stay readable on a completed sale.
+    expect(screen.getByText('Booked')).toBeTruthy();
+    expect(screen.getByText('$1,200.00 · paid $800.00')).toBeTruthy();
+    // Nothing may be added, advanced, or voided.
+    expect(screen.queryByRole('button', { name: 'Add invoice' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Book shipment' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Ship' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Record payment' })).toBeNull();
+    expect(screen.queryByRole('button', { name: /void invoice/i })).toBeNull();
   });
 });

@@ -155,6 +155,8 @@ describe('CommercialTable - Detail Mode (groupBy=none)', () => {
     expect(screen.getByText('Due ($)')).toBeTruthy();
     expect(screen.getByText('Status')).toBeTruthy();
     expect(screen.getByText('Comment')).toBeTruthy();
+    // Phase 5: the row opens the existing sale editor.
+    expect(screen.getByText('Actions')).toBeTruthy();
   });
 
   it('renders detail rows with correct data', () => {
@@ -263,6 +265,44 @@ describe('CommercialTable - Detail Mode (groupBy=none)', () => {
     render(<CommercialTable data={mockDetailData.rows} groupBy="none" onPageChange={onPageChange} />);
 
     expect(screen.getByText('Acme Corp')).toBeTruthy();
+  });
+
+  it('marks provisional PI fallback rows, and only those', () => {
+    const rows = [
+      { ...mockDetailData.rows[0], is_provisional: true },
+      { ...mockDetailData.rows[1], is_provisional: false },
+    ];
+    render(<CommercialTable data={{ rows }} groupBy="none" onPageChange={onPageChange} />);
+
+    expect(screen.getAllByText('Provisional')).toHaveLength(1);
+    const acmeRow = screen.getByText('PI-001').closest('tr');
+    expect(acmeRow.textContent).toContain('Provisional');
+    const betaRow = screen.getByText('PI-002').closest('tr');
+    expect(betaRow.textContent).not.toContain('Provisional');
+  });
+
+  it('reports the sale id from the row Edit action', () => {
+    const onEditSale = vi.fn();
+    render(
+      <CommercialTable
+        data={mockDetailData}
+        groupBy="none"
+        onPageChange={onPageChange}
+        onEditSale={onEditSale}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit sale PI-001' }));
+    expect(onEditSale).toHaveBeenCalledWith(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit sale PI-002' }));
+    expect(onEditSale).toHaveBeenLastCalledWith(2);
+  });
+
+  it('draws one skeleton cell per detail column (20)', () => {
+    render(<CommercialTable data={mockDetailData} groupBy="none" onPageChange={onPageChange} isLoading />);
+
+    const firstRow = document.querySelector('.animate-pulse');
+    expect(firstRow.querySelectorAll('td')).toHaveLength(20);
   });
 });
 

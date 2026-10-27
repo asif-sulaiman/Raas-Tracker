@@ -36,8 +36,12 @@ function Field({ label, value, mono }) {
  */
 function InvoiceLinesSection({ saleId, sale, onChanged }) {
   const invoices = Array.isArray(sale?.invoices) ? sale.invoices : [];
-  // Only invoices that can still take lines: a paid one is settled.
-  const openInvoices = invoices.filter((i) => i.status !== 'paid');
+  // Lines may only join an invoice the backend still treats as mutable: a
+  // booked invoice is frozen (its shipment is committed), so it is not offered
+  // as a target even though its row stays visible in the panel above.
+  const openInvoices = invoices.filter(
+    (i) => i.status === 'planned' || i.status === 'produced'
+  );
   const [targetId, setTargetId] = useState(() => String(openInvoices[0]?.invoice_id ?? ''));
 
   const target = openInvoices.find((i) => String(i.invoice_id) === String(targetId));
@@ -556,25 +560,31 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
             )}
           </div>
 
-          {sale.stage === 'shipment_ongoing' && (
+          {/* Invoices follow the sale from Shipment Ongoing onward. A completed
+              sale keeps them read-only so the report row stays an honest record
+              while payments and dates below remain correctable (audited). */}
+          {['shipment_ongoing', 'payment_due', 'completed'].includes(sale.stage) && (
             <>
               <InvoicePanel
                 key={sale.id}
                 saleId={sale.id}
                 isAdmin={isAdmin}
+                readOnly={sale.stage === 'completed'}
                 onChanged={() => {
                   refresh(saleId);
                   onSaved?.();
                 }}
               />
-              <InvoiceLinesSection
-                saleId={sale.id}
-                sale={sale}
-                onChanged={() => {
-                  refresh(saleId);
-                  onSaved?.();
-                }}
-              />
+              {sale.stage !== 'completed' && (
+                <InvoiceLinesSection
+                  saleId={sale.id}
+                  sale={sale}
+                  onChanged={() => {
+                    refresh(saleId);
+                    onSaved?.();
+                  }}
+                />
+              )}
             </>
           )}
 

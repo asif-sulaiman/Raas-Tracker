@@ -4,6 +4,7 @@ import React from 'react';
 import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { AuthProvider } from '../context/AuthContext';
+import { ConfirmProvider } from '../context/ConfirmContext';
 import Reports from './Reports';
 
 vi.mock('sonner', () => {
@@ -33,8 +34,9 @@ function jsonResponse(data, ok = true, status = 200, headers = {}) {
 
 function installFetch({ role = 'admin', companiesFailTimes = 0, companiesError = 'Companies service unavailable', recipes = [], report = [], periods = [], filteredTotal = null } = {}) {
   let companyFailsLeft = companiesFailTimes;
-  const fetchMock = vi.fn(async (url) => {
+  const fetchMock = vi.fn(async (url, options) => {
     const u = String(url);
+    const method = options?.method || 'GET';
     if (u.includes('/api/auth/me')) return jsonResponse({ id: 1, username: role, role });
     if (u.includes('/api/companies')) {
       if (companyFailsLeft > 0) {
@@ -44,6 +46,19 @@ function installFetch({ role = 'admin', companiesFailTimes = 0, companiesError =
       return jsonResponse(COMPANIES);
     }
     if (u.includes('/api/recipes')) return jsonResponse(recipes);
+    // The report's edit path opens the existing sale editor.
+    if (/\/api\/sales\/\d+$/.test(u)) {
+      const id = Number(u.match(/(\d+)$/)[1]);
+      if (method === 'PUT') return jsonResponse({ comments: 'ok' });
+      return jsonResponse({
+        id, stage: 'payment_due', pi_number: `PI-${id}`, pi_date: '2026-01-15',
+        client_name: 'Cust', items: [], history: [], payments: [], shipments: [],
+        invoices: [], invoice_total: 0, total_paid: 0, balance: 0, comments: null,
+      });
+    }
+    if (u.includes('/invoice-lines')) return jsonResponse({ lines: [], has_line_less_invoices: false });
+    if (u.includes('/invoices')) return jsonResponse([]);
+    if (u.includes('/completion')) return jsonResponse({ status: 'none', paid: 0, total: 0 });
     // Honest contracts: /live/summary returns {periods:[...]}, /live/filtered a bare array.
     if (u.includes('/api/reports/live/summary')) return jsonResponse({ periods });
     if (u.includes('/api/reports/live/filtered')) {
@@ -58,14 +73,17 @@ function installFetch({ role = 'admin', companiesFailTimes = 0, companiesError =
 }
 
 function renderReports(opts = {}) {
-  installFetch(opts);
-  return render(
+  const fetchMock = installFetch(opts);
+  const utils = render(
     <MemoryRouter>
       <AuthProvider>
-        <Reports />
+        <ConfirmProvider>
+          <Reports />
+        </ConfirmProvider>
       </AuthProvider>
     </MemoryRouter>
   );
+  return { ...utils, fetchMock };
 }
 
 async function openCommercialTab() {
@@ -190,5 +208,43 @@ describe('Commercial detail report pagination', () => {
     expect(screen.getAllByText('42 sales · USD').length).toBe(2);
     // Page-only sums (10 + 20) must not be presented as the report totals.
     expect(screen.queryByText('$30.00')).toBeNull();
+  });
+});
+
+describe('Commercial report provisional rows and editing', () => {
+  it('marks a provisional PI row and explains the fallback', async () => {
+    renderReports({
+      report: [makeRow(1, { is_provisional: true })],
+      filteredTotal: '1',
+    });
+    await openCommercialTab();
+
+    expect(await screen.findByText('Provisional')).toBeTruthy();
+    expect(screen.getByText(/provisional rows show PI quantities/i)).toBeTruthy();
+  });
+
+  it('opens the sale editor from a report row and refreshes after a save', async () => {
+    const { fetchMock } = renderReports({
+      report: [makeRow(1, { is_provisional: true })],
+      filteredTotal: '1',
+    });
+    await openCommercialTab();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit sale PI-1' }));
+    await waitFor(() => {
+      expect(fetchMock.mock.calls.some(([u]) => String(u) === '/api/sales/1')).toBe(true);
+    });
+
+    const reportReads = () =>
+      fetchMock.mock.calls.filter(([u]) => String(u).includes('/api/reports/live/filtered')).length;
+    const before = reportReads();
+
+    // Saving from the editor must reload the report (and its KPI summary).
+    fireEvent.change(await screen.findByLabelText('Sale comments'), {
+      target: { value: 'corrected after completion' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(reportReads()).toBeGreaterThan(before));
   });
 });

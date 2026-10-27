@@ -3,10 +3,17 @@ import { toCents, fromCents } from './format.js';
 export const STAGES = [
   { key: 'pi_issued', title: 'PI Issued', actionLabel: 'Enter LC', actionVariant: 'primary', action: 'lc' },
   { key: 'lc_received', title: 'LC Received', actionLabel: 'Start Shipment', actionVariant: 'primary', action: 'move' },
-  { key: 'shipment_ongoing', title: 'Shipment Ongoing', actionLabel: 'Mark Shipped', actionVariant: 'primary', action: 'move' },
-  { key: 'payment_due', title: 'Payment Due', actionLabel: 'Record Payment', actionVariant: 'success', action: 'payment' },
+  { key: 'shipment_ongoing', title: 'Shipment Ongoing', actionLabel: 'Move to Payment Due', actionVariant: 'primary', action: 'move' },
+  { key: 'payment_due', title: 'Payment Due', actionLabel: 'Manage Invoices', actionVariant: 'success', action: 'detail' },
   { key: 'completed', title: 'Completed', actionLabel: null, action: null },
 ];
+
+/**
+ * Board columns. Completed is archived: the API hides those sales, the report
+ * keeps them, and the only way back in is the report's row editor. `STAGES`
+ * stays complete for labels, KPI cards and `nextStageFor`.
+ */
+export const BOARD_STAGES = STAGES.filter((s) => s.key !== 'completed');
 
 export const STAGE_LABELS = {
   pi_issued: 'PI Issued',
