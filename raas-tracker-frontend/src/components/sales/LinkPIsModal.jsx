@@ -33,6 +33,8 @@ export default function LinkPIsModal({
   const [lcId, setLcId] = useState('');
   const [lcNumber, setLcNumber] = useState('');
   const [lcDate, setLcDate] = useState('');
+  const [paymentTerms, setPaymentTerms] = useState('at_sight');
+  const [tenorDays, setTenorDays] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
 
@@ -47,6 +49,8 @@ export default function LinkPIsModal({
       setLcId('');
       setLcNumber('');
       setLcDate('');
+      setPaymentTerms('at_sight');
+      setTenorDays('');
       setError(null);
       setSaving(false);
     }
@@ -106,11 +110,14 @@ export default function LinkPIsModal({
     setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
   };
 
+  // Deferred terms need a positive tenor: the server refuses the LC otherwise,
+  // so the button stays disabled instead of offering a request that must 400.
+  const tenorValid = paymentTerms === 'at_sight' || Number(tenorDays) > 0;
   const canSubmit =
     selected.length > 0 &&
     !saving &&
     (mode === 'new'
-      ? lcNumber.trim() !== '' && !crossCompany && !nullCompany
+      ? lcNumber.trim() !== '' && !crossCompany && !nullCompany && tenorValid
       : lcId !== '' && !mismatch);
 
   const handleLink = async () => {
@@ -139,6 +146,10 @@ export default function LinkPIsModal({
       setError('Selected PI has no company — pick an existing LC or set its company first');
       return;
     }
+    if (mode === 'new' && paymentTerms === 'deferred' && !(Number(tenorDays) > 0)) {
+      setError('Tenor days is required for deferred payment terms');
+      return;
+    }
     setSaving(true);
     try {
       let targetId = lcId;
@@ -157,6 +168,8 @@ export default function LinkPIsModal({
             company_id: companyId,
             lc_number: lcNumber.trim(),
             lc_date: lcDate || null,
+            payment_terms: paymentTerms,
+            tenor_days: paymentTerms === 'deferred' ? Number(tenorDays) : null,
           }),
         });
         const created = await res.json().catch(() => ({}));
@@ -349,6 +362,37 @@ export default function LinkPIsModal({
                   className={inputCls}
                 />
               </div>
+              <div>
+                <label className="text-xs font-medium text-slate-600 dark:text-slate-300">
+                  Payment terms
+                </label>
+                <select
+                  aria-label="Payment terms"
+                  value={paymentTerms}
+                  onChange={(e) => setPaymentTerms(e.target.value)}
+                  className={inputCls}
+                >
+                  <option value="at_sight">At sight</option>
+                  <option value="deferred">Deferred</option>
+                </select>
+              </div>
+              {paymentTerms === 'deferred' && (
+                <div>
+                  <label className="text-xs font-medium text-slate-600 dark:text-slate-300">
+                    Tenor days *
+                  </label>
+                  <input
+                    aria-label="Tenor days"
+                    type="number"
+                    min="1"
+                    max="720"
+                    value={tenorDays}
+                    onChange={(e) => setTenorDays(e.target.value)}
+                    className={inputCls}
+                    placeholder="90"
+                  />
+                </div>
+              )}
             </div>
           )}
         </div>
