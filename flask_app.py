@@ -5,6 +5,7 @@ import sys
 import io
 import json
 import math
+import re
 import hashlib
 from flask import Flask, request, jsonify, send_from_directory, g, redirect
 from flask.json.provider import DefaultJSONProvider
@@ -166,6 +167,8 @@ from raas_tracker.sales import (
     # Per-invoice production gate for GET /api/invoices/<id>/readiness, plus the
     # shared blocked-message so the readiness hint and book_invoice's 409 agree.
     invoice_production_readiness, _production_blocked_message,
+    # Maturity readiness inherits the same LC terms the ship service uses.
+    invoice_terms_for_sale,
 )
 from raas_tracker.stock import sync_reorder_notifications
 # Phase 4-A: the HTTP status of a service refusal comes from its TYPE.
@@ -2417,8 +2420,24 @@ class InvoiceBookIn(_StrippedModel):
 
 class InvoiceShipIn(_StrippedModel):
     actual_ship_date: str = Field(min_length=1)
+    # Operator override of the computed maturity; audited when used.
+    maturity_date: str | None = None
     invoice_number: str | None = None
     notes: str | None = None
+
+    @field_validator("maturity_date")
+    @classmethod
+    def _valid_maturity(cls, value):
+        if value is None or not str(value).strip():
+            return None
+        text = str(value).strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            raise ValueError("must be a date (YYYY-MM-DD)")
+        try:
+            date.fromisoformat(text)
+        except ValueError:
+            raise ValueError("must be a date (YYYY-MM-DD)")
+        return text
 
 
 class InvoicePayIn(_FiniteModel):
@@ -2606,7 +2625,8 @@ def api_ship_invoice(sale_id, invoice_id):
             conn, invoice_id, payload.actual_ship_date,
             invoice_number=payload.invoice_number,
             notes=payload.notes,
-            created_by=getattr(g, "current_identity", {}).get("id")
+            created_by=getattr(g, "current_identity", {}).get("id"),
+            maturity_date=payload.maturity_date,
         )
     except ValueError as e:
         return _invoice_transition_error(conn, e)
@@ -3332,8 +3352,44 @@ def api_cron_maturity_check():
 # Route-level LC helpers (permanent route-level helpers — no update/delete
 # service in raas_tracker/, so they live here, use parameterized SQL only,
 # and audit with atomic=False + one commit).
+_LC_PAYMENT_TERMS = ("at_sight", "deferred")
+
+
+def _lc_terms_error(payment_terms, tenor_days):
+    """Field-shaped 400 for invalid LC payment terms; None when valid.
+
+    At-sight LCs ignore any supplied tenor (the service stores NULL); deferred
+    LCs require a tenor between 1 and 720 days.
+    """
+    terms = payment_terms or "at_sight"
+    if terms not in _LC_PAYMENT_TERMS:
+        return jsonify({
+            "error": "Invalid payload",
+            "details": [{"field": "payment_terms",
+                         "message": "must be 'at_sight' or 'deferred'"}]}), 400
+    if terms == "at_sight":
+        return None
+    if tenor_days is None:
+        return jsonify({
+            "error": "Invalid payload",
+            "details": [{"field": "tenor_days",
+                         "message": "is required when payment_terms is "
+                                    "'deferred'"}]}), 400
+    try:
+        tenor = int(tenor_days)
+    except (TypeError, ValueError):
+        tenor = 0
+    if not 1 <= tenor <= 720:
+        return jsonify({
+            "error": "Invalid payload",
+            "details": [{"field": "tenor_days",
+                         "message": "must be between 1 and 720 days"}]}), 400
+    return None
+
+
 def _lc_update_fields(conn, lc_id, fields):
-    allowed = ("lc_date", "expiry_date", "bank_ref", "notes")
+    allowed = ("lc_date", "expiry_date", "bank_ref", "notes",
+               "payment_terms", "tenor_days")
     clean = {k: v for k, v in fields.items() if k in allowed}
     if not conn.execute("SELECT 1 FROM letters_of_credit WHERE id = %s",
                         (lc_id,)).fetchone():
@@ -3428,6 +3484,8 @@ class LcCreateIn(_StrippedModel):
     expiry_date: str | None = None
     bank_ref: str | None = None
     notes: str | None = None
+    payment_terms: str | None = None
+    tenor_days: int | None = None
 
 
 class LcUpdateIn(BaseModel):
@@ -3437,6 +3495,8 @@ class LcUpdateIn(BaseModel):
     expiry_date: str | None = None
     bank_ref: str | None = None
     notes: str | None = None
+    payment_terms: str | None = None
+    tenor_days: int | None = None
 
 
 class LcAttachIn(_StrippedModel):
@@ -3499,6 +3559,9 @@ def api_create_lc():
         payload = LcCreateIn.model_validate(request.get_json() or {})
     except ValidationError as e:
         return _validation_error_response(e)
+    terms_error = _lc_terms_error(payload.payment_terms, payload.tenor_days)
+    if terms_error:
+        return terms_error
     conn = get_db()
     if not get_company(conn, payload.company_id):
         conn.close()
@@ -3507,7 +3570,9 @@ def api_create_lc():
         lc = create_lc(conn, payload.company_id, payload.lc_number,
                        lc_date=payload.lc_date,
                        expiry_date=payload.expiry_date,
-                       bank_ref=payload.bank_ref, notes=payload.notes)
+                       bank_ref=payload.bank_ref, notes=payload.notes,
+                       payment_terms=payload.payment_terms,
+                       tenor_days=payload.tenor_days)
     except ValueError as e:
         _rollback_close(conn)
         # Status comes from the exception TYPE (raas_tracker._exceptions):
@@ -3561,6 +3626,8 @@ def api_lc_readiness(lc_id):
         "recipes_ok": readiness.get("recipes_ok"),
         "produced_ok": readiness.get("produced_ok"),
         "booked_ok": readiness.get("booked_ok"),
+        "payment_terms": lc.get("payment_terms"),
+        "tenor_days": lc.get("tenor_days"),
         "detail": readiness.get("detail"),
         "pis": [{"id": p["id"], "pi_number": p.get("pi_number"), "stage": p.get("stage")}
                 for p in (lc.get("pis") or [])],
@@ -3573,11 +3640,12 @@ def api_invoice_readiness(invoice_id):
     conn = get_db()
     try:
         inv = conn.execute(
-            "SELECT id, sale_id, status, shipment_status FROM invoices WHERE id = %s",
+            "SELECT id, sale_id, status, shipment_status, maturity_date "
+            "FROM invoices WHERE id = %s",
             (invoice_id,)).fetchone()
         if not inv:
             return jsonify({"error": "Invoice not found"}), 404
-        invoice_id, sale_id, status, shipment_status = inv
+        invoice_id, sale_id, status, shipment_status, invoice_maturity = inv
         # Production readiness is per INVOICE, not per sale: producing a
         # sibling invoice's product must not make this one look ready.
         # (It used to call the sale-scoped production_readiness.)
@@ -3585,6 +3653,8 @@ def api_invoice_readiness(invoice_id):
             "SELECT company_id FROM sales WHERE id = %s", (sale_id,)).fetchone()
         company_id = company_row[0] if company_row else None
         ready = invoice_production_readiness(conn, company_id, invoice_id)
+        # Terms are inherited from the LC; a sale without one reads at-sight.
+        payment_terms, tenor_days = invoice_terms_for_sale(conn, sale_id)
         # Booking is only a live option from an open status, and only once
         # every invoiced product has been produced. Mirrors book_invoice.
         can_book = status in ("planned", "produced") and ready["ok"]
@@ -3596,6 +3666,9 @@ def api_invoice_readiness(invoice_id):
             "invoice_id": invoice_id,
             "status": status,
             "shipment_status": shipment_status,
+            "maturity_date": invoice_maturity,
+            "payment_terms": payment_terms,
+            "tenor_days": tenor_days,
             "can_book": can_book,
             "can_ship": can_ship,
             "can_pay": can_pay,
@@ -3630,6 +3703,27 @@ def api_update_lc_record(lc_id):
         return jsonify({"error": "nothing to update"}), 400
     conn = get_db()
     try:
+        # Payment terms are cross-field: a partial update keeps the stored
+        # value for whichever side was not sent, and switching to at-sight
+        # clears any stored tenor in the same write.
+        if "payment_terms" in fields or "tenor_days" in fields:
+            current = conn.execute(
+                "SELECT payment_terms, tenor_days FROM letters_of_credit "
+                "WHERE id = %s", (lc_id,)).fetchone()
+            if not current:
+                _rollback_close(conn)
+                return jsonify({"error": "LC not found"}), 404
+            terms = (fields.get("payment_terms", current[0] or "at_sight")
+                     or "at_sight")
+            if terms == "at_sight":
+                fields["payment_terms"] = "at_sight"
+                fields["tenor_days"] = None
+            else:
+                terms_error = _lc_terms_error(
+                    terms, fields.get("tenor_days", current[1]))
+                if terms_error:
+                    _rollback_close(conn)
+                    return terms_error
         # Permanent route-level helper: no update service in
         # raas_tracker/; explicit allowlist keeps number+company immutable.
         ok = _lc_update_fields(conn, lc_id, fields)

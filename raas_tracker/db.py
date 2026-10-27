@@ -138,7 +138,10 @@ _SCHEMA_VERSION_KEY = "raas_schema_version"
 # 6 = INVOICE-CONTRACT: invoices.invoice_date column added and backfilled from
 #     created_at on existing databases (invoices are now created with explicit
 #     lines + a stated date; there is no line-less mode any more).
-_SCHEMA_VERSION = 6
+# 7 = INVOICE-MATURITY: letters_of_credit.payment_terms/tenor_days and
+#     invoices.maturity_date columns added. NULL legacy rows read as at-sight;
+#     no backfill rewrite (the ship-time computation is the source of truth).
+_SCHEMA_VERSION = 7
 
 # Frozen legacy tokens from builds that shipped them — do NOT add
 # per-migration entries. _SCHEMA_VERSION is authoritative; these only preserve
@@ -951,6 +954,16 @@ def _run_migration(conn: psycopg.Connection) -> None:
     # INV-REVISION: letters_of_credit.shipment_gate (per-invoice vs all_invoices)
     if "shipment_gate" not in _table_columns(conn, "letters_of_credit"):
         conn.execute("ALTER TABLE letters_of_credit ADD COLUMN shipment_gate TEXT DEFAULT 'per_invoice'")
+
+    # INVOICE-MATURITY: payment terms live on the LC; each invoice carries its
+    # own maturity date computed at ship time (at sight -> ship date, deferred
+    # -> ship date + tenor). NULL legacy terms read as at-sight.
+    if "payment_terms" not in _table_columns(conn, "letters_of_credit"):
+        conn.execute("ALTER TABLE letters_of_credit ADD COLUMN payment_terms TEXT")
+    if "tenor_days" not in _table_columns(conn, "letters_of_credit"):
+        conn.execute("ALTER TABLE letters_of_credit ADD COLUMN tenor_days INTEGER")
+    if "maturity_date" not in _table_columns(conn, "invoices"):
+        conn.execute("ALTER TABLE invoices ADD COLUMN maturity_date TEXT")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS invoice_items (
