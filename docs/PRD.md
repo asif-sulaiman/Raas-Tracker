@@ -107,6 +107,7 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 9. **Completion is defined by invoices, not the PI.** A sale in Payment Due completes the moment it has at least one invoice and every one of them is `paid`; the money compared is `SUM(invoice_items.line_total)`, so an invoice set that bills less than the PI still settles the sale. A payment edit, a payment delete, or an invoice void that leaves an invoice unpaid reopens the completed sale to Payment Due. A sale with no invoices cannot complete (**409**, "no invoices").
    - An LC follows its children: it completes automatically with its last completed child and reverts to Payment Due when a child reopens. An operator moving an LC to `completed` by hand is refused (**409**) while any child invoice is unsettled.
    - The sale header and its payments read the **invoiced** total; the PI total remains available as the offer (`get_sale_pi_total`) for the report's per-line fallback and maturity fallback.
+10. **Payment terms live on the LC; maturity is per invoice.** An LC is `at_sight` (default) or `deferred` with a tenor in days (1–720). Shipping an invoice stamps its `maturity_date`: at sight = the actual ship date; deferred = actual ship date + tenor (leap-safe calendar days); a sale without an LC is at sight. The operator may override the date in the Ship form, but never with one earlier than the actual ship date, and the override is audited. Legacy LCs without terms read as at sight. Invoice rows show "matures <date>" and an **Overdue** chip once a shipped invoice is past its maturity. All amounts remain USD.
 
 ### Flow 7: Commercial Report (live PI, invoice takes over)
 - One row per **PI line** (unchanged grain), same columns as before plus `is_provisional`
@@ -137,7 +138,8 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 | `sale_items` | id, sale_id (FK), item_no, product_name, quantity, unit_price, unit | Sales line items |
 | `companies` | id, name (unique), code, country, address, contact_person, swift, lc_bank | Customer master (P0) |
 | `shipments` | id, sale_id (FK), ship_date, invoice_number, invoice_date, notes | Actual shipments, partials as rows (P1) |
-| `invoices` | id, sale_id (FK), invoice_number, status (planned → produced → booked → shipped → paid), amount, approx/actual ship dates, notes | Per-invoice shipment lifecycle; a sale may hold several |
+| `invoices` | id, sale_id (FK), invoice_number, status (planned → produced → booked → shipped → paid), amount, approx/actual ship dates, maturity_date, notes | Per-invoice shipment lifecycle; a sale may hold several. `maturity_date` is stamped at ship time from the LC terms |
+| `letters_of_credit` | id, lc_number, company_id (FK), lc_date, expiry_date, bank_ref, stage, payment_terms (at_sight \| deferred), tenor_days, notes | LC header; owns the PIs' pipeline journey and the payment terms invoices mature under |
 | `production_runs` + `production_run_items` | run: recipe/order/batch/dates/material_number/packing/invoice_number/notes; items: frozen formula + deducted qtys | Immutable batch log (P1 DDL, P3 executes) |
 | `production_run_links` | id, run_id (FK), sale_id (FK), invoice_id (FK) | Ties a production run to the sale(s)/invoice(s) it fulfils |
 | `sale_payments` | id, sale_id, invoice_id (FK), payment_date, payment_amount, notes, created_at | Payment records |

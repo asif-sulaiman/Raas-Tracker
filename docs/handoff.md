@@ -5,6 +5,90 @@
 
 ---
 
+## 2026-10-27 — INVOICE-MATURITY Phase 1 (LC terms + per-invoice maturity)
+
+Worktree `O:/Projects/Raas-Tracker-worktrees/invoice-shipment-gate`, branch
+`feat/invoice-start-at-shipment`. Phase 1 of the approved 7-phase plan
+(`~/.qoder/plans/warm-cave-stag.md`): **schema + API + UI**, no reminders yet.
+
+### What shipped
+
+- **Schema v7.** `letters_of_credit.payment_terms` (TEXT, NULL = at sight) and
+  `tenor_days` (INTEGER); `invoices.maturity_date` (TEXT ISO). `_SCHEMA_VERSION`
+  6 → 7; guarded additive `ALTER TABLE`s inside `_create_tables()`; **no
+  backfill** — a legacy NULL row reads as at sight.
+- **LC terms service/API.** `create_lc(payment_terms, tenor_days)` defaults
+  `at_sight` and forces `tenor_days = NULL`; `deferred` requires 1..720;
+  `POST /api/lcs` and `PUT /api/lcs/<id>` validate with a field-shaped **400**
+  (`payment_terms` / `tenor_days`), and a PUT back to at sight clears the tenor.
+  `GET /api/lcs/<id>` and the list expose both.
+- **Ship-time maturity.** `invoice_terms_for_sale` reads the sale's LC terms;
+  `resolve_invoice_maturity` computes at sight = actual ship date, deferred =
+  actual + tenor (leap-safe, UTC date math), and accepts an operator override
+  only if it is strict `YYYY-MM-DD` and **not before** the actual ship date.
+  Resolution happens **before** the shipment INSERT; `ship_invoice` persists
+  `maturity_date`, audits `Shipped on <date> (maturity <date>)`, and returns it.
+  `GET /api/sales/<id>/invoices` rows and `GET /api/invoices/<id>/readiness`
+  carry `maturity_date` + the LC's `payment_terms`/`tenor_days` (a sale with no
+  LC reads `at_sight`, never null).
+- **UI.** `LinkPIsModal` (new LC) and `LcDetailModal` (edit) carry a
+  **Payment terms** select with a conditional **Tenor days** input (1..720);
+  the LC view shows `Deferred · N days` / `At sight`. `InvoicePanel`'s Ship
+  form prefills an editable **Maturity date** from the row's terms and follows
+  the actual ship date until the operator edits it; rows show
+  `matures <date>` plus an **Overdue** chip for a shipped invoice whose maturity
+  has passed.
+
+### Decisions made & why
+
+- **Terms live on the LC**, one tenor per LC, not per invoice — every invoice of
+  that LC inherits it, so an operator never re-enters terms per shipment.
+- **Maturity is computed at ship time, not at invoice creation.** Before the
+  actual ship date exists there is nothing to add a tenor to.
+- **The override is a correction, not a contract.** It cannot precede the
+  actual ship date and it is audited with the ship event.
+- **The UI prefill is convenience only.** The server recomputes/re-validates, so
+  a stale or hand-edited payload cannot store a wrong maturity.
+- **No backfill.** Legacy rows read as at sight; rewriting history would invent
+  ship dates for invoices that never shipped.
+- **All money stays USD.** Reminder email recipients will be the company's
+  directors only (never clients) — Phase 3.
+
+### Gate (all green)
+
+| Gate | Result |
+|---|---|
+| Full backend `python -m pytest tests/ -q` | **1302 passed, 8 skipped** in 1640.74s, exit 0 |
+| New tests | `tests/test_lc_terms.py` (**11**) + `tests/test_invoice_maturity.py` (**8**) |
+| `python -m ruff check .` | 63 findings repo-wide, all pre-existing; none in the changed hunks (baseline was 64) |
+| `python -m pyright` | 6 errors / 18 warnings — identical to baseline |
+| Frontend `npm test` | **348 passed / 39 files** |
+| `npx oxlint` | 0 errors / 0 warnings |
+| `npx vite build` | succeeded (chunk-size warning only) |
+
+### Not run
+
+- No manual browser pass and no isolated-Postgres E2E script for this phase; the
+  backend suite drives the real Flask app and the component tests cover the
+  three UI surfaces.
+- **Production is still at `raas_schema_version` 6.** The first boot after this
+  branch is deployed must apply v7; verify `payment_terms`/`tenor_days` on
+  `letters_of_credit` and `maturity_date` on `invoices`, then confirm the gate
+  returns to its fast path.
+
+### Next
+
+Phases 2–7 of the same approved plan, in order: **2** per-invoice Payment Due +
+board visibility (sale enters Payment Due on its first actual ship date, invoice
+list + inline forms on every card, manual move button removed in the UI),
+**3** daily reminder cron (at sight +7 days, deferred at maturity; in-app bell +
+email to `NOTIFY_EMAILS` directors only, deduped, one 7-day escalation),
+**4** late invoicing reopens a completed sale, **5** sheet-like report grain
+(per invoice line + provisional remainder), **6** report UI, **7** docs +
+verification.
+
+---
+
 ## 2026-10-27 — Phase 7 verification + push (SHIP-FIRST complete)
 
 Worktree `O:/Projects/Raas-Tracker-worktrees/invoice-shipment-gate`, branch
