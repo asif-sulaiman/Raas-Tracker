@@ -77,7 +77,7 @@ def test_letters_of_credit_columns(lc_db):
     assert set(cols) == {
         "id", "lc_number", "company_id", "lc_date", "expiry_date",
         "bank_ref", "stage", "notes", "created_at", "updated_at",
-        "shipment_gate",
+        "shipment_gate", "payment_terms", "tenor_days",
     }, f"unexpected letters_of_credit columns: {sorted(cols)}"
     assert cols["lc_number"]["nullable"] == "NO"
     assert cols["company_id"]["nullable"] == "NO"

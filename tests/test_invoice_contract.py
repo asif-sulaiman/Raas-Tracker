@@ -213,8 +213,10 @@ def test_api_create_invoice_stores_date(admin_client, db):
 # --------------------------------------------------------------------------- #
 # 5. schema version 6 carries the column
 # --------------------------------------------------------------------------- #
-def test_schema_v6_has_invoices_invoice_date(db):
-    assert _SCHEMA_VERSION == 6, "DDL changed: bump the version"
+def test_schema_version_covers_invoices_invoice_date(db):
+    # invoice_date landed in v6; later schema bumps (v7 adds invoice maturity)
+    # must keep carrying it, so assert the floor rather than one exact value.
+    assert _SCHEMA_VERSION >= 6
     assert "invoice_date" in _table_columns(db, "invoices")
 
 
