@@ -9,10 +9,8 @@ import LinkPIsModal from '../components/sales/LinkPIsModal';
 import LcDetailModal from '../components/sales/LcDetailModal';
 import UploadPI from '../components/sales/UploadPI';
 import ReviewModal from '../components/sales/ReviewModal';
-import PaymentModal from '../components/sales/PaymentModal';
 import SaleDetailModal from '../components/sales/SaleDetailModal';
-import ProductionRequiredModal from '../components/sales/ProductionRequiredModal';
-import { STAGES, groupSalesByLc, lcGroupKey, nextStageFor } from '../utils/sales';
+import { BOARD_STAGES, STAGES, groupSalesByLc, lcGroupKey, nextStageFor } from '../utils/sales';
 import { formatNumber, toCents, fromCents } from '../utils/format';
 import { useAuth } from '../context/AuthContext';
 import { useConfirm } from '../context/ConfirmContext';
@@ -25,7 +23,6 @@ const HEADER_STYLES = {
   lc_received: 'bg-indigo-50 dark:bg-indigo-950/40 border-indigo-200 dark:border-indigo-800 text-indigo-700 dark:text-indigo-300',
   shipment_ongoing: 'bg-amber-50 dark:bg-amber-950/40 border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-300',
   payment_due: 'bg-orange-50 dark:bg-orange-950/40 border-orange-200 dark:border-orange-800 text-orange-700 dark:text-orange-300',
-  completed: 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300',
 };
 
 export default function Sales() {
@@ -43,15 +40,11 @@ export default function Sales() {
   const [showLink, setShowLink] = useState(false);
   const [lcDetailId, setLcDetailId] = useState(null);
   const [reviewData, setReviewData] = useState(null);
-  const [paymentSale, setPaymentSale] = useState(null);
   const [detailSaleId, setDetailSaleId] = useState(null);
   const [query, setQuery] = useState('');
   const [page, setPage] = useState(1);
   const [totalSales, setTotalSales] = useState(0);
 
-  // Barrier modal
-  const [showProductionRequired, setShowProductionRequired] = useState(false);
-  const [barrierDetail, setBarrierDetail] = useState(null);
   const pageSize = 50;
 
   const abortRef = useRef(null);
@@ -124,8 +117,10 @@ export default function Sales() {
     // Legacy `Enter LC` (PUT /api/sales/<id>/lc) retired: it wrote lc_number
     // with lc_id NULL and stranded PIs. LC creation flows only through
     // LinkPIsModal (POST /api/lcs + POST .../pis).
-    if (stageDef.action === 'payment') {
-      setPaymentSale(sale);
+    if (stageDef.action === 'detail') {
+      // Payment Due is invoice territory now: the sale-level payment form is
+      // gone, and the card opens the editor that owns the invoices.
+      setDetailSaleId(sale.id);
     } else if (stageDef.action === 'move') {
       handleMove(sale);
     }
@@ -170,8 +165,9 @@ export default function Sales() {
 
   // LC lane: one card per LC moves/unlinks as a unit; PIs always travel
   // together. Entering Shipment Ongoing needs no invoice, so that crossing
-  // posts straight through. The Payment Due crossing still probes readiness
-  // and points the operator at the missing recipes/production runs.
+  // posts straight through. The Payment Due crossing asks for one BOOKED
+  // invoice across the group — booking already proves production, so the
+  // readiness probe reports `booked_ok` (recipes/production are informational).
   const handleLcMove = async (lc) => {
     if (typeof lc?.id !== 'number') return;
     const next = nextStageFor(lc.stage);
@@ -185,9 +181,11 @@ export default function Sales() {
           toast.error(body?.error || 'Readiness check failed');
           return;
         }
-        if (!body.recipes_ok || !body.produced_ok) {
-          setBarrierDetail(body.detail || {});
-          setShowProductionRequired(true);
+        if (!body.booked_ok) {
+          toast.error(
+            body?.error
+            || 'No booked invoice yet — produce and book an invoice before moving to Payment Due',
+          );
           return;
         }
       }
@@ -203,6 +201,13 @@ export default function Sales() {
       setMovingId(null);
       fetchData();
     }
+  };
+
+  // Payment Due LCs open invoice management on their first PI; the stage move
+  // is not offered from that column (payment accrues per invoice).
+  const handleLcManage = (lc) => {
+    const first = Array.isArray(lc?.pis) ? lc.pis[0] : null;
+    if (first?.id) setDetailSaleId(first.id);
   };
 
   const handleUnlink = async (lc, pi) => {    if (typeof lc?.id !== 'number' || !pi?.id) return;
@@ -349,13 +354,17 @@ export default function Sales() {
         </div>
       ) : (
         <>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-5 gap-4 items-start">
+          <div
+            role="region"
+            aria-label="Sales pipeline board"
+            className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4 items-start"
+          >
             {(() => {
               // F5a invariant: one lc_id split across stages would render 2
               // cards while the backend moves ALL children as a unit — render
               // the LC only in its earliest stage and warn on the split.
               const seenLcKeys = new Set();
-              return STAGES.map((st) => {
+              return BOARD_STAGES.map((st) => {
               const stageSales = salesByStage(st.key);
               const { groups } = groupSalesByLc(stageSales, lcs);
               const byKey = new Map(groups.map((g) => [g.key, g]));
@@ -408,13 +417,16 @@ export default function Sales() {
                       lc={group.lc}
                       actionLabel={movingId || !real || !atOwnStage ? null : st.actionLabel}
                       actionVariant={st.actionVariant}
-                      onAction={real && atOwnStage ? handleLcMove : undefined}
+                      onAction={
+                        real && atOwnStage
+                          ? (st.action === 'detail' ? handleLcManage : handleLcMove)
+                          : undefined
+                      }
                       onOpen={handleLcOpen}
                       onViewPI={(pi) => setDetailSaleId(pi.id)}
                       onUnlink={isAdmin && real ? (pi) => handleUnlink(group.lc, pi) : undefined}
                       onManageInvoices={
-                        (st.key === 'shipment_ongoing' || st.key === 'payment_due') &&
-                        group.lc.pis.length > 0
+                        st.key === 'shipment_ongoing' && group.lc.pis.length > 0
                           ? () => setDetailSaleId(group.lc.pis[0].id)
                           : undefined
                       }
@@ -512,13 +524,6 @@ export default function Sales() {
         onSave={handleReviewSave}
       />
 
-      <PaymentModal
-        isOpen={!!paymentSale}
-        sale={paymentSale}
-        onClose={() => setPaymentSale(null)}
-        onSaved={fetchData}
-      />
-
       <SaleDetailModal
         saleId={detailSaleId}
         onClose={() => setDetailSaleId(null)}
@@ -553,18 +558,6 @@ export default function Sales() {
         onViewPI={(pi) => {
           setLcDetailId(null);
           setDetailSaleId(pi.id);
-        }}
-      />
-
-      <ProductionRequiredModal
-        isOpen={showProductionRequired}
-        onClose={() => {
-          setShowProductionRequired(false);
-          setBarrierDetail({});
-        }}
-        missingDetail={barrierDetail}
-        onSuccess={() => {
-          fetchData();
         }}
       />
     </div>

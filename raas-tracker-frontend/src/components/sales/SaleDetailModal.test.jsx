@@ -39,13 +39,25 @@ function jsonResponse(data, ok = true, status = 200) {
   return { ok, status, json: async () => data, headers: { get: () => null } };
 }
 
-function installFetch({ role = 'admin', deletes = [], failGetsAfterPut = false, notFound = false } = {}) {
+function installFetch({
+  role = 'admin', deletes = [], failGetsAfterPut = false, notFound = false,
+  detail = DETAIL, invoices = [],
+} = {}) {
   let putSeen = false;
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
     const u = String(url);
     const method = options?.method || 'GET';
     if (u.includes('/api/auth/me')) {
       return jsonResponse({ id: 1, username: role, role });
+    }
+    if (u.includes('/invoice-lines') && method === 'GET') {
+      return jsonResponse({ lines: [], has_line_less_invoices: false });
+    }
+    if (u.match(/\/api\/sales\/5\/invoices$/) && method === 'GET') {
+      return jsonResponse(invoices);
+    }
+    if (u.includes('/completion') && method === 'GET') {
+      return jsonResponse({ status: 'none', paid: 0, total: invoices.length, invoices });
     }
     if (u.match(/\/api\/sales\/5\/shipments\/\d+/) && method === 'DELETE') {
       deletes.push(u);
@@ -58,10 +70,10 @@ function installFetch({ role = 'admin', deletes = [], failGetsAfterPut = false, 
     if (u.match(/\/api\/sales\/5$/)) {
       if (notFound) return jsonResponse({ error: 'Sale not found' }, false, 404);
       if (failGetsAfterPut && putSeen) return jsonResponse({ error: 'Bad gateway' }, false, 502);
-      return jsonResponse(DETAIL);
+      return jsonResponse(detail);
     }
     if (u.includes('/api/sales/5')) {
-      return jsonResponse(DETAIL);
+      return jsonResponse(detail);
     }
     return jsonResponse({});
   }));
@@ -227,6 +239,57 @@ describe('SaleDetailModal shipments', () => {
     expect(await screen.findByLabelText('Target invoice')).toBeTruthy();
     await waitFor(() => expect(budgetCalls).toBeGreaterThanOrEqual(1));
     expect(await screen.findByText(/sale not found/i)).toBeTruthy();
+  });
+});
+
+describe('SaleDetailModal invoice lifecycle by stage', () => {
+  it('mounts invoice management in Payment Due', async () => {
+    renderDetail({ detail: { ...DETAIL, stage: 'payment_due' } });
+    // Invoice management follows the sale past Shipment Ongoing.
+    expect(await screen.findByRole('button', { name: 'Add invoice' })).toBeTruthy();
+    expect(screen.getByText(/^Invoices \(/)).toBeTruthy();
+  });
+
+  it('shows completed invoices read-only while payments stay editable', async () => {
+    const invoices = [{
+      invoice_id: 101, invoice_number: 'INV-101', status: 'paid',
+      approx_ship_date: '2026-09-01', actual_ship_date: '2026-09-02', notes: null,
+      created_at: '2026-09-01 10:00:00', amount: 325, paid_amount: 325,
+    }];
+    const detail = {
+      ...DETAIL,
+      stage: 'completed',
+      invoices,
+      payments: [{ id: 3, payment_date: '2026-10-01', payment_amount: 325, notes: null }],
+      total_paid: 325, balance: 0,
+    };
+    renderDetail({ detail, invoices });
+
+    expect(await screen.findByText('INV-101')).toBeTruthy();
+    // No invoice or line may be added, advanced, or voided on a completed sale.
+    expect(screen.queryByRole('button', { name: 'Add invoice' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Book shipment' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Ship' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Record payment' })).toBeNull();
+    expect(screen.queryByRole('button', { name: /void invoice/i })).toBeNull();
+    expect(screen.queryByText(/add lines to invoice/i)).toBeNull();
+    // The payment ledger stays correctable — that is the report's edit path.
+    expect(screen.getByTitle('Edit payment')).toBeTruthy();
+  });
+
+  it('targets only planned or produced invoices for new lines', async () => {
+    const invoices = [
+      { invoice_id: 101, invoice_number: 'INV-PLAN', status: 'planned' },
+      { invoice_id: 102, invoice_number: 'INV-BOOK', status: 'booked' },
+    ];
+    renderDetail({ detail: { ...DETAIL, invoices }, invoices });
+
+    const select = await screen.findByLabelText('Target invoice');
+    const options = Array.from(select.querySelectorAll('option'));
+    // A booked invoice is frozen: lines may not be added behind its back.
+    expect(options).toHaveLength(1);
+    expect(select.textContent).toContain('INV-PLAN');
+    expect(select.textContent).not.toContain('INV-BOOK');
   });
 });
 

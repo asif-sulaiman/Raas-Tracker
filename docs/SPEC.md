@@ -555,6 +555,7 @@ CREATE TABLE app_settings (
 - The create path is **one transaction**: the `sales` row and the PI lines are locked `FOR UPDATE` and held to commit; the caller must supply at least one line (`flask_app.py:2383`, `sales.py:1817-1818`), so there is no seeding step and no derived remainder.
 - Quantities are free relative to the PI line: they may equal, exceed, or fall below it. The only rule is finite and > 0. Money is always exact to the cent (`ROUND(..., 2)`).
 - The CSV export appends a **Provisional** column (`Yes`/empty) and keeps the existing 19 columns.
+- **UI:** a provisional row shows a `Provisional` badge and a legend explains the PI fallback. The detail table has a trailing `Actions` column whose Edit button opens `SaleDetailModal` for that `sale_id`. In a completed sale the invoice panel renders read-only (no add/advance/void) while payments, comments and sale fields stay editable; a successful save refetches whatever the current `group_by` renders (detail rows + KPI summary, or the period summary).
 
 ### Audit & Notifications
 | Method | Path | Auth | Description |
@@ -1191,8 +1192,8 @@ than removed.
 
 ### Frontend (Vitest)
 - **Environment**: jsdom
-- **Coverage**: 40 test files, 331 tests (utils, components, contexts, pages) - includes `InvoiceEditor.test.jsx` (the one composer, both modes: open quantity input with live `Remaining` under PI qty, read-only computed Total price, no cap — quantities are free relative to the PI, structural 400/404 handling, per-row reporting on partial success) and `InvoicePanel.test.jsx`
-- **Lint**: oxlint (0 errors, 7 pre-existing warnings)
+- **Coverage**: 39 test files, 339 tests (utils, components, contexts, pages) - includes `InvoiceEditor.test.jsx` (the one composer, both modes: open quantity input with live `Remaining` under PI qty, read-only computed Total price, no cap — quantities are free relative to the PI, structural 400/404 handling, per-row reporting on partial success), `InvoicePanel.test.jsx` (Pay only from `shipped`, Ship only from `booked`, server 409 wording surfaced verbatim, completed read-only hides every mutation), `Sales.test.jsx` (four live columns, completed archived, `'detail'` action opens the editor, LC Payment Due needs `booked_ok`), `SaleDetailModal.test.jsx` (invoice panel from Shipment Ongoing, completed read-only with editable payments) and `CommercialTable.test.jsx` / `Reports.test.jsx` (Provisional badge, Actions→Edit, save reloads the report)
+- **Lint**: oxlint (0 errors, 0 warnings)
 
 ### CI (`.github/workflows/ci.yml`)
 - **Runtime**: Python **3.12** pinned to the Vercel deploy runtime (Vercel defaults to 3.12; no `.python-version`/`pyproject.toml` overrides it) · Node 22 · postgres:16

@@ -77,6 +77,7 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 3. `shipment_ongoing → payment_due` is **gated**: refused unless **at least one non-void invoice** on the LC's PIs is past booking (`booked`, `shipped`, or `paid`). Booking is the per-invoice proof that production finished, so unready siblings stay in their own statuses and do not block the ready invoice. The refusal names the missing booked invoice.
 4. `shipment_ongoing` → invoices advance individually and **strictly in order** (book → ship → pay). **Completion is invoice-defined** (see Flow 6, step 9): a sale completes once it has at least one invoice and every invoice is `paid`, measured on invoice lines rather than the PI. The parent LC completes with its last settled child and reopens if any child reopens.
 5. All PIs under one LC progress together — the pipeline board shows one LC card with its PIs nested
+6. The board shows the **four live stages only** (PI Issued, LC Received, Shipment Ongoing, Payment Due). Completed sales leave the board but stay in the commercial report, where they can be corrected. In Shipment Ongoing the card offers the sale's invoices; in Payment Due it opens that same editor — payment is recorded per invoice, never on the sale.
 
 ### Flow 4: Recipe/Production Reports
 1. User goes to **Reports** → selects recipes → enters production quantity → **Generate**
@@ -115,6 +116,8 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 - `due = max(sale_total − received, 0)`; payment status follows those totals
 - **Completed sales stay in the report.** Completion removes a sale from the board, never from the report, where its rows remain available for correction and audit
 - Filters add **LC** (exact match on the LC), alongside quick search, dates, company, stage and status, and they apply to provisional rows too
+- A provisional row carries a **Provisional** badge, and a legend says those quantities come from the PI until an invoice line covers them
+- Every detail row has an **Actions** column whose Edit button opens the same sale/invoice editor the pipeline uses. Completed sales stay editable there: invoice lines are read-only, while sale fields, comments and payment records remain correctable (audited). A save reloads the report and its KPI summary immediately
 
 ## 6. Data Model
 

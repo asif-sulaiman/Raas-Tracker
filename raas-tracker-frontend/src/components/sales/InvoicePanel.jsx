@@ -87,7 +87,7 @@ function StatusChip({ status }) {
  * it must state what is being shipped rather than inheriting the PI remainder
  * (which silently produced a $0 "paid" row).
  */
-export default function InvoicePanel({ saleId, isAdmin = false, onChanged }) {
+export default function InvoicePanel({ saleId, isAdmin = false, readOnly = false, onChanged }) {
   const { apiFetch } = useAuth();
   const { confirm } = useConfirm();
   const [invoices, setInvoices] = useState([]);
@@ -159,8 +159,8 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged }) {
     return () => {
       cancelled = true;
     };
-    // `apiFetch` identity shifts on route navigation (same as PaymentModal) —
-    // saleId is the real input here. The panel is keyed by sale in the modal.
+    // `apiFetch` identity shifts on route navigation — saleId is the real
+    // input here. The panel is keyed by sale in the modal.
     // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [saleId]);
 
@@ -284,6 +284,9 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged }) {
     }
   };
 
+  // A completed sale keeps its invoices on screen as evidence, but nothing may
+  // be added, advanced, or voided: the lifecycle is closed.
+  const canEdit = isAdmin && !readOnly;
   const paidCount = completion && typeof completion.paid === 'number'
     ? completion.paid
     : invoices.filter((i) => i.status === 'paid').length;
@@ -309,13 +312,18 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged }) {
               {totalsReady && ` · ${usd(completion.paid_amount)} of ${usd(completion.total_amount)}`}
             </span>
           )}
+          {readOnly && (
+            <span className="ml-2 text-xs font-normal text-slate-400 dark:text-slate-500">
+              read-only
+            </span>
+          )}
           {totalsUnavailable && !totalsReady && (
             <span className="ml-2 text-xs font-normal text-amber-600 dark:text-amber-400">
               Money totals unavailable
             </span>
           )}
         </h4>
-        {isAdmin && !adding && !step && (
+        {canEdit && !adding && !step && (
           <Button variant="secondary" size="sm" icon={Plus} onClick={openAdd}>
             Add invoice
           </Button>
@@ -395,7 +403,7 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged }) {
                     </span>
                   )}
                   <span className="flex-1" />
-                  {isAdmin && kind && !active && !adding && (
+                  {canEdit && kind && !active && !adding && (
                     <Button
                       variant="secondary"
                       size="sm"
@@ -406,12 +414,12 @@ export default function InvoicePanel({ saleId, isAdmin = false, onChanged }) {
                       {STEP_LABEL[kind]}
                     </Button>
                   )}
-                  {blocked && (
+                  {blocked && !readOnly && (
                     <span className="text-[11px] text-amber-600 dark:text-amber-400">
                       {blockedReason}
                     </span>
                   )}
-                  {isAdmin && !active && !adding && (
+                  {canEdit && !active && !adding && (
                     <button
                       type="button"
                       onClick={() => handleVoid(inv)}
