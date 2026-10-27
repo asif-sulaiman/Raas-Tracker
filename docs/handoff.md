@@ -5,6 +5,104 @@
 
 ---
 
+## 2026-10-27 — Phase 7 verification + push (SHIP-FIRST complete)
+
+Worktree `O:/Projects/Raas-Tracker-worktrees/invoice-shipment-gate`, branch
+`feat/invoice-start-at-shipment`. All six feature/docs commits are in the
+branch; this entry adds the Phase 7 evidence commit and the push.
+
+### Full gate (all green)
+
+| Gate | Result |
+|---|---|
+| Targeted backend group 1 (shipment gates, integrity, production, order, completion, LC) | **137 passed** in 150.16s |
+| Targeted backend group 2 (commercial report ×2, sales, typed errors) | **183 passed** in 150.11s |
+| Full backend `python -m pytest tests/ -q` | **1283 passed, 8 skipped** in 1096.86s (18:16), exit 0 |
+| `python -m ruff check .` | 64 pre-existing repo-wide findings, unchanged; the two backend files this branch touched (`sales.py`, `flask_app.py`) carry only baseline import/unused findings outside the changed hunks |
+| `python -m pyright` | **6 errors, 18 warnings** — identical to the recorded baseline |
+| Frontend `npm test` | **339 passed / 39 files** |
+| `npx oxlint` | **0 errors, 0 warnings** |
+| `npx vite build` | succeeded (JS 1,051.63 kB; chunk-size warning only) |
+
+Copied `raas-tracker-frontend/dist/` → `react_frontend/` (gitignored) so Flask
+serves the SPA under test.
+
+### Isolated-Postgres manual E2E (never the production DSN)
+
+Harness lives outside the repo (`%TEMP%\raas_e2e\server.py`, `flow.py`,
+`seed_ui.py`). `server.py` pops the inherited `DATABASE_URL`, starts an
+embedded `pgserver` in a fresh temp dir, asserts the DSN contains `raas_e2e`
+and not `supabase`, pins `DATABASE_URL`/`RAAS_SECRET`/`COOKIE_SECURE=0`
+before importing the app, seeds `e2e-admin`, and serves on
+`127.0.0.1:5099`. `flow.py` drove the plan's A=100/B=100 PI end to end:
+**61/61 checks PASS**, exit 0.
+
+Evidence highlights:
+
+- LC Received → Shipment Ongoing with **zero invoices**; sale
+  `shipment_status=production_running`.
+- Invoice A1 = 80 KG of A: product/unit price **inherited** from the PI
+  (`$5.00`), amount derived `400.00`, born `planned`.
+- Refusals before any write: ship before booking **409**, pay before shipping
+  **409**, book before production **409**; no shipment row was created.
+- Produce from the recipe page → `produced` → book **200**; LC
+  Shipment Ongoing → Payment Due with **one booked invoice**.
+- Ship A1 → shipment row carries the invoice's `invoice_date` (2026-10-20);
+  partial payment keeps `shipped`; balance flips `paid`.
+- Invoice-defined completion: A1's paid invoice set settles the sale even
+  though PI line B was never invoiced. Report then shows A final (80) and B
+  **provisional** (100).
+- A2 (100 KG of B) → produce/book/ship/pay → sale `completed`,
+  `invoice_total = 1100`, LC auto-completed, board archived the sale,
+  `include_completed=true` returns it, report keeps both rows (B now final).
+- Report CSV export returns JSON `{content, row_count}`: 20 columns, trailing
+  `Provisional` column, 2 rows for the completed PI.
+- Payment correction on the completed sale: `700 → 600` reopens it to
+  `payment_due` and B back to `shipped`; restoring `700` completes it again
+  (stage history records both crossings).
+
+**Plan deviation (expected).** The approved plan's E2E step said "verify the
+sale does not complete while A2 is uninvoiced". That step predates the locked
+Q4 decision — completion is the invoice set (≥ 1 invoice, all paid), so A1
+settling *does* complete the sale. The run asserts the shipped/documented
+contract instead; PRD Flow 6 step 9 and SPEC say the same.
+
+### UI pass (Playwright MCP against the same server)
+
+- Board renders exactly **four** live columns (PI Issued, LC Received,
+  Shipment Ongoing, Payment Due); the completed LC is absent. LC Received
+  card shows **Start Shipment**; Shipment Ongoing card shows **Move to
+  Payment Due** + **Manage invoices**.
+- Sale detail from the board shows Invoices (0) with **Add invoice**; the
+  composer pre-fills today's invoice date, Product/PI qty/Remaining, and
+  Unit price + Total are `readOnly`. Typing **120** against a PI line of 50
+  produced `$600.00` with no tolerance/exceed copy — uncapped quantities are
+  live in the UI.
+- Commercial report shows Provisional badges on every uninvoiced row,
+  keeps the completed PI-E2E-1 rows, renders the legend, and each row's
+  Actions pencil opens `SaleDetailModal`; the completed editor is
+  invoice-**read-only** ("2/2 invoices paid · $1,100 of $1,100"), keeps the
+  payments list with **Edit payment / Delete payment** controls, and its
+  stage history shows Payment Due → Completed → Payment Due → Completed.
+- No console errors on the reports/sales pages.
+
+### Known follow-up (not touched in Phase 7)
+
+Creating a **new** invoice on an already `completed` sale does not re-sync
+completion (`create_invoice` / `create_invoices_batch` do not call
+`_sync_sale_completion`), so the sale can briefly read `completed` while
+holding a `planned` invoice. Payment/void/delete edits do re-sync. This is
+pre-existing behaviour, not a regression of this branch; closing it needs a
+red test plus a product decision (reopen vs refuse) and belongs in its own
+task.
+
+### Push
+
+`feat/invoice-start-at-shipment` (7 commits incl. this one) pushed to origin
+on 2026-10-27 under the owner's explicit "PUSH ALL". **Not merged** to `main`.
+
+---
+
 ## 2026-10-27 — Invoice-first pipeline (SHIP-FIRST phases 1–6)
 
 Worktree `O:/Projects/Raas-Tracker-worktrees/invoice-shipment-gate`, branch
