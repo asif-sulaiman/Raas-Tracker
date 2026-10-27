@@ -5,6 +5,69 @@
 
 ---
 
+## 2026-10-27 — Invoice-first pipeline (SHIP-FIRST phases 1–6)
+
+Worktree `O:/Projects/Raas-Tracker-worktrees/invoice-shipment-gate`, branch
+`feat/invoice-start-at-shipment`. Nothing pushed or merged.
+
+### What was completed
+
+- **Phase 1 (`eb18d5e`) — shipment before invoicing.** `lc_received →
+  shipment_ongoing` no longer needs an invoice; the sale and LC readiness
+  barriers and the frontend barrier modal were removed. Payment Due kept its
+  old production gate until Phase 2.
+- **Phase 2 (`b4cc66c`) — strict Book → Ship → Pay.** `ship_invoice` requires
+  `booked` and stamps the invoice's `invoice_date` on the shipment;
+  `mark_invoice_paid` requires `shipped`. Typed `InvoiceNotBooked` /
+  `InvoiceNotShipped` / `SaleNotReadyPastShipment` map to **409**.
+  `booked_invoice_readiness` powers the sale and LC Payment Due gates; LC
+  readiness gained `booked_ok`; invoice readiness `can_pay` only for `shipped`.
+- **Phase 3 (`df07754`) — completion defined by invoices.** A sale completes
+  only with ≥ 1 invoice and every invoice `paid`, compared on
+  `SUM(invoice_items.line_total)`. Payment edits/deletes and voids re-sync
+  through `_sync_sale_completion`; an uncovered correction reopens to Payment
+  Due. LC auto-completion (`_sync_lc_completion`) closes with its last
+  completed child and reverts on reopen.
+- **Phase 4 (`591bc48`) — report fallback + retention.** Shared
+  `_commercial_report_base_sql` CTE gives each PI line invoice quantity/price
+  once invoiced and PI quantity with `is_provisional` before; completed sales
+  stay in the report while `/api/sales` hides them (`include_completed=true`
+  opts back in); CSV gained the trailing `Provisional` column (20 columns).
+- **Phase 5 (`7f3a2bc`) — UI.** Four live board columns; Shipment Ongoing =
+  “Move to Payment Due”, Payment Due = “Manage Invoices” opening
+  `SaleDetailModal`. LC crossing gates on `booked_ok`; `ProductionRequiredModal`
+  and the sale-level `PaymentModal` deleted. `InvoicePanel` takes `readOnly`
+  for completed sales; add-line targets are only `planned`/`produced`. The
+  report has an `Actions` column + Provisional badge + legend; a row opens the
+  editor and a save reloads the report/KPIs.
+- **Phase 6 (this commit) — docs.** PRD Flow 3/6/7, SPEC move gates + 409s,
+  payment completion re-sync, report money/columns/CSV + UI contract,
+  `include_completed`, refreshed test coverage; plan rows 1–6 checked;
+  locked decisions recorded.
+
+### Gates (evidence)
+
+- Backend full suite (end of Phase 4, no backend file touched since):
+  **1283 passed, 8 skipped** in 19:17, exit 0. Ruff/pyright unchanged from the
+  pre-existing baseline (repo-wide ruff findings and pyright errors were
+  verified identical at Phase 2; Phase 5 is frontend-only).
+- Phase 5 targeted: 5 files / **91 tests** green.
+- Frontend full suite: **339 passed / 39 files**.
+- `oxlint`: **0 errors, 0 warnings**. `vite build`: succeeded.
+- No DDL, no `_SCHEMA_VERSION` bump, no auth/gate edits.
+
+### Next steps
+
+- **Phase 7** — full pytest + ruff + pyright + vitest + oxlint + build, then
+  the isolated-Postgres manual E2E in the approved plan (A=100/B=100 PI →
+  zero-invoice shipment → partial invoices → book/ship/pay → completion →
+  report provisional/final rows → edit a completed row → CSV).
+- Manual E2E must never point at the production `DATABASE_URL`.
+- Commit 6 (this docs commit) then Phase 7. Push/merge/deploy left to the
+  owner.
+
+---
+
 ## 2026-10-25 — Uncapped invoice quantities
 
 ### What was completed
