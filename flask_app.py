@@ -2057,7 +2057,7 @@ def api_commercial_report_export():
         "Product Name", "Unit", "Quantity", "Unit Price", "Total Price ($)",
         "Invoice Date", "Latest Ship Date", "Actual Ship Date",
         "Maturity Date", "Receive Date", "Received Amount ($)",
-        "Due Amount ($)", "Payment Status", "Payment Comment"
+        "Due Amount ($)", "Payment Status", "Payment Comment", "Provisional"
     ])
     for r in rows:
         writer.writerow([csv_safe(v) for v in (
@@ -2073,7 +2073,8 @@ def api_commercial_report_export():
             r.get("receive_date", ""),
             r.get("received_amount", 0),
             r.get("due_amount", 0),
-            r.get("payment_status", ""), r.get("payment_comment", "")
+            r.get("payment_status", ""), r.get("payment_comment", ""),
+            "Yes" if r.get("is_provisional") else ""
         )])
     from datetime import date as _date
     filename = f"commercial_report_{_date.today().isoformat()}.csv"
@@ -2819,8 +2820,14 @@ def api_list_sales():
     search = request.args.get("q")
     page = request.args.get("page", 1, type=int)
     page_size = request.args.get("page_size", 50, type=int)
+    # Completed sales leave the board by default; the report and CSV export
+    # still carry them, and an explicit include_completed=true opts back in.
+    include_completed = request.args.get(
+        "include_completed", "").strip().lower() in ("1", "true", "yes")
     conn = get_db()
-    result = get_all_sales(conn, stage=stage, search=search, page=page, page_size=page_size)
+    result = get_all_sales(conn, stage=stage, search=search, page=page,
+                           page_size=page_size,
+                           include_completed=include_completed)
     conn.close()
     return jsonify(result)
 
@@ -2833,7 +2840,8 @@ def api_sales_export():
     from flask import Response
     from datetime import date as _date
     conn = get_db()
-    sales = get_all_sales(conn, page=1, page_size=10000)["sales"]
+    sales = get_all_sales(conn, page=1, page_size=10000,
+                          include_completed=True)["sales"]
     conn.close()
     buf = io.StringIO()
     writer = csv.writer(buf)

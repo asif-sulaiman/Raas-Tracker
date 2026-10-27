@@ -535,24 +535,26 @@ CREATE TABLE app_settings (
 |---|---|---|---|
 | POST | `/api/reports/generate` | Session/Key (15/min) | Multi-recipe report JSON |
 | POST | `/api/reports/export` | Session/Key (15/min) | CSV export |
-| GET | `/api/reports/live` | Admin | Live commercial report — one row per sale item, sale-level payment fields repeated (P4) |
+| GET | `/api/reports/live` | Admin | Live commercial report — one row per sale item with per-line PI fallback (`is_provisional`), sale-level payment fields repeated (P4) |
 | GET | `/api/reports/live/filtered` | Admin | Filtered commercial report — detail rows with date_anchor, date_from/to, customer_name, product_name, company_id, stage, payment_status, `lc_id`, `q` (quick search: PI number OR customer OR product), pagination. Non-integer `lc_id`/`company_id` is a 400, never a silently unfiltered result. Sets `X-Total-Count` header = rows matching the filters across ALL pages (the pager keys off it; a full page is never mistaken for the whole report) |
 | GET | `/api/reports/live/summary` | Admin | Period-aggregated commercial report — month/week/year grouping with KPIs and optional detail items. Accepts the same filters as `/live/filtered` including `q` and `lc_id`. `group_by=none` returns one period of whole-filter KPIs (the detail view's KPI cards source) |
-| GET | `/api/reports/live/export` | Admin (15/min) | Commercial report CSV export with same filter params as `/live/filtered` (including `q` and `lc_id`). Response `{success, filename, content, row_count, truncated}` — `row_count` is the full filtered total, `truncated` true when it exceeds the 10 000-row export cap. Client `page`/`page_size` are ignored (export always starts at page 1) |
+| GET | `/api/reports/live/export` | Admin (15/min) | Commercial report CSV export with same filter params as `/live/filtered` (including `q` and `lc_id`). 20 columns: the original 19 plus a trailing `Provisional` (`Yes`/empty). Response `{success, filename, content, row_count, truncated}` — `row_count` is the full filtered total, `truncated` true when it exceeds the 10 000-row export cap. Client `page`/`page_size` are ignored (export always starts at page 1) |
 | POST | `/api/reports/live/export` | Admin (15/min) | Commercial report CSV with filter params in body |
 
-**Commercial report money contract** (the report is invoice-driven; the row grain and columns never change)
-- Per-row `quantity` = `SUM(invoice_items.quantity)` matched on `sale_item_id`; a PI line with nothing invoiced shows `0`.
-- Per-row `total_price` = `ROUND(quantity × sale_items.unit_price, 2)` — the price is always the PI's.
-- Per-sale `sale_total` = `SUM(invoice_items.line_total)` over that sale's invoices.
+**Commercial report money contract** (live PI with per-line invoice fallback; the row grain never changes)
+- Per-row `quantity` = `COALESCE(SUM(invoice_items.quantity), sale_items.quantity)` matched on `sale_item_id`. A line with invoice rows is **final**; a line with none displays the PI quantity and sets `is_provisional = true`.
+- Per-row `total_price` = `ROUND(displayed_quantity × sale_items.unit_price, 2)` — the price is always the PI's, invoiced or not.
+- Per-sale `sale_total` = `SUM(total_price)` over the sale's displayed lines (`SUM(...) OVER (PARTITION BY sale_id)` in the shared `base` CTE), so a partially invoiced sale is coherent.
 - `received_amount` = `SUM(sale_payments.payment_amount)` for the sale (unchanged).
 - `due_amount` = `GREATEST(sale_total − received_amount, 0)` — clamped at zero in the detail rows, the summary KPIs **and** the per-period drill-down alike.
-- Inclusion requires at least one invoice row for the sale.
-- `sale_rows` collapses the per-line `base` to one row per sale (`MAX` for the repeated sale scalars, `SUM` only for per-line gross), so sale-level money is never multiplied by the line count.
+- **No invoice inclusion gate.** A fresh PI is reportable the moment it has lines; completed sales are never dropped.
+- `invoice_date` is the invoice's own `MAX(invoices.invoice_date)` for the line (null while provisional), not the shipment's copy. `actual_ship_date` falls back from the line's invoice ship date to `sales.shipment_date`; `latest_ship_date` is the sale's latest shipment, falling back to `sales.shipment_date`.
+- `sale_rows` collapses the per-line `base` to one row per sale (`MAX` for the repeated sale scalars, `SUM` for both `sale_total` and per-line `gross_sales`), so sale-level money is never multiplied by the line count. The summary drill-down returns the same rows as `/live/filtered`, `is_provisional` included.
 - **One source of truth:** because the row grain is the PI line while the money is `invoice_items`, a PI line that already has invoice lines can be neither deleted nor re-based. `DELETE /api/sales/<id>/items/<item_id>`, `PUT /api/sales/<id>/items/<item_id>` (quantity/price) and the bulk `PUT /api/sales/<id>` (both `removedIds` **and** an `items[].id` rewrite that changes quantity/price) all return **409** (`InvoicedLineConflict`) rather than silently desynchronising the money. `product_name`/`unit` and no-op writes stay editable — they are descriptive only.
-- A legacy invoice with no lines is **not** reconciled. Nothing seeds lines for it: the invoice stays line-less, contributes nothing to `sale_total`, and a sale whose only invoice is line-less therefore reports `gross_sales = 0`, `due_amount = 0` and `payment_status = "Paid"` (`sales.py:1203-1206`, `:1240-1242`, `:1045-1046`). That is deliberate — synthesising lines from a header amount fabricates a receivable — and every deployment must verify the state is empty (`SELECT count(*) FROM invoices i WHERE NOT EXISTS (SELECT 1 FROM invoice_items ii WHERE ii.invoice_id = i.id)` = 0) rather than repair it silently.
+- A legacy invoice with no lines is **not** reconciled. Nothing seeds lines for it: the invoice stays line-less, so its sale lines simply read provisional from the PI. That is deliberate — synthesising lines from a header amount fabricates a receivable — and every deployment must verify the state is empty (`SELECT count(*) FROM invoices i WHERE NOT EXISTS (SELECT 1 FROM invoice_items ii WHERE ii.invoice_id = i.id)` = 0) rather than repair it silently.
 - The create path is **one transaction**: the `sales` row and the PI lines are locked `FOR UPDATE` and held to commit; the caller must supply at least one line (`flask_app.py:2383`, `sales.py:1817-1818`), so there is no seeding step and no derived remainder.
 - Quantities are free relative to the PI line: they may equal, exceed, or fall below it. The only rule is finite and > 0. Money is always exact to the cent (`ROUND(..., 2)`).
+- The CSV export appends a **Provisional** column (`Yes`/empty) and keeps the existing 19 columns.
 
 ### Audit & Notifications
 | Method | Path | Auth | Description |
@@ -646,9 +648,9 @@ future call sites are covered without opting in:
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | POST | `/api/sales/parse` | Session/Key (15/min) | Parse PI PDF/`.docx` → extraction |
-| GET | `/api/sales` | Session/Key | List (filter: stage, q, page, page_size) → `{sales, total}`; rows carry `lc_id` for grouping; includes `shipment_status` |
+| GET | `/api/sales` | Session/Key | List (filter: stage, q, page, page_size) → `{sales, total}`; rows carry `lc_id` for grouping; includes `shipment_status`. **Completed sales are excluded by default** (archived off the board); `include_completed=true` opts them back in |
 | POST | `/api/sales/batch` | Session/Key (15/min) | Create **N PIs in ONE transaction** — `{sales:[{sale, items}]}` → `{ids, warnings}`. Any item failure rolls the whole batch back |
-| GET | `/api/sales/export` | Session/Key (15/min) | CSV export |
+| GET | `/api/sales/export` | Session/Key (15/min) | CSV export (includes completed sales, unlike the board list) |
 | GET | `/api/sales/summary` | Session/Key | Stage-wise summary |
 | GET | `/api/sales/<id>` | Session/Key | Detail: items (incl. `item_no`), `invoices[]`, `shipment_status`, **invoiced** total/balance (`SUM(invoice_items.line_total)`, not the PI) |
 | POST | `/api/sales` | Session/Key | Create (header + items; company_id, unit, item_no) |
@@ -817,8 +819,9 @@ and read the same way. See [Rate Limiting](#rate-limiting-flask-limiter).
 
 `POST /api/sales/batch` was demoted from admin to operator: identical intent and blast
 radius to `POST /api/sales` (both create a PI at `pi_issued`; neither can reach money
-without an admin action later — attach PI → LC → create invoice → book → pay), and the
-commercial report is invoice-driven so an uninvoiced PI contributes 0 to gross sales.
+without an admin action later — attach PI → LC → create invoice → book → pay). The
+commercial report now shows a fresh PI as provisional from the moment it has lines, so
+that list value is visible immediately without being a receivable.
 
 #### Open decisions (deliberately unchanged, not yet ratified)
 

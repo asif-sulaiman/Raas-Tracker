@@ -91,7 +91,7 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 ### Flow 6: Go for Production & Invoice Tracking
 1. An invoice is created against a PI (existing or new number). Its **lines** carry the product, the invoiced quantity, the unit price and the line total. Quantity is **free relative to the PI**: it may be the full PI quantity, less than it, **more than it** (a shipment advantage), or split across several invoices. Unit price is inherited from the PI line and enforced server-side — the client cannot set it
 2. Because quantity may differ per invoice, a product can be partly shipped and the remainder abandoned. Nothing records "abandoned": a quantity that was never invoiced simply never becomes due
-3. The invoice's money is **always derived**, never typed: `amount` = `SUM(invoice_items.line_total)`, restated by the server after the lines are written, so `invoices.amount` always equals the sum of its lines and every invoice reads correctly on the commercial report. A typed amount is not accepted — a header carrying money no line backs is invisible to the report, which showed a real receivable as "Paid" and dropped it from gross sales. In the UI an invoice is therefore always created **with** its lines (pick a PI line, type the quantity, stage it, then save); the invoice cannot be saved line-less. A body with no `lines` is rejected, so there is no line-less path through the API either. Go for Production is the remaining shortcut that creates an invoice on the way to something else — it invoices that PI's **entire remaining quantity** in one invoice, and refuses to create one when nothing is left or when an older header-only invoice makes the remainder unknowable; invoicing less is done from the sale.
+3. The invoice's money is **always derived**, never typed: `amount` = `SUM(invoice_items.line_total)`, restated by the server after the lines are written, so `invoices.amount` always equals the sum of its lines. A typed amount is not accepted. In the UI an invoice is therefore always created **with** its lines (pick a PI line, type the quantity, stage it, then save); the invoice cannot be saved line-less. A body with no `lines` is rejected, so there is no line-less path through the API either. Go for Production is the remaining shortcut that creates an invoice on the way to something else — it invoices that PI's **entire remaining quantity** in one invoice, and refuses to create one when nothing is left or when an older header-only invoice makes the remainder unknowable; invoicing less is done from the sale.
 4. A create is always born **`planned`**, never `paid`. `paid` asserts that money was received, so only a payment record may set it (`_sync_invoice_paid_status`); it is never derived from create-time arithmetic, which once turned a $0-remainder invoice into a terminal row reported as settled
 5. **Multi-invoice creation:** Use `POST /api/sales/<id>/invoices/batch` to create N invoices in one atomic transaction. Body: `{invoices:[{invoice_number, lines:[{sale_item_id, quantity}]}]}`. Each invoice gets ≥1 line; headers are restated as `SUM(invoice_items.line_total)`; atomic (one commit or full rollback). Both paths validate against the same contract: per-line quantity is **free relative to the PI** (equal, more, or less) and the only rule is finite and > 0 — there is no tolerance or ceiling (2026-10-25).
 6. Recipes → detail → **Go for Production** → company → sale/PI → invoice → material number (auto-filled from item no.), packing, batch, date, quantity, optional multi-recipe rows → production run created and linked
@@ -107,12 +107,14 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
    - An LC follows its children: it completes automatically with its last completed child and reverts to Payment Due when a child reopens. An operator moving an LC to `completed` by hand is refused (**409**) while any child invoice is unsettled.
    - The sale header and its payments read the **invoiced** total; the PI total remains available as the offer (`get_sale_pi_total`) for the report's per-line fallback and maturity fallback.
 
-### Flow 7: Commercial Report (invoice-driven)
-- One row per **PI line** (unchanged grain), same columns as before
-- Quantity, total price and due come from **invoice lines**, not the PI: a proforma is an offer, not a receivable
-- Only sales with at least one invoice appear; a PI line with zero invoiced quantity shows 0
-- `due = max(invoiced_total − received, 0)`; payment status follows the invoice totals
-- Filters add **LC** (exact match on the LC), alongside quick search, dates, company, stage and status
+### Flow 7: Commercial Report (live PI, invoice takes over)
+- One row per **PI line** (unchanged grain), same columns as before plus `is_provisional`
+- A fresh PI appears the moment it has lines: quantity, price and total come from the PI and the row is **provisional** (`is_provisional = true`)
+- Once a line is invoiced its quantity comes from **invoice lines** and the row becomes final; the unit price is always the PI's, so an offer and its invoice can never disagree on price
+- A partially invoiced sale mixes both: invoiced lines are final, the rest stay provisional, and the sale total is the sum of the displayed line totals
+- `due = max(sale_total − received, 0)`; payment status follows those totals
+- **Completed sales stay in the report.** Completion removes a sale from the board, never from the report, where its rows remain available for correction and audit
+- Filters add **LC** (exact match on the LC), alongside quick search, dates, company, stage and status, and they apply to provisional rows too
 
 ## 6. Data Model
 

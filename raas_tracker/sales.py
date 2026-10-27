@@ -141,11 +141,14 @@ def add_sale(conn: psycopg.Connection, sale_data: Dict[str, Any],
 
 def get_all_sales(conn: psycopg.Connection, stage: Optional[str] = None,
                   search: Optional[str] = None, page: int = 1,
-                  page_size: int = 50) -> Dict[str, Any]:
+                  page_size: int = 50,
+                  include_completed: bool = False) -> Dict[str, Any]:
     """Return paginated sales (optionally filtered by stage and/or search text).
 
-    Search matches PI number, client name, LC number, and product names.
-    Returns dict with 'sales' list and 'total' count.
+    Completed sales are archived out of the board by default: the report and
+    the CSV export still see them (``include_completed=True``), but the
+    pipeline list does not. Search matches PI number, client name, LC number,
+    and product names. Returns dict with 'sales' list and 'total' count.
     """
     if page < 1:
         page = 1
@@ -179,6 +182,8 @@ def get_all_sales(conn: psycopg.Connection, stage: Optional[str] = None,
     if stage:
         clauses.append("s.stage = %s")
         params.append(stage)
+    if not include_completed:
+        clauses.append("s.stage <> 'completed'")
     if search:
         like = f"%{search}%"
         clauses.append("""(s.pi_number ILIKE %s OR s.client_name ILIKE %s OR s.lc_number ILIKE %s
@@ -1177,6 +1182,64 @@ def _payment_status(due_amount: float, maturity_date: Any,
     return "Pending"
 
 
+def _commercial_report_base_sql(date_anchor_expr: str) -> str:
+    """The per-line CTE shared by the flat report, summary and drill-down.
+
+    One row per PI line. A line with invoice rows displays the invoiced
+    quantity (``SUM(invoice_items.quantity)``) and is final; a line with no
+    invoice rows displays the PI quantity and is provisional. Unit price is
+    always the PI unit price — the invoice never overrides it. ``sale_total``
+    is the sum of those displayed line totals, so a partially invoiced sale
+    still reports a coherent, billable amount.
+
+    ``date_anchor_expr`` is one of the fixed expressions built from the
+    ``date_anchor`` filter map (never user text).
+    """
+    return f"""
+        SELECT l.*,
+               ROUND(SUM(l.total_price) OVER (PARTITION BY l.sale_id)::numeric, 2)::float8
+                   AS sale_total
+        FROM (
+            SELECT
+                s.id AS sale_id,
+                COALESCE(c.name, s.client_name) AS customer_name,
+                s.pi_number, s.pi_date,
+                s.lc_number, s.lc_date,
+                s.shipment_date, s.maturity_date, s.stage, s.comments,
+                s.company_id,
+                s.lc_id,
+                si.product_name, si.unit,
+                COALESCE(ii.inv_qty, si.quantity, 0)::float8 AS quantity,
+                si.unit_price,
+                ROUND((COALESCE(ii.inv_qty, si.quantity, 0) * si.unit_price)::numeric, 2)::float8
+                    AS total_price,
+                (ii.inv_qty IS NULL) AS is_provisional,
+                ii.invoice_date,
+                COALESCE((SELECT MAX(sh.ship_date)
+                            FROM shipments sh WHERE sh.sale_id = s.id),
+                         s.shipment_date) AS latest_ship_date,
+                COALESCE(ii.actual_ship_date, s.shipment_date) AS actual_ship_date,
+                (SELECT MAX(sp.payment_date)
+                   FROM sale_payments sp WHERE sp.sale_id = s.id) AS receive_date,
+                (SELECT COALESCE(ROUND(SUM(sp.payment_amount)::numeric, 2), 0)::float8
+                   FROM sale_payments sp WHERE sp.sale_id = s.id) AS received_amount,
+                {date_anchor_expr} AS date_anchor_col
+            FROM sales s
+            LEFT JOIN sale_items si ON si.sale_id = s.id
+            LEFT JOIN companies c ON c.id = s.company_id
+            LEFT JOIN LATERAL (
+                SELECT SUM(ii.quantity) AS inv_qty,
+                       MAX(i.invoice_date) AS invoice_date,
+                       MAX(i.actual_ship_date) AS actual_ship_date
+                FROM invoice_items ii
+                JOIN invoices i ON i.id = ii.invoice_id
+                WHERE i.sale_id = s.id
+                AND ii.sale_item_id = si.id
+            ) ii ON true
+        ) l
+    """
+
+
 def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> "tuple[List[Dict[str, Any]], int]":
     """Live commercial report — one output row per sale_item, USD only.
 
@@ -1191,9 +1254,12 @@ def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> "tu
     scalar subqueries so item x shipment x payment joins can never
     double count.
 
-    INVOICE-DRIVEN: per-row quantity/total come from invoice_items
-    (SUM per sale_item). Only sales with >=1 invoice row are included
-    (EXISTS invoices). Zero-invoiced lines show 0.
+    LIVE PI FALLBACK: per-line quantity/total come from invoice_items
+    (SUM per sale_item) once the line is invoiced; a line with no invoice
+    rows shows the PI quantity × PI unit price and is flagged
+    ``is_provisional``. Sale total is the sum of displayed line totals, so a
+    partially invoiced sale is coherent. Completed sales remain in the
+    report — the board archives them, the report never drops them.
 
     filters: {
         "date_anchor": "pi_date" | "lc_date" | "shipment_date" | "receive_date" | "maturity_date",
@@ -1285,10 +1351,9 @@ def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> "tu
         """)
         params["payment_status"] = filters["payment_status"]
 
-    # Build WHERE clauses: start with the invoice EXISTS requirement, then add filter clauses
-    all_where_clauses = ["EXISTS (SELECT 1 FROM invoices WHERE sale_id = base.sale_id)"]
-    all_where_clauses.extend(where_clauses)
-    where_sql = "WHERE " + " AND ".join(all_where_clauses)
+    # Per-line PI fallback: no invoice EXISTS gate. A fresh PI is reportable
+    # the moment it has lines; its lines read provisional until invoiced.
+    where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
     # Pagination. Clamped, not trusted: a negative or zero page reaches
     # LIMIT/OFFSET as a negative OFFSET, which Postgres rejects with
@@ -1303,41 +1368,7 @@ def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> "tu
 
     query = f"""
         WITH base AS (
-            SELECT
-                s.id AS sale_id,
-                COALESCE(c.name, s.client_name) AS customer_name,
-                s.pi_number, s.pi_date,
-                s.lc_number, s.lc_date,
-                s.shipment_date, s.maturity_date, s.stage, s.comments,
-                s.company_id,
-                s.lc_id,
-                si.product_name, si.unit,
-                COALESCE(ii.inv_qty, 0)::float8 AS quantity,
-                si.unit_price,
-                ROUND((COALESCE(ii.inv_qty, 0) * si.unit_price)::numeric, 2)::float8 AS total_price,
-                (SELECT MAX(sh.invoice_date)
-                   FROM shipments sh WHERE sh.sale_id = s.id) AS invoice_date,
-                (SELECT MAX(sh.ship_date)
-                   FROM shipments sh WHERE sh.sale_id = s.id) AS latest_ship_date,
-                (SELECT MAX(sp.payment_date)
-                   FROM sale_payments sp WHERE sp.sale_id = s.id) AS receive_date,
-                (SELECT COALESCE(ROUND(SUM(sp.payment_amount)::numeric, 2), 0)::float8
-                   FROM sale_payments sp WHERE sp.sale_id = s.id) AS received_amount,
-                (SELECT COALESCE(ROUND(SUM(ii2.line_total)::numeric, 2), 0)::float8
-                   FROM invoice_items ii2
-                   JOIN invoices i2 ON i2.id = ii2.invoice_id
-                   WHERE i2.sale_id = s.id) AS sale_total,
-                {date_anchor_expr} AS date_anchor_col
-            FROM sales s
-            LEFT JOIN sale_items si ON si.sale_id = s.id
-            LEFT JOIN companies c ON c.id = s.company_id
-            LEFT JOIN LATERAL (
-                SELECT SUM(ii.quantity) AS inv_qty
-                FROM invoice_items ii
-                JOIN invoices i ON i.id = ii.invoice_id
-                WHERE i.sale_id = s.id
-                AND ii.sale_item_id = si.id
-            ) ii ON true
+            {_commercial_report_base_sql(date_anchor_expr)}
         )
         SELECT *, COUNT(*) OVER() AS _total_rows
         FROM base
@@ -1357,8 +1388,9 @@ def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> "tu
         (sale_id, customer_name, pi_number, pi_date, lc_number, lc_date,
          shipment_date, maturity_date, stage, comments, company_id, lc_id,
          product_name, unit, quantity, unit_price, total_price,
-         invoice_date, latest_ship_date, receive_date, received_amount,
-         sale_total, date_anchor_col, _total_rows) = r
+         is_provisional, invoice_date, latest_ship_date, actual_ship_date,
+         receive_date, received_amount, date_anchor_col, sale_total,
+         _total_rows) = r
 
         received = round(float(received_amount or 0), 2)
         due_amount = round(max(round(float(sale_total or 0), 2) - received, 0.0), 2)
@@ -1377,9 +1409,10 @@ def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> "tu
             "quantity": quantity,
             "unit_price": unit_price,
             "total_price": total_price,
+            "is_provisional": bool(is_provisional),
             "invoice_date": invoice_date,
             "latest_ship_date": latest_ship_date,
-            "actual_ship_date": shipment_date,
+            "actual_ship_date": actual_ship_date,
             "maturity_date": maturity_date,
             "receive_date": receive_date,
             "received_amount": received,
@@ -1490,12 +1523,8 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
         rendered = (c.replace("{alias}", alias) for c in where_clauses)
         return prefix + " AND ".join(rendered) if where_clauses else ""
 
-    # Include the invoice EXISTS requirement in the sale-level WHERE
+    # No invoice EXISTS gate: provisional PI lines are revenue from day one.
     sale_where_sql = _where_sql("b", prefix="WHERE ")
-    if sale_where_sql:
-        sale_where_sql += " AND EXISTS (SELECT 1 FROM invoices WHERE sale_id = b.sale_id)"
-    else:
-        sale_where_sql = "WHERE EXISTS (SELECT 1 FROM invoices WHERE sale_id = b.sale_id)"
     period_where_sql = _where_sql("base", prefix="AND ")
 
     # Build the period truncation expression using the CTE column
@@ -1527,45 +1556,12 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
     # drift — and due is clamped with GREATEST(..., 0) so an overpaid sale
     # reports 0 due, matching get_commercial_report's Python clamp.
     #
-    # INVOICE-DRIVEN: per-row quantity/total come from invoice_items
-    # (SUM per sale_item). Only sales with >=1 invoice row are included
-    # (EXISTS invoices). Zero-invoiced lines show 0.
+    # LIVE PI FALLBACK: per-row quantity/total come from invoice_items once a
+    # line is invoiced, otherwise from the PI line. No sale is excluded for
+    # lacking invoices; sale_total is the sum of displayed line totals.
     summary_query = f"""
         WITH base AS (
-            SELECT
-                s.id AS sale_id,
-                COALESCE(c.name, s.client_name) AS customer_name,
-                s.pi_number, s.pi_date,
-                s.lc_number, s.lc_date,
-                s.shipment_date, s.maturity_date, s.stage, s.comments,
-                s.company_id,
-                s.lc_id,
-                si.product_name, si.unit, si.unit_price,
-                COALESCE(ii.inv_qty, 0)::float8 AS quantity,
-                ROUND((COALESCE(ii.inv_qty, 0) * si.unit_price)::numeric, 2)::float8 AS total_price,
-                (SELECT MAX(sh.invoice_date)
-                   FROM shipments sh WHERE sh.sale_id = s.id) AS invoice_date,
-                (SELECT MAX(sh.ship_date)
-                   FROM shipments sh WHERE sh.sale_id = s.id) AS latest_ship_date,
-                (SELECT MAX(sp.payment_date)
-                   FROM sale_payments sp WHERE sp.sale_id = s.id) AS receive_date,
-                (SELECT COALESCE(ROUND(SUM(sp.payment_amount)::numeric, 2), 0)::float8
-                   FROM sale_payments sp WHERE sp.sale_id = s.id) AS received_amount,
-                (SELECT COALESCE(ROUND(SUM(ii2.line_total)::numeric, 2), 0)::float8
-                   FROM invoice_items ii2
-                   JOIN invoices i2 ON i2.id = ii2.invoice_id
-                   WHERE i2.sale_id = s.id) AS sale_total,
-                {date_anchor_expr} AS date_anchor_col
-            FROM sales s
-            LEFT JOIN sale_items si ON si.sale_id = s.id
-            LEFT JOIN companies c ON c.id = s.company_id
-            LEFT JOIN LATERAL (
-                SELECT SUM(ii.quantity) AS inv_qty
-                FROM invoice_items ii
-                JOIN invoices i ON i.id = ii.invoice_id
-                WHERE i.sale_id = s.id
-                AND ii.sale_item_id = si.id
-            ) ii ON true
+            {_commercial_report_base_sql(date_anchor_expr)}
         ),
         sale_rows AS (
             SELECT
@@ -1576,7 +1572,7 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
                 MAX(b.stage) AS stage,
                 MAX(b.maturity_date) AS maturity_date,
                 MAX(b.received_amount) AS received_amount,
-                MAX(b.sale_total) AS sale_total,
+                SUM(b.total_price) AS sale_total,
                 SUM(b.total_price) AS gross_sales
             FROM base b
             {sale_where_sql}
@@ -1629,45 +1625,13 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
             
             detail_query = f"""
                 WITH base AS (
-                    SELECT
-                        s.id AS sale_id,
-                        COALESCE(c.name, s.client_name) AS customer_name,
-                        s.pi_number, s.pi_date,
-                        s.lc_number, s.lc_date,
-                        s.shipment_date, s.maturity_date, s.stage, s.comments,
-                        s.company_id,
-                        s.lc_id,
-                        si.product_name, si.unit, si.unit_price,
-                        COALESCE(ii.inv_qty, 0)::float8 AS quantity,
-                        ROUND((COALESCE(ii.inv_qty, 0) * si.unit_price)::numeric, 2)::float8 AS total_price,
-                        (SELECT MAX(sh.invoice_date)
-                           FROM shipments sh WHERE sh.sale_id = s.id) AS invoice_date,
-                        (SELECT MAX(sh.ship_date)
-                           FROM shipments sh WHERE sh.sale_id = s.id) AS latest_ship_date,
-                        (SELECT MAX(sp.payment_date)
-                           FROM sale_payments sp WHERE sp.sale_id = s.id) AS receive_date,
-                        (SELECT COALESCE(ROUND(SUM(sp.payment_amount)::numeric, 2), 0)::float8
-                           FROM sale_payments sp WHERE sp.sale_id = s.id) AS received_amount,
-                        (SELECT COALESCE(ROUND(SUM(ii2.line_total)::numeric, 2), 0)::float8
-                           FROM invoice_items ii2
-                           JOIN invoices i2 ON i2.id = ii2.invoice_id
-                           WHERE i2.sale_id = s.id) AS sale_total,
-                        {date_anchor_expr} AS date_anchor_col
-                    FROM sales s
-                    LEFT JOIN sale_items si ON si.sale_id = s.id
-                    LEFT JOIN companies c ON c.id = s.company_id
-                    LEFT JOIN LATERAL (
-                        SELECT SUM(ii.quantity) AS inv_qty
-                        FROM invoice_items ii
-                        JOIN invoices i ON i.id = ii.invoice_id
-                        WHERE i.sale_id = s.id
-                        AND ii.sale_item_id = si.id
-                    ) ii ON true
+                    {_commercial_report_base_sql(date_anchor_expr)}
                 )
                 SELECT
                     sale_id, customer_name, pi_number, pi_date, lc_number, lc_date,
                     product_name, unit, quantity, unit_price, total_price,
-                    invoice_date, latest_ship_date, shipment_date AS actual_ship_date, maturity_date,
+                    is_provisional,
+                    invoice_date, latest_ship_date, actual_ship_date, maturity_date,
                     receive_date, received_amount, 
                     GREATEST(sale_total - received_amount, 0) AS due_amount,
                     CASE 
@@ -1679,8 +1643,7 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
                     END AS payment_status,
                     comments AS payment_comment
                 FROM base
-                WHERE EXISTS (SELECT 1 FROM invoices WHERE sale_id = base.sale_id)
-                AND {period_trunc} >= %(period_start)s
+                WHERE {period_trunc} >= %(period_start)s
                 AND {period_trunc} <= %(period_end)s
                 {period_where_sql}
                 ORDER BY sale_id DESC
@@ -1692,8 +1655,9 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
             for r in detail_rows:
                 (sale_id, customer_name, pi_number, pi_date, lc_number, lc_date,
                  product_name, unit, quantity, unit_price, total_price,
-                 invoice_date, latest_ship_date, actual_ship_date, maturity_date,
-                 receive_date, received_amount, due_amount, payment_status, payment_comment) = r
+                 is_provisional, invoice_date, latest_ship_date, actual_ship_date,
+                 maturity_date, receive_date, received_amount, due_amount,
+                 payment_status, payment_comment) = r
                 
                 items.append({
                     "sale_id": sale_id,
@@ -1707,6 +1671,7 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
                     "quantity": float(quantity or 0),
                     "unit_price": float(unit_price or 0),
                     "total_price": float(total_price or 0),
+                    "is_provisional": bool(is_provisional),
                     "invoice_date": invoice_date,
                     "latest_ship_date": latest_ship_date,
                     "actual_ship_date": actual_ship_date,

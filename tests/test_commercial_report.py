@@ -13,7 +13,7 @@ CONTRACT_KEYS = {
     "product_name", "unit", "quantity", "unit_price", "total_price",
     "invoice_date", "latest_ship_date", "actual_ship_date",
     "received_amount", "due_amount", "receive_date", "maturity_date",
-    "payment_status", "payment_comment",
+    "payment_status", "payment_comment", "is_provisional",
 }
 
 STATUSES = {"Paid", "Overdue", "Partial", "Due", "Pending"}
@@ -22,13 +22,14 @@ CSV_HEADER = (
     "Customer Name,PI No,PI Date,LC No,LC Date,Product Name,Unit,Quantity,"
     "Unit Price,Total Price ($),Invoice Date,Latest Ship Date,Actual Ship Date,"
     "Maturity Date,Receive Date,Received Amount ($),Due Amount ($),"
-    "Payment Status,Payment Comment"
+    "Payment Status,Payment Comment,Provisional"
 )
 
 
 def _sale(db, pi_number, client_name="Test Client", items=None, created_at="2026-01-01 00:00:00",
           maturity_date=None, comments=None, shipment_date=None, pi_date="2026-01-15",
-          lc_number=None, lc_date=None, lc_id=None, invoice_lines="auto"):
+          lc_number=None, lc_date=None, lc_id=None, invoice_lines="auto",
+          invoice_date=None):
     """Insert a sale + items directly (full control over dates/totals).
     
     invoice_lines: 
@@ -59,9 +60,9 @@ def _sale(db, pi_number, client_name="Test Client", items=None, created_at="2026
     if invoice_lines == "auto":
         # Auto-create full invoice matching all sale item quantities
         inv_row = db.execute(
-            "INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at) "
-            "VALUES (%s, %s, 'planned', 0, %s) RETURNING id",
-            (sid, f"INV-{pi_number}", "2026-01-01 00:00:00")).fetchone()
+            "INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at, "
+            "invoice_date) VALUES (%s, %s, 'planned', 0, %s, %s) RETURNING id",
+            (sid, f"INV-{pi_number}", "2026-01-01 00:00:00", invoice_date)).fetchone()
         inv_id = inv_row[0]
         total_amount = 0
         for idx, si_id in enumerate(sale_item_ids):
@@ -83,9 +84,9 @@ def _sale(db, pi_number, client_name="Test Client", items=None, created_at="2026
     elif invoice_lines is not None:
         # Explicit invoice_lines provided (list, possibly empty)
         inv_row = db.execute(
-            "INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at) "
-            "VALUES (%s, %s, 'planned', 0, %s) RETURNING id",
-            (sid, f"INV-{pi_number}", "2026-01-01 00:00:00")).fetchone()
+            "INSERT INTO invoices (sale_id, invoice_number, status, amount, created_at, "
+            "invoice_date) VALUES (%s, %s, 'planned', 0, %s, %s) RETURNING id",
+            (sid, f"INV-{pi_number}", "2026-01-01 00:00:00", invoice_date)).fetchone()
         inv_id = inv_row[0]
         total_amount = 0
         for il in invoice_lines:
@@ -166,7 +167,7 @@ def test_row_shape_contract_keys(admin_client, db):
                 items=[{"product_name": "Acid", "quantity": 2, "unit_price": 25,
                         "unit": "DRUM"}],
                 maturity_date="2099-12-31", comments="  needs LC  ",
-                shipment_date="2026-03-15")
+                shipment_date="2026-03-15", invoice_date="2026-02-01")
     _ship(db, sid, "2026-03-10", "2026-03-05")
     _pay(db, sid, 10, "2026-03-20")
     rows = _of(_rows(admin_client), sid)
@@ -179,11 +180,13 @@ def test_row_shape_contract_keys(admin_client, db):
     assert row["product_name"] == "Acid"
     assert row["unit"] == "DRUM"
     assert row["total_price"] == 50
-    assert row["invoice_date"] == "2026-03-05"
+    # invoice_date is the invoice's own date, not the shipment's copy.
+    assert row["invoice_date"] == "2026-02-01"
     assert row["latest_ship_date"] == "2026-03-10"
     assert row["actual_ship_date"] == "2026-03-15"
     assert row["receive_date"] == "2026-03-20"
     assert row["payment_comment"] == "needs LC"
+    assert row["is_provisional"] is False
 
 
 def test_rows_ordered_by_created_at_desc(admin_client, db):
@@ -764,32 +767,31 @@ def test_split_across_two_invoices(admin_client, db):
     assert row["total_price"] == 100  # (8+2) * 10
 
 
-def test_abandoned_line_zero_invoiced(admin_client, db):
-    """Line with 0 invoiced quantity → row shows 0."""
+def test_line_without_invoice_lines_falls_back_to_pi(admin_client, db):
+    """A line with no invoice rows shows the PI quantity and reads provisional."""
     sid = _sale(db, "PI-QTY3", items=[
         {"product_name": "Abandoned", "quantity": 10, "unit_price": 10, "unit": "KG"}],
         invoice_lines=[])  # No invoice lines
     rows = _of(_rows(admin_client), sid)
     assert len(rows) == 1
     row = rows[0]
-    assert row["quantity"] == 0
-    assert row["total_price"] == 0
+    assert row["quantity"] == 10
+    assert row["total_price"] == 100
+    assert row["is_provisional"] is True
 
 
-def test_uninvoiced_sale_excluded(admin_client, db):
-    """Sale with no invoices at all → excluded from report."""
-    # This sale has no invoices
+def test_uninvoiced_sale_included_as_provisional(admin_client, db):
+    """A fresh PI is visible the moment it has lines — no invoice needed."""
     sid_no_inv = _sale(db, "PI-NO-INV", items=[
         {"product_name": "NoInv", "quantity": 5, "unit_price": 20, "unit": "KG"}],
         invoice_lines=None)
-    # This sale has an invoice
     sid_with_inv = _sale(db, "PI-WITH-INV", items=[
         {"product_name": "WithInv", "quantity": 5, "unit_price": 20, "unit": "KG"}],
         invoice_lines=[{"sale_item_index": 0, "quantity": 5}])
     rows = _rows(admin_client)
     sale_ids = {r["sale_id"] for r in rows}
-    assert sid_no_inv not in sale_ids, "Uninvoiced sale must be excluded"
-    assert sid_with_inv in sale_ids, "Invoiced sale must be included"
+    assert sid_no_inv in sale_ids, "fresh PI must be visible immediately"
+    assert sid_with_inv in sale_ids, "invoiced sale must be included"
 
 
 def test_lc_id_filter_isolates_one_lc(admin_client, db):
@@ -1065,3 +1067,173 @@ def test_default_created_invoice_reports_its_receivable(admin_client, db):
     assert row["total_price"] == 100
     assert row["due_amount"] == 100
     assert row["payment_status"] == "Due"
+
+
+# ------------------------- Phase 4: live PI fallback + completed retention -------------------------
+
+def test_fresh_pi_without_invoices_is_provisional(admin_client, db):
+    """A PI with no invoice rows shows one provisional row per PI line."""
+    sid = _sale(db, "PI-FRESH", items=[
+        {"product_name": "A", "quantity": 2, "unit_price": 25, "unit": "KG"},
+        {"product_name": "B", "quantity": 4, "unit_price": 5, "unit": "DRUM"}],
+        invoice_lines=None)
+    rows = _of(_rows(admin_client), sid)
+    assert len(rows) == 2
+    by_product = {r["product_name"]: r for r in rows}
+    assert by_product["A"]["quantity"] == 2
+    assert by_product["A"]["unit_price"] == 25
+    assert by_product["A"]["total_price"] == 50
+    assert by_product["B"]["quantity"] == 4
+    assert by_product["B"]["unit_price"] == 5
+    assert by_product["B"]["total_price"] == 20
+    for r in rows:
+        assert r["is_provisional"] is True
+        assert r["invoice_date"] is None
+        # Sale money = sum of displayed line totals (50 + 20).
+        assert r["due_amount"] == 70
+
+
+def test_invoiced_line_is_final_with_invoice_quantity(admin_client, db):
+    """Once a line is invoiced, its invoice quantity becomes final."""
+    sid = _sale(db, "PI-FINAL", items=[
+        {"product_name": "A", "quantity": 10, "unit_price": 10}],
+        invoice_lines=[{"sale_item_index": 0, "quantity": 8}],
+        invoice_date="2026-01-20")
+    row = _of(_rows(admin_client), sid)[0]
+    assert row["quantity"] == 8
+    assert row["unit_price"] == 10
+    assert row["total_price"] == 80
+    assert row["is_provisional"] is False
+    assert row["invoice_date"] == "2026-01-20"
+
+
+def test_line_split_across_two_invoices_sums_quantities(admin_client, db):
+    """6 + 4 invoiced on two invoices → one final row of 10."""
+    sid = _sale(db, "PI-SPLIT", items=[
+        {"product_name": "Split", "quantity": 10, "unit_price": 10}],
+        invoice_lines=None)
+    item_id = db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id", (sid,)
+    ).fetchone()[0]
+    for number, qty, inv_date in (("INV-S1", 6, "2026-01-10"),
+                                  ("INV-S2", 4, "2026-02-10")):
+        inv_id = db.execute(
+            "INSERT INTO invoices (sale_id, invoice_number, status, amount, invoice_date) "
+            "VALUES (%s, %s, 'planned', %s, %s) RETURNING id",
+            (sid, number, qty * 10, inv_date)).fetchone()[0]
+        db.execute(
+            """INSERT INTO invoice_items (invoice_id, sale_item_id, product_name, unit,
+                  quantity, unit_price, line_total)
+               VALUES (%s, %s, 'Split', 'KG', %s, 10, %s)""",
+            (inv_id, item_id, qty, qty * 10))
+    db.commit()
+
+    row = _of(_rows(admin_client), sid)[0]
+    assert row["quantity"] == 10
+    assert row["total_price"] == 100
+    assert row["is_provisional"] is False
+    assert row["invoice_date"] == "2026-02-10"  # latest invoice date for the line
+
+
+def test_mixed_sale_returns_final_and_provisional_rows(admin_client, db):
+    """Line A invoiced, line B not: both rows, one final one provisional."""
+    sid = _sale(db, "PI-MIXED", items=[
+        {"product_name": "Final", "quantity": 10, "unit_price": 10},
+        {"product_name": "Prov", "quantity": 5, "unit_price": 20}],
+        invoice_lines=[{"sale_item_index": 0, "quantity": 8}])
+    rows = _of(_rows(admin_client), sid)
+    assert len(rows) == 2
+    by_product = {r["product_name"]: r for r in rows}
+    assert by_product["Final"]["quantity"] == 8
+    assert by_product["Final"]["total_price"] == 80
+    assert by_product["Final"]["is_provisional"] is False
+    assert by_product["Prov"]["quantity"] == 5
+    assert by_product["Prov"]["total_price"] == 100
+    assert by_product["Prov"]["is_provisional"] is True
+    # Sale money is the sum of displayed line totals (80 + 100), on every row.
+    for r in rows:
+        assert r["due_amount"] == 180
+
+
+def test_completed_sale_stays_in_the_report(admin_client, db):
+    """Completion leaves the board but never leaves the commercial report."""
+    sid = _sale(db, "PI-COMPLETE", items=[
+        {"product_name": "Done", "quantity": 2, "unit_price": 30}],
+        invoice_lines=None)
+    db.execute("UPDATE sales SET stage = 'completed' WHERE id = %s", (sid,))
+    db.commit()
+
+    row = _of(_rows(admin_client), sid)[0]
+    assert row["product_name"] == "Done"
+    assert row["is_provisional"] is True
+
+    filtered = _filtered_rows(admin_client, {"stage": "completed"})
+    assert {r["sale_id"] for r in filtered} == {sid}
+
+
+def test_filters_apply_to_provisional_rows(admin_client, db):
+    """date_anchor/product/customer/stage/payment_status filter fresh PIs too."""
+    sid = _sale(db, "PI-FILT", client_name="Fresh Co", pi_date="2026-03-10",
+                maturity_date="2099-12-31",
+                items=[{"product_name": "Uninvoiced", "quantity": 2, "unit_price": 30}],
+                invoice_lines=None)
+
+    assert {r["sale_id"] for r in _filtered_rows(admin_client, {
+        "date_anchor": "pi_date", "date_from": "2026-03-01",
+        "date_to": "2026-03-31"})} == {sid}
+    assert {r["sale_id"] for r in _filtered_rows(
+        admin_client, {"product_name": "uninvoiced"})} == {sid}
+    assert {r["sale_id"] for r in _filtered_rows(
+        admin_client, {"customer_name": "fresh"})} == {sid}
+    assert {r["sale_id"] for r in _filtered_rows(
+        admin_client, {"stage": "pi_issued"})} == {sid}
+    assert {r["sale_id"] for r in _filtered_rows(
+        admin_client, {"payment_status": "Due"})} == {sid}
+
+
+def test_export_marks_provisional_rows(admin_client, db):
+    """The CSV carries a Provisional column and marks fresh PI lines."""
+    _sale(db, "PI-EX-PROV", invoice_lines=None)
+    _sale(db, "PI-EX-FINAL", invoice_lines=[{"sale_item_index": 0, "quantity": 1}])
+    r = admin_client.post("/api/reports/live/export", json={})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["row_count"] == 2
+    assert body["truncated"] is False
+
+    parsed = list(csv.reader(io.StringIO(body["content"])))
+    assert len(parsed) == 3
+    assert len(parsed[0]) == 20
+    assert parsed[0][-1] == "Provisional"
+    by_pi = {row[1]: row for row in parsed[1:]}
+    assert by_pi["PI-EX-PROV"][-1] == "Yes"
+    assert by_pi["PI-EX-FINAL"][-1] == ""
+
+
+# ------------------------- Phase 4: completed sales leave the board -------------------------
+
+def test_sales_list_hides_completed_by_default(admin_client, db):
+    active = _sale(db, "PI-LIST-ACTIVE", invoice_lines=None)
+    done = _sale(db, "PI-LIST-DONE", invoice_lines=None)
+    db.execute("UPDATE sales SET stage = 'completed' WHERE id = %s", (done,))
+    db.commit()
+
+    ids = {r["id"] for r in admin_client.get("/api/sales").get_json()["sales"]}
+    assert active in ids
+    assert done not in ids
+
+    ids = {r["id"] for r in admin_client.get(
+        "/api/sales?include_completed=true").get_json()["sales"]}
+    assert {active, done} <= ids
+
+
+def test_sales_csv_export_still_includes_completed(admin_client, db):
+    _sale(db, "PI-LIST-ACTIVE", invoice_lines=None)
+    done = _sale(db, "PI-LIST-DONE", invoice_lines=None)
+    db.execute("UPDATE sales SET stage = 'completed' WHERE id = %s", (done,))
+    db.commit()
+
+    r = admin_client.get("/api/sales/export")
+    assert r.status_code == 200
+    parsed = list(csv.reader(io.StringIO(r.get_data(as_text=True))))
+    assert {"PI-LIST-ACTIVE", "PI-LIST-DONE"} <= {row[2] for row in parsed[1:]}

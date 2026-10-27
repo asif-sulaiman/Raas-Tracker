@@ -7,19 +7,28 @@ that sale, so a naive SUM(received_amount) / SUM(sale_total - received_amount)
 multiplies the money by the item count. These tests pin the KPIs to per-sale
 truth (gross_sales stays a per-ITEM sum) and to the file's money convention
 (COALESCE(ROUND(SUM(...)::numeric, 2)::float8, 0), due clamped at zero).
+
+Phase 4: a line with no invoice rows displays PI quantity × PI unit price and
+is provisional; an invoiced line displays its invoice quantity. Sale money is
+the sum of those displayed line totals either way.
 """
-from raas_tracker.sales import get_commercial_report_summary
+from raas_tracker.sales import (
+    get_commercial_report,
+    get_commercial_report_summary,
+)
 
 
 # ---------- helpers ----------
 
-def _sale(db, pi_number, items, maturity_date=None, pi_date="2026-01-15"):
+def _sale(db, pi_number, items, maturity_date=None, pi_date="2026-01-15",
+          invoice_qty=None):
     """Insert a sale + line items directly (full control of totals/dates).
 
-    The report is invoice-driven, so each line is also invoiced in full. That
-    keeps invoiced total == PI total here, so these tests keep pinning what
-    they are about (per-sale money counted once, no float drift, due clamp)
-    rather than the PI-vs-invoice source.
+    ``invoice_qty`` selects what the report sees as final:
+      * None (default) — every line is invoiced in full, so invoiced total
+        equals PI total and these tests keep pinning per-sale money counting;
+      * ``{}`` — no invoice at all, so every line is provisional PI data;
+      * ``{index: qty}`` — only those lines are invoiced, at those quantities.
     """
     sid = db.execute(
         """INSERT INTO sales (stage, pi_number, pi_date, client_name, maturity_date)
@@ -32,21 +41,25 @@ def _sale(db, pi_number, items, maturity_date=None, pi_date="2026-01-15"):
             "VALUES (%s, %s, %s, %s, %s) RETURNING id",
             (sid, it["product_name"], it["quantity"], it["unit_price"],
              it.get("unit", "KG"))).fetchone()[0])
-    inv_id = db.execute(
-        "INSERT INTO invoices (sale_id, invoice_number, status, amount) "
-        "VALUES (%s, %s, 'planned', 0) RETURNING id",
-        (sid, f"INV-{pi_number}")).fetchone()[0]
-    total = 0.0
-    for line_id, it in zip(line_ids, items):
-        line_total = round(it["quantity"] * it["unit_price"], 2)
-        total = round(total + line_total, 2)
-        db.execute(
-            """INSERT INTO invoice_items (invoice_id, sale_item_id, product_name,
-                  unit, quantity, unit_price, line_total)
-               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-            (inv_id, line_id, it["product_name"], it.get("unit", "KG"),
-             it["quantity"], it["unit_price"], line_total))
-    db.execute("UPDATE invoices SET amount = %s WHERE id = %s", (total, inv_id))
+    if invoice_qty is None:
+        invoice_qty = {idx: it["quantity"] for idx, it in enumerate(items)}
+    if invoice_qty:
+        inv_id = db.execute(
+            "INSERT INTO invoices (sale_id, invoice_number, status, amount) "
+            "VALUES (%s, %s, 'planned', 0) RETURNING id",
+            (sid, f"INV-{pi_number}")).fetchone()[0]
+        total = 0.0
+        for idx, qty in invoice_qty.items():
+            it = items[idx]
+            line_total = round(qty * it["unit_price"], 2)
+            total = round(total + line_total, 2)
+            db.execute(
+                """INSERT INTO invoice_items (invoice_id, sale_item_id, product_name,
+                      unit, quantity, unit_price, line_total)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (inv_id, line_ids[idx], it["product_name"], it.get("unit", "KG"),
+                 qty, it["unit_price"], line_total))
+        db.execute("UPDATE invoices SET amount = %s WHERE id = %s", (total, inv_id))
     db.commit()
     return sid
 
@@ -199,4 +212,56 @@ def test_summary_filters_apply_over_per_sale_rows(db):
     kpis = _kpis(db, stage="pi_issued")
     assert kpis["order_count"] == 2
     assert kpis["gross_sales"] == 2100
+
+
+# ---------- 4. provisional PI lines feed the same KPIs ----------
+
+def test_provisional_pi_lines_count_in_kpis(db):
+    """A fresh PI with no invoices is revenue the moment it has lines."""
+    sid = _sale(db, "PI-KPI-PROV", [
+        {"product_name": "A", "quantity": 2, "unit_price": 100},
+        {"product_name": "B", "quantity": 1, "unit_price": 50},
+    ], maturity_date="2020-01-01", invoice_qty={})
+    _pay(db, sid, 100)
+
+    kpis = _kpis(db)
+    assert kpis["gross_sales"] == 250
+    assert kpis["received"] == 100
+    assert kpis["due"] == 150
+    assert kpis["overdue"] == 150
+    assert kpis["order_count"] == 1
+
+
+def test_mixed_sale_kpis_and_detail_use_displayed_line_totals(db):
+    """Line A invoiced 8@10, line B provisional 5@20 → 80 + 100 = 180."""
+    _sale(db, "PI-KPI-MIX", [
+        {"product_name": "A", "quantity": 10, "unit_price": 10},
+        {"product_name": "B", "quantity": 5, "unit_price": 20},
+    ], pi_date="2026-01-10", invoice_qty={0: 8})
+
+    kpis = _kpis(db)
+    assert kpis["gross_sales"] == 180
+    assert kpis["due"] == 180
+
+    flat, _total = get_commercial_report(db, {
+        "date_anchor": "pi_date", "date_from": "2026-01-01",
+        "date_to": "2026-01-31",
+    })
+    periods = get_commercial_report_summary(
+        db, {"group_by": "month", "date_anchor": "pi_date"})
+    jan = next(p for p in periods if p["period_start"] == "2026-01-01")
+
+    assert len(jan["items"]) == len(flat) == 2
+
+    def shape(rows):
+        return {
+            r["product_name"]: (r["quantity"], r["total_price"],
+                                r["due_amount"], r["is_provisional"])
+            for r in rows
+        }
+    assert shape(jan["items"]) == shape(flat)
+    assert shape(flat) == {
+        "A": (8, 80, 180, False),
+        "B": (5, 100, 180, True),
+    }
 
