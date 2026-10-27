@@ -5,7 +5,7 @@ import psycopg
 import json
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, List, Dict, Any, Union
 
@@ -2160,9 +2160,63 @@ def book_invoice(conn: psycopg.Connection, invoice_id: int, approx_ship_date: st
     return True
 
 
+def _parse_iso_date(value: str, field: str) -> date:
+    """Parse a strict ``YYYY-MM-DD`` value or raise a plain ``ValueError``.
+
+    ``date.fromisoformat`` accepts looser spellings on newer Pythons; the
+    regex keeps the contract identical across runtimes, so a stored maturity
+    is always byte-comparable with the TEXT dates the rest of the schema uses.
+    """
+    text = (value or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        raise ValueError(f"{field} must be a date (YYYY-MM-DD)")
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        raise ValueError(f"{field} must be a date (YYYY-MM-DD)")
+
+
+def invoice_terms_for_sale(conn: psycopg.Connection, sale_id: int):
+    """Payment terms ``(payment_terms, tenor_days)`` governing a sale.
+
+    Terms live on the LC and every invoice of that LC inherits them. A sale
+    without an LC — or a legacy row with NULL terms — is at-sight, and an
+    at-sight LC never reports a tenor.
+    """
+    row = conn.execute(
+        "SELECT l.payment_terms, l.tenor_days FROM sales s "
+        "JOIN letters_of_credit l ON l.id = s.lc_id WHERE s.id = %s",
+        (sale_id,)).fetchone()
+    if not row or (row[0] or "at_sight") == "at_sight":
+        return "at_sight", None
+    return "deferred", row[1]
+
+
+def resolve_invoice_maturity(actual_ship_date: str, payment_terms: str,
+                             tenor_days, override: Optional[str] = None) -> str:
+    """Maturity for a shipped invoice (ISO date string).
+
+    At sight matures on the actual ship date; deferred adds the LC tenor.
+    An operator override is accepted only when it is not earlier than the
+    actual shipment — maturity is when money is due, never before it left.
+    """
+    actual = _parse_iso_date(actual_ship_date, "actual_ship_date")
+    if override:
+        maturity = _parse_iso_date(override, "maturity_date")
+        if maturity < actual:
+            raise ValueError("maturity_date cannot be before the actual ship date")
+        return maturity.isoformat()
+    if payment_terms == "deferred":
+        if not tenor_days:
+            raise ValueError("deferred LC payment terms require tenor_days")
+        return (actual + timedelta(days=int(tenor_days))).isoformat()
+    return actual.isoformat()
+
+
 def ship_invoice(conn: psycopg.Connection, invoice_id: int, actual_ship_date: str,
                  invoice_number: str, notes: Optional[str] = None,
-                 created_by: Optional[int] = None) -> Dict[str, Any]:
+                 created_by: Optional[int] = None,
+                 maturity_date: Optional[str] = None) -> Dict[str, Any]:
     """Mark an invoice as shipped - creates shipment record and updates invoice.
 
     Phase 2 order: only a ``booked`` invoice may ship. Booking is where
@@ -2173,6 +2227,11 @@ def ship_invoice(conn: psycopg.Connection, invoice_id: int, actual_ship_date: st
     checked BEFORE any shipment row is written, so a refused transition
     (terminal 'shipped'/'paid', or un-booked) never leaves a phantom shipment
     behind. The shipment carries the invoice's own ``invoice_date``.
+
+    Maturity is resolved from the LC's payment terms (at sight → the actual
+    ship date, deferred → ship date + tenor), or taken from an explicit
+    ``maturity_date`` override. Resolution happens before the shipment insert,
+    so a bad date refuses the whole transition with nothing written.
     """
     if not actual_ship_date or not actual_ship_date.strip():
         raise ValueError("actual_ship_date is required for shipping")
@@ -2195,6 +2254,12 @@ def ship_invoice(conn: psycopg.Connection, invoice_id: int, actual_ship_date: st
         raise InvoiceNotBooked(
             f"invoice must be booked before shipping (current status: {current})")
 
+    # Maturity is part of the shipment decision: resolve it before any row is
+    # written so a malformed or too-early date refuses the transition whole.
+    terms, tenor = invoice_terms_for_sale(conn, sale_id)
+    maturity = resolve_invoice_maturity(
+        actual_ship_date, terms, tenor, maturity_date)
+
     # Shipment insert is inlined (not via add_shipment, which COMMITs) so the
     # lock is held until the guarded status flip below commits atomically.
     ship_row = conn.execute(
@@ -2208,8 +2273,10 @@ def ship_invoice(conn: psycopg.Connection, invoice_id: int, actual_ship_date: st
     # Guarded flip: a concurrent transition to a terminal state wins the race.
     cur = conn.execute(
         "UPDATE invoices SET status = 'shipped', actual_ship_date = %s, "
+        "maturity_date = %s, "
         "notes = COALESCE(notes, '') || %s WHERE id = %s AND status NOT IN ('shipped', 'paid')",
-        (actual_ship_date, f"\nShipped on {actual_ship_date}: " + (notes or ""), invoice_id)
+        (actual_ship_date, maturity,
+         f"\nShipped on {actual_ship_date}: " + (notes or ""), invoice_id)
     )
     if cur.rowcount == 0:
         conn.rollback()
@@ -2225,9 +2292,11 @@ def ship_invoice(conn: psycopg.Connection, invoice_id: int, actual_ship_date: st
     log_audit_action(conn, "SHIPMENT_RECORD", "sale", sale_id,
                      new_value=f"{actual_ship_date}", atomic=False)
     log_audit_action(conn, "INVOICE_SHIP", "invoice", invoice_id,
-                     new_value=f"Shipped on {actual_ship_date}", atomic=False)
+                     new_value=(f"Shipped on {actual_ship_date}"
+                                f" (maturity {maturity})"), atomic=False)
     conn.commit()
-    return {"invoice_id": invoice_id, "shipment_id": shipment_id, "status": "shipped"}
+    return {"invoice_id": invoice_id, "shipment_id": shipment_id,
+            "status": "shipped", "maturity_date": maturity}
 
 
 def _invoice_paid_amount(conn: psycopg.Connection, invoice_id: int) -> float:
@@ -2451,15 +2520,19 @@ def list_invoices(conn: psycopg.Connection, sale_id: int,
     too (a booked invoice is not "blocked", it is simply past booking);
     ``can_book`` carries that distinction on its own.
     """
+    # The panel prefills its maturity input from the LC's terms, so every row
+    # carries them. One query for the whole sale; NULL legacy LCs read at-sight.
+    payment_terms, tenor_days = invoice_terms_for_sale(conn, sale_id)
     rows = [
         {"invoice_id": r[0], "invoice_number": r[1], "status": r[2],
          "approx_ship_date": r[3], "actual_ship_date": r[4], "notes": r[5],
-         "invoice_date": r[6], "created_at": r[7],
-         "amount": (float(r[8]) if r[8] is not None else None),
-         "paid_amount": float(r[9])}
+         "invoice_date": r[6], "created_at": r[7], "maturity_date": r[8],
+         "amount": (float(r[9]) if r[9] is not None else None),
+         "paid_amount": float(r[10]),
+         "payment_terms": payment_terms, "tenor_days": tenor_days}
         for r in conn.execute(
             """SELECT id, invoice_number, status, approx_ship_date, actual_ship_date,
-                      notes, invoice_date, created_at, amount,
+                      notes, invoice_date, created_at, maturity_date, amount,
                       (SELECT COALESCE(ROUND(SUM(sp.payment_amount)::numeric, 2)::float8, 0)
                        FROM sale_payments sp WHERE sp.invoice_id = invoices.id) AS paid_amount
                FROM invoices WHERE sale_id = %s ORDER BY id""",

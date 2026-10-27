@@ -50,18 +50,21 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
         "notes": row[7],
         "created_at": row[8],
         "updated_at": row[9],
+        # NULL legacy rows predate the terms columns: they are at-sight.
+        "payment_terms": row[10] or "at_sight",
+        "tenor_days": row[11],
     }
 
 
 _LC_COLS = (
     "id, lc_number, company_id, lc_date, expiry_date, bank_ref, "
-    "stage, notes, created_at, updated_at"
+    "stage, notes, created_at, updated_at, payment_terms, tenor_days"
 )
 
 
 def create_lc(conn: psycopg.Connection, company_id: int, lc_number: str,
               lc_date=None, expiry_date=None, bank_ref=None,
-              notes=None) -> dict:
+              notes=None, payment_terms=None, tenor_days=None) -> dict:
     """Create an LC for a company. Trims ``lc_number``; rejects blank.
 
     Scoped UNIQUE per ``(company_id, lc_number)``: a trimmed duplicate for
@@ -69,6 +72,10 @@ def create_lc(conn: psycopg.Connection, company_id: int, lc_number: str,
     the DB unique index, which raises the same class so the two paths cannot
     disagree; the same number for a different company is fine. Audits
     ``LC_CREATE``.
+
+    Payment terms: ``payment_terms`` is ``at_sight`` (default) or ``deferred``;
+    a deferred LC requires a positive ``tenor_days``. At-sight LCs store a NULL
+    tenor so an inherited number can never be mistaken for a real tenor.
     """
     from .audit import log_audit_action
 
@@ -95,13 +102,26 @@ def create_lc(conn: psycopg.Connection, company_id: int, lc_number: str,
         text = str(value).strip()
         return text or None
 
+    terms = _clean(payment_terms) or "at_sight"
+    if terms not in ("at_sight", "deferred"):
+        raise ValueError("payment_terms must be 'at_sight' or 'deferred'")
+    if terms == "at_sight":
+        tenor = None
+    else:
+        if tenor_days is None:
+            raise ValueError("tenor_days is required for deferred payment terms")
+        tenor = int(tenor_days)
+        if tenor <= 0:
+            raise ValueError("tenor_days must be positive")
+
     try:
         row = conn.execute(
             f"INSERT INTO letters_of_credit (lc_number, company_id, lc_date,"
-            f" expiry_date, bank_ref, notes) VALUES (%s, %s, %s, %s, %s, %s)"
+            f" expiry_date, bank_ref, notes, payment_terms, tenor_days)"
+            f" VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
             f" RETURNING {_LC_COLS}",
             (lc_number, company_id, _clean(lc_date), _clean(expiry_date),
-             _clean(bank_ref), _clean(notes)),
+             _clean(bank_ref), _clean(notes), terms, tenor),
         ).fetchone()
     except psycopg.errors.IntegrityError:
         try:
