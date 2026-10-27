@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Plus, Check, Trash2 } from 'lucide-react';
 import Button from '../ui/Button';
 import InvoiceEditor from './InvoiceEditor';
-import { formatDate, formatNumber, toCents, fromCents } from '../../utils/format';
+import { formatDate, formatNumber, toCents, fromCents, todayLocalISO } from '../../utils/format';
 import { useAuth } from '../../context/AuthContext';
 import { useConfirm } from '../../context/ConfirmContext';
 import { toast } from 'sonner';
@@ -64,6 +64,31 @@ function balanceCents(amount, paidAmount) {
   return Math.max(0, toCents(amount) - toCents(paidAmount));
 }
 
+/**
+ * Add whole days to a YYYY-MM-DD date in UTC. The API slices dates as plain
+ * calendar strings, so local-time `Date` math could shift a leap day.
+ */
+function addDaysISO(dateStr, days) {
+  const parts = String(dateStr || '').split('-').map(Number);
+  if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return '';
+  const base = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]));
+  base.setUTCDate(base.getUTCDate() + Number(days || 0));
+  return base.toISOString().slice(0, 10);
+}
+
+/**
+ * The maturity the server will compute on ship: at sight = the actual ship
+ * date; deferred = actual + tenor. It is only a prefill — the operator may
+ * override it in the form, and the server re-validates.
+ */
+function computeMaturity(shipDate, invoice) {
+  if (!shipDate) return '';
+  if (invoice?.payment_terms === 'deferred' && invoice.tenor_days) {
+    return addDaysISO(shipDate, invoice.tenor_days);
+  }
+  return shipDate;
+}
+
 function StatusChip({ status }) {
   return (
     <span
@@ -104,6 +129,8 @@ export default function InvoicePanel({ saleId, isAdmin = false, readOnly = false
   const [formError, setFormError] = useState(null);
   const [step, setStep] = useState(null); // { invoiceId, kind: 'book' | 'ship' | 'pay' }
   const [stepDate, setStepDate] = useState('');
+  const [maturityDate, setMaturityDate] = useState('');
+  const [maturityTouched, setMaturityTouched] = useState(false);
   const [payAmount, setPayAmount] = useState('');
   const [saving, setSaving] = useState(false);
 
@@ -184,8 +211,13 @@ export default function InvoicePanel({ saleId, isAdmin = false, readOnly = false
   };
 
   const openStep = (invoiceId, kind) => {
+    const date = kind === 'book' ? '' : today();
+    const invoice = invoices.find((i) => i.invoice_id === invoiceId) || null;
     setStep({ invoiceId, kind });
-    setStepDate(kind === 'book' ? '' : today());
+    setStepDate(date);
+    setMaturityDate(kind === 'ship' ? computeMaturity(date, invoice) : '');
+    // A fresh form starts from the computed date; typing over it takes over.
+    setMaturityTouched(false);
     setPayAmount('');
     setFormError(null);
   };
@@ -193,6 +225,8 @@ export default function InvoicePanel({ saleId, isAdmin = false, readOnly = false
   const closeStep = () => {
     setStep(null);
     setStepDate('');
+    setMaturityDate('');
+    setMaturityTouched(false);
     setPayAmount('');
     setFormError(null);
   };
@@ -210,6 +244,10 @@ export default function InvoicePanel({ saleId, isAdmin = false, readOnly = false
     }
     if (kind === 'ship' && !stepDate) {
       setFormError('Actual ship date is required');
+      return;
+    }
+    if (kind === 'ship' && !maturityDate) {
+      setFormError('Maturity date is required');
       return;
     }
     let amount = 0;
@@ -239,7 +277,10 @@ export default function InvoicePanel({ saleId, isAdmin = false, readOnly = false
         await apiFetch(`/api/sales/${saleId}/invoices/${invoiceId}/ship`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ actual_ship_date: stepDate }),
+          body: JSON.stringify({
+            actual_ship_date: stepDate,
+            maturity_date: maturityDate,
+          }),
         });
         toast.success('Invoice shipped');
       } else {
@@ -397,6 +438,18 @@ export default function InvoicePanel({ saleId, isAdmin = false, readOnly = false
                       shipped {formatDate(inv.actual_ship_date)}
                     </span>
                   )}
+                  {inv.maturity_date && (
+                    <span className="text-[11px] text-slate-400">
+                      matures {formatDate(inv.maturity_date)}
+                    </span>
+                  )}
+                  {inv.status === 'shipped'
+                    && inv.maturity_date
+                    && inv.maturity_date < todayLocalISO() && (
+                      <span className="inline-flex items-center rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-[11px] font-medium text-rose-700 dark:border-rose-800 dark:bg-rose-950/40 dark:text-rose-300">
+                        Overdue
+                      </span>
+                    )}
                   {!inv.approx_ship_date && !inv.actual_ship_date && inv.created_at && (
                     <span className="text-[11px] text-slate-400">
                       added {formatDate(inv.created_at)}
@@ -471,18 +524,50 @@ export default function InvoicePanel({ saleId, isAdmin = false, readOnly = false
                         </div>
                       </>
                     ) : (
-                      <div>
-                        <label className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1">
-                          {step.kind === 'book' ? 'Approximate ship date *' : 'Actual ship date *'}
-                        </label>
-                        <input
-                          aria-label={step.kind === 'book' ? 'Approximate ship date' : 'Actual ship date'}
-                          type="date"
-                          value={stepDate}
-                          onChange={(e) => setStepDate(e.target.value)}
-                          className={`${inputCls} w-36`}
-                        />
-                      </div>
+                      <>
+                        <div>
+                          <label className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1">
+                            {step.kind === 'book' ? 'Approximate ship date *' : 'Actual ship date *'}
+                          </label>
+                          <input
+                            aria-label={step.kind === 'book' ? 'Approximate ship date' : 'Actual ship date'}
+                            type="date"
+                            value={stepDate}
+                            onChange={(e) => {
+                              const value = e.target.value;
+                              setStepDate(value);
+                              // Follow the ship date until the operator edits
+                              // the due date themselves.
+                              if (step.kind === 'ship' && !maturityTouched) {
+                                setMaturityDate(computeMaturity(value, stepInvoice));
+                              }
+                            }}
+                            className={`${inputCls} w-36`}
+                          />
+                        </div>
+                        {step.kind === 'ship' && (
+                          <div>
+                            <label className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1">
+                              Maturity date *
+                            </label>
+                            <input
+                              aria-label="Maturity date"
+                              type="date"
+                              value={maturityDate}
+                              onChange={(e) => {
+                                setMaturityDate(e.target.value);
+                                setMaturityTouched(true);
+                              }}
+                              className={`${inputCls} w-36`}
+                            />
+                            <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                              {stepInvoice?.payment_terms === 'deferred' && stepInvoice.tenor_days
+                                ? `Deferred ${stepInvoice.tenor_days} days`
+                                : 'At sight'}
+                            </p>
+                          </div>
+                        )}
+                      </>
                     )}
                     <div className="flex items-center gap-1.5">
                       <Button

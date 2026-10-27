@@ -36,6 +36,8 @@ function lcRow(pis) {
     bank_ref: 'REF-1',
     notes: '',
     total_value: 1000,
+    payment_terms: 'at_sight',
+    tenor_days: null,
     pis,
   };
 }
@@ -111,5 +113,57 @@ describe('LcDetailModal edit + guards', () => {
 
     expect(await screen.findByRole('heading', { name: /LC-100/ })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Delete LC' }).disabled).toBe(false);
+  });
+});
+
+describe('LcDetailModal payment terms', () => {
+  it('shows at sight for an LC that carries no tenor', async () => {
+    renderDetail({ lc: lcRow([]) });
+
+    expect(await screen.findByRole('heading', { name: /LC-100/ })).toBeTruthy();
+    expect(screen.getByText('At sight')).toBeTruthy();
+  });
+
+  it('edits deferred terms and PUTs the tenor', async () => {
+    const puts = [];
+    renderDetail({ lc: lcRow([]), puts });
+
+    await screen.findByRole('heading', { name: /LC-100/ });
+    fireEvent.click(screen.getByRole('button', { name: 'Edit LC' }));
+    fireEvent.change(await screen.findByLabelText('Payment terms'), {
+      target: { value: 'deferred' },
+    });
+    fireEvent.change(await screen.findByLabelText('Tenor days'), {
+      target: { value: '120' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+    await waitFor(() => expect(puts).toHaveLength(1));
+    expect(puts[0]).toMatchObject({
+      payment_terms: 'deferred',
+      tenor_days: 120,
+    });
+  });
+
+  it('clears the tenor when switching back to at sight', async () => {
+    const puts = [];
+    renderDetail({
+      lc: { ...lcRow([]), payment_terms: 'deferred', tenor_days: 90 },
+      puts,
+    });
+
+    await screen.findByRole('heading', { name: /LC-100/ });
+    fireEvent.click(screen.getByRole('button', { name: 'Edit LC' }));
+    expect(await screen.findByLabelText('Tenor days')).toHaveValue(90);
+    fireEvent.change(screen.getByLabelText('Payment terms'), {
+      target: { value: 'at_sight' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+    await waitFor(() => expect(puts).toHaveLength(1));
+    expect(puts[0]).toMatchObject({
+      payment_terms: 'at_sight',
+      tenor_days: null,
+    });
   });
 });

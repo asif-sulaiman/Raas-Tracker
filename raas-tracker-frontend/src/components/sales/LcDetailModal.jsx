@@ -43,6 +43,8 @@ export default function LcDetailModal({ lcId, isOpen, onClose, onSaved, onViewPI
   const [expiryDate, setExpiryDate] = useState('');
   const [bankRef, setBankRef] = useState('');
   const [notes, setNotes] = useState('');
+  const [paymentTerms, setPaymentTerms] = useState('at_sight');
+  const [tenorDays, setTenorDays] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
   const [detachingId, setDetachingId] = useState(null);
@@ -85,14 +87,20 @@ export default function LcDetailModal({ lcId, isOpen, onClose, onSaved, onViewPI
     setExpiryDate(lc.expiry_date || '');
     setBankRef(lc.bank_ref || '');
     setNotes(lc.notes || '');
+    setPaymentTerms(lc.payment_terms || 'at_sight');
+    setTenorDays(lc.tenor_days ?? '');
     setError(null);
     setEditing(true);
   };
 
-  // PUT accepts dates/bank_ref/notes only — lc_number + company_id are
+  // PUT accepts dates/bank_ref/notes/terms — lc_number + company_id are
   // deliberately absent so the form cannot offer immutable fields.
   const handleSave = async () => {
     setError(null);
+    if (paymentTerms === 'deferred' && !(Number(tenorDays) > 0)) {
+      setError('Tenor days is required for deferred payment terms');
+      return;
+    }
     setSaving(true);
     try {
       const res = await apiFetch(`/api/lcs/${lcId}`, {
@@ -103,6 +111,8 @@ export default function LcDetailModal({ lcId, isOpen, onClose, onSaved, onViewPI
           expiry_date: expiryDate || null,
           bank_ref: bankRef.trim() || null,
           notes: notes.trim() || null,
+          payment_terms: paymentTerms,
+          tenor_days: paymentTerms === 'deferred' ? Number(tenorDays) : null,
         }),
       });
       const saved = await res.json();
@@ -255,6 +265,37 @@ export default function LcDetailModal({ lcId, isOpen, onClose, onSaved, onViewPI
                   placeholder="Free-form notes…"
                 />
               </div>
+              <div>
+                <label className="text-xs font-medium text-slate-600 dark:text-slate-300">
+                  Payment terms
+                </label>
+                <select
+                  aria-label="Payment terms"
+                  value={paymentTerms}
+                  onChange={(e) => setPaymentTerms(e.target.value)}
+                  className={inputCls}
+                >
+                  <option value="at_sight">At sight</option>
+                  <option value="deferred">Deferred</option>
+                </select>
+              </div>
+              {paymentTerms === 'deferred' && (
+                <div>
+                  <label className="text-xs font-medium text-slate-600 dark:text-slate-300">
+                    Tenor days *
+                  </label>
+                  <input
+                    aria-label="Tenor days"
+                    type="number"
+                    min="1"
+                    max="720"
+                    value={tenorDays}
+                    onChange={(e) => setTenorDays(e.target.value)}
+                    className={inputCls}
+                    placeholder="90"
+                  />
+                </div>
+              )}
             </div>
           ) : (
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -262,6 +303,14 @@ export default function LcDetailModal({ lcId, isOpen, onClose, onSaved, onViewPI
               <Field label="Expiry Date" value={formatDate(lc.expiry_date)} />
               <Field label="Bank Ref" value={lc.bank_ref} mono />
               <Field label="Notes" value={lc.notes} />
+              <Field
+                label="Payment terms"
+                value={
+                  lc.payment_terms === 'deferred'
+                    ? `Deferred · ${lc.tenor_days ?? '—'} days`
+                    : 'At sight'
+                }
+              />
             </div>
           )}
           {editing && error && (

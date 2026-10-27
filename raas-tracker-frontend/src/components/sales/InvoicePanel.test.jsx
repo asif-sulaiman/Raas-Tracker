@@ -669,3 +669,104 @@ describe('InvoicePanel lifecycle order and read-only mode', () => {
     expect(screen.queryByRole('button', { name: /void invoice/i })).toBeNull();
   });
 });
+
+describe('InvoicePanel invoice maturity', () => {
+  it('prefills the maturity from a deferred LC and posts it with the shipment', async () => {
+    const posts = [];
+    const invoices = [{
+      invoice_id: 61, invoice_number: 'INV-M1', status: 'booked',
+      approx_ship_date: '2026-11-01', actual_ship_date: null, notes: null,
+      created_at: '2026-10-01 10:00:00', amount: 100, paid_amount: 0,
+      payment_terms: 'deferred', tenor_days: 90,
+    }];
+    renderPanel({ invoices, posts });
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Ship' }));
+    fireEvent.change(await screen.findByLabelText('Actual ship date'), {
+      target: { value: '2026-11-10' },
+    });
+
+    // Deferred 90 days from the actual ship date — leap-safe UTC arithmetic.
+    expect(screen.getByLabelText('Maturity date')).toHaveValue('2027-02-08');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save shipment' }));
+    await waitFor(() => expect(posts.filter((p) => p.url.includes('/ship'))).toHaveLength(1));
+    expect(posts.find((p) => p.url.includes('/ship')).body).toMatchObject({
+      actual_ship_date: '2026-11-10',
+      maturity_date: '2027-02-08',
+    });
+  });
+
+  it('defaults maturity to the actual ship date on an at-sight LC', async () => {
+    const posts = [];
+    const invoices = [{
+      invoice_id: 62, invoice_number: 'INV-M2', status: 'booked',
+      approx_ship_date: '2026-11-01', actual_ship_date: null, notes: null,
+      created_at: '2026-10-01 10:00:00', amount: 100, paid_amount: 0,
+      payment_terms: 'at_sight', tenor_days: null,
+    }];
+    renderPanel({ invoices, posts });
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Ship' }));
+    fireEvent.change(await screen.findByLabelText('Actual ship date'), {
+      target: { value: '2026-11-10' },
+    });
+    expect(screen.getByLabelText('Maturity date')).toHaveValue('2026-11-10');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save shipment' }));
+    await waitFor(() => expect(posts.filter((p) => p.url.includes('/ship'))).toHaveLength(1));
+    expect(posts.find((p) => p.url.includes('/ship')).body).toMatchObject({
+      actual_ship_date: '2026-11-10',
+      maturity_date: '2026-11-10',
+    });
+  });
+
+  it('posts an operator-edited maturity override', async () => {
+    const posts = [];
+    const invoices = [{
+      invoice_id: 63, invoice_number: 'INV-M3', status: 'booked',
+      approx_ship_date: '2026-11-01', actual_ship_date: null, notes: null,
+      created_at: '2026-10-01 10:00:00', amount: 100, paid_amount: 0,
+      payment_terms: 'deferred', tenor_days: 90,
+    }];
+    renderPanel({ invoices, posts });
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Ship' }));
+    fireEvent.change(await screen.findByLabelText('Actual ship date'), {
+      target: { value: '2026-11-10' },
+    });
+    fireEvent.change(screen.getByLabelText('Maturity date'), {
+      target: { value: '2027-03-15' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save shipment' }));
+
+    await waitFor(() => expect(posts.filter((p) => p.url.includes('/ship'))).toHaveLength(1));
+    expect(posts.find((p) => p.url.includes('/ship')).body.maturity_date).toBe('2027-03-15');
+  });
+
+  it('shows each shipped invoice maturity and flags an overdue one', async () => {
+    const invoices = [
+      {
+        invoice_id: 71, invoice_number: 'INV-OD', status: 'shipped',
+        approx_ship_date: '2025-12-01', actual_ship_date: '2025-12-02', notes: null,
+        created_at: '2025-11-01 10:00:00', amount: 100, paid_amount: 0,
+        maturity_date: '2026-01-01',
+      },
+      {
+        invoice_id: 72, invoice_number: 'INV-OK', status: 'paid',
+        approx_ship_date: '2026-09-01', actual_ship_date: '2026-09-02', notes: null,
+        created_at: '2026-08-01 10:00:00', amount: 200, paid_amount: 200,
+        maturity_date: '2027-01-01',
+      },
+    ];
+    renderPanel({ invoices });
+
+    const overdueRow = (await screen.findByText('INV-OD')).closest('div');
+    expect(within(overdueRow).getByText(/matures/i)).toBeTruthy();
+    expect(within(overdueRow).getByText('Overdue')).toBeTruthy();
+
+    const paidRow = screen.getByText('INV-OK').closest('div');
+    expect(within(paidRow).getByText(/matures/i)).toBeTruthy();
+    expect(within(paidRow).queryByText('Overdue')).toBeNull();
+  });
+});

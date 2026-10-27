@@ -40,7 +40,7 @@ const LC_ACME = {
   id: 10, lc_number: 'LC-100', company_name: 'Acme', client_name: 'Acme', pi_count: 0,
 };
 
-function installFetch({ attaches = [] } = {}) {
+function installFetch({ attaches = [], creates = [] } = {}) {
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
     const u = String(url);
     const method = options?.method || 'GET';
@@ -52,6 +52,7 @@ function installFetch({ attaches = [] } = {}) {
       return jsonResponse({ id: 10 });
     }
     if (u.endsWith('/api/lcs') && method === 'POST') {
+      creates.push(JSON.parse(options.body));
       return jsonResponse({ id: 11, lc_number: 'LC-NEW' }, true, 201);
     }
     return jsonResponse({});
@@ -152,5 +153,56 @@ describe('LinkPIsModal attach wiring', () => {
     expect(await screen.findByText(/Selected PI has no company/)).toBeTruthy();
     expect(screen.getByRole('button', { name: /Link 1 PI/ }).disabled).toBe(true);
     expect(posts).toHaveLength(0);
+  });
+});
+
+describe('LinkPIsModal payment terms', () => {
+  async function fillNewLc() {
+    fireEvent.click(await screen.findByLabelText('Select PI PI-001'));
+    fireEvent.change(await screen.findByLabelText('New LC number'), {
+      target: { value: 'LC-NEW' },
+    });
+  }
+
+  it('posts at-sight terms by default', async () => {
+    const creates = [];
+    renderLink(
+      { unlinkedSales: [PI_ACME_1], existingLcs: [] },
+      { creates },
+    );
+    await fillNewLc();
+
+    // No tenor field until the LC is declared deferred.
+    expect(screen.queryByLabelText('Tenor days')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Link 1 PI' }));
+    await waitFor(() => expect(creates).toHaveLength(1));
+    expect(creates[0]).toMatchObject({
+      payment_terms: 'at_sight',
+      tenor_days: null,
+    });
+  });
+
+  it('creates a deferred LC with its tenor', async () => {
+    const creates = [];
+    renderLink(
+      { unlinkedSales: [PI_ACME_1], existingLcs: [] },
+      { creates },
+    );
+    await fillNewLc();
+
+    fireEvent.change(screen.getByLabelText('Payment terms'), {
+      target: { value: 'deferred' },
+    });
+    fireEvent.change(await screen.findByLabelText('Tenor days'), {
+      target: { value: '90' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Link 1 PI' }));
+
+    await waitFor(() => expect(creates).toHaveLength(1));
+    expect(creates[0]).toMatchObject({
+      payment_terms: 'deferred',
+      tenor_days: 90,
+    });
   });
 });
