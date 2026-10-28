@@ -2061,7 +2061,7 @@ def api_commercial_report_export():
     writer.writerow([
         "Customer Name", "PI No", "PI Date", "LC No", "LC Date",
         "Product Name", "Unit", "Quantity", "Unit Price", "Total Price ($)",
-        "Invoice Date", "Latest Ship Date", "Actual Ship Date",
+        "Prod. Date", "Invoice Date", "Latest Ship Date", "Actual Ship Date",
         "Maturity Date", "Receive Date", "Received Amount ($)",
         "Due Amount ($)", "Payment Status", "Payment Comment", "Provisional"
     ])
@@ -2073,6 +2073,7 @@ def api_commercial_report_export():
             r.get("product_name", ""),
             r.get("unit", ""), r.get("quantity", 0),
             r.get("unit_price", 0), r.get("total_price", 0),
+            r.get("prod_date", ""),
             r.get("invoice_date", ""),
             r.get("latest_ship_date", ""), r.get("actual_ship_date", ""),
             r.get("maturity_date", ""),

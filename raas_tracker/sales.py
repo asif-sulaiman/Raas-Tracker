@@ -1298,83 +1298,220 @@ def _payment_status(due_amount: float, maturity_date: Any,
 
 
 def _commercial_report_base_sql(date_anchor_expr: str) -> str:
-    """The per-line CTE shared by the flat report, summary and drill-down.
+    """The per-row CTE shared by the flat report, summary and drill-down.
 
-    One row per PI line. A line with invoice rows displays the invoiced
-    quantity (``SUM(invoice_items.quantity)``) and is final; a line with no
-    invoice rows displays the PI quantity and is provisional. Unit price is
-    always the PI unit price — the invoice never overrides it. ``sale_total``
-    is the sum of those displayed line totals, so a partially invoiced sale
-    still reports a coherent, billable amount.
+    One row per invoice line plus one ``is_provisional`` remainder row per PI
+    line when the PI quantity is not fully invoiced. Money is per row:
+
+    * an invoice's payments are allocated to its lines in line order, the last
+      line absorbing any overpayment;
+    * payments with no ``invoice_id`` (legacy sale-level rows) are allocated
+      across the sale's rows in the same order;
+    * ``due_amount`` is ``max(total_price - received_amount, 0)`` per row.
+
+    ``prod_date`` comes from the recipe production of the row's product for
+    this sale — ``production_run_links`` → ``production_runs`` → ``recipes``,
+    matching either the run's ``sale_item_id`` or the recipe's
+    ``company_id``/``product_name``. The invoice link is deliberately ignored:
+    production belongs to the recipe batch, not to an invoice.
 
     ``date_anchor_expr`` is one of the fixed expressions built from the
     ``date_anchor`` filter map (never user text).
     """
+    alloc_order = (
+        "sale_item_id ASC NULLS LAST, invoice_date ASC NULLS LAST, "
+        "item_id ASC NULLS LAST, is_provisional ASC, product_name ASC"
+    )
     return f"""
-        SELECT l.*,
-               ROUND(SUM(l.total_price) OVER (PARTITION BY l.sale_id)::numeric, 2)::float8
-                   AS sale_total
-        FROM (
+        WITH invoiced AS (
+            SELECT ii.sale_item_id, SUM(ii.quantity)::numeric AS qty
+            FROM invoice_items ii
+            JOIN invoices i ON i.id = ii.invoice_id
+            WHERE i.status <> 'void'
+              AND ii.sale_item_id IS NOT NULL
+            GROUP BY ii.sale_item_id
+        ),
+        inv_paid AS (
+            SELECT invoice_id,
+                   COALESCE(SUM(payment_amount), 0)::numeric AS paid,
+                   MAX(payment_date) AS last_payment
+            FROM sale_payments
+            WHERE invoice_id IS NOT NULL
+            GROUP BY invoice_id
+        ),
+        legacy_paid AS (
+            SELECT sale_id,
+                   COALESCE(SUM(payment_amount), 0)::numeric AS paid,
+                   MAX(payment_date) AS last_payment
+            FROM sale_payments
+            WHERE invoice_id IS NULL
+            GROUP BY sale_id
+        ),
+        inv_lines AS (
             SELECT
-                s.id AS sale_id,
-                COALESCE(c.name, s.client_name) AS customer_name,
-                s.pi_number, s.pi_date,
-                s.lc_number, s.lc_date,
-                s.shipment_date, s.maturity_date, s.stage, s.comments,
-                s.company_id,
-                s.lc_id,
-                si.product_name, si.unit,
-                COALESCE(ii.inv_qty, si.quantity, 0)::float8 AS quantity,
-                si.unit_price,
-                ROUND((COALESCE(ii.inv_qty, si.quantity, 0) * si.unit_price)::numeric, 2)::float8
-                    AS total_price,
-                (ii.inv_qty IS NULL) AS is_provisional,
-                ii.invoice_date,
-                COALESCE((SELECT MAX(sh.ship_date)
-                            FROM shipments sh WHERE sh.sale_id = s.id),
-                         s.shipment_date) AS latest_ship_date,
-                COALESCE(ii.actual_ship_date, s.shipment_date) AS actual_ship_date,
-                (SELECT MAX(sp.payment_date)
-                   FROM sale_payments sp WHERE sp.sale_id = s.id) AS receive_date,
-                (SELECT COALESCE(ROUND(SUM(sp.payment_amount)::numeric, 2), 0)::float8
-                   FROM sale_payments sp WHERE sp.sale_id = s.id) AS received_amount,
-                {date_anchor_expr} AS date_anchor_col
-            FROM sales s
-            LEFT JOIN sale_items si ON si.sale_id = s.id
-            LEFT JOIN companies c ON c.id = s.company_id
-            LEFT JOIN LATERAL (
-                SELECT SUM(ii.quantity) AS inv_qty,
-                       MAX(i.invoice_date) AS invoice_date,
-                       MAX(i.actual_ship_date) AS actual_ship_date
-                FROM invoice_items ii
-                JOIN invoices i ON i.id = ii.invoice_id
-                WHERE i.sale_id = s.id
-                AND ii.sale_item_id = si.id
-            ) ii ON true
-        ) l
+                i.sale_id,
+                i.id AS invoice_id,
+                ii.id AS item_id,
+                ii.sale_item_id,
+                ii.product_name,
+                ii.unit,
+                COALESCE(ii.quantity, 0)::numeric AS quantity,
+                COALESCE(si.unit_price, ii.unit_price, 0)::numeric AS unit_price,
+                COALESCE(
+                    ii.line_total,
+                    ROUND((COALESCE(ii.quantity, 0)
+                           * COALESCE(si.unit_price, ii.unit_price, 0))::numeric, 2)
+                )::numeric AS total_price,
+                i.invoice_date,
+                i.approx_ship_date,
+                i.actual_ship_date,
+                i.maturity_date AS invoice_maturity,
+                false AS is_provisional,
+                SUM(COALESCE(
+                        ii.line_total,
+                        ROUND((COALESCE(ii.quantity, 0)
+                               * COALESCE(si.unit_price, ii.unit_price, 0))::numeric, 2)
+                    )) OVER (
+                        PARTITION BY i.id ORDER BY ii.id
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                    ) AS prev_inv_total,
+                (ROW_NUMBER() OVER (PARTITION BY i.id ORDER BY ii.id DESC) = 1)
+                    AS is_last_inv_line
+            FROM invoice_items ii
+            JOIN invoices i ON i.id = ii.invoice_id
+            LEFT JOIN sale_items si ON si.id = ii.sale_item_id
+            WHERE i.status <> 'void'
+        ),
+        remainders AS (
+            SELECT
+                si.sale_id,
+                NULL::integer AS invoice_id,
+                NULL::integer AS item_id,
+                si.id AS sale_item_id,
+                si.product_name,
+                si.unit,
+                GREATEST(COALESCE(si.quantity, 0)::numeric
+                         - COALESCE(inv.qty, 0), 0) AS quantity,
+                COALESCE(si.unit_price, 0)::numeric AS unit_price,
+                ROUND((GREATEST(COALESCE(si.quantity, 0)::numeric
+                                - COALESCE(inv.qty, 0), 0)
+                       * COALESCE(si.unit_price, 0))::numeric, 2) AS total_price,
+                NULL::text AS invoice_date,
+                NULL::text AS approx_ship_date,
+                NULL::text AS actual_ship_date,
+                NULL::text AS invoice_maturity,
+                true AS is_provisional,
+                NULL::numeric AS prev_inv_total,
+                NULL::boolean AS is_last_inv_line
+            FROM sale_items si
+            LEFT JOIN invoiced inv ON inv.sale_item_id = si.id
+            WHERE GREATEST(COALESCE(si.quantity, 0)::numeric
+                           - COALESCE(inv.qty, 0), 0) > 0
+        ),
+        row_alloc AS (
+            SELECT r.*,
+                   (row_number() OVER (PARTITION BY r.sale_id ORDER BY {alloc_order})
+                    = count(*) OVER (PARTITION BY r.sale_id)) AS is_last_row,
+                   sum(r.total_price) OVER (
+                       PARTITION BY r.sale_id ORDER BY {alloc_order}
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                   ) AS prev_sale_total
+            FROM (
+                SELECT * FROM inv_lines
+                UNION ALL
+                SELECT * FROM remainders
+            ) r
+        ),
+        rows_money AS (
+            SELECT r.*,
+                   ROUND((
+                       CASE WHEN r.invoice_id IS NULL THEN 0
+                            WHEN r.is_last_inv_line
+                                THEN GREATEST(COALESCE(ip.paid, 0)
+                                              - COALESCE(r.prev_inv_total, 0), 0)
+                            ELSE LEAST(r.total_price,
+                                       GREATEST(COALESCE(ip.paid, 0)
+                                                - COALESCE(r.prev_inv_total, 0), 0))
+                       END
+                       +
+                       CASE WHEN r.is_last_row
+                                THEN GREATEST(COALESCE(lp.paid, 0)
+                                              - COALESCE(r.prev_sale_total, 0), 0)
+                            ELSE LEAST(r.total_price,
+                                       GREATEST(COALESCE(lp.paid, 0)
+                                                - COALESCE(r.prev_sale_total, 0), 0))
+                       END
+                   )::numeric, 2) AS received_amount,
+                   GREATEST(ip.last_payment, lp.last_payment) AS receive_date
+            FROM row_alloc r
+            LEFT JOIN inv_paid ip ON ip.invoice_id = r.invoice_id
+            LEFT JOIN legacy_paid lp ON lp.sale_id = r.sale_id
+        )
+        SELECT
+            r.sale_id,
+            COALESCE(c.name, s.client_name) AS customer_name,
+            s.pi_number, s.pi_date,
+            s.lc_number, s.lc_date,
+            s.shipment_date, s.stage, s.comments,
+            s.company_id, s.lc_id,
+            r.product_name, r.unit,
+            r.quantity::float8 AS quantity,
+            r.unit_price::float8 AS unit_price,
+            r.total_price::float8 AS total_price,
+            r.is_provisional,
+            r.invoice_date,
+            CASE WHEN r.invoice_id IS NOT NULL
+                 THEN COALESCE(r.actual_ship_date, r.approx_ship_date)
+                 ELSE COALESCE((SELECT MAX(sh.ship_date)
+                                  FROM shipments sh WHERE sh.sale_id = s.id),
+                               s.shipment_date)
+            END AS latest_ship_date,
+            CASE WHEN r.invoice_id IS NOT NULL
+                 THEN r.actual_ship_date
+                 ELSE s.shipment_date
+            END AS actual_ship_date,
+            CASE WHEN r.invoice_id IS NOT NULL
+                 THEN COALESCE(r.invoice_maturity, r.actual_ship_date,
+                               s.maturity_date)
+                 ELSE s.maturity_date
+            END AS maturity_date,
+            r.receive_date,
+            r.received_amount,
+            ROUND(GREATEST(r.total_price - r.received_amount, 0)::numeric, 2)::float8
+                AS due_amount,
+            (SELECT MAX(pr.production_date)
+               FROM production_run_links prl
+               JOIN production_runs pr ON pr.id = prl.run_id
+               JOIN recipes rec ON rec.id = pr.recipe_id
+              WHERE prl.sale_id = r.sale_id
+                AND (pr.sale_item_id = r.sale_item_id
+                     OR (rec.product_name IS NOT NULL
+                         AND rec.product_name = r.product_name
+                         AND rec.company_id = s.company_id))
+            ) AS prod_date,
+            {date_anchor_expr} AS date_anchor_col,
+            r.sale_item_id, r.item_id, r.invoice_id
+        FROM rows_money r
+        JOIN sales s ON s.id = r.sale_id
+        LEFT JOIN companies c ON c.id = s.company_id
     """
 
 
 def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> "tuple[List[Dict[str, Any]], int]":
-    """Live commercial report — one output row per sale_item, USD only.
+    """Live commercial report — one row per invoice line + PI remainder, USD only.
 
     Returns (rows, total): `rows` is the requested page (page/page_size),
     `total` is how many rows match the filters across ALL pages.
 
-    Item-level columns (product, qty, price, total_price, dates on the
-    shipment) vary per row. Sale-level payment columns — received_amount,
-    due_amount, receive_date, maturity_date, payment_status,
-    payment_comment — are computed per SALE and repeated identically on
-    every row of that sale. Sale total and sale paid are aggregated in
-    scalar subqueries so item x shipment x payment joins can never
-    double count.
+    Row grain follows the sheet: every non-void invoice line is a row, and a
+    PI line whose quantity is not fully invoiced adds one ``is_provisional``
+    remainder row. Money is per row — an invoice's payments are allocated to
+    its lines in line order, a legacy sale-level payment is allocated across
+    the sale's rows, and ``due_amount = max(total_price - received_amount, 0)``.
 
-    LIVE PI FALLBACK: per-line quantity/total come from invoice_items
-    (SUM per sale_item) once the line is invoiced; a line with no invoice
-    rows shows the PI quantity × PI unit price and is flagged
-    ``is_provisional``. Sale total is the sum of displayed line totals, so a
-    partially invoiced sale is coherent. Completed sales remain in the
-    report — the board archives them, the report never drops them.
+    ``prod_date`` comes from the recipe production of the row's product for
+    this sale (``production_run_links`` → ``production_runs`` → ``recipes``),
+    never from the invoice link.
 
     filters: {
         "date_anchor": "pi_date" | "lc_date" | "shipment_date" | "receive_date" | "maturity_date",
@@ -1457,8 +1594,9 @@ def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> "tu
     if filters.get("payment_status"):
         where_clauses.append("""
             CASE
-                WHEN sale_total - received_amount <= 0 THEN 'Paid'
-                WHEN maturity_date::date < CURRENT_DATE AND sale_total - received_amount > 0 THEN 'Overdue'
+                WHEN ROUND((total_price - received_amount)::numeric, 2) <= 0 THEN 'Paid'
+                WHEN maturity_date::date < CURRENT_DATE
+                     AND total_price - received_amount > 0 THEN 'Overdue'
                 WHEN received_amount > 0 THEN 'Partial'
                 WHEN maturity_date IS NOT NULL THEN 'Due'
                 ELSE 'Pending'
@@ -1466,8 +1604,8 @@ def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> "tu
         """)
         params["payment_status"] = filters["payment_status"]
 
-    # Per-line PI fallback: no invoice EXISTS gate. A fresh PI is reportable
-    # the moment it has lines; its lines read provisional until invoiced.
+    # Per-row money: a fresh PI is reportable the moment it has lines; each
+    # line has an invoice line row and/or a provisional remainder row.
     where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
     # Pagination. Clamped, not trusted: a negative or zero page reaches
@@ -1488,7 +1626,12 @@ def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> "tu
         SELECT *, COUNT(*) OVER() AS _total_rows
         FROM base
         {where_sql}
-        ORDER BY sale_id DESC
+        ORDER BY sale_id DESC,
+                 sale_item_id ASC NULLS LAST,
+                 invoice_date ASC NULLS LAST,
+                 item_id ASC NULLS LAST,
+                 is_provisional ASC,
+                 product_name ASC
         LIMIT %(page_size)s OFFSET %(offset)s
     """
 
@@ -1501,14 +1644,16 @@ def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> "tu
     report = []
     for r in rows:
         (sale_id, customer_name, pi_number, pi_date, lc_number, lc_date,
-         shipment_date, maturity_date, stage, comments, company_id, lc_id,
+         shipment_date, stage, comments, company_id, lc_id,
          product_name, unit, quantity, unit_price, total_price,
          is_provisional, invoice_date, latest_ship_date, actual_ship_date,
-         receive_date, received_amount, date_anchor_col, sale_total,
+         maturity_date, receive_date, received_amount, due_amount_db, prod_date,
+         date_anchor_col, sale_item_id, item_id, invoice_id,
          _total_rows) = r
 
         received = round(float(received_amount or 0), 2)
-        due_amount = round(max(round(float(sale_total or 0), 2) - received, 0.0), 2)
+        line_total = round(float(total_price or 0), 2)
+        due_amount = round(max(line_total - received, 0.0), 2)
         pay_status = _payment_status(due_amount, maturity_date, received)
         pay_comment = (comments or "").strip()
 
@@ -1524,6 +1669,7 @@ def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> "tu
             "quantity": quantity,
             "unit_price": unit_price,
             "total_price": total_price,
+            "prod_date": prod_date,
             "is_provisional": bool(is_provisional),
             "invoice_date": invoice_date,
             "latest_ship_date": latest_ship_date,
@@ -1619,8 +1765,9 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
     if filters.get("payment_status"):
         where_clauses.append("""
             CASE
-                WHEN sale_total - received_amount <= 0 THEN 'Paid'
-                WHEN maturity_date::date < CURRENT_DATE AND sale_total - received_amount > 0 THEN 'Overdue'
+                WHEN ROUND((total_price - received_amount)::numeric, 2) <= 0 THEN 'Paid'
+                WHEN maturity_date::date < CURRENT_DATE
+                     AND total_price - received_amount > 0 THEN 'Overdue'
                 WHEN received_amount > 0 THEN 'Partial'
                 WHEN maturity_date IS NOT NULL THEN 'Due'
                 ELSE 'Pending'
@@ -1628,18 +1775,18 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
         """)
         params["payment_status"] = filters["payment_status"]
 
-    # The product filter is the only clause that names the base relation, so it
-    # is rendered once per query: the summary collapses `base` to one row per
-    # sale inside a CTE aliased `b`, while the detail query selects FROM base.
-    # Only the static alias is substituted — every user value stays a %(name)s
-    # placeholder. `prefix` lets the per-period items query chain the clauses
-    # with AND after its own WHERE instead of emitting a second WHERE.
+    # Every filter clause is rendered against the alias of the relation it
+    # queries: the summary selects FROM base, and the per-period items query
+    # uses the same alias. Only the static alias is substituted — every user
+    # value stays a %(name)s placeholder. `prefix` lets the per-period items
+    # query chain the clauses with AND after its own WHERE instead of emitting
+    # a second WHERE.
     def _where_sql(alias, prefix="WHERE "):
         rendered = (c.replace("{alias}", alias) for c in where_clauses)
         return prefix + " AND ".join(rendered) if where_clauses else ""
 
     # No invoice EXISTS gate: provisional PI lines are revenue from day one.
-    sale_where_sql = _where_sql("b", prefix="WHERE ")
+    sale_where_sql = _where_sql("base", prefix="WHERE ")
     period_where_sql = _where_sql("base", prefix="AND ")
 
     # Build the period truncation expression using the CTE column
@@ -1659,51 +1806,28 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
 
     # Summary query with period grouping.
     #
-    # `base` carries ONE ROW PER LINE ITEM, so the sale-level scalars
-    # (received_amount / sale_total / maturity_date) repeat on every row of the
-    # same sale: a bare SUM(received_amount) multiplies the money by the item
-    # count (a 3-item sale of 3000 paid 1000 reported 3000 received).
-    # sale_rows collapses `base` to ONE ROW PER SALE (MAX keeps the single
-    # copy of each sale-level scalar, SUM(total_price) keeps the per-item gross
-    # ), so the outer per-period aggregates count the money exactly once per
-    # sale while gross_sales stays a per-item sum. Money follows the file
-    # convention COALESCE(ROUND(SUM(...)::numeric, 2)::float8, 0) — no float
-    # drift — and due is clamped with GREATEST(..., 0) so an overpaid sale
-    # reports 0 due, matching get_commercial_report's Python clamp.
-    #
-    # LIVE PI FALLBACK: per-row quantity/total come from invoice_items once a
-    # line is invoiced, otherwise from the PI line. No sale is excluded for
-    # lacking invoices; sale_total is the sum of displayed line totals.
+    # `base` carries ONE ROW PER INVOICE LINE / PROVISIONAL REMAINDER, and each
+    # row's received_amount is its own allocation, so the KPIs are plain sums
+    # over rows. Money follows the file convention
+    # COALESCE(ROUND(SUM(...)::numeric, 2)::float8, 0) — no float drift — and
+    # due is clamped with GREATEST(..., 0) so an overpaid row reports 0 due,
+    # matching get_commercial_report's Python clamp.
     summary_query = f"""
         WITH base AS (
             {_commercial_report_base_sql(date_anchor_expr)}
-        ),
-        sale_rows AS (
-            SELECT
-                b.sale_id,
-                MAX(b.date_anchor_col) AS date_anchor_col,
-                MAX(b.customer_name) AS customer_name,
-                MAX(b.company_id) AS company_id,
-                MAX(b.stage) AS stage,
-                MAX(b.maturity_date) AS maturity_date,
-                MAX(b.received_amount) AS received_amount,
-                SUM(b.total_price) AS sale_total,
-                SUM(b.total_price) AS gross_sales
-            FROM base b
-            {sale_where_sql}
-            GROUP BY b.sale_id
         )
         SELECT
             {period_trunc} AS period_start,
             {period_end} AS period_end,
             COUNT(DISTINCT sale_id) AS order_count,
-            COALESCE(ROUND(SUM(gross_sales)::numeric, 2)::float8, 0) AS gross_sales,
+            COALESCE(ROUND(SUM(total_price)::numeric, 2)::float8, 0) AS gross_sales,
             COALESCE(ROUND(SUM(received_amount)::numeric, 2)::float8, 0) AS total_received,
-            COALESCE(ROUND(SUM(GREATEST(sale_total - received_amount, 0))::numeric, 2)::float8, 0) AS total_due,
+            COALESCE(ROUND(SUM(GREATEST(total_price - received_amount, 0))::numeric, 2)::float8, 0) AS total_due,
             COALESCE(ROUND(SUM(CASE WHEN maturity_date::date < CURRENT_DATE
-                                     AND sale_total - received_amount > 0
-                                  THEN sale_total - received_amount ELSE 0 END)::numeric, 2)::float8, 0) AS total_overdue
-        FROM sale_rows
+                                     AND total_price - received_amount > 0
+                                  THEN total_price - received_amount ELSE 0 END)::numeric, 2)::float8, 0) AS total_overdue
+        FROM base
+        {sale_where_sql}
         GROUP BY period_start, period_end
         ORDER BY period_start DESC
     """
@@ -1745,13 +1869,16 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
                 SELECT
                     sale_id, customer_name, pi_number, pi_date, lc_number, lc_date,
                     product_name, unit, quantity, unit_price, total_price,
-                    is_provisional,
+                    prod_date, is_provisional,
                     invoice_date, latest_ship_date, actual_ship_date, maturity_date,
                     receive_date, received_amount, 
-                    GREATEST(sale_total - received_amount, 0) AS due_amount,
+                    ROUND(GREATEST(total_price - received_amount, 0)::numeric, 2)
+                        AS due_amount,
                     CASE 
-                        WHEN sale_total - received_amount <= 0 THEN 'Paid'
-                        WHEN maturity_date::date < CURRENT_DATE AND sale_total - received_amount > 0 THEN 'Overdue'
+                        WHEN ROUND((total_price - received_amount)::numeric, 2) <= 0
+                            THEN 'Paid'
+                        WHEN maturity_date::date < CURRENT_DATE
+                             AND total_price - received_amount > 0 THEN 'Overdue'
                         WHEN received_amount > 0 THEN 'Partial'
                         WHEN maturity_date IS NOT NULL THEN 'Due'
                         ELSE 'Pending'
@@ -1761,7 +1888,8 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
                 WHERE {period_trunc} >= %(period_start)s
                 AND {period_trunc} <= %(period_end)s
                 {period_where_sql}
-                ORDER BY sale_id DESC
+                ORDER BY sale_id DESC, product_name ASC,
+                         invoice_date ASC NULLS LAST, is_provisional ASC
             """
             
             detail_rows = conn.execute(detail_query, detail_params).fetchall()
@@ -1770,9 +1898,9 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
             for r in detail_rows:
                 (sale_id, customer_name, pi_number, pi_date, lc_number, lc_date,
                  product_name, unit, quantity, unit_price, total_price,
-                 is_provisional, invoice_date, latest_ship_date, actual_ship_date,
-                 maturity_date, receive_date, received_amount, due_amount,
-                 payment_status, payment_comment) = r
+                 prod_date, is_provisional, invoice_date, latest_ship_date,
+                 actual_ship_date, maturity_date, receive_date, received_amount,
+                 due_amount, payment_status, payment_comment) = r
                 
                 items.append({
                     "sale_id": sale_id,
@@ -1786,6 +1914,7 @@ def get_commercial_report_summary(conn: psycopg.Connection, filters: dict = None
                     "quantity": float(quantity or 0),
                     "unit_price": float(unit_price or 0),
                     "total_price": float(total_price or 0),
+                    "prod_date": prod_date,
                     "is_provisional": bool(is_provisional),
                     "invoice_date": invoice_date,
                     "latest_ship_date": latest_ship_date,
