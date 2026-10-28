@@ -3,7 +3,9 @@ import { toCents, fromCents } from './format.js';
 export const STAGES = [
   { key: 'pi_issued', title: 'PI Issued', actionLabel: 'Enter LC', actionVariant: 'primary', action: 'lc' },
   { key: 'lc_received', title: 'LC Received', actionLabel: 'Start Shipment', actionVariant: 'primary', action: 'move' },
-  { key: 'shipment_ongoing', title: 'Shipment Ongoing', actionLabel: 'Move to Payment Due', actionVariant: 'primary', action: 'move' },
+  // No manual move: entering an invoice's actual ship date advances the sale
+  // server-side (`ship_invoice`), so the card acts per invoice instead.
+  { key: 'shipment_ongoing', title: 'Shipment Ongoing', actionLabel: null, actionVariant: 'primary', action: null },
   { key: 'payment_due', title: 'Payment Due', actionLabel: 'Manage Invoices', actionVariant: 'success', action: 'detail' },
   { key: 'completed', title: 'Completed', actionLabel: null, action: null },
 ];

@@ -163,32 +163,16 @@ export default function Sales() {
     }
   };
 
-  // LC lane: one card per LC moves/unlinks as a unit; PIs always travel
-  // together. Entering Shipment Ongoing needs no invoice, so that crossing
-  // posts straight through. The Payment Due crossing asks for one BOOKED
-  // invoice across the group — booking already proves production, so the
-  // readiness probe reports `booked_ok` (recipes/production are informational).
+  // LC lane: one card per LC moves/unlinks as a unit; PIs travel with the LC.
+  // Shipment Ongoing needs no invoice, so that crossing posts straight through.
+  // The Payment Due hop is not offered here: the LC rolls up server-side when
+  // its last invoice gets an actual ship date (`_sync_lc_payment_due`).
   const handleLcMove = async (lc) => {
     if (typeof lc?.id !== 'number') return;
     const next = nextStageFor(lc.stage);
     if (!next) return;
     setMovingId(`lc-${lc.id}`);
     try {
-      if (next === 'payment_due') {
-        const res = await apiFetch(`/api/lcs/${lc.id}/readiness`);
-        const body = await res.json().catch(() => null);
-        if (!res.ok) {
-          toast.error(body?.error || 'Readiness check failed');
-          return;
-        }
-        if (!body.booked_ok) {
-          toast.error(
-            body?.error
-            || 'No booked invoice yet — produce and book an invoice before moving to Payment Due',
-          );
-          return;
-        }
-      }
       await apiFetch(`/api/lcs/${lc.id}/move`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -208,6 +192,32 @@ export default function Sales() {
   const handleLcManage = (lc) => {
     const first = Array.isArray(lc?.pis) ? lc.pis[0] : null;
     if (first?.id) setDetailSaleId(first.id);
+  };
+
+  // One invoice step straight from the board. Shipping posts the actual date,
+  // which advances the sale (and possibly the LC) server-side — so the board
+  // is refreshed after every step. When the PI still has uninvoiced quantity,
+  // the operator is asked whether more invoices are coming.
+  const handleInvoiceStep = async (sale, invoice, kind, payload) => {
+    const res = await apiFetch(`/api/sales/${sale.id}/invoices/${invoice.invoice_id}/${kind}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (kind === 'book') toast.success('Shipment booked');
+    else if (kind === 'ship') toast.success('Invoice shipped');
+    else toast.success(data?.status === 'paid' ? 'Invoice paid' : 'Payment recorded');
+    fetchData();
+    if (kind === 'ship' && sale.has_uninvoiced_remainder) {
+      const more = await confirm({
+        title: 'Create more invoices?',
+        message: `${sale.pi_number || `PI #${sale.id}`} still has uninvoiced quantity. Will you invoice the rest of the PI?`,
+        confirmLabel: 'Add invoice',
+        cancelLabel: 'No more invoices',
+      });
+      if (more) setDetailSaleId(sale.id);
+    }
   };
 
   const handleUnlink = async (lc, pi) => {    if (typeof lc?.id !== 'number' || !pi?.id) return;
@@ -360,92 +370,85 @@ export default function Sales() {
             className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4 items-start"
           >
             {(() => {
-              // F5a invariant: one lc_id split across stages would render 2
-              // cards while the backend moves ALL children as a unit — render
-              // the LC only in its earliest stage and warn on the split.
-              const seenLcKeys = new Set();
+              // Group once across every stage: an invoice can advance a PI
+              // ahead of its LC (a sibling invoice has not shipped yet), so a
+              // lagging LC must still render in its own column while the
+              // advanced PI renders on its own in the later column.
+              const { groups: allGroups } = groupSalesByLc(sales, lcs);
+              const groupByKey = new Map(allGroups.map((g) => [g.key, g]));
               return BOARD_STAGES.map((st) => {
               const stageSales = salesByStage(st.key);
-              const { groups } = groupSalesByLc(stageSales, lcs);
-              const byKey = new Map(groups.map((g) => [g.key, g]));
               const rendered = new Set();
               const nodes = [];
+
+              const saleCard = (sale) => (
+                <SaleCard
+                  key={sale.id}
+                  sale={sale}
+                  actionLabel={movingId || st.action === 'lc' ? null : st.actionLabel}
+                  actionVariant={st.actionVariant}
+                  onAction={st.action === 'lc' ? undefined : (s) => handleCardAction(s, st)}
+                  onView={(s) => setDetailSaleId(s.id)}
+                  onDelete={isAdmin ? handleDelete : undefined}
+                  onInvoiceStep={handleInvoiceStep}
+                  canEdit={isAdmin}
+                />
+              );
+
+              const lcCard = (group) => {
+                const real = typeof group.lc.id === 'number';
+                return (
+                  <LcBoardCard
+                    key={`lc-${group.key}`}
+                    lc={group.lc}
+                    actionLabel={movingId || !real ? null : st.actionLabel}
+                    actionVariant={st.actionVariant}
+                    onAction={
+                      real
+                        ? (st.action === 'detail' ? handleLcManage : handleLcMove)
+                        : undefined
+                    }
+                    onOpen={handleLcOpen}
+                    onViewPI={(pi) => setDetailSaleId(pi.id)}
+                    onUnlink={isAdmin && real ? (pi) => handleUnlink(group.lc, pi) : undefined}
+                    onManageInvoices={
+                      st.key === 'shipment_ongoing' && group.lc.pis.length > 0
+                        ? () => setDetailSaleId(group.lc.pis[0].id)
+                        : undefined
+                    }
+                    onDelete={isAdmin && real ? handleLcDelete : undefined}
+                  />
+                );
+              };
+
+              // F6: null-company mirrors carry no meta — render their PIs as
+              // unlinked SaleCards, never as a dead LcBoardCard.
+              const isDeadMirror = (group) => group.lc._mirror && group.lc.company_id == null;
+
               for (const sale of stageSales) {
                 const key = lcGroupKey(sale);
-                if (key && byKey.has(key)) {
-                  if (rendered.has(key)) continue;
-                  rendered.add(key);
-                  const group = byKey.get(key);
-                  const dedupeKey =
-                    typeof group.lc.id === 'number' ? `id:${group.lc.id}` : group.key;
-                  if (seenLcKeys.has(dedupeKey)) {
-                    console.warn(
-                      `Split LC ${dedupeKey} appears in multiple stages — rendering only in its earliest stage`
-                    );
-                    continue;
-                  }
-                  seenLcKeys.add(dedupeKey);
-                  // F6: null-company mirrors carry no meta — render their PIs
-                  // as unlinked SaleCards, never as a dead LcBoardCard.
-                  if (group.lc._mirror && group.lc.company_id == null) {
-                    for (const pi of group.lc.pis) {
-                      nodes.push(
-                        <SaleCard
-                          key={pi.id}
-                          sale={pi}
-                          actionLabel={movingId || st.action === 'lc' ? null : st.actionLabel}
-                          actionVariant={st.actionVariant}
-                          onAction={st.action === 'lc' ? undefined : (s) => handleCardAction(s, st)}
-                          onView={(s) => setDetailSaleId(s.id)}
-                          onDelete={isAdmin ? handleDelete : undefined}
-                        />
-                      );
-                    }
-                    continue;
-                  }
-                  const real = typeof group.lc.id === 'number';
-                  // Board honesty (INV-link): the card acts only from the
-                  // LC's own stage column. A card rendered early (split LC,
-                  // lagging PI) shows no move action — otherwise its button
-                  // promises one move (e.g. "Enter LC") while handleLcMove
-                  // attempts another (e.g. the Payment Due production check)
-                  // from the wrong column.
-                  const atOwnStage = st.key === group.lc.stage;
-                  nodes.push(
-                    <LcBoardCard
-                      key={`lc-${group.key}`}
-                      lc={group.lc}
-                      actionLabel={movingId || !real || !atOwnStage ? null : st.actionLabel}
-                      actionVariant={st.actionVariant}
-                      onAction={
-                        real && atOwnStage
-                          ? (st.action === 'detail' ? handleLcManage : handleLcMove)
-                          : undefined
-                      }
-                      onOpen={handleLcOpen}
-                      onViewPI={(pi) => setDetailSaleId(pi.id)}
-                      onUnlink={isAdmin && real ? (pi) => handleUnlink(group.lc, pi) : undefined}
-                      onManageInvoices={
-                        st.key === 'shipment_ongoing' && group.lc.pis.length > 0
-                          ? () => setDetailSaleId(group.lc.pis[0].id)
-                          : undefined
-                      }
-                      onDelete={isAdmin && real ? handleLcDelete : undefined}
-                    />
-                  );
-                } else {
-                  nodes.push(
-                    <SaleCard
-                      key={sale.id}
-                      sale={sale}
-                      actionLabel={movingId || st.action === 'lc' ? null : st.actionLabel}
-                      actionVariant={st.actionVariant}
-                      onAction={st.action === 'lc' ? undefined : (s) => handleCardAction(s, st)}
-                      onView={(s) => setDetailSaleId(s.id)}
-                      onDelete={isAdmin ? handleDelete : undefined}
-                    />
-                  );
+                const group = key ? groupByKey.get(key) : null;
+                if (!group || isDeadMirror(group)) {
+                  nodes.push(saleCard(sale));
+                  continue;
                 }
+                // The PI advanced ahead of its LC: it keeps its own card here
+                // (with its invoice rows) and the LC card stays behind.
+                if (group.lc.stage !== st.key) {
+                  nodes.push(saleCard(sale));
+                  continue;
+                }
+                if (rendered.has(group.key)) continue;
+                rendered.add(group.key);
+                nodes.push(lcCard(group));
+              }
+              // An LC whose PIs all sit in other columns still shows in its
+              // own column, so it never disappears from the board.
+              for (const group of allGroups) {
+                if (group.lc.stage !== st.key || rendered.has(group.key)) continue;
+                if (isDeadMirror(group)) continue;
+                rendered.add(group.key);
+                nodes.push(lcCard(group));
               }
               // PI total (visible page slice) in integer cents — never an
               // invoice total, never a canonical LC total.
@@ -466,7 +469,7 @@ export default function Sales() {
                     </p>
                   </div>
                   <div className="flex flex-col gap-2.5 p-2.5 flex-1">
-                    {stageSales.length === 0 ? (
+                    {nodes.length === 0 ? (
                       <div className="flex-1 flex items-center justify-center py-8 text-xs text-slate-400 dark:text-slate-500">
                         No sales
                       </div>
