@@ -436,23 +436,26 @@ while later products are still unbuilt.
 
 Invoices are created **in Shipment Ongoing**, not at LC Received. Each invoice
 matures independently and strictly: `planned → produced → booked → shipped →
-paid`. Booking is the per-invoice proof of production, so the sale/LC Payment
-Due gate asks for **one booked invoice**, not every product produced.
+paid`. Booking is the per-invoice proof of production. (The Payment Due gate
+first asked for **one booked invoice**; INVOICE-MATURITY Phase 2 replaced that
+with an **actual ship date** — booking alone no longer opens Payment Due.)
 
 | # | Phase | Scope | State |
 |---|---|---|---|
 | 1 | **Start shipment without an invoice** | `lc_received → shipment_ongoing` needs no invoice (sale + LC + readiness + Sales UI barrier/modal removed); Payment Due gate deliberately left as the old production gate | ✅ 2026-10-26 (`eb18d5e`) |
-| 2 | **Strict Book → Ship → Pay** | `ship_invoice` requires `booked` (and stamps the invoice's `invoice_date` on the shipment); `mark_invoice_paid` requires `shipped`; typed `InvoiceNotBooked` / `InvoiceNotShipped` / `SaleNotReadyPastShipment`; `booked_invoice_readiness` powers both the sale and LC Payment Due gates; LC readiness gains `booked_ok`; `POST /api/sales/<id>/move` is rate-limited and returns typed 409s; invoice readiness `can_pay` only for `shipped` | ✅ 2026-10-26 |
+| 2 | **Strict Book → Ship → Pay** | `ship_invoice` requires `booked` (and stamps the invoice's `invoice_date` on the shipment); `mark_invoice_paid` requires `shipped`; typed `InvoiceNotBooked` / `InvoiceNotShipped` / `SaleNotReadyPastShipment`; `booked_invoice_readiness` powers both the sale and LC Payment Due gates; LC readiness gains `booked_ok`; `POST /api/sales/<id>/move` is rate-limited and returns typed 409s; invoice readiness `can_pay` only for `shipped` | ✅ 2026-10-26 — booking gate superseded 2026-10-27 by INVOICE-MATURITY Phase 2 (`shipped_invoice_readiness`) |
 | 3 | **Completion on invoice totals** | Complete only when ≥ 1 invoice exists and every invoice is `paid`; amount compared is `SUM(invoice_items.line_total)`, never the PI (`get_sale_pi_total` keeps the offer); `move_sale_to_stage`, `mark_invoice_paid`, payment edits/deletes and voids funnel through `_sync_sale_completion`; a completed sale reopens when a correction leaves an invoice unpaid; LC auto-completes with its last completed child (`_sync_lc_completion`, `LC_MOVE`) and reverts on reopen; manual completion is gated by `SaleNotReadyForCompletion` / `LcNotReadyForCompletion` (**409**) | ✅ 2026-10-26 |
 | 4 | **Report: live PI fallback + completed retention** | Shared `_commercial_report_base_sql` CTE: a line with invoice rows shows invoice quantity and final price, a line with none shows PI quantity and `is_provisional`; `sale_total` = sum of displayed line totals; `invoice_date` from `invoices`; no invoice inclusion gate, completed rows retained; summary/drill-down use the same base; `get_all_sales(include_completed=False)` archives completed from `/api/sales` while `/api/sales/export` and the report keep them; report CSV gains a `Provisional` column (20 columns) | ✅ 2026-10-27 |
-| 5 | **Frontend board / panel / report editor** | 4-column board (`BOARD_STAGES`, completed archived); Shipment Ongoing action “Move to Payment Due”, Payment Due action `'detail'`; LC crossing gates on `booked_ok` (ProductionRequiredModal deleted); sale-level PaymentModal deleted — payment is invoice-level; `InvoicePanel` gains `readOnly` for completed sales and its step buttons follow status (`Book` planned/produced, `Ship` booked, `Pay` shipped); add-line targets restricted to `planned`/`produced`; report `Actions` column + Provisional badge + legend; row Edit opens `SaleDetailModal` and a save reloads the report/KPIs; skeleton/empty/pagination colspans 20 | ✅ 2026-10-27 — 5 test files / 91 tests green; full frontend 339/339, oxlint 0/0, build OK |
+| 5 | **Frontend board / panel / report editor** | 4-column board (`BOARD_STAGES`, completed archived); Shipment Ongoing action “Move to Payment Due”, Payment Due action `'detail'`; LC crossing gates on `booked_ok` (ProductionRequiredModal deleted); sale-level PaymentModal deleted — payment is invoice-level; `InvoicePanel` gains `readOnly` for completed sales and its step buttons follow status (`Book` planned/produced, `Ship` booked, `Pay` shipped); add-line targets restricted to `planned`/`produced`; report `Actions` column + Provisional badge + legend; row Edit opens `SaleDetailModal` and a save reloads the report/KPIs; skeleton/empty/pagination colspans 20 | ✅ 2026-10-27 — 5 test files / 91 tests green; full frontend 339/339, oxlint 0/0, build OK. The Shipment Ongoing “Move to Payment Due” action was removed 2026-10-27 by INVOICE-MATURITY Phase 2 |
 | 6 | **Docs** | PRD/SPEC completion and report contract; handoff | ✅ 2026-10-27 — PRD Flow 3 (no invoice at LC Received, four live board columns, per-invoice strict order, invoice-defined completion, Payment Due opens invoices), Flow 7 (PI fallback, Provisional badge, completed retention, row editor); SPEC `/api/sales/<id>/move` gates + typed 409s, payment edit/delete completion re-sync, report money/columns/CSV contract, UI contract, `include_completed`, refreshed test coverage (1283/8 backend, 339 frontend); locked decisions recorded in this table; session handoff written |
 | 7 | **Verification** | Full pytest/ruff/pyright/vitest/oxlint/build + isolated-Postgres E2E | ✅ 2026-10-27 — full backend 1283 passed / 8 skipped; ruff + pyright at baseline; frontend 339/339, oxlint 0/0, build OK; isolated pgserver E2E 61/61 checks (zero-invoice shipment → A1 80 KG → strict-order 409s → produce/book/ship/pay → invoice-defined completion → A2 completes sale/LC → report provisional→final, completed retention, 20-column CSV, payment-correction reopen) + Playwright UI pass (four columns, invoice composer read-only price + uncapped qty, report badge/legend/edit modal). The plan's “sale stays Payment Due while A2 is uninvoiced” step was superseded by the locked Q4 rule and is recorded as a deviation in `handoff.md` |
 
 **Locked decisions:** stage is a rollup, invoice status is the source of truth;
-one booked invoice is enough to enter Payment Due; unready siblings stay behind;
-completion is invoice-defined; report is per PI line with PI fallback; report
-rows open the existing editor; strict Book → Ship → Pay.
+**an actual ship date** opens Payment Due for a sale (booking alone does not);
+unshipped siblings stay behind and advance individually; the LC advances only
+when every invoice under it has shipped; completion is invoice-defined; report
+is per PI line with PI fallback; report rows open the existing editor; strict
+Book → Ship → Pay.
 
 **Constraints:** no new tables/columns, no `_SCHEMA_VERSION` bump; parameterized
 SQL; typed refusals are 409; every mutating route stays admin-only and
@@ -460,11 +463,12 @@ rate-limited; `chem_stock.py` compatibility imports kept in sync.
 
 ---
 
-## 🧾 Phase INVOICE-MATURITY: LC payment terms + per-invoice maturity (Phase 1 of 7, completed 2026-10-27)
+## 🧾 Phase INVOICE-MATURITY: LC payment terms + per-invoice maturity + board visibility (Phases 1–2 of 7, completed 2026-10-27)
 
 Invoices are USD receivables that mature under the LC's payment terms. Phase 1
-ships the data and the operator surface only; reminder delivery (bell + email to
-directors) is a later phase.
+ships the data and the operator surface; Phase 2 makes the actual ship date the
+Payment Due trigger and puts every invoice on its sale's board card. Reminder
+delivery (bell + email to directors) is Phase 3.
 
 | # | Slice | Scope | State |
 |---|---|---|---|
@@ -484,6 +488,44 @@ email recipients will be the company's directors only, never clients.
 **Constraints:** parameterized SQL only; every mutating LC/invoice route stays
 admin-only and rate-limited; no auth/gate edits; the maturity computation is
 server-owned (the UI prefill is convenience, re-validated on POST).
+
+### Phase 2 — per-invoice Payment Due + board visibility ✅ 2026-10-28
+
+An invoice is a shipment: booking says production is planned, but only the
+**actual ship date** starts the payment clock. Shipping therefore moves its own
+sale, while the LC — a container — waits for all of its invoices.
+
+| # | Slice | Scope | State |
+|---|---|---|---|
+| 1 | **Shipment gate** | `shipped_invoice_readiness` → `shipped_ok` (a sale needs one `shipped`/`paid` invoice) and `all_shipped_ok` (every non-void invoice under the LC shipped). Sale gate in `move_sale_to_stage` raises `SaleNotReadyPastShipment` ("at least one shipped invoice required"); `check_lc_shipment_ready` exposes both keys; `booked_ok`/`invoices_ok` become informational | ✅ `tests/test_gate_integrity.py`, `tests/test_typed_errors.py`, `tests/test_invoice_order.py` |
+| 2 | **Auto-move on ship** | `ship_invoice` moves a `shipment_ongoing` sale to `payment_due` in the same transaction (`SALE_MOVE`, note names the invoice), then calls `_sync_lc_payment_due`: the LC advances (`LC_MOVE`) once every non-void invoice under it has shipped, carrying still-uninvoiced PIs along. An unshipped sibling stays behind | ✅ `tests/test_invoice_payment_due.py` (9 — including a sale that ships one of two invoices, a booked-only sale that refuses the move, and the LC rollup carrying an uninvoiced PI) |
+| 3 | **List summaries** | `GET /api/sales` attaches `invoices[]` per sale (non-void: id, number, status, invoice/approx/actual dates, maturity, amount, `paid_amount`, LC `payment_terms`/`tenor_days`) and `has_uninvoiced_remainder` (a PI line with quantity but no invoice) | ✅ `tests/test_invoice_payment_due.py` |
+| 4 | **Shared step form** | `InvoiceStepForm.jsx` extracted from `InvoicePanel`: book (approx. date), ship (actual date + prefilled editable maturity), pay (amount + date); inline validation and `error`/`localError` display. Used by the panel and the card so both post identical payloads | ✅ `InvoicePanel.test.jsx` unchanged in behaviour |
+| 5 | **Board cards** | `SaleCard` renders an invoice section whenever `sale.invoices` is non-empty: status chip (`Payment due`/`Completed`), `$amount`, `paid $X`, `Matures <date>`, **Overdue** chip, and that invoice's next-action button; the active row opens `InvoiceStepForm` inline. Book is disabled with a reason until produced. `utils/invoices.js` holds the shared vocabulary/date/money helpers | ✅ `SaleCard.test.jsx` (7, new) |
+| 6 | **Board wiring** | `utils/sales.js`: `shipment_ongoing` action `null` (manual “Move to Payment Due” gone). `Sales.jsx`: `handleInvoiceStep` posts book/ship/pay, toasts, refreshes; after a ship with `has_uninvoiced_remainder` asks “Create more invoices?” and opens the sale's editor on confirm. Grouping computed once globally so an LC card stays in its own column while an advanced PI renders its own card in the later column. `handleLcMove` probes no readiness (rollup is server-side) | ✅ `Sales.test.jsx` (lagging PI visible, no manual LC move, card ship + remainder prompt) |
+| 7 | **Docs + gate** | PRD Flow 3/6, SPEC sales/LC/readiness/ship contracts + board visibility section, this table, handoff; full pytest/ruff/pyright/vitest/oxlint/vite build | ✅ 2026-10-28 — see gate row below |
+
+**Gate run (2026-10-28):** backend **1311 passed / 8 skipped** in 1613.58s
+(9 new tests in `test_invoice_payment_due.py`, adapted gate/invoice/LC suites);
+ruff **63** repo-wide findings, unchanged from the Phase 1 baseline, none in the
+changed hunks; pyright **6 errors / 18 warnings** = baseline; frontend
+**355 passed / 40 files**, oxlint **0/0**, vite build OK.
+
+**Deviation from the approved plan:** the plan said the LC gate and the derived
+LC rollup needed "one shipped invoice" like the sale. Per the user's rule
+(2026-10-27) a container cannot leave while any invoice under it is still
+unshipped, so the LC uses `all_shipped_ok` instead. The user's second rule — an
+uninvoiced PI must not be stranded — is why `_sync_lc_payment_due` carries
+lagging children forward and why the board asks about more invoices.
+
+**Locked decisions:** an actual ship date (never booking) opens Payment Due;
+shipping moves its own sale; the LC waits for all invoices; unshipped siblings
+advance individually; the manual ship-stage board action is gone but the API
+move stays behind `shipped_ok`; board labels `Payment due`/`Completed` while the
+data statuses stay `shipped`/`paid`.
+
+**Constraints:** no schema change; one commit per slice; parameterised SQL;
+invoice status is still the source of truth and the stage is its rollup.
 
 ---
 
