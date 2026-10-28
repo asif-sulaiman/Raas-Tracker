@@ -250,7 +250,7 @@ describe('SaleDetailModal invoice lifecycle by stage', () => {
     expect(screen.getByText(/^Invoices \(/)).toBeTruthy();
   });
 
-  it('shows completed invoices read-only while payments stay editable', async () => {
+  it('freezes completed invoices but keeps late invoicing and payments', async () => {
     const invoices = [{
       invoice_id: 101, invoice_number: 'INV-101', status: 'paid',
       approx_ship_date: '2026-09-01', actual_ship_date: '2026-09-02', notes: null,
@@ -266,8 +266,9 @@ describe('SaleDetailModal invoice lifecycle by stage', () => {
     renderDetail({ detail, invoices });
 
     expect(await screen.findByText('INV-101')).toBeTruthy();
-    // No invoice or line may be added, advanced, or voided on a completed sale.
-    expect(screen.queryByRole('button', { name: 'Add invoice' })).toBeNull();
+    // Late invoicing: a completed PI may still be invoiced, which reopens it.
+    expect(screen.getByRole('button', { name: 'Add invoice' })).toBeTruthy();
+    // Existing invoices stay frozen: no step, no void, no extra lines.
     expect(screen.queryByRole('button', { name: 'Book shipment' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Ship' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Record payment' })).toBeNull();

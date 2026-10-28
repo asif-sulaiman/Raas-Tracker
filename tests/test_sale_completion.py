@@ -5,14 +5,20 @@ invoice is ``paid``; the money compared is ``SUM(invoice_items.line_total)``.
 A completed sale reopens when a correction leaves an invoice unpaid, and an LC
 follows its children (auto-complete on the last, revert on any reopen).
 
+Phase 4 adds the forward case: **late invoicing**. Creating an invoice (single
+or batch) on a completed sale reopens it and its LC, because the new open
+invoice is money still to be collected. Other stages are left alone.
+
 Booking/shipping order is pinned in ``tests/test_invoice_order.py``. These
 tests stand invoices at the status they need with direct UPDATEs so the
-completion logic is what is under test.
+completion logic is what is under test; the one end-to-end test builds real
+production rows because ``book_invoice`` re-reads them.
 """
 import uuid
 
 import pytest
 
+from chem_stock import add_recipe
 from raas_tracker import lcs as lcsmod
 from raas_tracker._exceptions import (
     LcNotReadyForCompletion,
@@ -20,12 +26,15 @@ from raas_tracker._exceptions import (
 )
 from raas_tracker.sales import (
     add_sale,
+    book_invoice,
     create_invoice,
+    create_invoices_batch,
     delete_sale_payment_record,
     get_sale_by_id,
     invoice_settlement,
     mark_invoice_paid,
     move_sale_to_stage,
+    ship_invoice,
     update_sale_payment_record,
     void_invoice,
 )
@@ -346,4 +355,134 @@ def test_lc_manual_completion_succeeds_when_every_child_is_settled(db):
 
     assert lcsmod.move_lc_stage(db, lc["id"], "completed") is True
     assert _lc_stage(db, lc["id"]) == "completed"
+    assert _stage(db, sid) == "completed"
+
+
+# --------------------------------------------------------------------------- #
+# late invoicing reopens the completed sale (Phase 4)
+# --------------------------------------------------------------------------- #
+def test_creating_an_invoice_on_a_completed_sale_reopens_it_to_payment_due(db):
+    tag = _tag()
+    sid, _, _ = _completed_sale(db, tag)
+
+    late = _invoice(db, sid, f"INV-LATE-{tag}", quantities=[2.0])
+
+    assert db.execute("SELECT status FROM invoices WHERE id = %s",
+                      (late,)).fetchone()[0] == "planned"
+    assert _stage(db, sid) == "payment_due"
+    move = db.execute(
+        "SELECT from_stage, to_stage, notes FROM sales_stage_history"
+        " WHERE sale_id = %s ORDER BY id DESC LIMIT 1", (sid,)).fetchone()
+    assert move[0] == "completed"
+    assert move[1] == "payment_due"
+    assert "reopened" in move[2]
+
+
+def test_batch_create_on_a_completed_sale_reopens_it_once(db):
+    tag = _tag()
+    sid, _, _ = _completed_sale(db, tag)
+    sale_item_id = db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id",
+        (sid,)).fetchone()[0]
+
+    create_invoices_batch(db, sid, [
+        {"invoice_number": f"INV-BATCH-A-{tag}", "invoice_date": "2026-07-01",
+         "lines": [{"sale_item_id": sale_item_id, "quantity": 1}]},
+        {"invoice_number": f"INV-BATCH-B-{tag}", "invoice_date": "2026-07-02",
+         "lines": [{"sale_item_id": sale_item_id, "quantity": 2}]},
+    ])
+
+    assert _stage(db, sid) == "payment_due"
+    reopens = db.execute(
+        "SELECT COUNT(*) FROM sales_stage_history WHERE sale_id = %s"
+        " AND from_stage = 'completed' AND to_stage = 'payment_due'",
+        (sid,)).fetchone()[0]
+    assert reopens == 1, "the batch reopened the sale more than once"
+
+
+def test_create_invoice_leaves_shipment_ongoing_and_payment_due_untouched(db):
+    tag = _tag()
+    # Shipment Ongoing: no payment clock yet, so a new invoice is just another
+    # shipment in planning.
+    so = _sale(db, f"PI-SO-{tag}")
+    _invoice(db, so, f"INV-SO-{tag}")
+    assert move_sale_to_stage(db, so, "shipment_ongoing") is True
+    _invoice(db, so, f"INV-SO2-{tag}", quantities=[1.0])
+    assert _stage(db, so) == "shipment_ongoing"
+
+    # Payment Due: already open, so the new invoice changes nothing.
+    pd = _sale(db, f"PI-PD-{tag}")
+    inv = _invoice(db, pd, f"INV-PD-{tag}")
+    _ship(db, inv)
+    assert move_sale_to_stage(db, pd, "payment_due") is True
+    _invoice(db, pd, f"INV-PD2-{tag}", quantities=[1.0])
+    assert _stage(db, pd) == "payment_due"
+
+
+def test_late_invoice_on_a_completed_lc_child_reopens_sale_and_lc(db):
+    tag = _tag()
+    lc_id, s1, s2, inv1, inv2 = _two_child_lc_at_payment_due(db, tag)
+    mark_invoice_paid(db, inv1, 100, "2026-10-25")
+    mark_invoice_paid(db, inv2, 100, "2026-10-26")
+    assert _stage(db, s1) == "completed"
+    assert _lc_stage(db, lc_id) == "completed"
+
+    _invoice(db, s1, f"INV-LC-LATE-{tag}", quantities=[2.0])
+
+    assert _stage(db, s1) == "payment_due"
+    assert _lc_stage(db, lc_id) == "payment_due", (
+        "the LC stayed completed while a child was reopened by a late invoice")
+
+
+def test_late_invoice_books_ships_pays_and_recompletes(db):
+    """The reopened sale walks the full lifecycle again, then closes."""
+    tag = _tag()
+    company_id = _company(db, f"Late Co {tag}")
+    product = f"PI-LATE-{tag}-P"
+    sid = _sale(db, f"PI-LATE-{tag}", company_id=company_id)
+    first = _invoice(db, sid, f"INV-LATE-1-{tag}")
+    _book(db, first)
+    _ship(db, first)
+    move_sale_to_stage(db, sid, "payment_due")
+    mark_invoice_paid(db, first, 100, "2026-10-25")
+    assert _stage(db, sid) == "completed"
+
+    late = _invoice(db, sid, f"INV-LATE-2-{tag}", quantities=[2.0])
+    assert _stage(db, sid) == "payment_due"
+
+    # Booking reads production content, not the invoice status: build the
+    # recipe and the run linked to THIS invoice, as the recipe page does.
+    sale_item_id = db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id",
+        (sid,)).fetchone()[0]
+    assert add_recipe(db, f"R-LATE-{tag}", 100, 0, company_id, product) is not False
+    recipe_id = db.execute(
+        "SELECT id FROM recipes WHERE company_id = %s AND lower(name) = lower(%s)",
+        (company_id, f"R-LATE-{tag}")).fetchone()[0]
+    run_id = db.execute(
+        "INSERT INTO production_runs (recipe_id, sale_item_id, order_number,"
+        " batch_number, production_date, qty_produced, created_by)"
+        " VALUES (%s, %s, NULL, NULL, NULL, 2.0, NULL) RETURNING id",
+        (recipe_id, sale_item_id)).fetchone()[0]
+    db.execute(
+        "INSERT INTO production_run_links (run_id, sale_id, invoice_id)"
+        " VALUES (%s, %s, %s)", (run_id, sid, late))
+    db.commit()
+
+    assert book_invoice(db, late, "2026-11-01") is True
+    ship_invoice(db, late, "2026-10-20", invoice_number=f"LATE-SHIP-{tag}")
+    mark_invoice_paid(db, late, 20, "2026-10-27")
+
+    assert _stage(db, sid) == "completed", (
+        "paying the late invoice did not settle the reopened sale")
+
+
+def test_voiding_the_late_invoice_recompletes_the_sale(db):
+    tag = _tag()
+    sid, _, _ = _completed_sale(db, tag)
+    late = _invoice(db, sid, f"INV-VOID-LATE-{tag}", quantities=[1.0])
+    assert _stage(db, sid) == "payment_due"
+
+    assert void_invoice(db, sid, late) is True
+
     assert _stage(db, sid) == "completed"

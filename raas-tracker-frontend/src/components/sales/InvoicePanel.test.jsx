@@ -654,7 +654,7 @@ describe('InvoicePanel lifecycle order and read-only mode', () => {
     expect(await screen.findByText('Invoice must be booked before it can ship')).toBeTruthy();
   });
 
-  it('hides every mutating control in read-only mode', async () => {
+  it('freezes the existing invoices but lets an admin add one', async () => {
     renderPanel({ readOnly: true });
 
     expect(await screen.findByText('INV-1')).toBeTruthy();
@@ -662,12 +662,23 @@ describe('InvoicePanel lifecycle order and read-only mode', () => {
     // Status and money stay readable on a completed sale.
     expect(screen.getByText('Booked')).toBeTruthy();
     expect(screen.getByText('$1,200.00 · paid $800.00')).toBeTruthy();
-    // Nothing may be added, advanced, or voided.
-    expect(screen.queryByRole('button', { name: 'Add invoice' })).toBeNull();
+    // The badge names the one affordance left: adding an invoice reopens.
+    expect(screen.getByText('read-only · add an invoice to reopen')).toBeTruthy();
+    // Existing invoices may not be advanced or voided…
     expect(screen.queryByRole('button', { name: 'Book shipment' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Ship' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Record payment' })).toBeNull();
     expect(screen.queryByRole('button', { name: /void invoice/i })).toBeNull();
+    // …but a late invoice is how a completed PI is corrected.
+    fireEvent.click(screen.getByRole('button', { name: 'Add invoice' }));
+    expect(await screen.findByLabelText('Invoice number')).toBeTruthy();
+  });
+
+  it('does not offer Add invoice to a non-admin on a completed sale', async () => {
+    renderPanel({ readOnly: true, isAdmin: false });
+
+    expect(await screen.findByText('INV-1')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Add invoice' })).toBeNull();
   });
 });
 
