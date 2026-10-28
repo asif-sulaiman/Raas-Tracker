@@ -5,6 +5,89 @@
 
 ---
 
+## 2026-10-28 — INVOICE-MATURITY Phase 7 (full gate, isolated-Postgres E2E, browser pass)
+
+Worktree `O:/Projects/Raas-Tracker-worktrees/invoice-shipment-gate`, branch
+`feat/invoice-start-at-shipment`. Phase 7 of the approved 7-phase plan: release
+verification for the whole epic plus the docs close-out. No product code changed
+in this phase.
+
+### What shipped
+
+- **Docs audit.** `docs/SPEC.md` now says the compared total is
+  `SUM(invoice_items.line_total)` and that the report derives provisional rows
+  from `sale_items` directly; the Phase 5 handoff "Not run" note was corrected to
+  point at Phase 6, which actually built the report UI. `docs/plan.md` header now
+  reads **Phases 1–7 of 7, completed 2026-10-28**, with a Phase 7 section holding
+  the evidence below.
+
+### Gate (all green)
+
+| Gate | Result |
+|---|---|
+| Backend `pytest` | **1347 passed / 8 skipped** in 1205.87s (exit 0) |
+| Backend `ruff` | 63 findings — the known baseline |
+| Backend `pyright` | 6 errors / 18 warnings — the known baseline |
+| Frontend `npx vitest run` | **358 passed / 40 files** in 93.25s (exit 0) |
+| `npx oxlint` | 0 errors / 0 warnings |
+| `npx vite build` | succeeded (chunk-size warning only) |
+| Isolated-Postgres E2E | **64 / 64 checks**, exit 0 |
+| Playwright pass | clean (only the pre-login `/api/auth/me` 401) |
+
+### Isolated-Postgres E2E (never the production DSN)
+
+Harness lived in `%TEMP%\raas_e2e_maturity\` (outside the repo, not committed):
+embedded `pgserver` on a temp dir, a `raas_e2e` database asserted against the
+DSN, and a local SMTP sink on `127.0.0.1:2525` writing a mailbox file. The
+scenario:
+
+- LC-MAT-1 **deferred / 90 days**; PI-MAT-1 with ProdA 100 @ $5 and ProdB 100 @ $7.
+- Invoice A1 for 80 units: produce (prod date **2026-10-15**) → book → actual ship
+  **2026-10-26** → maturity resolves to **2027-01-24**; sale and LC auto-move to
+  `payment_due`. Pay $400 → sale and LC `completed`.
+- Report then shows **A final 80** ($400 received / $0 due, maturity
+  2027-01-24, `prod_date` 2026-10-15) and **B provisional 100** ($0 / $700).
+- A late invoice for B **reopens** the completed sale and LC; B produces
+  (2026-10-27), books, ships (maturity **2027-01-26**) and pays $700. The sale
+  completes again with `invoice_total` **$1,100**.
+- CSV export: **21 columns**, `Prod. Date` after `Total Price ($)`, trailing
+  `Provisional`.
+- At-sight PI-MAT-2 / LC-MAT-2 with invoice C1 shipped 2026-10-20: cron run 1
+  raises **one reminder + one email** naming `INV-MAT-C1`; run 2 is **0 / 0**
+  (dedupe key holds); the bell carries the same reminder.
+
+### Browser pass (`127.0.0.1:5098`)
+
+- LC detail shows `Payment terms: Deferred · 90 days`; the Ship form prefills
+  `Actual ship date 2026-10-28` and `Maturity date 2027-01-26` with a
+  `Deferred 90 days` note. Saving moves the sale to **Payment Due**, the stage
+  history names INV-MAT-D1, and the card reads `shipped Oct 28, 2026` /
+  `matures Jan 26, 2027`.
+- After unlinking PI-MAT-2, its standalone card lists `INV-MAT-C1`, `$30.00`,
+  `Matures Oct 20, 2026`, an **Overdue** chip and `Record payment`.
+- Report renders 21 columns with per-row `Prod. Date` (Oct 15/19/24/27), per-row
+  money and maturity, Provisional badges and the legend under `5 report rows · USD`.
+- Bell: `Invoice payment due: … INV-MAT-C1 on PI PI-MAT-2 is due 2026-10-27 —
+  $30.00 USD outstanding`.
+
+### Notes
+
+- **Harness ordering, not app behaviour.** Recipes require a product registered
+  by a PI, so the E2E had to create PIs before their recipes — the first attempt
+  was refused 400 `product … is not registered for this company`.
+- The E2E never read or wrote the production `DATABASE_URL`; the embedded
+  Postgres and the SMTP sink were both local and disposable.
+- The ship-first follow-up recorded in Phase 1 is closed: Phase 4 made booking
+  the only path to shipping.
+
+### Next
+
+Branch integration (`feat/invoice-start-at-shipment` → `main`) is left to you;
+nothing was pushed. Two untracked configs (`ruff.toml`, `pyrightconfig.json`)
+remain outside this commit.
+
+---
+
 ## 2026-10-28 — INVOICE-MATURITY Phase 6 (report UI: Prod. Date, per-row money)
 
 Worktree `O:/Projects/Raas-Tracker-worktrees/invoice-shipment-gate`, branch
@@ -129,8 +212,9 @@ the invoice.
 ### Not run
 
 - No frontend change, so no vitest/oxlint/build run and no browser pass in this
-  phase. The report UI still renders the 20-column table without
-  `Prod. Date` and repeats sale-level money until **Phase 6**.
+  phase. At that point the report UI still rendered the 20-column table without
+  `Prod. Date` and repeated sale-level money; **Phase 6** (recorded above)
+  addressed both.
 
 ### Next
 
