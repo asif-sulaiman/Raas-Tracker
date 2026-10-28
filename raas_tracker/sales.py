@@ -210,7 +210,62 @@ def get_all_sales(conn: psycopg.Connection, stage: Optional[str] = None,
          "balance": r[17] - r[19]}
         for r in rows
     ]
+    if sales:
+        _attach_invoice_summaries(conn, sales)
     return {"sales": sales, "total": total}
+
+
+def _attach_invoice_summaries(conn: psycopg.Connection,
+                              sales: List[Dict[str, Any]]) -> None:
+    """Attach each sale's non-void invoices and its uninvoiced-PI flag.
+
+    The board needs both: the invoice rows say which shipment is already on
+    its way (and its maturity), and ``has_uninvoiced_remainder`` tells the UI
+    a PI still has quantity without an invoice, so shipping the last invoice
+    can ask whether more are coming before the LC advances.
+    """
+    sale_ids = [s["id"] for s in sales]
+    by_sale: Dict[int, List[Dict[str, Any]]] = {sid: [] for sid in sale_ids}
+    for r in conn.execute(
+        """SELECT i.sale_id, i.id, i.invoice_number, i.status, i.invoice_date,
+                  i.approx_ship_date, i.actual_ship_date, i.maturity_date,
+                  i.amount, lc.payment_terms, lc.tenor_days,
+                  (SELECT COALESCE(ROUND(SUM(sp.payment_amount)::numeric, 2)::float8, 0)
+                     FROM sale_payments sp WHERE sp.invoice_id = i.id)
+             FROM invoices i
+             JOIN sales s ON s.id = i.sale_id
+             LEFT JOIN letters_of_credit lc ON lc.id = s.lc_id
+            WHERE i.sale_id = ANY(%s) AND i.status != 'void'
+            ORDER BY i.id""",
+        (sale_ids,)).fetchall():
+        by_sale[r[0]].append({
+            "invoice_id": r[1], "invoice_number": r[2], "status": r[3],
+            "invoice_date": r[4], "approx_ship_date": r[5],
+            "actual_ship_date": r[6], "maturity_date": r[7],
+            "amount": float(r[8]) if r[8] is not None else None,
+            # The board's Ship form prefills deferred maturity from these.
+            "payment_terms": r[9], "tenor_days": r[10],
+            "paid_amount": float(r[11]),
+        })
+    remainder = {
+        r[0] for r in conn.execute(
+            """SELECT si.sale_id
+                 FROM sale_items si
+                 LEFT JOIN (
+                     SELECT ii.sale_item_id, SUM(ii.quantity) AS qty
+                       FROM invoice_items ii
+                       JOIN invoices i ON i.id = ii.invoice_id
+                      WHERE i.status != 'void'
+                      GROUP BY ii.sale_item_id
+                 ) inv ON inv.sale_item_id = si.id
+                WHERE si.sale_id = ANY(%s)
+                GROUP BY si.sale_id
+               HAVING SUM(si.quantity) > SUM(COALESCE(inv.qty, 0))""",
+            (sale_ids,)).fetchall()
+    }
+    for sale in sales:
+        sale["invoices"] = by_sale.get(sale["id"], [])
+        sale["has_uninvoiced_remainder"] = sale["id"] in remainder
 
 
 def get_sale_by_id(conn: psycopg.Connection, sale_id: int) -> Optional[Dict[str, Any]]:
@@ -282,8 +337,9 @@ def move_sale_to_stage(conn: psycopg.Connection, sale_id: int, new_stage: str,
     - lc_received -> shipment_ongoing: no invoice required (invoices are
       created in Shipment Ongoing)
     - any earlier stage -> payment_due: at least one non-void invoice must be
-      booked (booked/shipped/paid). Booking is the per-invoice proof that
-      production finished; siblings still planned or produced stay behind.
+      shipped (or paid). Payment Due means money is due, and only an actual
+      ship date starts that clock; booking alone stays behind. Shipping an
+      invoice moves its own sale here automatically (see ``ship_invoice``).
 
     Phase 3 barriers:
     - any earlier stage -> completed: at least one invoice must exist and every
@@ -302,15 +358,15 @@ def move_sale_to_stage(conn: psycopg.Connection, sale_id: int, new_stage: str,
     if new_stage == "shipment_ongoing" and not via_lc and lc_id is not None:
         return False
 
-    # Phase 2: Barrier 2 - entering payment_due requires a booked invoice.
+    # Phase 2: Barrier 2 - entering payment_due requires a shipped invoice.
     if (SALE_STAGE_ORDER.index(current) < SALE_STAGE_ORDER.index("payment_due")
             and new_stage == "payment_due"):
-        ready = booked_invoice_readiness(conn, [sale_id])
-        if not ready["booked_ok"]:
+        ready = shipped_invoice_readiness(conn, [sale_id])
+        if not ready["shipped_ok"]:
             conn.rollback()
             raise SaleNotReadyPastShipment(
                 "Sale is not ready to move to Payment Due: "
-                "at least one booked invoice required")
+                "at least one shipped invoice required")
 
     # Phase 3: completion is defined by the invoices, never by the PI proposal.
     if new_stage == "completed" and current != "completed":
@@ -350,6 +406,10 @@ def move_sale_to_stage(conn: psycopg.Connection, sale_id: int, new_stage: str,
                      old_value=current, new_value=new_stage)
     conn.commit()
     notify_sale_stage(conn, sale_id, client_name, current, new_stage)
+    if lc_id is not None and new_stage == "payment_due":
+        # The shipping invoice may have been the LC's last one: advance the
+        # container and carry the PIs still waiting on an invoice.
+        _sync_lc_payment_due(conn, lc_id)
     if lc_id is not None and new_stage in ("completed", "payment_due"):
         _sync_lc_completion(conn, lc_id)
     if new_stage == "payment_due":
@@ -669,6 +729,58 @@ def _sync_lc_completion(conn: psycopg.Connection, lc_id: int) -> bool:
         (new_stage, _now_str(), lc_id))
     log_audit_action(conn, "LC_MOVE", "lc", lc_id,
                      old_value=stage, new_value=new_stage, atomic=False)
+    conn.commit()
+    return True
+
+
+def _sync_lc_payment_due(conn: psycopg.Connection, lc_id: int) -> bool:
+    """Advance an LC out of Shipment Ongoing once every invoice has shipped.
+
+    The LC is the container, not the shipment: it may only move when every
+    non-void invoice across its child PIs carries an actual ship date. When it
+    does, the LC advances and carries the children still behind it — including
+    a PI whose product was never invoiced. Payment Due is where the operator
+    decides whether more invoices are coming, so a PI must not be stranded in
+    Shipment Ongoing behind an LC that has already moved on.
+
+    Direct writes (like ``_sync_lc_completion``): the route gate exists for
+    operator-initiated moves, while this rollup is derived from shipping an
+    invoice. Returns True when the LC stage changed.
+    """
+    row = conn.execute(
+        "SELECT stage FROM letters_of_credit WHERE id = %s", (lc_id,)).fetchone()
+    if not row or row[0] != "shipment_ongoing":
+        return False
+    children = conn.execute(
+        "SELECT id, stage FROM sales WHERE lc_id = %s ORDER BY id", (lc_id,)
+    ).fetchall()
+    if not children:
+        return False
+    ready = shipped_invoice_readiness(conn, [c[0] for c in children])
+    if not ready["all_shipped_ok"]:
+        return False
+
+    conn.execute(
+        "UPDATE letters_of_credit SET stage = 'payment_due', updated_at = %s "
+        "WHERE id = %s", (_now_str(), lc_id))
+    log_audit_action(conn, "LC_MOVE", "lc", lc_id,
+                     old_value="shipment_ongoing", new_value="payment_due",
+                     atomic=False)
+    pay_idx = SALE_STAGE_ORDER.index("payment_due")
+    for child_id, child_stage in children:
+        if SALE_STAGE_ORDER.index(child_stage) >= pay_idx:
+            continue
+        conn.execute(
+            "UPDATE sales SET stage = 'payment_due', updated_at = %s "
+            "WHERE id = %s", (_now_str(), child_id))
+        conn.execute(
+            """INSERT INTO sales_stage_history (sale_id, from_stage, to_stage, notes)
+               VALUES (%s, %s, 'payment_due', %s)""",
+            (child_id, child_stage,
+             "Every invoice under the LC has shipped"))
+        log_audit_action(conn, "SALE_MOVE", "sale", child_id,
+                         old_value=child_stage, new_value="payment_due",
+                         atomic=False)
     conn.commit()
     return True
 
@@ -2294,7 +2406,23 @@ def ship_invoice(conn: psycopg.Connection, invoice_id: int, actual_ship_date: st
     log_audit_action(conn, "INVOICE_SHIP", "invoice", invoice_id,
                      new_value=(f"Shipped on {actual_ship_date}"
                                 f" (maturity {maturity})"), atomic=False)
-    conn.commit()
+
+    # Shipping is what opens Payment Due, so this sale moves in the same
+    # transaction as the shipment (if it is still in Shipment Ongoing). A
+    # sibling invoice that has not shipped stays behind.
+    sale_row = conn.execute(
+        "SELECT stage, lc_id FROM sales WHERE id = %s", (sale_id,)).fetchone()
+    sale_stage, lc_id = sale_row if sale_row else (None, None)
+    if sale_stage == "shipment_ongoing":
+        move_sale_to_stage(
+            conn, sale_id, "payment_due",
+            f"Shipped invoice {db_number} on {actual_ship_date}")
+    else:
+        conn.commit()
+    if lc_id is not None:
+        # The last invoice under the LC may have just shipped: advance the
+        # container and carry its still-uninvoiced PIs along.
+        _sync_lc_payment_due(conn, lc_id)
     return {"invoice_id": invoice_id, "shipment_id": shipment_id,
             "status": "shipped", "maturity_date": maturity}
 
@@ -2838,6 +2966,36 @@ def booked_invoice_readiness(conn: psycopg.Connection,
     }
 
 
+def shipped_invoice_readiness(conn: psycopg.Connection,
+                              sale_ids: List[int]) -> Dict[str, Any]:
+    """Gate core for ``payment_due``: has an invoice actually shipped?
+
+    ``shipped_ok`` is the sale-level barrier — one shipped (or paid) invoice
+    opens Payment Due for its sale. ``all_shipped_ok`` is the LC-level
+    barrier — every non-void invoice under the LC has shipped. An LC with no
+    invoices cannot advance: nothing proves a shipment happened.
+    """
+    invoice_count = 0
+    shipped_count = 0
+    if sale_ids:
+        row = conn.execute(
+            """SELECT COUNT(*),
+                      COUNT(*) FILTER (WHERE status IN ('shipped', 'paid'))
+                 FROM invoices
+                WHERE sale_id = ANY(%s) AND status != 'void'""",
+            (sale_ids,)).fetchone()
+        invoice_count, shipped_count = int(row[0]), int(row[1])
+    return {
+        "shipped_ok": shipped_count >= 1,
+        "all_shipped_ok": invoice_count >= 1 and shipped_count == invoice_count,
+        "detail": {
+            "sale_count": len(sale_ids),
+            "invoice_count": invoice_count,
+            "shipped_count": shipped_count,
+        },
+    }
+
+
 def production_readiness(conn: psycopg.Connection, company_id: int,
                          sale_ids: List[int]) -> Dict[str, Any]:
     """Gate core for ``shipment_ongoing -> payment_due``.
@@ -2953,9 +3111,11 @@ def check_lc_shipment_ready(conn: psycopg.Connection,
     """Readiness snapshot for an LC.
 
     ``invoices_ok`` is informational only — entering Shipment Ongoing no
-    longer requires an invoice. ``booked_ok`` is the
-    ``shipment_ongoing -> payment_due`` gate; ``recipes_ok``/``produced_ok``
-    stay informational for the production form.
+    longer requires an invoice. ``shipped_ok`` (one invoice shipped anywhere
+    under the LC) is informational for the board; ``all_shipped_ok`` is the
+    ``shipment_ongoing -> payment_due`` gate — the LC is a container, so it
+    advances only once every invoice under it has an actual ship date.
+    ``booked_ok`` and ``recipes_ok``/``produced_ok`` stay informational.
     """
     lc = conn.execute(
         "SELECT id, company_id FROM letters_of_credit WHERE id = %s",
@@ -2969,15 +3129,19 @@ def check_lc_shipment_ready(conn: psycopg.Connection,
     invoice = invoice_readiness(conn, sale_ids)
     production = production_readiness(conn, company_id, sale_ids)
     booked = booked_invoice_readiness(conn, sale_ids)
+    shipped = shipped_invoice_readiness(conn, sale_ids)
     return {
         "recipes_ok": production["recipes_ok"],
         "invoices_ok": invoice["invoices_ok"],
         "produced_ok": production["produced_ok"],
         "booked_ok": booked["booked_ok"],
+        "shipped_ok": shipped["shipped_ok"],
+        "all_shipped_ok": shipped["all_shipped_ok"],
         "detail": {
             "sale_count": invoice["detail"]["sale_count"],
             "invoice_count": invoice["detail"]["invoice_count"],
             "booked_count": booked["detail"]["booked_count"],
+            "shipped_count": shipped["detail"]["shipped_count"],
             "products": production["detail"]["products"],
             "missing_recipes": production["detail"]["missing_recipes"],
             "missing_production": production["detail"]["missing_production"],
