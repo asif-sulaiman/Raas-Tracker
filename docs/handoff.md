@@ -5,6 +5,92 @@
 
 ---
 
+## 2026-10-28 — INVOICE-MATURITY Phase 3 (per-invoice payment reminders)
+
+Worktree `O:/Projects/Raas-Tracker-worktrees/invoice-shipment-gate`, branch
+`feat/invoice-start-at-shipment`. Phase 3 of the approved 7-phase plan
+(`~/.qoder/plans/warm-cave-stag.md`): the daily maturity cron now reminds
+**per invoice**, not per sale. No new UI — the existing bell (30 s poll) and
+`entityRoute` (`sale → /sales`) surface the notifications.
+
+### What shipped
+
+- **`raas_tracker/reminders.py` (new).** `run_invoice_reminders(conn, today)`
+  scans `status = 'shipped'` invoices, resolves each due date —
+  `AT_SIGHT_GRACE_DAYS = 7` after `actual_ship_date` for at sight, or
+  `maturity_date` for deferred — and inserts two `notify()` rows at most:
+  `invoice_payment_due` (warning, key `invoice:{id}:due`) on the due day and
+  `invoice_payment_escalated` (critical, key `invoice:{id}:due:7`) once
+  `days_late >= 7`. The body names invoice, PI and client and quotes the
+  **outstanding balance in USD** (`amount − payments` on that invoice). Returns
+  one item (with `email_subject` / `email_body`) per **newly inserted**
+  notification, so a second run on the same day produces nothing.
+- **`raas_tracker/mailer.py` (new).** Env-only SMTP (`SMTP_HOST`,
+  `SMTP_PORT` default 587, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`,
+  `SMTP_USE_TLS` default on) via stdlib `EmailMessage` + `smtplib`, 10 s
+  timeout, recipients **exactly** `NOTIFY_EMAILS` (internal directors — a
+  client address is never read or stored). Unconfigured = log-once warning and
+  `False`; any send error is caught and logged. The cron treats `False` as "no
+  email", not as a failure.
+- **`notifications.clear_invoice_reminders`.** Deletes both keys, no commit;
+  called from `mark_invoice_paid` when the invoice reaches `paid` and from
+  `void_invoice` before the row is deleted. `notify_maturity_initial` /
+  `notify_maturity_escalation` now return the inserted id so the cron's counts
+  are real inserts, not attempts.
+- **`flask_app.py` cron.** `/api/cron/maturity-check` keeps the Bearer
+  `CRON_SECRET` check and the `cron` actor. The legacy sale-level scan is now
+  restricted to sales with **no invoices** (`NOT EXISTS`), so a sale that has
+  invoices is never double-notified. The cron runs the invoice engine, mails
+  once per newly created reminder, returns
+  `{success, checked, notified, sale_reminders, invoice_reminders, emails_sent}`
+  and audits `CRON_MATURITY_CHECK` with those counts. Rollback/500 and the
+  missing/wrong-secret paths are unchanged.
+- **`.env.example`.** Documented `SMTP_*` and `NOTIFY_EMAILS` with no values,
+  noting the recipients are internal directors and that leaving them empty
+  keeps email a clean no-op.
+- **`docs/SPEC.md` / `docs/PRD.md`.** Cron contract rewritten around the invoice
+  engine; `invoice_payment_due` / `invoice_payment_escalated` added to the
+  notification list; env table extended; PRD Flow 6 step 11 states the clock,
+  the clearing rules and the directors-only email rule.
+
+### Decisions made & why
+
+- **Per invoice, not per sale.** A sale can ship several invoices on different
+  days; a sale-level reminder would either nag about a settled invoice or miss
+  the second one. Each invoice's own due date and own payments drive its key.
+- **At sight waits 7 days after the ship date.** Without an LC tenor there is no
+  contractual maturity, so the grace is explicit and short; deferred invoices
+  use the stamped `maturity_date` and are never reminded early.
+- **Escalation is one step, not a cadence.** A second notification 7 days later,
+  then silence — the bell is not a dunning engine, and the report is the
+  ledger. This also keeps the cron idempotent.
+- **Clear only on full payment.** A partial payment leaves a real balance due,
+  so the reminder stays; paying or voiding ends the condition and both keys go.
+- **No client-facing email.** `NOTIFY_EMAILS` is the only recipient source, so a
+  mis-set `client_name` can never leak a receivable notice to the customer.
+- **Unconfigured mailer is a no-op.** A missing SMTP host must not turn the
+  cron red or lose the bell notification; the log-once warning is the operator's
+  signal.
+
+### Gate (all green)
+
+| Gate | Result |
+|---|---|
+| Full backend `python -m pytest tests/ -q` | **1327 passed, 8 skipped** in 1231.46s, exit 0 |
+| New tests | `tests/test_invoice_reminders.py` (**16**) |
+| `python -m ruff check .` | 63 findings repo-wide (baseline); new files clean |
+| `python -m pyright` | 6 errors / 18 warnings — baseline, none in new files |
+| Frontend `npm test` | **355 passed / 40 files** |
+| `npx oxlint` | 0 errors / 0 warnings |
+| `npx vite build` | succeeded (chunk-size warning only) |
+
+### Next
+
+Phase 4 of the approved plan (late invoicing reopens a completed sale), then
+Phase 5 (report grain), Phase 6 (UI polish) and Phase 7 (gate).
+
+---
+
 ## 2026-10-28 — INVOICE-MATURITY Phase 2 (per-invoice Payment Due + board visibility)
 
 Worktree `O:/Projects/Raas-Tracker-worktrees/invoice-shipment-gate`, branch
