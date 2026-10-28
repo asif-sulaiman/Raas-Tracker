@@ -2,13 +2,16 @@ import { useEffect, useState } from 'react';
 import { Plus, Check, Trash2 } from 'lucide-react';
 import Button from '../ui/Button';
 import InvoiceEditor from './InvoiceEditor';
-import { formatDate, formatNumber, toCents, fromCents, todayLocalISO } from '../../utils/format';
+import InvoiceStepForm from './InvoiceStepForm';
+import { formatDate, formatNumber, todayLocalISO } from '../../utils/format';
+import {
+  INVOICE_NEXT_STEP,
+  INVOICE_STATUS_LABELS,
+  INVOICE_STEP_LABEL,
+} from '../../utils/invoices';
 import { useAuth } from '../../context/AuthContext';
 import { useConfirm } from '../../context/ConfirmContext';
 import { toast } from 'sonner';
-
-const inputCls =
-  'rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1 text-xs text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
 
 // One badge tone per lifecycle step: planned → produced → booked → shipped → paid.
 const STATUS_STYLES = {
@@ -19,74 +22,14 @@ const STATUS_STYLES = {
   paid: 'bg-green-50 text-green-700 border-green-200 dark:bg-green-950/40 dark:text-green-300 dark:border-green-800',
 };
 
-const STATUS_LABELS = {
-  planned: 'Planned',
-  produced: 'Produced',
-  booked: 'Booked',
-  shipped: 'Shipped',
-  paid: 'Paid',
-};
-
-// The next thing a user can do with an invoice, per status.
-// 'planned' still offers 'book', but BLOCKED below: production is mandatory
-// before a ship can be booked for an invoice.
-const NEXT_STEP = {
-  planned: 'book',
-  produced: 'book',
-  booked: 'ship',
-  shipped: 'pay',
-  paid: null,
-};
-
-const STEP_LABEL = {
-  book: 'Book shipment',
-  ship: 'Ship',
-  pay: 'Record payment',
-};
-
 // Booking commits to a real shipment, so it is gated on the invoice having
 // been produced from the recipe page. The action stays visible but disabled so
 // the prerequisite is discoverable rather than silently absent.
 const NEEDS_PRODUCTION = 'Produce this invoice from the recipe page before booking a shipment.';
 
-function today() {
-  return new Date().toISOString().slice(0, 10);
-}
-
 /** Money label — same `$1,200.00` shape the rest of the app uses. */
 function usd(value) {
   return `$${formatNumber(value)}`;
-}
-
-/** Exact remaining balance in integer cents (no float subtraction on display). */
-function balanceCents(amount, paidAmount) {
-  if (amount === null || amount === undefined) return null;
-  return Math.max(0, toCents(amount) - toCents(paidAmount));
-}
-
-/**
- * Add whole days to a YYYY-MM-DD date in UTC. The API slices dates as plain
- * calendar strings, so local-time `Date` math could shift a leap day.
- */
-function addDaysISO(dateStr, days) {
-  const parts = String(dateStr || '').split('-').map(Number);
-  if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return '';
-  const base = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]));
-  base.setUTCDate(base.getUTCDate() + Number(days || 0));
-  return base.toISOString().slice(0, 10);
-}
-
-/**
- * The maturity the server will compute on ship: at sight = the actual ship
- * date; deferred = actual + tenor. It is only a prefill — the operator may
- * override it in the form, and the server re-validates.
- */
-function computeMaturity(shipDate, invoice) {
-  if (!shipDate) return '';
-  if (invoice?.payment_terms === 'deferred' && invoice.tenor_days) {
-    return addDaysISO(shipDate, invoice.tenor_days);
-  }
-  return shipDate;
 }
 
 function StatusChip({ status }) {
@@ -96,7 +39,7 @@ function StatusChip({ status }) {
         STATUS_STYLES[status] || STATUS_STYLES.planned
       }`}
     >
-      {STATUS_LABELS[status] || status}
+      {INVOICE_STATUS_LABELS[status] || status}
     </span>
   );
 }
@@ -128,10 +71,6 @@ export default function InvoicePanel({ saleId, isAdmin = false, readOnly = false
   const [adding, setAdding] = useState(false);
   const [formError, setFormError] = useState(null);
   const [step, setStep] = useState(null); // { invoiceId, kind: 'book' | 'ship' | 'pay' }
-  const [stepDate, setStepDate] = useState('');
-  const [maturityDate, setMaturityDate] = useState('');
-  const [maturityTouched, setMaturityTouched] = useState(false);
-  const [payAmount, setPayAmount] = useState('');
   const [saving, setSaving] = useState(false);
 
   /**
@@ -211,23 +150,12 @@ export default function InvoicePanel({ saleId, isAdmin = false, readOnly = false
   };
 
   const openStep = (invoiceId, kind) => {
-    const date = kind === 'book' ? '' : today();
-    const invoice = invoices.find((i) => i.invoice_id === invoiceId) || null;
     setStep({ invoiceId, kind });
-    setStepDate(date);
-    setMaturityDate(kind === 'ship' ? computeMaturity(date, invoice) : '');
-    // A fresh form starts from the computed date; typing over it takes over.
-    setMaturityTouched(false);
-    setPayAmount('');
     setFormError(null);
   };
 
   const closeStep = () => {
     setStep(null);
-    setStepDate('');
-    setMaturityDate('');
-    setMaturityTouched(false);
-    setPayAmount('');
     setFormError(null);
   };
 
@@ -235,59 +163,31 @@ export default function InvoicePanel({ saleId, isAdmin = false, readOnly = false
     setAdding(true);
   };
 
-  const handleStep = async () => {
+  // The form has already validated and rounded; `payload` is the API body.
+  const handleStep = async (payload) => {
     if (!step) return;
     const { invoiceId, kind } = step;
-    if (kind === 'book' && !stepDate) {
-      setFormError('Approximate ship date is required');
-      return;
-    }
-    if (kind === 'ship' && !stepDate) {
-      setFormError('Actual ship date is required');
-      return;
-    }
-    if (kind === 'ship' && !maturityDate) {
-      setFormError('Maturity date is required');
-      return;
-    }
-    let amount = 0;
-    if (kind === 'pay') {
-      // Money is exact: round to the cent the same way invoice creation does,
-      // so a typed 25.555 never posts an unrounded float.
-      amount = fromCents(toCents(parseFloat(payAmount)));
-      if (!amount || amount <= 0) {
-        setFormError('Enter a payment amount greater than 0');
-        return;
-      }
-      if (!stepDate) {
-        setFormError('Payment date is required');
-        return;
-      }
-    }
     setSaving(true);
     try {
       if (kind === 'book') {
         await apiFetch(`/api/sales/${saleId}/invoices/${invoiceId}/book`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ approx_ship_date: stepDate }),
+          body: JSON.stringify(payload),
         });
         toast.success('Shipment booked');
       } else if (kind === 'ship') {
         await apiFetch(`/api/sales/${saleId}/invoices/${invoiceId}/ship`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            actual_ship_date: stepDate,
-            maturity_date: maturityDate,
-          }),
+          body: JSON.stringify(payload),
         });
         toast.success('Invoice shipped');
       } else {
         const payRes = await apiFetch(`/api/sales/${saleId}/invoices/${invoiceId}/pay`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ payment_amount: amount, payment_date: stepDate }),
+          body: JSON.stringify(payload),
         });
         // A partial payment leaves the invoice short of paid — only the
         // returned status says whether it is actually paid now.
@@ -338,9 +238,7 @@ export default function InvoicePanel({ saleId, isAdmin = false, readOnly = false
   const totalsReady = !!completion
     && typeof completion.total_amount === 'number'
     && typeof completion.paid_amount === 'number';
-  // Balance hint for the open "Record payment" form (exact, in cents).
   const stepInvoice = step ? invoices.find((i) => i.invoice_id === step.invoiceId) : null;
-  const stepBalance = stepInvoice ? balanceCents(stepInvoice.amount, stepInvoice.paid_amount) : null;
 
   return (
     <div>
@@ -395,7 +293,7 @@ export default function InvoicePanel({ saleId, isAdmin = false, readOnly = false
           )}
 
           {invoices.map((inv) => {
-            const kind = NEXT_STEP[inv.status];
+            const kind = INVOICE_NEXT_STEP[inv.status];
             const active = step?.invoiceId === inv.invoice_id;
             // Booking is gated on production CONTENT, which the status alone
             // cannot express: record_production flips an invoice to 'produced'
@@ -464,7 +362,7 @@ export default function InvoicePanel({ saleId, isAdmin = false, readOnly = false
                       title={blocked ? blockedReason : undefined}
                       onClick={() => !blocked && openStep(inv.invoice_id, kind)}
                     >
-                      {STEP_LABEL[kind]}
+                      {INVOICE_STEP_LABEL[kind]}
                     </Button>
                   )}
                   {blocked && !readOnly && (
@@ -487,106 +385,14 @@ export default function InvoicePanel({ saleId, isAdmin = false, readOnly = false
                 </div>
 
                 {active && (
-                  <div className="mt-2 flex flex-wrap items-end gap-2 rounded-lg bg-slate-50 dark:bg-slate-800/60 px-2.5 py-2">
-                    {step.kind === 'pay' ? (
-                      <>
-                        <div>
-                          <label className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1">
-                            Amount (USD) *
-                          </label>
-                          <input
-                            aria-label="Payment amount"
-                            type="number"
-                            min="0"
-                            step="any"
-                            value={payAmount}
-                            onChange={(e) => setPayAmount(e.target.value)}
-                            placeholder="0.00"
-                            className={`${inputCls} w-24`}
-                          />
-                          {stepBalance !== null && (
-                            <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
-                              Balance {usd(fromCents(stepBalance))}
-                            </p>
-                          )}
-                        </div>
-                        <div>
-                          <label className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1">
-                            Payment date *
-                          </label>
-                          <input
-                            aria-label="Payment date"
-                            type="date"
-                            value={stepDate}
-                            onChange={(e) => setStepDate(e.target.value)}
-                            className={`${inputCls} w-36`}
-                          />
-                        </div>
-                      </>
-                    ) : (
-                      <>
-                        <div>
-                          <label className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1">
-                            {step.kind === 'book' ? 'Approximate ship date *' : 'Actual ship date *'}
-                          </label>
-                          <input
-                            aria-label={step.kind === 'book' ? 'Approximate ship date' : 'Actual ship date'}
-                            type="date"
-                            value={stepDate}
-                            onChange={(e) => {
-                              const value = e.target.value;
-                              setStepDate(value);
-                              // Follow the ship date until the operator edits
-                              // the due date themselves.
-                              if (step.kind === 'ship' && !maturityTouched) {
-                                setMaturityDate(computeMaturity(value, stepInvoice));
-                              }
-                            }}
-                            className={`${inputCls} w-36`}
-                          />
-                        </div>
-                        {step.kind === 'ship' && (
-                          <div>
-                            <label className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1">
-                              Maturity date *
-                            </label>
-                            <input
-                              aria-label="Maturity date"
-                              type="date"
-                              value={maturityDate}
-                              onChange={(e) => {
-                                setMaturityDate(e.target.value);
-                                setMaturityTouched(true);
-                              }}
-                              className={`${inputCls} w-36`}
-                            />
-                            <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
-                              {stepInvoice?.payment_terms === 'deferred' && stepInvoice.tenor_days
-                                ? `Deferred ${stepInvoice.tenor_days} days`
-                                : 'At sight'}
-                            </p>
-                          </div>
-                        )}
-                      </>
-                    )}
-                    <div className="flex items-center gap-1.5">
-                      <Button
-                        variant="primary"
-                        size="sm"
-                        onClick={handleStep}
-                        loading={saving}
-                        disabled={saving}
-                      >
-                        {step.kind === 'book' ? 'Save booking' : step.kind === 'ship' ? 'Save shipment' : 'Save payment'}
-                      </Button>
-                      <Button variant="secondary" size="sm" onClick={closeStep} disabled={saving}>
-                        Cancel
-                      </Button>
-                    </div>
-                    {formError && (
-                      <p className="w-full text-xs font-medium text-rose-600 dark:text-rose-400">{formError}</p>
-                    )}
-                  </div>
+                  <InvoiceStepForm
+                    kind={step.kind}
+                    invoice={stepInvoice}
+                    saving={saving}
+                    error={formError}
+                    onSubmit={handleStep}
+                    onCancel={closeStep}
+                  />
                 )}
               </div>
             );
