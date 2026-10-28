@@ -106,9 +106,9 @@ def test_shipment_ongoing_passes_with_invoice_only(admin_client, db):
 
 
 # --------------------------------------------------------------------------- #
-# Barrier 2: payment_due needs a booked invoice
+# Barrier 2: payment_due needs a shipped invoice
 # --------------------------------------------------------------------------- #
-def test_payment_due_blocked_without_a_booked_invoice(admin_client, db):
+def test_payment_due_blocked_without_a_shipped_invoice(admin_client, db):
     tag = _tag()
     co = _company(db, f"G3 {tag}")
     lc = _mk_lc(admin_client, co, f"LC-G3-{tag}")
@@ -127,11 +127,11 @@ def test_payment_due_blocked_without_a_booked_invoice(admin_client, db):
                           json={"new_stage": "payment_due"})
     assert r.status_code == 409, r.get_json()
     body = r.get_json()
-    assert body["booked_ok"] is False
-    assert any("booked" in str(m).lower() for m in body["missing"])
+    assert body["all_shipped_ok"] is False
+    assert any("ship" in str(m).lower() for m in body["missing"])
 
 
-def test_payment_due_blocked_with_recipe_but_no_booked_invoice(admin_client, db):
+def test_payment_due_blocked_with_recipe_but_no_shipped_invoice(admin_client, db):
     tag = _tag()
     co = _company(db, f"G4 {tag}")
     lc = _mk_lc(admin_client, co, f"LC-G4-{tag}")
@@ -150,11 +150,11 @@ def test_payment_due_blocked_with_recipe_but_no_booked_invoice(admin_client, db)
                           json={"new_stage": "payment_due"})
     assert r.status_code == 409, r.get_json()
     body = r.get_json()
-    assert any("booked" in str(m).lower() for m in body["missing"])
+    assert any("ship" in str(m).lower() for m in body["missing"])
 
 
-def test_payment_due_ignores_a_sale_linked_run_that_never_booked(admin_client, db):
-    """Production alone is not enough any more: the invoice must be booked."""
+def test_payment_due_ignores_a_sale_linked_run_that_never_shipped(admin_client, db):
+    """Production alone is not enough any more: the invoice must ship."""
     tag = _tag()
     co = _company(db, f"G5 {tag}")
     lc = _mk_lc(admin_client, co, f"LC-G5-{tag}")
@@ -186,7 +186,7 @@ def test_payment_due_ignores_a_sale_linked_run_that_never_booked(admin_client, d
     assert r.status_code == 409, r.get_json()
 
 
-def test_payment_due_passes_with_a_booked_invoice(admin_client, db):
+def test_payment_due_passes_with_a_shipped_invoice(admin_client, db):
     tag = _tag()
     co = _company(db, f"G6 {tag}")
     lc = _mk_lc(admin_client, co, f"LC-G6-{tag}")
@@ -213,6 +213,11 @@ def test_payment_due_passes_with_a_booked_invoice(admin_client, db):
         (run_id, sid, inv_id))
     db.commit()
     assert book_invoice(db, inv_id, "2026-11-01") is True
+    # Shipment is the gate (status-only here: this test is about the LC gate).
+    db.execute(
+        "UPDATE invoices SET status = 'shipped', actual_ship_date = %s "
+        "WHERE id = %s", ("2026-11-10", inv_id))
+    db.commit()
     assert admin_client.post(f"/api/lcs/{lc['id']}/move",
                              json={"new_stage": "shipment_ongoing"}).status_code == 200
 
@@ -221,7 +226,7 @@ def test_payment_due_passes_with_a_booked_invoice(admin_client, db):
     assert r.status_code == 200, r.get_json()
 
 
-def test_direct_jump_from_lc_received_to_payment_due_requires_a_booked_invoice(
+def test_direct_jump_from_lc_received_to_payment_due_requires_a_shipped_invoice(
         admin_client, db):
     tag = _tag()
     co = _company(db, f"G7 {tag}")
@@ -234,12 +239,12 @@ def test_direct_jump_from_lc_received_to_payment_due_requires_a_booked_invoice(
     _invoice(db, sid, f"INV-G7-{tag}")
     assert add_recipe(db, f"R-G7-{tag}", 100, 0, co, product) is not False
 
-    # A direct overshoot to payment_due still has to clear the booked gate.
+    # A direct overshoot to payment_due still has to clear the shipped gate.
     r = admin_client.post(f"/api/lcs/{lc['id']}/move",
                           json={"new_stage": "payment_due"})
     assert r.status_code == 409, r.get_json()
     body = r.get_json()
-    assert any("booked" in str(m).lower() for m in body["missing"])
+    assert any("ship" in str(m).lower() for m in body["missing"])
     assert admin_client.get(
         f"/api/lcs/{lc['id']}").get_json()["stage"] == "lc_received"
 
@@ -254,13 +259,15 @@ def test_readiness_endpoint_reports_booked_state(admin_client, db):
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
 
-    # Nothing yet: invoices_ok/booked_ok are false; production checks are
-    # vacuous-truth and informational only.
+    # Nothing yet: invoices_ok/booked_ok/shipped_ok are false; production
+    # checks are vacuous-truth and informational only.
     r = admin_client.get(f"/api/lcs/{lc['id']}/readiness")
     assert r.status_code == 200, r.get_json()
     out = r.get_json()
     assert out["invoices_ok"] is False
     assert out["booked_ok"] is False
+    assert out["shipped_ok"] is False
+    assert out["all_shipped_ok"] is False
     assert out["recipes_ok"] is True
     assert out["produced_ok"] is True
     assert out["pis"][0]["id"] == sid
@@ -271,5 +278,7 @@ def test_readiness_endpoint_reports_booked_state(admin_client, db):
     _invoice(db, sid, f"INV-G8-{tag}")
     out = admin_client.get(f"/api/lcs/{lc['id']}/readiness").get_json()
     assert out["invoices_ok"] is True
-    # ...but the payment barrier still wants a booked invoice.
+    # ...but the payment barrier still wants a shipped invoice.
     assert out["booked_ok"] is False
+    assert out["shipped_ok"] is False
+    assert out["all_shipped_ok"] is False

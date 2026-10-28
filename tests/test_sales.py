@@ -85,8 +85,8 @@ def test_partial_payment_totals(db):
 def test_paying_every_invoice_auto_completes(db):
     sid = _sale(db)
     inv = _book_invoice(db, sid)
-    move_sale_to_stage(db, sid, "payment_due", "test")
     _ship_invoice(db, inv)
+    move_sale_to_stage(db, sid, "payment_due", "test")
     mark_invoice_paid(db, inv, 100.0, "2026-09-02")
     assert get_sale_by_id(db, sid)["stage"] == "completed"
 
@@ -94,8 +94,8 @@ def test_paying_every_invoice_auto_completes(db):
 def test_partial_payment_does_not_complete(db):
     sid = _sale(db)
     inv = _book_invoice(db, sid)
-    move_sale_to_stage(db, sid, "payment_due", "test")
     _ship_invoice(db, inv)
+    move_sale_to_stage(db, sid, "payment_due", "test")
     out = record_sale_payment(db, sid, "2026-09-02", 99.99)
     assert out["stage"] == "payment_due"
 

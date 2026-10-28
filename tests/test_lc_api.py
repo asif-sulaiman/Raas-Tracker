@@ -279,6 +279,10 @@ def test_move_happy_skips_gate_for_other_stages(admin_client, db):
                (run_id, sid, inv_id))
     db.commit()
     assert book_invoice(db, inv_id, "2026-11-01") is True
+    # Payment Due now needs an actual ship date, not just a booking.
+    db.execute("UPDATE invoices SET status = 'shipped', actual_ship_date = %s "
+               "WHERE id = %s", ("2026-11-10", inv_id))
+    db.commit()
     r = admin_client.post(f"/api/lcs/{lc['id']}/move",
                           json={"new_stage": "payment_due"})
     assert r.status_code == 200, r.get_json()
@@ -302,7 +306,7 @@ def test_move_to_shipment_without_invoice_succeeds_then_payment_gated(admin_clie
     assert admin_client.get(
         f"/api/lcs/{lc['id']}").get_json()["stage"] == "shipment_ongoing"
 
-    # Invoicing in Shipment Ongoing does not clear the booking gate.
+    # Invoicing in Shipment Ongoing does not clear the shipping gate.
     assert add_recipe(db, f"R-G-{tag}", 100, 0, co, product) is not False
     sale_item_id = db.execute(
         "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id LIMIT 1",
@@ -315,9 +319,9 @@ def test_move_to_shipment_without_invoice_succeeds_then_payment_gated(admin_clie
                           json={"new_stage": "payment_due"})
     assert r.status_code == 409, r.get_json()
     body = r.get_json()
-    assert body["booked_ok"] is False
+    assert body["all_shipped_ok"] is False
     assert "missing" in body and len(body["missing"]) > 0
-    assert any("booked" in str(m).lower() for m in body["missing"])
+    assert any("ship" in str(m).lower() for m in body["missing"])
     # stage must not have moved
     assert admin_client.get(
         f"/api/lcs/{lc['id']}").get_json()["stage"] == "shipment_ongoing"
@@ -370,8 +374,8 @@ def test_move_validation_400_shape(admin_client, db):
     assert isinstance(r.get_json().get("details"), list)
 
 
-def _lc_and_booked_invoice(admin_client, db, tag):
-    """An LC with one attached sale carrying a booked invoice (total 50)."""
+def _lc_and_shipped_invoice(admin_client, db, tag):
+    """An LC with one attached sale carrying a shipped invoice (total 50)."""
     co = _company(db, f"LC DONE {tag}")
     lc = _mk_lc(admin_client, co, f"LC-DONE-{tag}")
     sid = _sale(db, f"PI-DONE-{tag}", company_id=co)
@@ -381,10 +385,12 @@ def _lc_and_booked_invoice(admin_client, db, tag):
         db, sid, f"INV-DONE-{tag}",
         lines=[{"sale_item_id": _sale_item_id(db, sid), "quantity": 10}],
         invoice_date="2026-01-15")["invoice_id"]
-    # Booking's production gate is not under test here; the invoice only needs
-    # to stand booked for Payment Due to accept the LC.
-    db.execute("UPDATE invoices SET status = 'booked', approx_ship_date = %s"
-               " WHERE id = %s", ("2026-11-01", inv))
+    # Production and the book/ship services are not under test here; the
+    # invoice only needs an actual ship date for Payment Due to accept the LC.
+    db.execute(
+        "UPDATE invoices SET status = 'shipped', actual_ship_date = %s, "
+        "maturity_date = %s WHERE id = %s",
+        ("2026-10-20", "2026-10-20", inv))
     db.commit()
     return lc, sid, inv
 
@@ -392,7 +398,7 @@ def _lc_and_booked_invoice(admin_client, db, tag):
 def test_move_to_completed_409_while_a_child_invoice_is_unpaid(admin_client, db):
     """Phase 3: an LC completes only once every child invoice is settled."""
     tag = _tag()
-    lc, sid, _inv = _lc_and_booked_invoice(admin_client, db, tag)
+    lc, sid, _inv = _lc_and_shipped_invoice(admin_client, db, tag)
     for stage in ("shipment_ongoing", "payment_due"):
         r = admin_client.post(f"/api/lcs/{lc['id']}/move",
                               json={"new_stage": stage})
@@ -411,13 +417,10 @@ def test_move_to_completed_accepts_settled_children(admin_client, db):
     """A child paid while still shipping is settled but not completed — the
     LC must still be able to close the group."""
     tag = _tag()
-    lc, sid, inv = _lc_and_booked_invoice(admin_client, db, tag)
+    lc, sid, inv = _lc_and_shipped_invoice(admin_client, db, tag)
     assert admin_client.post(f"/api/lcs/{lc['id']}/move",
                              json={"new_stage": "shipment_ongoing"}
                              ).status_code == 200
-    assert admin_client.post(f"/api/sales/{sid}/invoices/{inv}/ship",
-                             json={"actual_ship_date": "2026-10-20"}
-                             ).status_code == 201
     assert admin_client.post(f"/api/sales/{sid}/invoices/{inv}/pay",
                              json={"payment_amount": 50,
                                    "payment_date": "2026-10-25"}

@@ -464,8 +464,8 @@ def test_ship_route_409_for_terminal_invoice(admin_client, db, produce_for):
     assert r.get_json()["error"] == "invoice already paid"
 
 
-def test_move_sale_route_409_without_a_booked_invoice(admin_client, db):
-    """Payment Due requires a booked invoice, and the refusal is a 409."""
+def test_move_sale_route_409_without_a_shipped_invoice(admin_client, db):
+    """Payment Due requires a shipped invoice, and the refusal is a 409."""
     cid = _company(admin_client, db, "TypedMoveCo")
     sid = _sale(admin_client, cid, "PI-TM-1", "TypedMoveProd")
     assert admin_client.post(f"/api/sales/{sid}/move", json={}).status_code == 200
@@ -473,7 +473,7 @@ def test_move_sale_route_409_without_a_booked_invoice(admin_client, db):
 
     r = admin_client.post(f"/api/sales/{sid}/move", json={})
     assert r.status_code == 409, r.get_json()
-    assert "booked invoice" in r.get_json()["error"]
+    assert "shipped invoice" in r.get_json()["error"]
     assert db.execute("SELECT stage FROM sales WHERE id = %s",
                       (sid,)).fetchone()[0] == "shipment_ongoing"
 
@@ -489,10 +489,11 @@ def test_move_sale_route_409_when_invoices_are_still_open(admin_client, db):
     assert admin_client.post(f"/api/sales/{sid}/move", json={}).status_code == 200
     assert admin_client.post(f"/api/sales/{sid}/move", json={}).status_code == 200
     inv = _invoice(admin_client, db, sid, "INV-TD-1")
-    # Booking's production gate is not under test; the invoice only needs to
-    # stand booked so Payment Due accepts the sale.
-    db.execute("UPDATE invoices SET status = 'booked', approx_ship_date = %s"
-               " WHERE id = %s", ("2026-11-01", inv))
+    # Booking/production gates are not under test; the invoice only needs a
+    # shipped status so Payment Due accepts the sale.
+    db.execute("UPDATE invoices SET status = 'shipped', approx_ship_date = %s,"
+               " actual_ship_date = %s WHERE id = %s",
+               ("2026-11-01", "2026-11-02", inv))
     db.commit()
     assert admin_client.post(f"/api/sales/{sid}/move", json={}).status_code == 200
 
@@ -672,7 +673,8 @@ def _raiser(exc):
 # `move_lc_stage` is actually reached instead of the route's own pre-check
 # short-circuiting first.
 _ALL_READY = {"invoices_ok": True, "recipes_ok": True, "produced_ok": True,
-              "booked_ok": True, "detail": {}}
+              "booked_ok": True, "shipped_ok": True, "all_shipped_ok": True,
+              "detail": {}}
 
 
 # ---------- 6a. real routes, real service refusals ----------
@@ -838,11 +840,11 @@ def test_route_400_survives_a_reworded_plain_refusal(admin_client, db,
 
 
 def test_move_lc_stage_payment_gate_is_typed(admin_client, db):
-    """lcs.py:347 — invoiced but never booked: the other half of the 409.
+    """lcs.py — invoiced but never shipped: the other half of the 409.
 
     The old route matched this on "recipes:" / "production:" — bare vocabulary
-    shared with half the readiness payload. The gate now asks for a booked
-    invoice (booking itself proves production), and the refusal is still typed.
+    shared with half the readiness payload. The gate now asks every invoice to
+    ship, and the refusal is still typed.
     """
     from raas_tracker import lcs as lcsmod
 

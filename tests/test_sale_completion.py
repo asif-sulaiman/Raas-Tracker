@@ -157,7 +157,9 @@ def test_zero_invoice_sale_cannot_complete(db):
 
 def test_unpaid_invoice_blocks_completion(db):
     sid = _sale(db, f"PI-OPEN-{_tag()}")
-    _book(db, _invoice(db, sid, f"INV-OPEN-{_tag()}"))
+    inv = _invoice(db, sid, f"INV-OPEN-{_tag()}")
+    _book(db, inv)
+    _ship(db, inv)
     move_sale_to_stage(db, sid, "payment_due")
 
     with pytest.raises(SaleNotReadyForCompletion, match="1 invoice"):
@@ -170,9 +172,9 @@ def test_sale_completes_only_when_every_invoice_is_paid(db):
     inv1 = _invoice(db, sid, f"INV-TWO-A-{_tag()}", quantities=[6.0])
     inv2 = _invoice(db, sid, f"INV-TWO-B-{_tag()}", quantities=[4.0])
     _book(db, inv1)
+    _ship(db, inv1)
     move_sale_to_stage(db, sid, "payment_due")
 
-    _ship(db, inv1)
     mark_invoice_paid(db, inv1, 60, "2026-10-25")
     assert _stage(db, sid) == "payment_due", "one unpaid invoice completed the sale"
 
@@ -188,9 +190,9 @@ def test_completion_uses_invoice_total_not_the_pi(db):
     sid = _sale(db, f"PI-PART-{_tag()}")  # PI proposal 100
     inv = _invoice(db, sid, f"INV-PART-{_tag()}", quantities=[4.0])  # 40 billed
     _book(db, inv)
+    _ship(db, inv)
     move_sale_to_stage(db, sid, "payment_due")
 
-    _ship(db, inv)
     mark_invoice_paid(db, inv, 40, "2026-10-25")
 
     assert _stage(db, sid) == "completed", "the unbilled PI remainder blocked completion"
@@ -217,8 +219,8 @@ def _completed_sale(db, tag):
     sid = _sale(db, f"PI-COR-{tag}")
     inv = _invoice(db, sid, f"INV-COR-{tag}")
     _book(db, inv)
-    move_sale_to_stage(db, sid, "payment_due")
     _ship(db, inv)
+    move_sale_to_stage(db, sid, "payment_due")
     paid = mark_invoice_paid(db, inv, 100, "2026-10-25")
     assert _stage(db, sid) == "completed"
     return sid, inv, paid
@@ -250,8 +252,8 @@ def test_voiding_a_paid_invoice_keeps_a_paid_set_completed(db):
     inv1 = _invoice(db, sid, f"INV-VOID-A-{tag}", quantities=[6.0])
     inv2 = _invoice(db, sid, f"INV-VOID-B-{tag}", quantities=[4.0])
     _book(db, inv1)
-    move_sale_to_stage(db, sid, "payment_due")
     _ship(db, inv1)
+    move_sale_to_stage(db, sid, "payment_due")
     _ship(db, inv2)
     mark_invoice_paid(db, inv1, 60, "2026-10-25")
     mark_invoice_paid(db, inv2, 40, "2026-10-26")
@@ -276,6 +278,9 @@ def _two_child_lc_at_payment_due(db, tag):
     _book(db, inv1)
     _book(db, inv2)
     assert lcsmod.move_lc_stage(db, lc_id, "shipment_ongoing") is True
+    # The LC advances only once every invoice under it has shipped.
+    _ship(db, inv1)
+    _ship(db, inv2)
     assert lcsmod.move_lc_stage(db, lc_id, "payment_due") is True
     return lc_id, s1, s2, inv1, inv2
 

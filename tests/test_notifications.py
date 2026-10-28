@@ -12,16 +12,18 @@ from raas_tracker.notifications import (
 from raas_tracker.sales import create_invoice, mark_invoice_paid
 
 
-def _book_invoice(db, sale_id, number):
-    """A booked invoice is the entry ticket to Payment Due (Phase 2)."""
+def _shipped_invoice(db, sale_id, number):
+    """A shipped invoice is the entry ticket to Payment Due (Phase 2)."""
     lines = [{"sale_item_id": r[0], "quantity": float(r[1])}
              for r in db.execute(
                  "SELECT id, quantity FROM sale_items WHERE sale_id = %s "
                  "ORDER BY id", (sale_id,)).fetchall()]
     inv = create_invoice(db, sale_id, number, lines=lines,
                          invoice_date="2026-01-15")["invoice_id"]
-    db.execute("UPDATE invoices SET status = 'booked', approx_ship_date = %s"
-               " WHERE id = %s", ("2026-11-01", inv))
+    db.execute(
+        "UPDATE invoices SET status = 'shipped', actual_ship_date = %s, "
+        "maturity_date = %s WHERE id = %s",
+        ("2026-10-20", "2026-10-20", inv))
     db.commit()
     return inv
 
@@ -114,7 +116,7 @@ def test_reorder_low_needs_positive_level(db):
 
 
 def test_sale_stage_due_completed_and_revert_clears(db):
-    # The (untouched) Payment Due production gate refuses a company-less sale.
+    # The Payment Due gate reads this sale's invoices, so give it a company.
     cid = db.execute(
         "INSERT INTO companies (name) VALUES ('Notify Co') RETURNING id"
     ).fetchone()[0]
@@ -124,22 +126,19 @@ def test_sale_stage_due_completed_and_revert_clears(db):
     move_sale_to_stage(db, sid, "lc_received")
     assert "sale_payment_due" not in _types(db)
     move_sale_to_stage(db, sid, "shipment_ongoing")
-    inv = _book_invoice(db, sid, "INV-NOTIF-1")
+    inv = _shipped_invoice(db, sid, "INV-NOTIF-1")
     move_sale_to_stage(db, sid, "payment_due")
     assert "sale_payment_due" in _types(db)
     move_sale_to_stage(db, sid, "payment_due")  # dedupe on same stage re-entry
     assert _types(db).count("sale_payment_due") == 1
     # Completion is invoice-defined (Phase 3): the invoice must be paid first.
-    db.execute("UPDATE invoices SET status = 'shipped', actual_ship_date = %s"
-               " WHERE id = %s", ("2026-10-20", inv))
-    db.commit()
     mark_invoice_paid(db, inv, 10, "2026-10-26")
     assert "sale_completed" in _types(db)
     assert "sale_payment_due" not in _types(db)  # cleared on completion
 
     sid2 = add_sale(db, {"client_name": "BetaCo", "pi_number": "PI-2", "company_id": cid},
                     [{"product_name": "Y", "quantity": 2, "unit_price": 5}])
-    _book_invoice(db, sid2, "INV-NOTIF-2")
+    _shipped_invoice(db, sid2, "INV-NOTIF-2")
     for stage in ("lc_received", "shipment_ongoing", "payment_due"):
         move_sale_to_stage(db, sid2, stage)
     assert "sale_payment_due" in _types(db)
