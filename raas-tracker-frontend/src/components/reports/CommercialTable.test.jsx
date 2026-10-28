@@ -20,6 +20,7 @@ const mockDetailData = {
       quantity: 1000,
       unit_price: 2.5,
       total_price: 2500,
+      prod_date: '2025-01-28',
       invoice_date: '2025-02-01',
       latest_ship_date: '2025-02-10',
       actual_ship_date: '2025-02-12',
@@ -42,6 +43,7 @@ const mockDetailData = {
       quantity: 500,
       unit_price: 5.0,
       total_price: 2500,
+      prod_date: '2025-02-05',
       invoice_date: '2025-02-15',
       latest_ship_date: '2025-02-20',
       actual_ship_date: '2025-02-22',
@@ -80,6 +82,7 @@ const mockGroupedData = {
           quantity: 1000,
           unit_price: 2.5,
           total_price: 2500,
+          prod_date: '2025-01-28',
           invoice_date: '2025-02-01',
           latest_ship_date: '2025-02-10',
           actual_ship_date: '2025-02-12',
@@ -146,6 +149,8 @@ describe('CommercialTable - Detail Mode (groupBy=none)', () => {
     expect(screen.getByText('Qty')).toBeTruthy();
     expect(screen.getByText('Unit Price')).toBeTruthy();
     expect(screen.getByText('Total ($)')).toBeTruthy();
+    // Phase 6: production date comes from recipe production, not the invoice.
+    expect(screen.getByText('Prod. Date')).toBeTruthy();
     expect(screen.getByText('Invoice Date')).toBeTruthy();
     expect(screen.getByText('Latest Ship')).toBeTruthy();
     expect(screen.getByText('Actual Ship')).toBeTruthy();
@@ -168,6 +173,8 @@ describe('CommercialTable - Detail Mode (groupBy=none)', () => {
     expect(screen.getByText('Beta Ltd')).toBeTruthy();
     expect(screen.getByText('Chemical A')).toBeTruthy();
     expect(screen.getByText('Chemical B')).toBeTruthy();
+    expect(screen.getByText('Jan 28, 2025')).toBeTruthy();
+    expect(screen.getByText('Feb 5, 2025')).toBeTruthy();
   });
 
   it('renders payment status badges correctly', () => {
@@ -298,11 +305,44 @@ describe('CommercialTable - Detail Mode (groupBy=none)', () => {
     expect(onEditSale).toHaveBeenLastCalledWith(2);
   });
 
-  it('draws one skeleton cell per detail column (20)', () => {
+  it('draws one skeleton cell per detail column (21)', () => {
     render(<CommercialTable data={mockDetailData} groupBy="none" onPageChange={onPageChange} isLoading />);
 
     const firstRow = document.querySelector('.animate-pulse');
-    expect(firstRow.querySelectorAll('td')).toHaveLength(20);
+    expect(firstRow.querySelectorAll('td')).toHaveLength(21);
+  });
+
+  it('renders money per row when one sale has several invoice rows', () => {
+    const rows = [
+      {
+        ...mockDetailData.rows[0],
+        sale_id: 7, pi_number: 'PI-SPLIT', product_name: 'Part A',
+        total_price: 80, received_amount: 50, due_amount: 30,
+        payment_status: 'Partial', maturity_date: '2025-03-15',
+        prod_date: '2025-01-28',
+      },
+      {
+        ...mockDetailData.rows[1],
+        sale_id: 7, pi_number: 'PI-SPLIT', product_name: 'Part B',
+        total_price: 20, received_amount: 0, due_amount: 20,
+        payment_status: 'Due', maturity_date: '2025-04-10',
+        prod_date: '2025-02-02',
+      },
+    ];
+    render(<CommercialTable data={{ rows }} groupBy="none" onPageChange={onPageChange} />);
+
+    const rowA = screen.getByText('Part A').closest('tr');
+    const rowB = screen.getByText('Part B').closest('tr');
+    // The sale's money is not repeated: each invoice row carries its own.
+    expect(rowA.textContent).toContain('50.00');
+    expect(rowA.textContent).toContain('30.00');
+    expect(rowA.textContent).toContain('Partial');
+    expect(rowB.textContent).not.toContain('50.00');
+    expect(rowB.textContent).toContain('0.00');
+    expect(rowB.textContent).toContain('20.00');
+    expect(rowB.textContent).toContain('Due');
+    expect(rowA.textContent).toContain('Jan 28, 2025');
+    expect(rowB.textContent).toContain('Feb 2, 2025');
   });
 });
 
@@ -349,6 +389,7 @@ describe('CommercialTable - Grouped Mode (groupBy=month/week/year)', () => {
     // Detail rows should be visible
     expect(screen.getByText('Acme Corp')).toBeTruthy();
     expect(screen.getByText('PI-001')).toBeTruthy();
+    expect(screen.getByText('Jan 28, 2025')).toBeTruthy();
   });
 
   it('collapses period when clicked again', () => {

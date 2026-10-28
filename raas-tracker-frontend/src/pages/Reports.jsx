@@ -25,40 +25,6 @@ import CommercialTable from '../components/reports/CommercialTable';
 import CommercialCalendarNavigator from '../components/reports/CommercialCalendarNavigator';
 import SaleDetailModal from '../components/sales/SaleDetailModal';
 
-/**
- * Commercial report rows are per sale-item.
- * - Item-level fields (quantity, unit_price, total_price) sum across every row.
- * - Sale-level fields (received_amount, due_amount, receive_date, maturity_date,
- *   payment_status) are repeated on each row of the same sale, so they must be
- *   deduped by sale_id before summing.
- */
-function dedupeSales(rows) {
-  const seen = new Set();
-  const sales = [];
-  let prevSaleTuple = null;
-  rows.forEach(row => {
-    if (row.sale_id != null) {
-      const key = `sale:${row.sale_id}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-      prevSaleTuple = null;
-      sales.push(row);
-      return;
-    }
-    // Fallback when a row carries no sale_id: rows of one sale are contiguous
-    // and repeat the same sale-level fields, so compare against the previous row.
-    const tuple = [
-      row.customer_name, row.pi_number, row.pi_date,
-      row.lc_number, row.lc_date, row.maturity_date,
-      row.receive_date, row.received_amount, row.due_amount, row.payment_status
-    ].join('|');
-    if (tuple === prevSaleTuple) return;
-    prevSaleTuple = tuple;
-    sales.push(row);
-  });
-  return sales;
-}
-
 export default function Reports() {
   const { apiFetch, user } = useAuth();
   const isAdmin = user?.role === 'admin';
@@ -458,32 +424,30 @@ export default function Reports() {
     // For detail mode, KPIs prefer the whole-filter summary totals so the
     // cards can never disagree with the export; page sums are a last-resort
     // fallback whose captions say "this page" instead of passing silently.
+    // Rows are per invoice line / provisional remainder and carry their own
+    // money, so both the whole-filter KPIs and the page fallback sum rows.
     if (!isGrouped) {
       const rows = commercialReport;
-      const sales = dedupeSales(rows);
       const pageGross = rows.reduce((sum, r) => sum + (Number(r.total_price) || 0), 0);
-      const pageReceived = sales.reduce((sum, r) => sum + (Number(r.received_amount) || 0), 0);
-      const pageDue = sales.reduce((sum, r) => sum + (Number(r.due_amount) || 0), 0);
-      const overdueSales = sales.filter(r => r.payment_status === 'Overdue');
-      const pageOverdue = overdueSales.reduce((sum, r) => sum + (Number(r.due_amount) || 0), 0);
+      const pageReceived = rows.reduce((sum, r) => sum + (Number(r.received_amount) || 0), 0);
+      const pageDue = rows.reduce((sum, r) => sum + (Number(r.due_amount) || 0), 0);
+      const overdueRows = rows.filter(r => r.payment_status === 'Overdue');
+      const pageOverdue = overdueRows.reduce((sum, r) => sum + (Number(r.due_amount) || 0), 0);
 
       const whole = commercialKpis;
       const grossSales = whole ? Number(whole.gross_sales) || 0 : pageGross;
       const receivedTotal = whole ? Number(whole.received) || 0 : pageReceived;
       const dueTotal = whole ? Number(whole.due) || 0 : pageDue;
       const overdueTotal = whole ? Number(whole.overdue) || 0 : pageOverdue;
-      const lineCaption = whole
-        ? `${commercialTotal} sale line${commercialTotal !== 1 ? 's' : ''} · USD`
-        : `${rows.length} sale line${rows.length !== 1 ? 's' : ''} (this page) · USD`;
-      const salesCaption = whole
-        ? `${whole.order_count} sale${whole.order_count !== 1 ? 's' : ''} · USD`
-        : `${sales.length} sale${sales.length !== 1 ? 's' : ''} (this page) · USD`;
+      const rowCaption = whole
+        ? `${commercialTotal} report row${commercialTotal !== 1 ? 's' : ''} · USD`
+        : `${rows.length} report row${rows.length !== 1 ? 's' : ''} (this page) · USD`;
 
       const kpis = [
         {
           label: 'Gross Sales',
           value: grossSales,
-          caption: lineCaption,
+          caption: rowCaption,
           icon: DollarSign,
           box: 'bg-blue-100 dark:bg-blue-950/50',
           iconCls: 'text-blue-600 dark:text-blue-400',
@@ -492,7 +456,7 @@ export default function Reports() {
         {
           label: 'Received',
           value: receivedTotal,
-          caption: salesCaption,
+          caption: rowCaption,
           icon: CreditCard,
           box: 'bg-emerald-100 dark:bg-emerald-950/50',
           iconCls: 'text-emerald-600 dark:text-emerald-400',
@@ -501,7 +465,7 @@ export default function Reports() {
         {
           label: 'Due',
           value: dueTotal,
-          caption: salesCaption,
+          caption: rowCaption,
           icon: CreditCard,
           box: 'bg-sky-100 dark:bg-sky-950/50',
           iconCls: 'text-sky-600 dark:text-sky-400',
@@ -512,7 +476,7 @@ export default function Reports() {
           value: overdueTotal,
           caption: whole
             ? 'past maturity · USD'
-            : `${overdueSales.length} past maturity`,
+            : `${overdueRows.length} past-maturity row${overdueRows.length !== 1 ? 's' : ''} (this page)`,
           icon: AlertTriangle,
           box: 'bg-rose-100 dark:bg-rose-950/50',
           iconCls: 'text-rose-600 dark:text-rose-400',
@@ -570,8 +534,9 @@ export default function Reports() {
             onEditSale={setEditSaleId}
           />
           <p className="text-[11px] text-slate-400 dark:text-slate-500">
-            Provisional rows show PI quantities until an invoice line covers them.
-            Completed sales stay in the report and can be corrected from Actions.
+            Provisional rows are the uninvoiced remainder of a PI line; an invoice
+            row replaces that quantity as it is invoiced. Completed sales stay in
+            the report and can be corrected from Actions.
           </p>
         </div>
       );

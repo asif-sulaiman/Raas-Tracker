@@ -70,6 +70,7 @@ function DetailSkeleton() {
               <th className={TH}>Qty</th>
               <th className={TH}>Unit Price</th>
               <th className={TH}>Total ($)</th>
+              <th className={TH}>Prod. Date</th>
               <th className={TH}>Invoice Date</th>
               <th className={TH}>Latest Ship</th>
               <th className={TH}>Actual Ship</th>
@@ -85,7 +86,7 @@ function DetailSkeleton() {
           <tbody>
             {[...Array(5)].map((_, i) => (
               <tr key={i} className="animate-pulse">
-                {[...Array(20)].map((_, j) => (
+                {[...Array(21)].map((_, j) => (
                   <td key={j} className={TD}>
                     <div className="h-4 bg-slate-200 dark:bg-slate-700 rounded w-3/4" />
                   </td>
@@ -164,6 +165,7 @@ function DetailTable({ rows, currentPage, pageSize, totalRows, onPageChange, onE
               <th className={TH}>Qty</th>
               <th className={TH}>Unit Price</th>
               <th className={TH}>Total ($)</th>
+              <th className={TH}>Prod. Date</th>
               <th className={TH}>Invoice Date</th>
               <th className={TH}>Latest Ship</th>
               <th className={TH}>Actual Ship</th>
@@ -196,6 +198,7 @@ function DetailTable({ rows, currentPage, pageSize, totalRows, onPageChange, onE
                 <td className={clsx(TD, 'text-right font-mono text-slate-700 dark:text-slate-300')}>{formatNumber(row.quantity || 0)}</td>
                 <td className={clsx(TD, 'text-right font-mono text-slate-700 dark:text-slate-300')}>{formatNumber(row.unit_price || 0)}</td>
                 <td className={clsx(TD, 'text-right font-mono font-semibold text-slate-900 dark:text-white')}>{formatNumber(row.total_price || 0)}</td>
+                <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.prod_date)}</td>
                 <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.invoice_date)}</td>
                 <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.latest_ship_date)}</td>
                 <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(row.actual_ship_date)}</td>
@@ -318,6 +321,7 @@ function GroupedTable({ periods, currentPage, pageSize, totalRows, onPageChange 
                         <td className={clsx(TD, 'text-right font-mono text-slate-700 dark:text-slate-300')}>{formatNumber(item.quantity || 0)}</td>
                         <td className={clsx(TD, 'text-right font-mono text-slate-700 dark:text-slate-300')}>{formatNumber(item.unit_price || 0)}</td>
                         <td className={clsx(TD, 'text-right font-mono font-semibold text-slate-900 dark:text-white')}>{formatNumber(item.total_price || 0)}</td>
+                        <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(item.prod_date)}</td>
                         <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(item.invoice_date)}</td>
                         <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(item.latest_ship_date)}</td>
                         <td className={clsx(TD, 'text-slate-500 dark:text-slate-400')}>{formatDate(item.actual_ship_date)}</td>
