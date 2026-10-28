@@ -463,12 +463,13 @@ rate-limited; `chem_stock.py` compatibility imports kept in sync.
 
 ---
 
-## 🧾 Phase INVOICE-MATURITY: LC payment terms + per-invoice maturity + board visibility (Phases 1–2 of 7, completed 2026-10-27)
+## 🧾 Phase INVOICE-MATURITY: LC payment terms + per-invoice maturity + board visibility (Phases 1–3 of 7, completed 2026-10-27)
 
 Invoices are USD receivables that mature under the LC's payment terms. Phase 1
 ships the data and the operator surface; Phase 2 makes the actual ship date the
-Payment Due trigger and puts every invoice on its sale's board card. Reminder
-delivery (bell + email to directors) is Phase 3.
+Payment Due trigger and puts every invoice on its sale's board card; Phase 3
+delivers the per-invoice payment reminders (bell + email to directors) from the
+existing daily cron.
 
 | # | Slice | Scope | State |
 |---|---|---|---|
@@ -526,6 +527,42 @@ data statuses stay `shipped`/`paid`.
 
 **Constraints:** no schema change; one commit per slice; parameterised SQL;
 invoice status is still the source of truth and the stage is its rollup.
+
+### Phase 3 — per-invoice payment reminders (bell + email) ✅ 2026-10-28
+
+The daily maturity cron now reminds **per invoice**, not per sale: at sight a
+shipped invoice is reminded at `actual_ship_date + 7`; a deferred one at its
+`maturity_date`; each escalates once, 7 days later. No new UI — the existing
+bell, its 30 s poll and `entityRoute` (`sale → /sales`) already surface the
+notifications.
+
+| # | Slice | Scope | State |
+|---|---|---|---|
+| 1 | **Mailer** | New `raas_tracker/mailer.py`: env-only SMTP (`SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/`SMTP_PASSWORD`/`SMTP_FROM`/`SMTP_USE_TLS`), recipients **only** `NOTIFY_EMAILS` (internal directors), `EmailMessage`, 10 s timeout, starttls + optional login; unconfigured is a log-once no-op returning `False`; send failures are caught and logged, never raised | ✅ `tests/test_invoice_reminders.py` (FakeSMTP + no-config + failure) |
+| 2 | **Reminder engine** | New `raas_tracker/reminders.py`: `_due_date` (deferred + maturity → maturity; else ship + 7), `AT_SIGHT_GRACE_DAYS = 7`, `ESCALATION_AFTER_DAYS = 7`; scans `status = 'shipped'` invoices, reads the invoice's own payments, builds a USD body naming invoice/PI/client and the outstanding balance; `notify()` keys `invoice:{id}:due` / `invoice:{id}:due:7`; returns one item per **newly inserted** notification | ✅ 16 tests: at-sight grace, dedupe + escalation, deferred on maturity, paid/void clears, siblings independent, USD payload, outstanding balance |
+| 3 | **Clear on settle** | `notifications.clear_invoice_reminders` deletes both keys (no commit); called from `mark_invoice_paid` on a full payment and from `void_invoice` before the row disappears. `notify_maturity_initial`/`_escalation` now return the inserted id so counts are real | ✅ `test_paying_the_invoice_clears_its_reminder_keys`, `test_voiding_the_invoice_clears_its_reminder_keys` |
+| 4 | **Cron wiring** | `POST /api/cron/maturity-check` keeps the Bearer check, restricts the legacy sale-level scan to sales **without** invoices, runs the invoice engine, mails one message per newly created reminder, returns `{success, checked, notified, sale_reminders, invoice_reminders, emails_sent}`, audits `CRON_MATURITY_CHECK` with the counts; unconfigured mailer still 200 | ✅ `test_cron_creates_reminders_and_emails_each_new_one`, `test_cron_second_run_creates_nothing_and_emails_nothing`, `test_sale_scan_skips_sales_that_have_invoices`, `test_unconfigured_mailer_*`. Upstream Vercel cron support shipped in SHIP-FIRST |
+| 5 | **Config docs** | `.env.example` documents the SMTP keys and `NOTIFY_EMAILS` (no values), noting recipients are internal directors, never client addresses | ✅ |
+| 6 | **Docs + gate** | PRD Flow 6 step 11, SPEC cron/notifications/env table, this table, handoff; full pytest/ruff/pyright/vitest/oxlint/vite build | ✅ 2026-10-28 — gate row below |
+
+**Gate run (2026-10-28):** backend **1327 passed / 8 skipped** in 1231.46s
+(16 new tests in `test_invoice_reminders.py`); ruff **63** repo-wide findings,
+unchanged baseline, new files clean; pyright **6 errors / 18 warnings** =
+baseline, none in the new modules; frontend **355 passed / 40 files**, oxlint
+**0/0**, vite build OK.
+
+**Locked decisions:** reminders are per invoice (a sibling neither waits for nor
+suppresses another); at sight waits 7 days after the **actual ship date** and a
+deferred invoice waits for **maturity**; escalation is one extra notification 7
+days later, never repeats; the balance is `amount − payments` in USD; a partial
+payment keeps the reminder; full payment and void clear both keys; email exists
+only for a newly created notification and only to `NOTIFY_EMAILS`; a sale with
+invoices never hits the legacy sale-level scan; an unconfigured mailer is a
+no-op, not an error.
+
+**Constraints:** no schema change, no new UI; env-only secrets; `clear_*` stays
+commit-free so the caller keeps its single transaction and row lock; the cron
+stays idempotent — a second run on the same day creates and mails nothing.
 
 ---
 

@@ -108,6 +108,13 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
    - An LC follows its children: it completes automatically with its last completed child and reverts to Payment Due when a child reopens. An operator moving an LC to `completed` by hand is refused (**409**) while any child invoice is unsettled.
    - The sale header and its payments read the **invoiced** total; the PI total remains available as the offer (`get_sale_pi_total`) for the report's per-line fallback and maturity fallback.
 10. **Payment terms live on the LC; maturity is per invoice.** An LC is `at_sight` (default) or `deferred` with a tenor in days (1–720). Shipping an invoice stamps its `maturity_date`: at sight = the actual ship date; deferred = actual ship date + tenor (leap-safe calendar days); a sale without an LC is at sight. The operator may override the date in the Ship form, but never with one earlier than the actual ship date, and the override is audited. Legacy LCs without terms read as at sight. Invoice rows show "matures <date>" and an **Overdue** chip once a shipped invoice is past its maturity. All amounts remain USD.
+11. **Reminders are per invoice, on the daily cron.** A shipped invoice that is not fully paid is reminded **once** and **escalated once**, with no repeats:
+    - **At sight** — nothing before `actual_ship_date + 7`; the reminder lands on that day. **Deferred** — the reminder lands on `maturity_date`, never before.
+    - An **escalation** (critical) follows 7 days after the reminder's own day.
+    - The reminder names the invoice, the PI, the client and the **outstanding balance in USD** (`amount − payments`); it is a bell notification for every operator and an email to the company's **internal directors** (`NOTIFY_EMAILS`) — a client address is never read, stored or mailed.
+    - Paying the invoice in full or voiding it **clears both reminders**; a partial payment keeps them, because the balance is still due.
+    - Each invoice is reminded on its own schedule, so an unpaid sibling neither waits for nor suppresses another. Sales **without** invoices keep the older sale-level maturity scan; a sale that has invoices is never scanned at that level, so no reminder is doubled.
+    - An unconfigured mailer is a clean no-op: the bell notification still lands and the cron still succeeds.
 
 ### Flow 7: Commercial Report (live PI, invoice takes over)
 - One row per **PI line** (unchanged grain), same columns as before plus `is_provisional`
