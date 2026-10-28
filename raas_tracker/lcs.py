@@ -314,9 +314,10 @@ def move_lc_stage(conn: psycopg.Connection, lc_id: int, new_stage: str,
     ``SALE_STAGE_ORDER`` (``ValueError`` otherwise). Crossing into
     ``shipment_ongoing`` requires no invoice: invoices are created in Shipment
     Ongoing. When the move carries the LC into ``payment_due`` the gate
-    requires at least one non-void invoice past booking (booked/shipped/paid)
-    across the LC's child PIs; booking is the per-invoice proof that
-    production finished. Crossing into ``completed`` requires every child sale
+    requires every non-void invoice across the LC's child PIs to have shipped
+    (``shipped``/``paid``): the LC is a container, not a shipment, so one
+    shipped invoice is enough to move its own sale but not the container.
+    Crossing into ``completed`` requires every child sale
     to be settled (at least one invoice, all paid) — completion is
     invoice-defined, so an open invoice refuses the move.
 
@@ -333,8 +334,8 @@ def move_lc_stage(conn: psycopg.Connection, lc_id: int, new_stage: str,
     from .audit import log_audit_action
     from .sales import (
         SALE_STAGE_ORDER,
-        booked_invoice_readiness,
         invoice_settlement,
+        shipped_invoice_readiness,
     )
 
     if new_stage not in SALE_STAGE_ORDER:
@@ -355,9 +356,9 @@ def move_lc_stage(conn: psycopg.Connection, lc_id: int, new_stage: str,
             "SELECT id, stage FROM sales WHERE lc_id = %s ORDER BY id FOR UPDATE",
             (lc_id,)).fetchall()
         # Gate inside the txn: which barrier(s) apply depends on how far this
-        # stage move carries the LC. Crossing into ``payment_due`` means at
-        # least one invoice past booking across the LC's child PIs. Shipment
-        # entry is ungated.
+        # stage move carries the LC. Crossing into ``payment_due`` means every
+        # invoice across the LC's child PIs has shipped. Shipment entry is
+        # ungated.
         try:
             tgt_idx = SALE_STAGE_ORDER.index(new_stage)
         except ValueError:
@@ -370,10 +371,10 @@ def move_lc_stage(conn: psycopg.Connection, lc_id: int, new_stage: str,
         sale_ids = [c[0] for c in children]
 
         if tgt_idx >= pay_idx > cur_idx:
-            ready = booked_invoice_readiness(conn, sale_ids)
-            if not ready["booked_ok"]:
+            ready = shipped_invoice_readiness(conn, sale_ids)
+            if not ready["all_shipped_ok"]:
                 msg = ("LC is not ready to go past shipment: "
-                       "invoices: at least one booked invoice required")
+                       "invoices: every invoice must ship first")
                 try:
                     conn.rollback()
                 except Exception:
