@@ -463,13 +463,13 @@ rate-limited; `chem_stock.py` compatibility imports kept in sync.
 
 ---
 
-## 🧾 Phase INVOICE-MATURITY: LC payment terms + per-invoice maturity + board visibility (Phases 1–3 of 7, completed 2026-10-27)
+## 🧾 Phase INVOICE-MATURITY: LC payment terms + per-invoice maturity + board visibility (Phases 1–4 of 7, completed 2026-10-27)
 
 Invoices are USD receivables that mature under the LC's payment terms. Phase 1
 ships the data and the operator surface; Phase 2 makes the actual ship date the
 Payment Due trigger and puts every invoice on its sale's board card; Phase 3
 delivers the per-invoice payment reminders (bell + email to directors) from the
-existing daily cron.
+existing daily cron; Phase 4 lets a late invoice reopen a completed sale.
 
 | # | Slice | Scope | State |
 |---|---|---|---|
@@ -563,6 +563,37 @@ no-op, not an error.
 **Constraints:** no schema change, no new UI; env-only secrets; `clear_*` stays
 commit-free so the caller keeps its single transaction and row lock; the cron
 stays idempotent — a second run on the same day creates and mails nothing.
+
+### Phase 4 — late invoicing reopens the sale ✅ 2026-10-28
+
+A completed PI is not frozen: a shipment that was invoiced late is still
+receivable. Creating an invoice on a completed sale now reopens it (and its LC)
+to Payment Due, and the new invoice walks the ordinary lifecycle.
+
+| # | Slice | Scope | State |
+|---|---|---|---|
+| 1 | **Single create** | `create_invoice` calls `_sync_sale_completion` after the `INVOICE_CREATE` audit and before its commit; `completed → payment_due` (`SALE_MOVE`, note "Invoice no longer settled — reopened"). Other stages are a no-op | ✅ `test_creating_an_invoice_on_a_completed_sale_reopens_it_to_payment_due`, `test_create_invoice_leaves_shipment_ongoing_and_payment_due_untouched` |
+| 2 | **Batch create** | `create_invoices_batch` runs the same reconciliation **once** after the `shipment_status` UPDATE, so N late invoices reopen the sale exactly once | ✅ `test_batch_create_on_a_completed_sale_reopens_it_once` |
+| 3 | **LC follows** | Reopening goes through `move_sale_to_stage`, whose `payment_due` crossing reconciles the parent LC (`_sync_lc_completion`), so a completed LC reverts with its child | ✅ `test_late_invoice_on_a_completed_lc_child_reopens_sale_and_lc` |
+| 4 | **Lifecycle resumes** | The late invoice is `planned`; produce → book → ship (actual date) → pay completes the sale again; voiding it instead re-completes immediately | ✅ `test_late_invoice_books_ships_pays_and_recompletes`, `test_voiding_the_late_invoice_recompletes_the_sale` |
+| 5 | **Report** | The late invoice line turns the PI line final in the report while the sale is reopened | ✅ `test_late_invoice_on_a_completed_sale_turns_its_line_final` |
+| 6 | **Panel** | `InvoicePanel`: `canAddInvoice = isAdmin` so a completed sale keeps an **Add invoice** action; `canEdit` still freezes existing rows (no step, no void); badge reads `read-only · add an invoice to reopen` | ✅ `InvoicePanel.test.jsx` (admin add, non-admin absent, frozen rows) |
+| 7 | **Docs + gate** | PRD Flow 6 item 9 + Flow 7, SPEC create/completion contracts, this table, handoff; full pytest/ruff/pyright/vitest/oxlint/vite build | ✅ gate row below |
+
+**Gate run (2026-10-28):** backend **1334 passed / 8 skipped** in 1550.78s
+(7 new tests across `test_sale_completion.py` and `test_commercial_report.py`);
+ruff **63** repo-wide findings, baseline, none in the changed hunks; pyright
+**6 errors / 18 warnings** = baseline; frontend **356 passed / 40 files**,
+oxlint **0/0**, vite build OK.
+
+**Locked decisions:** creation is the reopen trigger (a `planned` invoice is
+unsettled by definition), single and batch share one reconciliation point,
+only `completed` is affected, the LC reopens because it follows its children,
+and adding is admin-only while advancing/voiding existing invoices stays
+frozen on a completed sale.
+
+**Constraints:** no schema change; the reconciliation runs before the caller's
+commit so the invoice, its audits and the stage move land together.
 
 ---
 

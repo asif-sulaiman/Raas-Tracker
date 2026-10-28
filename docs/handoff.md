@@ -5,6 +5,67 @@
 
 ---
 
+## 2026-10-28 — INVOICE-MATURITY Phase 4 (late invoicing reopens the sale)
+
+Worktree `O:/Projects/Raas-Tracker-worktrees/invoice-shipment-gate`, branch
+`feat/invoice-start-at-shipment`. Phase 4 of the approved 7-phase plan: a
+completed PI can still be invoiced, and that late invoice reopens the sale.
+
+### What shipped
+
+- **Single create reopens.** `create_invoice` runs `_sync_sale_completion`
+  after the `INVOICE_CREATE` audit and before its commit. A `planned` invoice
+  is unsettled by definition, so a completed sale moves back to `payment_due`
+  (`SALE_MOVE`, note "Invoice no longer settled — reopened") in the same
+  transaction as the invoice. A create on `shipment_ongoing` or `payment_due`
+  changes no stage.
+- **Batch reopens once.** `create_invoices_batch` runs the same reconciliation
+  **once**, after the `shipment_status` UPDATE, so N late invoices produce one
+  reopen.
+- **LC follows.** The reopen goes through `move_sale_to_stage`, whose
+  `payment_due` crossing reconciles the parent LC — a completed LC reverts with
+  its child, as it already did for corrections.
+- **Lifecycle resumes.** The late invoice is `planned`; produce → book (actual
+  production rows linked to it) → ship (actual date) → pay completes the sale
+  again. Voiding the late invoice re-completes immediately because the original
+  paid invoice still settles the set.
+- **Report.** The late invoice line turns its PI line final (quantity from the
+  invoice), while the sale shows as reopened.
+- **Panel.** `InvoicePanel` separates `canAddInvoice = isAdmin` from
+  `canEdit = isAdmin && !readOnly`. On a completed sale the **Add invoice**
+  button stays and existing rows stay frozen (no step, no void); the badge now
+  reads `read-only · add an invoice to reopen`. Non-admins see no Add action.
+
+### Decisions made & why
+
+- **Creation is the trigger, not a status flip.** Any new invoice is `planned`
+  and unsettled, so the reopen condition is the same one payments use; no
+  special-case date or amount logic.
+- **One reconciliation for a batch.** Reopening per invoice would write
+  redundant stage history and audits; the batch is one unit of work.
+- **Adding stays admin-only.** A late invoice changes receivables; advancing and
+  voiding existing completed rows stays frozen so the completed record keeps its
+  evidence.
+
+### Gate (all green)
+
+| Gate | Result |
+|---|---|
+| Full backend `python -m pytest tests/ -q` | **1334 passed, 8 skipped** in 1550.78s, exit 0 |
+| New tests | `test_sale_completion.py` (**6**), `test_commercial_report.py` (**1**), `InvoicePanel.test.jsx` (**1** added, 1 rewritten), `SaleDetailModal.test.jsx` (1 rewritten) |
+| `python -m ruff check .` | 63 findings repo-wide (baseline); changed hunks clean |
+| `python -m pyright` | 6 errors / 18 warnings — baseline |
+| Frontend `npm test` | **356 passed / 40 files** |
+| `npx oxlint` | 0 errors / 0 warnings |
+| `npx vite build` | succeeded (chunk-size warning only) |
+
+### Next
+
+Phase 5 (report regrain: invoice-line rows, per-row money, prod date), then
+Phase 6 (report UI) and Phase 7 (docs + verification).
+
+---
+
 ## 2026-10-28 — INVOICE-MATURITY Phase 3 (per-invoice payment reminders)
 
 Worktree `O:/Projects/Raas-Tracker-worktrees/invoice-shipment-gate`, branch
