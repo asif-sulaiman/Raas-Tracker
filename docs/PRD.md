@@ -116,12 +116,12 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
     - Each invoice is reminded on its own schedule, so an unpaid sibling neither waits for nor suppresses another. Sales **without** invoices keep the older sale-level maturity scan; a sale that has invoices is never scanned at that level, so no reminder is doubled.
     - An unconfigured mailer is a clean no-op: the bell notification still lands and the cron still succeeds.
 
-### Flow 7: Commercial Report (live PI, invoice takes over)
-- One row per **PI line** (unchanged grain), same columns as before plus `is_provisional`
-- A fresh PI appears the moment it has lines: quantity, price and total come from the PI and the row is **provisional** (`is_provisional = true`)
-- Once a line is invoiced its quantity comes from **invoice lines** and the row becomes final; the unit price is always the PI's, so an offer and its invoice can never disagree on price
-- A partially invoiced sale mixes both: invoiced lines are final, the rest stay provisional, and the sale total is the sum of the displayed line totals
-- `due = max(sale_total − received, 0)`; payment status follows those totals
+### Flow 7: Commercial Report (sheet-like rows, one per invoice line)
+- One row per **invoice line**, plus one **provisional remainder** row per PI line whose quantity is not fully invoiced. A PI line split across two invoices shows two final rows; a partly invoiced line shows the invoiced row and a `Provisional` row for what is left; a fully invoiced line has no remainder
+- A fresh PI appears the moment it has lines: quantity, price and total come from the PI and every row is **provisional** (`is_provisional = true`)
+- An invoice row displays the **invoice's** quantity and line total (price inherited from the PI line), so the report mirrors the sheet the operator keeps. The unit price is always the PI's, so an offer and its invoice can never disagree on price
+- **Money is per row.** An invoice's payments are allocated to that invoice's lines in order (the last line absorbs an overpayment); a legacy sale-level payment is spread across the sale's rows. `due = max(row total − row received, 0)`, and payment status follows that row's money — one row can be Paid while its sibling still owes
+- **`Prod. Date` comes from recipe production, not the invoice.** It is the latest production run for that sale whose recipe is the row's product; linking a run to an invoice neither sets nor restricts it
 - **Completed sales stay in the report.** Completion removes a sale from the board, never from the report, where its rows remain available for correction and audit
 - Filters add **LC** (exact match on the LC), alongside quick search, dates, company, stage and status, and they apply to provisional rows too
 - A provisional row carries a **Provisional** badge, and a legend says those quantities come from the PI until an invoice line covers them
