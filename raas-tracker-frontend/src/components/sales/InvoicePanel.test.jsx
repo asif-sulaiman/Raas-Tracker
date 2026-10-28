@@ -149,7 +149,8 @@ describe('InvoicePanel', () => {
     expect(screen.getByText('INV-2')).toBeTruthy();
     expect(screen.getByText('Produced')).toBeTruthy();
     expect(screen.getByText('Booked')).toBeTruthy();
-    expect(screen.getByText('Paid')).toBeTruthy();
+    // Board vocabulary: a paid invoice reads "Completed".
+    expect(screen.getByText('Completed')).toBeTruthy();
     expect(screen.getByText('1/3 invoices paid')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Add invoice' })).toBeTruthy();
   });
