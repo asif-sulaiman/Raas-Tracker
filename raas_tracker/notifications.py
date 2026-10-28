@@ -150,26 +150,39 @@ def notify_sale_stage(conn: psycopg.Connection, sale_id: int, client_name: str,
                dedupe_key=f"sale:{sale_id}:completed")
 
 
-def notify_maturity_initial(conn: psycopg.Connection, sale_id: int, client_name: str, maturity_date: Any) -> None:
+def notify_maturity_initial(conn: psycopg.Connection, sale_id: int, client_name: str, maturity_date: Any) -> Optional[int]:
     """Notify on maturity date (due/overdue). Dedupe key: maturity:{sale_id}:initial"""
     key = f"maturity:{sale_id}:initial"
-    notify(conn, type="maturity_due", title=f"Maturity due: {client_name}",
-           body=f"Sale #{sale_id} ({client_name}) maturity date reached ({maturity_date}).",
-           severity="warning", entity_type="sale", entity_id=sale_id, dedupe_key=key)
+    return notify(conn, type="maturity_due", title=f"Maturity due: {client_name}",
+                  body=f"Sale #{sale_id} ({client_name}) maturity date reached ({maturity_date}).",
+                  severity="warning", entity_type="sale", entity_id=sale_id, dedupe_key=key)
 
 
-def notify_maturity_escalation(conn: psycopg.Connection, sale_id: int, client_name: str, maturity_date: Any, days_overdue: int) -> None:
+def notify_maturity_escalation(conn: psycopg.Connection, sale_id: int, client_name: str, maturity_date: Any, days_overdue: int) -> Optional[int]:
     """Escalation at 7+ days overdue. Dedupe key: maturity:{sale_id}:escalated"""
     key = f"maturity:{sale_id}:escalated"
-    notify(conn, type="maturity_escalated", title=f"Maturity escalated: {client_name}",
-           body=f"Sale #{sale_id} ({client_name}) is {days_overdue} days overdue (maturity {maturity_date}).",
-           severity="critical", entity_type="sale", entity_id=sale_id, dedupe_key=key)
+    return notify(conn, type="maturity_escalated", title=f"Maturity escalated: {client_name}",
+                  body=f"Sale #{sale_id} ({client_name}) is {days_overdue} days overdue (maturity {maturity_date}).",
+                  severity="critical", entity_type="sale", entity_id=sale_id, dedupe_key=key)
 
 
 def clear_maturity_dedupe(conn: psycopg.Connection, sale_id: int) -> None:
     """Clear both maturity dedupe keys so future breaches can notify again."""
     clear_dedupe(conn, f"maturity:{sale_id}:initial")
     clear_dedupe(conn, f"maturity:{sale_id}:escalated")
+
+
+def clear_invoice_reminders(conn: psycopg.Connection, invoice_id: int) -> None:
+    """Drop an invoice's due/escalation reminders (paid or voided).
+
+    Deliberately does not commit: the callers already own a transaction
+    (``mark_invoice_paid`` holds the invoice row lock), and committing here
+    would release that lock before the payment and its audit row land.
+    """
+    conn.execute(
+        "DELETE FROM notifications WHERE dedupe_key IN (%s, %s)",
+        (f"invoice:{invoice_id}:due", f"invoice:{invoice_id}:due:7"),
+    )
 
 
 def _row_to_dict(row: Any) -> Dict[str, Any]:

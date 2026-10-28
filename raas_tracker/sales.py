@@ -10,7 +10,10 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, List, Dict, Any, Union
 
 from .audit import log_audit_action
-from .notifications import notify_sale_stage, clear_dedupe, clear_maturity_dedupe
+from .notifications import (
+    notify_sale_stage, clear_dedupe, clear_maturity_dedupe,
+    clear_invoice_reminders,
+)
 from ._numeric import finite_values as _finite
 from ._exceptions import (
     InvoiceAlreadyAdvanced,
@@ -2578,6 +2581,10 @@ def mark_invoice_paid(conn: psycopg.Connection, invoice_id: int,
     ).fetchone()[0]
     log_audit_action(conn, "INVOICE_PAYMENT", "invoice", invoice_id,
                      new_value=f"amount={payment_amount:g} date={payment_date}")
+    if actual_status == "paid":
+        # The reminder condition is resolved: clear both keys so the bell
+        # empties now and a reopened invoice could notify again later.
+        clear_invoice_reminders(conn, invoice_id)
     # Completion is invoice-defined: paying the last open invoice closes the
     # sale (and may close its LC) in this same call.
     _sync_sale_completion(conn, sale_id)
@@ -2602,6 +2609,8 @@ def void_invoice(conn: psycopg.Connection, sale_id: int, invoice_id: int) -> boo
     ).fetchone()
     if not row or row[0] != sale_id:
         return False
+    # Cleared before the row disappears; the keys name the invoice id only.
+    clear_invoice_reminders(conn, invoice_id)
     conn.execute("DELETE FROM invoices WHERE id = %s", (invoice_id,))
     # atomic=False, commit below: the DELETE and its audit row are one unit.
     # A voided invoice's money is gone from the report, so an unaudited void is
