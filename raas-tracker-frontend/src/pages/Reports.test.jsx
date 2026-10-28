@@ -204,10 +204,31 @@ describe('Commercial detail report pagination', () => {
     await openCommercialTab();
 
     expect(await screen.findByText('$9,999.00')).toBeTruthy();
-    expect(screen.getByText('99 sale lines · USD')).toBeTruthy();
-    expect(screen.getAllByText('42 sales · USD').length).toBe(2);
+    // Captions name rows: gross/received/due each sum report rows.
+    expect(screen.getAllByText('99 report rows · USD').length).toBe(3);
     // Page-only sums (10 + 20) must not be presented as the report totals.
     expect(screen.queryByText('$30.00')).toBeNull();
+  });
+
+  it('KPI fallback sums report rows instead of deduping them by sale', async () => {
+    renderReports({
+      report: [
+        makeRow(1, { sale_id: 7, total_price: 80, received_amount: 50, due_amount: 30, payment_status: 'Partial' }),
+        makeRow(2, { sale_id: 7, total_price: 20, received_amount: 10, due_amount: 10, payment_status: 'Partial' }),
+        makeRow(3, { sale_id: 8, total_price: 100, received_amount: 0, due_amount: 100, payment_status: 'Overdue' }),
+      ],
+      filteredTotal: '3',
+    });
+    await openCommercialTab();
+
+    // Gross 200, received 60 (50 + 10), due 140 (30 + 10 + 100), overdue 100.
+    expect(await screen.findByText('$200.00')).toBeTruthy();
+    expect(screen.getByText('$60.00')).toBeTruthy();
+    expect(screen.getByText('$140.00')).toBeTruthy();
+    expect(screen.getByText('$100.00')).toBeTruthy();
+    // Deduping by sale would drop the second row's 10.
+    expect(screen.queryByText('$50.00')).toBeNull();
+    expect(screen.getAllByText('3 report rows (this page) · USD').length).toBe(3);
   });
 });
 
@@ -220,7 +241,7 @@ describe('Commercial report provisional rows and editing', () => {
     await openCommercialTab();
 
     expect(await screen.findByText('Provisional')).toBeTruthy();
-    expect(screen.getByText(/provisional rows show PI quantities/i)).toBeTruthy();
+    expect(screen.getByText(/uninvoiced remainder of a PI line/i)).toBeTruthy();
   });
 
   it('opens the sale editor from a report row and refreshes after a save', async () => {
