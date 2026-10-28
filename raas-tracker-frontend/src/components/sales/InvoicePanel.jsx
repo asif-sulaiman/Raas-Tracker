@@ -225,9 +225,11 @@ export default function InvoicePanel({ saleId, isAdmin = false, readOnly = false
     }
   };
 
-  // A completed sale keeps its invoices on screen as evidence, but nothing may
-  // be added, advanced, or voided: the lifecycle is closed.
+  // A completed sale keeps its invoices on screen as evidence: they may not be
+  // advanced or voided. Adding one is still allowed — a late invoice is how a
+  // completed PI is corrected, and the server reopens the sale when it lands.
   const canEdit = isAdmin && !readOnly;
+  const canAddInvoice = isAdmin;
   const paidCount = completion && typeof completion.paid === 'number'
     ? completion.paid
     : invoices.filter((i) => i.status === 'paid').length;
@@ -253,7 +255,7 @@ export default function InvoicePanel({ saleId, isAdmin = false, readOnly = false
           )}
           {readOnly && (
             <span className="ml-2 text-xs font-normal text-slate-400 dark:text-slate-500">
-              read-only
+              read-only · add an invoice to reopen
             </span>
           )}
           {totalsUnavailable && !totalsReady && (
@@ -262,7 +264,7 @@ export default function InvoicePanel({ saleId, isAdmin = false, readOnly = false
             </span>
           )}
         </h4>
-        {canEdit && !adding && !step && (
+        {canAddInvoice && !adding && !step && (
           <Button variant="secondary" size="sm" icon={Plus} onClick={openAdd}>
             Add invoice
           </Button>
