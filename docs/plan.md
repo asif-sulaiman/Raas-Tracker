@@ -463,7 +463,7 @@ rate-limited; `chem_stock.py` compatibility imports kept in sync.
 
 ---
 
-## 🧾 Phase INVOICE-MATURITY: LC payment terms + per-invoice maturity + board visibility (Phases 1–4 of 7, completed 2026-10-27)
+## 🧾 Phase INVOICE-MATURITY: LC payment terms + per-invoice maturity + board visibility (Phases 1–7 of 7, completed 2026-10-28)
 
 Invoices are USD receivables that mature under the LC's payment terms. Phase 1
 ships the data and the operator surface; Phase 2 makes the actual ship date the
@@ -658,6 +658,46 @@ skeleton must stay column-identical to the real table.
 new assertions in `CommercialTable.test.jsx` and `Reports.test.jsx` rewritten
 for row money); `npx oxlint` **0 errors / 0 warnings**; `npx vite build` OK
 (chunk-size warning only). Backend untouched in this phase.
+
+### Phase 7 — full gate, isolated-Postgres E2E, browser pass ✅ 2026-10-28
+
+Release verification for the whole epic, plus the docs close-out. No product
+code changed in this phase.
+
+| # | Slice | Scope | State |
+|---|---|---|---|
+| 1 | **Docs audit** | SPEC's `get_sale_pi_total` note no longer claimed a report fallback; the Phase 5 handoff note is past tense and points at Phase 6; historical plan/handoff entries left as written | ✅ `docs/SPEC.md`, `docs/handoff.md` |
+| 2 | **Backend gate** | `python -m pytest tests/ -q`, `python -m ruff check .`, `python -m pyright` | ✅ 1347 passed / 8 skipped; ruff 63; pyright 6 errors / 18 warnings |
+| 3 | **Frontend gate** | `npx vitest run`, `npx oxlint`, `npx vite build`; fresh `dist/` copied to the gitignored `react_frontend/` | ✅ 358/358 in 40 files; oxlint 0/0; build OK |
+| 4 | **Isolated-Postgres E2E** | Embedded pgserver in a throwaway temp dir (`DATABASE_URL` popped first and asserted to contain `raas_e2e`, never the production DSN); local SMTP sink so reminder mail is real-but-mocked | ✅ **64/64 checks**, exit 0 |
+| 5 | **Browser pass** | Playwright against the same server: ship form, LC terms, card invoice list + maturity chip, report `Prod. Date`/per-row money, bell | ✅ no page errors (only the pre-login `/api/auth/me` 401) |
+
+**E2E run (scenario from the approved plan).** Deferred-90 LC, PI A=100/B=100:
+A invoice 80 → produce (2026-10-15) → book → actual ship 2026-10-26 → maturity
+**2027-01-24** → sale and LC auto-move to Payment Due → pay → sale completes →
+report shows A final 80 (received 400 / due 0, maturity 2027-01-24, `Prod. Date`
+2026-10-15) and B provisional at the PI quantity 100 (0 / 700). A late B invoice
+reopens the sale and LC to Payment Due, then walks book → ship (maturity
+2027-01-26) → pay and completes again; CSV is 21 columns with `Prod. Date` after
+`Total Price ($)`. A second at-sight LC shipped 8 days ago yields exactly one
+cron reminder and one email to `NOTIFY_EMAILS` naming the invoice; a same-day
+rerun creates and mails nothing; the bell shows the reminder.
+
+**Browser pass highlights.** LC detail reads `Payment terms: Deferred · 90 days`;
+the Ship form prefills the actual date and a `Maturity date` hinting
+`Deferred 90 days`; saving moved the sale to Payment Due with no manual step and
+recorded `shipped … / matures …` on the invoice row; a standalone card showed
+its invoice list with `Matures Oct 20, 2026` + **Overdue**; the report rendered
+the 21-column table with per-row `Prod. Date`, money and maturity plus the
+provisional legend; the bell carried the `Invoice payment due` notification.
+
+**Deviation (harness ordering, not app behaviour).** Recipes require the product
+to be registered for the company, which the PI does; the E2E therefore creates
+each PI before its recipe. Reminder mail hit a local SMTP sink rather than the
+network.
+
+**Constraints:** the E2E never reads or writes the production `DATABASE_URL`;
+harness files live outside the repo; no schema, API, or gate changes.
 
 ---
 
