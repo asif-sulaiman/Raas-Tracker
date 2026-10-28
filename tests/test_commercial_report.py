@@ -1,6 +1,7 @@
 """P4: live commercial report — gates, row contract, sale-level aggregation, CSV export."""
 import csv
 import io
+import uuid
 from datetime import date
 
 import flask_app
@@ -13,7 +14,7 @@ from raas_tracker.sales import create_invoice
 CONTRACT_KEYS = {
     "sale_id", "customer_name", "pi_number", "pi_date", "lc_number", "lc_date",
     "product_name", "unit", "quantity", "unit_price", "total_price",
-    "invoice_date", "latest_ship_date", "actual_ship_date",
+    "prod_date", "invoice_date", "latest_ship_date", "actual_ship_date",
     "received_amount", "due_amount", "receive_date", "maturity_date",
     "payment_status", "payment_comment", "is_provisional",
 }
@@ -22,9 +23,9 @@ STATUSES = {"Paid", "Overdue", "Partial", "Due", "Pending"}
 
 CSV_HEADER = (
     "Customer Name,PI No,PI Date,LC No,LC Date,Product Name,Unit,Quantity,"
-    "Unit Price,Total Price ($),Invoice Date,Latest Ship Date,Actual Ship Date,"
-    "Maturity Date,Receive Date,Received Amount ($),Due Amount ($),"
-    "Payment Status,Payment Comment,Provisional"
+    "Unit Price,Total Price ($),Prod. Date,Invoice Date,Latest Ship Date,"
+    "Actual Ship Date,Maturity Date,Receive Date,Received Amount ($),"
+    "Due Amount ($),Payment Status,Payment Comment,Provisional"
 )
 
 
@@ -104,7 +105,9 @@ def _sale(db, pi_number, client_name="Test Client", items=None, created_at="2026
                 """INSERT INTO invoice_items (invoice_id, sale_item_id, product_name, unit,
                       quantity, unit_price, line_total)
                    VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-                (inv_id, si_id, il.get("product_name", ""), il.get("unit", "KG"),
+                (inv_id, si_id,
+                 il.get("product_name") or sale_items_list[si_idx].get("product_name", ""),
+                 il.get("unit") or sale_items_list[si_idx].get("unit", "KG"),
                  qty, unit_price, line_total))
         db.execute("UPDATE invoices SET amount = %s WHERE id = %s",
                    (round(total_amount, 2), inv_id))
@@ -170,7 +173,11 @@ def test_row_shape_contract_keys(admin_client, db):
                         "unit": "DRUM"}],
                 maturity_date="2099-12-31", comments="  needs LC  ",
                 shipment_date="2026-03-15", invoice_date="2026-02-01")
-    _ship(db, sid, "2026-03-10", "2026-03-05")
+    db.execute(
+        "UPDATE invoices SET approx_ship_date = '2026-03-05', "
+        "actual_ship_date = '2026-03-10', maturity_date = '2026-04-09' "
+        "WHERE sale_id = %s", (sid,))
+    db.commit()
     _pay(db, sid, 10, "2026-03-20")
     rows = _of(_rows(admin_client), sid)
     assert len(rows) == 1
@@ -182,10 +189,14 @@ def test_row_shape_contract_keys(admin_client, db):
     assert row["product_name"] == "Acid"
     assert row["unit"] == "DRUM"
     assert row["total_price"] == 50
+    assert row["prod_date"] is None
     # invoice_date is the invoice's own date, not the shipment's copy.
     assert row["invoice_date"] == "2026-02-01"
+    # Shipment dates follow the invoice row, not the sale header.
     assert row["latest_ship_date"] == "2026-03-10"
-    assert row["actual_ship_date"] == "2026-03-15"
+    assert row["actual_ship_date"] == "2026-03-10"
+    # Maturity prefers the invoice's own date over the sale header.
+    assert row["maturity_date"] == "2026-04-09"
     assert row["receive_date"] == "2026-03-20"
     assert row["payment_comment"] == "needs LC"
     assert row["is_provisional"] is False
@@ -209,17 +220,19 @@ def test_two_items_one_payment_not_double_counted(admin_client, db):
     _pay(db, sid, 50, "2026-04-15")
 
     rows = _of(_rows(admin_client), sid)
-    assert len(rows) == 2  # one row per sale_item, shipments must not multiply
+    assert len(rows) == 2  # one row per invoice line, shipments must not multiply
     assert {r["product_name"] for r in rows} == {"A", "B"}
-    # Sale total = 10*10 + 5*20 = 200; paid 50 once (not per item/shipment).
+    # Sale total = 10*10 + 5*20 = 200; the 50 is allocated once, to line A.
+    by_product = {r["product_name"]: r for r in rows}
+    assert by_product["A"]["received_amount"] == 50
+    assert by_product["A"]["due_amount"] == 50
+    assert by_product["B"]["received_amount"] == 0
+    assert by_product["B"]["due_amount"] == 100
+    assert sum(r["received_amount"] for r in rows) == 50
     for r in rows:
-        assert r["received_amount"] == 50
-        assert r["due_amount"] == 150
-        assert r["latest_ship_date"] == "2026-04-10"  # MAX across shipments
         assert r["receive_date"] == "2026-04-15"
-    assert rows[0]["due_amount"] == rows[1]["due_amount"]
-    assert rows[0]["total_price"] == 100
-    assert rows[1]["total_price"] == 100
+    assert by_product["A"]["total_price"] == 100
+    assert by_product["B"]["total_price"] == 100
 
 
 def test_due_clamped_at_zero_and_paid_status(admin_client, db):
@@ -740,33 +753,36 @@ def test_export_q_filter_and_row_count(admin_client, db):
     assert len(parsed) == 2  # header + 1 matching row
 
 
-# ------------------------- Phase 4 lane Q: invoice-driven math -------------------------
+# ------------------------- Phase 5: sheet-like grain -------------------------
 
-def test_partial_qty_line_invoiced(admin_client, db):
-    """8-of-10 invoiced → row shows 8."""
+def test_split_pi_line_renders_invoice_row_plus_remainder(admin_client, db):
+    """8-of-10 invoiced → one final invoice row (8) + one provisional row (2)."""
     sid = _sale(db, "PI-QTY1", items=[
         {"product_name": "Partial", "quantity": 10, "unit_price": 10, "unit": "KG"}],
         invoice_lines=[{"sale_item_index": 0, "quantity": 8}])
     rows = _of(_rows(admin_client), sid)
-    assert len(rows) == 1
-    row = rows[0]
-    # Invoice-driven: quantity from invoice_items, not sale_items
-    assert row["quantity"] == 8
-    assert row["total_price"] == 80  # 8 * 10
+    assert len(rows) == 2
+    final = next(r for r in rows if not r["is_provisional"])
+    remainder = next(r for r in rows if r["is_provisional"])
+    assert final["quantity"] == 8
+    assert final["total_price"] == 80
+    assert remainder["quantity"] == 2
+    assert remainder["total_price"] == 20
+    assert sum(r["total_price"] for r in rows) == 100
 
 
-def test_split_across_two_invoices(admin_client, db):
-    """8 + 2 invoiced across 2 invoices → row shows 10."""
+def test_two_lines_on_one_invoice_render_as_two_rows(admin_client, db):
+    """Each invoice line is its own report row — no line-level aggregation."""
     sid = _sale(db, "PI-QTY2", items=[
         {"product_name": "Split", "quantity": 10, "unit_price": 10, "unit": "KG"}],
         invoice_lines=[
             {"sale_item_index": 0, "quantity": 8},
             {"sale_item_index": 0, "quantity": 2}])
     rows = _of(_rows(admin_client), sid)
-    assert len(rows) == 1
-    row = rows[0]
-    assert row["quantity"] == 10
-    assert row["total_price"] == 100  # (8+2) * 10
+    assert len(rows) == 2
+    assert sorted(r["quantity"] for r in rows) == [2, 8]
+    assert all(r["is_provisional"] is False for r in rows)
+    assert sum(r["total_price"] for r in rows) == 100
 
 
 def test_line_without_invoice_lines_falls_back_to_pi(admin_client, db):
@@ -824,27 +840,30 @@ def test_lc_id_filter_isolates_one_lc(admin_client, db):
     assert rows == []
 
 
-def test_due_follows_invoice_total_not_pi_total(admin_client, db):
-    """due = max(invoice_total - received, 0), not PI total."""
-    # PI total = 10 * 10 = 100, but invoiced only 6 * 10 = 60
+def test_invoice_row_carries_its_own_money_and_allocation(admin_client, db):
+    """6-of-10 invoiced, 20 paid: the row due follows the invoice line, and the
+    remainder row keeps the unbilled part due."""
     sid = _sale(db, "PI-DUE1", maturity_date="2099-12-31", items=[
         {"product_name": "DueTest", "quantity": 10, "unit_price": 10, "unit": "KG"}],
         invoice_lines=[{"sale_item_index": 0, "quantity": 6}])
-    _pay(db, sid, 20)  # paid 20
+    _pay(db, sid, 20)  # legacy sale-level payment, allocated to the first row
     rows = _of(_rows(admin_client), sid)
-    assert len(rows) == 1
-    row = rows[0]
-    # sale_total from invoices = 60, received = 20, due = 40
-    assert row["received_amount"] == 20
-    assert row["due_amount"] == 40
-    assert row["payment_status"] == "Partial"
-    # Not 100 - 20 = 80 (which would be PI-based)
+    assert len(rows) == 2
+    final = next(r for r in rows if not r["is_provisional"])
+    remainder = next(r for r in rows if r["is_provisional"])
+    assert final["total_price"] == 60
+    assert final["received_amount"] == 20
+    assert final["due_amount"] == 40
+    assert final["payment_status"] == "Partial"
+    assert remainder["total_price"] == 40
+    assert remainder["received_amount"] == 0
+    assert remainder["due_amount"] == 40
 
 
 def test_due_clamped_at_zero_with_overpayment_on_invoice(admin_client, db):
-    """Overpayment on invoice total → due = 0."""
+    """Overpayment on a fully invoiced sale → due = 0."""
     sid = _sale(db, "PI-DUE2", maturity_date="2099-12-31", items=[
-        {"product_name": "Overpay", "quantity": 10, "unit_price": 10, "unit": "KG"}],
+        {"product_name": "Overpay", "quantity": 5, "unit_price": 10, "unit": "KG"}],
         invoice_lines=[{"sale_item_index": 0, "quantity": 5}])  # invoice total = 50
     _pay(db, sid, 70)  # paid 70 > 50
     rows = _of(_rows(admin_client), sid)
@@ -856,7 +875,7 @@ def test_due_clamped_at_zero_with_overpayment_on_invoice(admin_client, db):
 
 
 def test_quantity_and_total_per_line_from_invoice_items(admin_client, db):
-    """Multi-item sale: each line gets its own invoiced quantity/total."""
+    """Multi-item sale: each line's invoice rows plus its remainder."""
     sid = _sale(db, "PI-MULTI-INV", items=[
         {"product_name": "ItemA", "quantity": 10, "unit_price": 10, "unit": "KG"},
         {"product_name": "ItemB", "quantity": 5, "unit_price": 20, "unit": "L"}],
@@ -865,43 +884,50 @@ def test_quantity_and_total_per_line_from_invoice_items(admin_client, db):
             {"sale_item_index": 1, "quantity": 3},  # ItemB: 3 of 5
         ])
     rows = _of(_rows(admin_client), sid)
-    assert len(rows) == 2
-    by_product = {r["product_name"]: r for r in rows}
-    assert by_product["ItemA"]["quantity"] == 8
-    assert by_product["ItemA"]["total_price"] == 80
-    assert by_product["ItemB"]["quantity"] == 3
-    assert by_product["ItemB"]["total_price"] == 60
+    assert len(rows) == 4
+    def slot(product, provisional):
+        return next(r for r in rows
+                    if r["product_name"] == product
+                    and r["is_provisional"] is provisional)
+    assert slot("ItemA", False)["quantity"] == 8
+    assert slot("ItemA", False)["total_price"] == 80
+    assert slot("ItemA", True)["quantity"] == 2
+    assert slot("ItemA", True)["total_price"] == 20
+    assert slot("ItemB", False)["quantity"] == 3
+    assert slot("ItemB", False)["total_price"] == 60
+    assert slot("ItemB", True)["quantity"] == 2
+    assert slot("ItemB", True)["total_price"] == 40
 
 
-def test_summary_invoice_driven_kpis(admin_client, db):
-    """Summary KPIs (gross_sales, received, due, overdue) use invoice totals."""
-    # Sale 1: PI=100, Invoice=60, paid=20 → gross=60, received=20, due=40
+def test_summary_kpis_use_displayed_row_totals(admin_client, db):
+    """Summary KPIs match the rows: invoice line + PI remainder."""
+    # Sale 1: PI=100, Invoice=60, paid=20 → gross=100, received=20, due=80
     sid1 = _sale(db, "PI-SUM-INV1", created_at="2026-01-10", pi_date="2026-01-10",
                  items=[{"product_name": "A", "quantity": 10, "unit_price": 10}],
                  invoice_lines=[{"sale_item_index": 0, "quantity": 6}],
                  maturity_date="2026-02-15")
     _pay(db, sid1, 20, "2026-01-20")
-    # Sale 2: PI=200, Invoice=100, paid=0 → gross=100, received=0, due=100
+    # Sale 2: PI=200, Invoice=100, paid=0 → gross=200, received=0, due=200
     sid2 = _sale(db, "PI-SUM-INV2", created_at="2026-02-15", pi_date="2026-02-15",
                  items=[{"product_name": "B", "quantity": 10, "unit_price": 20}],
                  invoice_lines=[{"sale_item_index": 0, "quantity": 5}],
                  maturity_date="2026-03-15")
-    
+
     summary = _summary(admin_client, {"group_by": "month", "date_anchor": "pi_date"})
     periods = summary["periods"]
-    
+
     jan = next(p for p in periods if p["period_start"] == "2026-01-01")
-    assert jan["kpis"]["gross_sales"] == 60   # invoice-driven
+    assert jan["kpis"]["gross_sales"] == 100   # 60 invoiced + 40 remainder
     assert jan["kpis"]["received"] == 20
-    assert jan["kpis"]["due"] == 40
-    assert jan["kpis"]["overdue"] == 40
+    assert jan["kpis"]["due"] == 80
+    assert jan["kpis"]["overdue"] == 80
     assert jan["kpis"]["order_count"] == 1
-    
+
     feb = next(p for p in periods if p["period_start"] == "2026-02-01")
-    assert feb["kpis"]["gross_sales"] == 100  # invoice-driven
+    assert feb["kpis"]["gross_sales"] == 200   # 100 invoiced + 100 remainder
     assert feb["kpis"]["received"] == 0
-    assert feb["kpis"]["due"] == 100
-    assert feb["kpis"]["overdue"] == 100
+    assert feb["kpis"]["due"] == 200
+    assert feb["kpis"]["overdue"] == 200
     assert feb["kpis"]["order_count"] == 1
 
 
@@ -1091,26 +1117,30 @@ def test_fresh_pi_without_invoices_is_provisional(admin_client, db):
     for r in rows:
         assert r["is_provisional"] is True
         assert r["invoice_date"] is None
-        # Sale money = sum of displayed line totals (50 + 20).
-        assert r["due_amount"] == 70
+        # Money is per row: nothing has been paid against either line.
+        assert r["due_amount"] == r["total_price"]
 
 
 def test_invoiced_line_is_final_with_invoice_quantity(admin_client, db):
-    """Once a line is invoiced, its invoice quantity becomes final."""
+    """Once a line is invoiced, its invoice quantity is a final row; the rest
+    of the PI line stays provisional."""
     sid = _sale(db, "PI-FINAL", items=[
         {"product_name": "A", "quantity": 10, "unit_price": 10}],
         invoice_lines=[{"sale_item_index": 0, "quantity": 8}],
         invoice_date="2026-01-20")
-    row = _of(_rows(admin_client), sid)[0]
-    assert row["quantity"] == 8
-    assert row["unit_price"] == 10
-    assert row["total_price"] == 80
-    assert row["is_provisional"] is False
-    assert row["invoice_date"] == "2026-01-20"
+    rows = _of(_rows(admin_client), sid)
+    final = next(r for r in rows if not r["is_provisional"])
+    remainder = next(r for r in rows if r["is_provisional"])
+    assert final["quantity"] == 8
+    assert final["unit_price"] == 10
+    assert final["total_price"] == 80
+    assert final["invoice_date"] == "2026-01-20"
+    assert remainder["quantity"] == 2
+    assert remainder["total_price"] == 20
 
 
-def test_line_split_across_two_invoices_sums_quantities(admin_client, db):
-    """6 + 4 invoiced on two invoices → one final row of 10."""
+def test_line_split_across_two_invoices_renders_both_invoice_rows(admin_client, db):
+    """6 + 4 invoiced on two invoices → two rows, no remainder."""
     sid = _sale(db, "PI-SPLIT", items=[
         {"product_name": "Split", "quantity": 10, "unit_price": 10}],
         invoice_lines=None)
@@ -1130,31 +1160,35 @@ def test_line_split_across_two_invoices_sums_quantities(admin_client, db):
             (inv_id, item_id, qty, qty * 10))
     db.commit()
 
-    row = _of(_rows(admin_client), sid)[0]
-    assert row["quantity"] == 10
-    assert row["total_price"] == 100
-    assert row["is_provisional"] is False
-    assert row["invoice_date"] == "2026-02-10"  # latest invoice date for the line
+    rows = _of(_rows(admin_client), sid)
+    assert len(rows) == 2
+    assert sorted(r["quantity"] for r in rows) == [4, 6]
+    assert all(r["is_provisional"] is False for r in rows)
+    assert {r["invoice_date"] for r in rows} == {"2026-01-10", "2026-02-10"}
+    assert sum(r["total_price"] for r in rows) == 100
 
 
 def test_mixed_sale_returns_final_and_provisional_rows(admin_client, db):
-    """Line A invoiced, line B not: both rows, one final one provisional."""
+    """Line A partly invoiced, line B not: one row per invoice line + remainder."""
     sid = _sale(db, "PI-MIXED", items=[
         {"product_name": "Final", "quantity": 10, "unit_price": 10},
         {"product_name": "Prov", "quantity": 5, "unit_price": 20}],
         invoice_lines=[{"sale_item_index": 0, "quantity": 8}])
     rows = _of(_rows(admin_client), sid)
-    assert len(rows) == 2
-    by_product = {r["product_name"]: r for r in rows}
-    assert by_product["Final"]["quantity"] == 8
-    assert by_product["Final"]["total_price"] == 80
-    assert by_product["Final"]["is_provisional"] is False
-    assert by_product["Prov"]["quantity"] == 5
-    assert by_product["Prov"]["total_price"] == 100
-    assert by_product["Prov"]["is_provisional"] is True
-    # Sale money is the sum of displayed line totals (80 + 100), on every row.
+    assert len(rows) == 3
+    def slot(product, provisional):
+        return next(r for r in rows
+                    if r["product_name"] == product
+                    and r["is_provisional"] is provisional)
+    assert slot("Final", False)["quantity"] == 8
+    assert slot("Final", False)["total_price"] == 80
+    assert slot("Final", True)["quantity"] == 2
+    assert slot("Final", True)["total_price"] == 20
+    assert slot("Prov", True)["quantity"] == 5
+    assert slot("Prov", True)["total_price"] == 100
+    # Money is per row: nothing paid, so each row's due is its own total.
     for r in rows:
-        assert r["due_amount"] == 180
+        assert r["due_amount"] == r["total_price"]
 
 
 def test_completed_sale_stays_in_the_report(admin_client, db):
@@ -1205,8 +1239,9 @@ def test_export_marks_provisional_rows(admin_client, db):
 
     parsed = list(csv.reader(io.StringIO(body["content"])))
     assert len(parsed) == 3
-    assert len(parsed[0]) == 20
+    assert len(parsed[0]) == 21
     assert parsed[0][-1] == "Provisional"
+    assert parsed[0][10] == "Prod. Date"
     by_pi = {row[1]: row for row in parsed[1:]}
     assert by_pi["PI-EX-PROV"][-1] == "Yes"
     assert by_pi["PI-EX-FINAL"][-1] == ""
@@ -1258,10 +1293,268 @@ def test_late_invoice_on_a_completed_sale_turns_its_line_final(admin_client, db)
                    lines=[{"sale_item_id": item_id, "quantity": 3}],
                    invoice_date="2026-02-01")
 
-    row = _of(_rows(admin_client), sid)[0]
-    assert row["quantity"] == 3
-    assert row["total_price"] == 30
-    assert row["is_provisional"] is False
-    assert row["invoice_date"] == "2026-02-01"
+    rows = _of(_rows(admin_client), sid)
+    final = next(r for r in rows if not r["is_provisional"])
+    assert final["quantity"] == 3
+    assert final["total_price"] == 30
+    assert final["invoice_date"] == "2026-02-01"
+    remainder = next(r for r in rows if r["is_provisional"])
+    assert remainder["quantity"] == 7
     assert db.execute("SELECT stage FROM sales WHERE id = %s",
                       (sid,)).fetchone()[0] == "payment_due"
+
+
+# ------------------------- Phase 5: per-row money and production date -------------------------
+
+def _company(db, label):
+    co = db.execute(
+        "INSERT INTO companies (name) VALUES (%s) RETURNING id",
+        (f"{label}-{uuid.uuid4().hex[:8]}",)).fetchone()[0]
+    db.commit()
+    return co
+
+
+def _production_run(db, company_id, product, production_date, sale_id=None,
+                    invoice_id=None, sale_item_id=None):
+    """A recipe production run for ``product``, linked to a sale or an invoice.
+
+    The recipe's ``product_name`` is what ties production to a report line;
+    ``sale_item_id`` is left NULL exactly like ``create_production_run`` does.
+    """
+    tag = uuid.uuid4().hex[:8]
+    recipe_id = db.execute(
+        "INSERT INTO recipes (company_id, name, product_name, total_quantity, "
+        "water_percentage) VALUES (%s, %s, %s, 1, 0) RETURNING id",
+        (company_id, f"R-{tag}", product)).fetchone()[0]
+    run_id = db.execute(
+        "INSERT INTO production_runs (recipe_id, sale_item_id, production_date, "
+        "qty_produced) VALUES (%s, %s, %s, 1) RETURNING id",
+        (recipe_id, sale_item_id, production_date)).fetchone()[0]
+    if sale_id is not None:
+        db.execute("INSERT INTO production_run_links (run_id, sale_id) "
+                   "VALUES (%s, %s)", (run_id, sale_id))
+    if invoice_id is not None:
+        sale_of_invoice = db.execute(
+            "SELECT sale_id FROM invoices WHERE id = %s", (invoice_id,)).fetchone()[0]
+        db.execute("INSERT INTO production_run_links (run_id, sale_id, invoice_id) "
+                   "VALUES (%s, %s, %s)", (run_id, sale_of_invoice, invoice_id))
+    db.commit()
+    return run_id
+
+
+def _attach_company(db, sid, company_id):
+    db.execute("UPDATE sales SET company_id = %s WHERE id = %s", (company_id, sid))
+    db.commit()
+
+
+def test_prod_date_comes_from_recipe_production_not_the_invoice(admin_client, db):
+    """A sale-linked run of the line's recipe sets Prod. Date.
+
+    The invoice link is irrelevant: a newer run linked to the invoice but for a
+    different product must not touch this line.
+    """
+    sid = _sale(db, "PI-PROD-1", items=[
+        {"product_name": "Acid", "quantity": 5, "unit_price": 10}])
+    co = _company(db, "ProdCo")
+    _attach_company(db, sid, co)
+    invoice_id = db.execute(
+        "SELECT id FROM invoices WHERE sale_id = %s", (sid,)).fetchone()[0]
+
+    _production_run(db, co, "Acid", "2026-03-01", sale_id=sid)
+    _production_run(db, co, "Other", "2026-09-01", invoice_id=invoice_id)
+
+    row = _of(_rows(admin_client), sid)[0]
+    assert row["prod_date"] == "2026-03-01"
+    assert row["is_provisional"] is False
+
+
+def test_provisional_row_uses_the_sale_product_production_date(admin_client, db):
+    """An uninvoiced PI line still carries its recipe production date."""
+    sid = _sale(db, "PI-PROD-2", items=[
+        {"product_name": "Acid", "quantity": 5, "unit_price": 10}],
+        invoice_lines=None)
+    co = _company(db, "ProdCo")
+    _attach_company(db, sid, co)
+
+    _production_run(db, co, "Acid", "2026-03-05", sale_id=sid)
+
+    row = _of(_rows(admin_client), sid)[0]
+    assert row["is_provisional"] is True
+    assert row["prod_date"] == "2026-03-05"
+
+
+def test_production_for_another_sale_does_not_leak_into_this_row(admin_client, db):
+    """Production is sale-scoped: another sale's batch is not this row's date."""
+    sid = _sale(db, "PI-PROD-3", items=[
+        {"product_name": "Acid", "quantity": 5, "unit_price": 10}],
+        invoice_lines=None)
+    other = _sale(db, "PI-PROD-3-OTHER", items=[
+        {"product_name": "Acid", "quantity": 5, "unit_price": 10}],
+        invoice_lines=None)
+    co = _company(db, "ProdCo")
+    _attach_company(db, sid, co)
+    _attach_company(db, other, co)
+
+    _production_run(db, co, "Acid", "2026-07-01", sale_id=other)
+
+    assert _of(_rows(admin_client), sid)[0]["prod_date"] is None
+    assert _of(_rows(admin_client), other)[0]["prod_date"] == "2026-07-01"
+
+
+def test_over_invoiced_line_has_no_remainder_row(admin_client, db):
+    """Invoiced >= PI -> the invoice row stands alone."""
+    sid = _sale(db, "PI-OVERINV", items=[
+        {"product_name": "More", "quantity": 10, "unit_price": 10}],
+        invoice_lines=[{"sale_item_index": 0, "quantity": 12}])
+    rows = _of(_rows(admin_client), sid)
+    assert len(rows) == 1
+    assert rows[0]["quantity"] == 12
+    assert rows[0]["total_price"] == 120
+    assert rows[0]["is_provisional"] is False
+
+
+def test_invoice_payments_allocate_to_its_lines(admin_client, db):
+    """An invoice's payment lands on that invoice's lines, in line order."""
+    sid = _sale(db, "PI-INV-PAY", items=[
+        {"product_name": "A", "quantity": 10, "unit_price": 10},
+        {"product_name": "B", "quantity": 10, "unit_price": 20}])
+    invoice_id = db.execute(
+        "SELECT id FROM invoices WHERE sale_id = %s", (sid,)).fetchone()[0]
+    db.execute(
+        "INSERT INTO sale_payments (sale_id, invoice_id, payment_date, payment_amount) "
+        "VALUES (%s, %s, '2026-02-01', 150)", (sid, invoice_id))
+    db.commit()
+
+    rows = _of(_rows(admin_client), sid)
+    by_product = {r["product_name"]: r for r in rows}
+    assert by_product["A"]["received_amount"] == 100
+    assert by_product["A"]["due_amount"] == 0
+    assert by_product["A"]["payment_status"] == "Paid"
+    assert by_product["B"]["received_amount"] == 50
+    assert by_product["B"]["due_amount"] == 150
+    assert by_product["B"]["payment_status"] == "Partial"
+    assert sum(r["received_amount"] for r in rows) == 150
+
+
+def test_partial_invoice_payment_allocates_in_line_order_and_last_line_absorbs(
+        admin_client, db):
+    """Payments walk the invoice's lines; the last line takes the residue."""
+    sid = _sale(db, "PI-INV-ORDER", items=[
+        {"product_name": "A", "quantity": 1, "unit_price": 100},
+        {"product_name": "B", "quantity": 1, "unit_price": 100},
+        {"product_name": "C", "quantity": 1, "unit_price": 100}])
+    invoice_id = db.execute(
+        "SELECT id FROM invoices WHERE sale_id = %s", (sid,)).fetchone()[0]
+    db.execute(
+        "INSERT INTO sale_payments (sale_id, invoice_id, payment_date, payment_amount) "
+        "VALUES (%s, %s, '2026-02-01', 350)", (sid, invoice_id))
+    db.commit()
+
+    received = {r["product_name"]: r["received_amount"]
+                for r in _of(_rows(admin_client), sid)}
+    assert received == {"A": 100, "B": 100, "C": 150}
+    assert sum(received.values()) == 350
+
+
+def test_sale_level_legacy_payment_allocates_across_rows(admin_client, db):
+    """A payment with no invoice walks the sale's rows, invoice lines first."""
+    sid = _sale(db, "PI-LEGACY-ALLOC", items=[
+        {"product_name": "A", "quantity": 10, "unit_price": 10},
+        {"product_name": "B", "quantity": 5, "unit_price": 20}],
+        invoice_lines=[{"sale_item_index": 0, "quantity": 6}])
+    _pay(db, sid, 150)
+
+    rows = _of(_rows(admin_client), sid)
+    slots = {(r["product_name"], r["is_provisional"]): r for r in rows}
+    assert slots[("A", False)]["received_amount"] == 60
+    assert slots[("A", False)]["due_amount"] == 0
+    assert slots[("A", True)]["received_amount"] == 40
+    assert slots[("A", True)]["due_amount"] == 0
+    assert slots[("B", True)]["received_amount"] == 50
+    assert slots[("B", True)]["due_amount"] == 50
+    assert sum(r["received_amount"] for r in rows) == 150
+
+
+def test_report_row_maturity_prefers_the_invoice_maturity(admin_client, db):
+    """Each invoice row carries its own maturity; a remainder uses the sale's."""
+    sid = _sale(db, "PI-MATURITY", maturity_date="2099-12-31", items=[
+        {"product_name": "A", "quantity": 5, "unit_price": 10},
+        {"product_name": "B", "quantity": 5, "unit_price": 10},
+        {"product_name": "C", "quantity": 5, "unit_price": 10}],
+        invoice_lines=None)
+    item_ids = [r[0] for r in db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id", (sid,)).fetchall()]
+    for idx, (maturity, ship_date) in enumerate((
+            ("2026-05-01", "2026-04-01"), ("2026-06-01", "2026-05-01"))):
+        inv_id = db.execute(
+            "INSERT INTO invoices (sale_id, invoice_number, status, amount, "
+            "invoice_date, actual_ship_date, maturity_date) "
+            "VALUES (%s, %s, 'shipped', 50, '2026-03-01', %s, %s) RETURNING id",
+            (sid, f"INV-MAT-{idx}", ship_date, maturity)).fetchone()[0]
+        db.execute(
+            "INSERT INTO invoice_items (invoice_id, sale_item_id, product_name, unit, "
+            "quantity, unit_price, line_total) VALUES (%s, %s, %s, 'KG', 5, 10, 50)",
+            (inv_id, item_ids[idx], "ABC"[idx]))
+    db.commit()
+
+    rows = _of(_rows(admin_client), sid)
+    by_product = {r["product_name"]: r for r in rows}
+    assert by_product["A"]["maturity_date"] == "2026-05-01"
+    assert by_product["A"]["actual_ship_date"] == "2026-04-01"
+    assert by_product["B"]["maturity_date"] == "2026-06-01"
+    assert by_product["C"]["maturity_date"] == "2099-12-31"
+    assert by_product["C"]["is_provisional"] is True
+
+
+def test_voided_invoice_lines_do_not_reduce_the_remainder(admin_client, db):
+    """A voided invoice is invisible to the report and its PI quantity returns."""
+    sid = _sale(db, "PI-VOID-REP", items=[
+        {"product_name": "A", "quantity": 10, "unit_price": 10}],
+        invoice_lines=[{"sale_item_index": 0, "quantity": 4}])
+    db.execute("UPDATE invoices SET status = 'void' WHERE sale_id = %s", (sid,))
+    db.commit()
+
+    rows = _of(_rows(admin_client), sid)
+    assert len(rows) == 1
+    assert rows[0]["quantity"] == 10
+    assert rows[0]["is_provisional"] is True
+
+
+def test_legacy_invoice_line_without_sale_item_is_its_own_row(admin_client, db):
+    """A line that points at no PI row cannot reduce that PI row's remainder."""
+    sid = _sale(db, "PI-LEGACY-LINE", items=[
+        {"product_name": "A", "quantity": 10, "unit_price": 10}],
+        invoice_lines=None)
+    inv_id = db.execute(
+        "INSERT INTO invoices (sale_id, invoice_number, status, amount, invoice_date) "
+        "VALUES (%s, 'INV-LEGACY', 'planned', 30, '2026-02-01') RETURNING id",
+        (sid,)).fetchone()[0]
+    db.execute(
+        "INSERT INTO invoice_items (invoice_id, sale_item_id, product_name, unit, "
+        "quantity, unit_price, line_total) VALUES (%s, NULL, 'Manual', 'KG', 3, 10, 30)",
+        (inv_id,))
+    db.commit()
+
+    rows = _of(_rows(admin_client), sid)
+    assert len(rows) == 2
+    final = next(r for r in rows if not r["is_provisional"])
+    assert final["product_name"] == "Manual"
+    assert final["total_price"] == 30
+    remainder = next(r for r in rows if r["is_provisional"])
+    assert remainder["product_name"] == "A"
+    assert remainder["quantity"] == 10
+
+
+def test_export_carries_the_production_date(admin_client, db):
+    """The CSV's Prod. Date column is populated from recipe production."""
+    sid = _sale(db, "PI-EX-PROD", items=[
+        {"product_name": "Acid", "quantity": 5, "unit_price": 10}])
+    co = _company(db, "ProdCo")
+    _attach_company(db, sid, co)
+    _production_run(db, co, "Acid", "2026-03-01", sale_id=sid)
+
+    r = admin_client.post("/api/reports/live/export", json={})
+    assert r.status_code == 200
+    parsed = list(csv.reader(io.StringIO(r.get_json()["content"])))
+    assert parsed[0][10] == "Prod. Date"
+    assert parsed[1][10] == "2026-03-01"

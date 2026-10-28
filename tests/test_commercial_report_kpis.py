@@ -1,16 +1,14 @@
-"""Summary KPI integrity: sale-level money counted once, money rounding kept.
+"""Summary KPI integrity: row money summed once, rounding kept.
 
-get_commercial_report_summary builds its `base` CTE from
-`sales s LEFT JOIN sale_items si`, i.e. ONE ROW PER LINE ITEM. The per-sale
-scalars (received_amount / sale_total) are therefore repeated on every row of
-that sale, so a naive SUM(received_amount) / SUM(sale_total - received_amount)
-multiplies the money by the item count. These tests pin the KPIs to per-sale
-truth (gross_sales stays a per-ITEM sum) and to the file's money convention
-(COALESCE(ROUND(SUM(...)::numeric, 2)::float8, 0), due clamped at zero).
+``get_commercial_report_summary`` builds on the report's row grain: one row per
+invoice line plus one provisional remainder row per PI line. Payments are
+allocated to rows (invoice payments to that invoice's lines, legacy sale-level
+payments across the sale's rows), so a row's ``received_amount`` is its own
+money and the KPIs are plain sums of the displayed rows.
 
-Phase 4: a line with no invoice rows displays PI quantity × PI unit price and
-is provisional; an invoiced line displays its invoice quantity. Sale money is
-the sum of those displayed line totals either way.
+These tests pin the file's money convention
+(COALESCE(ROUND(SUM(...)::numeric, 2)::float8, 0), due clamped at zero) and
+that received/due/overdue never multiply by the row count.
 """
 from raas_tracker.sales import (
     get_commercial_report,
@@ -126,8 +124,8 @@ def test_two_multi_item_sales_money_counted_once(db):
     assert b  # both sales share the January period
 
 
-def test_multi_item_sale_detail_rows_keep_sale_level_money(db):
-    """Detail rows repeat the sale's money identically (per-item rows, sale money)."""
+def test_multi_item_sale_detail_rows_allocate_the_payment(db):
+    """Detail rows carry the sale's payment allocated in line order."""
     sid = _sale(db, "PI-KPI-2B-DET", [
         {"product_name": "A", "quantity": 1, "unit_price": 700},
         {"product_name": "B", "quantity": 1, "unit_price": 300},
@@ -137,10 +135,14 @@ def test_multi_item_sale_detail_rows_keep_sale_level_money(db):
     periods = get_commercial_report_summary(db, {"group_by": "month", "date_anchor": "pi_date"})
     items = periods[0]["items"]
     assert len(items) == 2
-    for row in items:
-        assert row["received_amount"] == 250
-        assert row["due_amount"] == 750
-        assert row["payment_status"] == "Overdue"
+    by_product = {r["product_name"]: r for r in items}
+    assert by_product["A"]["received_amount"] == 250
+    assert by_product["A"]["due_amount"] == 450
+    assert by_product["B"]["received_amount"] == 0
+    assert by_product["B"]["due_amount"] == 300
+    assert all(r["payment_status"] == "Overdue" for r in items)
+    assert sum(r["received_amount"] for r in items) == 250
+    assert sum(r["due_amount"] for r in items) == 750
 
 
 # ---------- 2. money rounding + due clamp ----------
@@ -233,15 +235,15 @@ def test_provisional_pi_lines_count_in_kpis(db):
 
 
 def test_mixed_sale_kpis_and_detail_use_displayed_line_totals(db):
-    """Line A invoiced 8@10, line B provisional 5@20 → 80 + 100 = 180."""
+    """A invoiced 8@10 + 2@10 remainder, B provisional 5@20 -> 200."""
     _sale(db, "PI-KPI-MIX", [
         {"product_name": "A", "quantity": 10, "unit_price": 10},
         {"product_name": "B", "quantity": 5, "unit_price": 20},
     ], pi_date="2026-01-10", invoice_qty={0: 8})
 
     kpis = _kpis(db)
-    assert kpis["gross_sales"] == 180
-    assert kpis["due"] == 180
+    assert kpis["gross_sales"] == 200
+    assert kpis["due"] == 200
 
     flat, _total = get_commercial_report(db, {
         "date_anchor": "pi_date", "date_from": "2026-01-01",
@@ -251,17 +253,49 @@ def test_mixed_sale_kpis_and_detail_use_displayed_line_totals(db):
         db, {"group_by": "month", "date_anchor": "pi_date"})
     jan = next(p for p in periods if p["period_start"] == "2026-01-01")
 
-    assert len(jan["items"]) == len(flat) == 2
+    assert len(jan["items"]) == len(flat) == 3
 
     def shape(rows):
         return {
-            r["product_name"]: (r["quantity"], r["total_price"],
-                                r["due_amount"], r["is_provisional"])
+            (r["product_name"], r["is_provisional"]): (
+                r["quantity"], r["total_price"], r["due_amount"])
             for r in rows
         }
     assert shape(jan["items"]) == shape(flat)
     assert shape(flat) == {
-        "A": (8, 80, 180, False),
-        "B": (5, 100, 180, True),
+        ("A", False): (8, 80, 80),
+        ("A", True): (2, 20, 20),
+        ("B", True): (5, 100, 100),
     }
+
+
+# ---------- 5. KPI rows are sums of the displayed rows ----------
+
+def test_report_kpi_received_equals_sum_of_row_payments(db):
+    """Received is the sum of the rows' allocated payments, once."""
+    sid = _sale(db, "PI-KPI-SUM-RECV", [
+        {"product_name": "A", "quantity": 10, "unit_price": 10},
+        {"product_name": "B", "quantity": 10, "unit_price": 10},
+    ], invoice_qty={0: 6})
+    _pay(db, sid, 120)
+
+    rows, _total = get_commercial_report(db, {})
+    kpis = _kpis(db)
+    assert sum(r["received_amount"] for r in rows) == 120
+    assert kpis["received"] == 120
+
+
+def test_report_kpi_due_equals_row_totals_minus_received(db):
+    """Due is each row's total minus its received, clamped and summed."""
+    sid = _sale(db, "PI-KPI-SUM-DUE", [
+        {"product_name": "A", "quantity": 10, "unit_price": 10},
+        {"product_name": "B", "quantity": 10, "unit_price": 10},
+    ], invoice_qty={0: 6})
+    _pay(db, sid, 120)
+
+    rows, _total = get_commercial_report(db, {})
+    kpis = _kpis(db)
+    expected = sum(max(r["total_price"] - r["received_amount"], 0) for r in rows)
+    assert kpis["due"] == expected == 80
+    assert kpis["gross_sales"] == sum(r["total_price"] for r in rows) == 200
 
