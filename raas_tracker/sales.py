@@ -2059,6 +2059,11 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
     log_audit_action(conn, "INVOICE_CREATE", "invoice", invoice_id,
                      new_value=f"{invoice_number} amount={amount} status={status}",
                      atomic=False)
+    # Late invoicing: a completed sale has money due again the moment a new
+    # (planned, therefore unsettled) invoice lands. This reopens the sale and
+    # its LC through move_sale_to_stage's normal reconciliation; on any other
+    # stage it is a no-op.
+    _sync_sale_completion(conn, sale_id)
     conn.commit()
     return {"invoice_id": invoice_id, "invoice_number": invoice_number,
             "status": status, "amount": float(amount),
@@ -2184,6 +2189,9 @@ def create_invoices_batch(conn: psycopg.Connection, sale_id: int,
     conn.execute(
         "UPDATE sales SET shipment_status = COALESCE(shipment_status, 'production_running'), updated_at = %s WHERE id = %s",
         (_now_str(), sale_id))
+    # One reconciliation for the whole batch: the first new invoice already
+    # makes the set unsettled, so reopening again per invoice would be noise.
+    _sync_sale_completion(conn, sale_id)
     conn.commit()
     return {"invoices": results}
 
