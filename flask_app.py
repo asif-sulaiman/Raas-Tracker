@@ -194,6 +194,9 @@ from raas_tracker.notifications import (
     list_notifications_for, unread_count, mark_read, mark_read_all_for,
     notify_reorder_status, notify_maturity_initial, notify_maturity_escalation
 )
+# Modules (not bare functions) so tests can stub the mailer without touching
+# the reminder logic, and so an import-time SMTP probe never runs.
+from raas_tracker import mailer, reminders
 
 SESSION_COOKIE = "raas_session"
 API_KEY_HEADER = "X-API-Key"
@@ -3279,10 +3282,15 @@ def api_delete_item(sale_id, item_id):
 # ==================== API: CRON JOBS ====================
 @app.route("/api/cron/maturity-check", methods=["POST"])
 def api_cron_maturity_check():
-    """Daily cron job to check for maturity due/escalated sales.
-    
+    """Daily cron job: invoice payment reminders plus legacy sale maturities.
+
     Auth: Requires Authorization: Bearer <CRON_SECRET> header.
-    Checks all unpaid sales with maturity_date <= today and creates notifications.
+
+    Invoices own the payment clock now, so the sale-level maturity scan only
+    covers sales that have no invoice at all (legacy rows); a sale with
+    invoices would otherwise be reminded twice for the same money. Each newly
+    created invoice reminder sends one email to the directors in NOTIFY_EMAILS
+    — an unconfigured mailer is a no-op and never fails the run.
     """
     cron_secret = os.getenv("CRON_SECRET")
     auth_header = request.headers.get("Authorization", "")
@@ -3296,11 +3304,13 @@ def api_cron_maturity_check():
     conn = get_db()
     try:
         today = date.today()
-        # Find sales with maturity_date not null, not fully paid
+        # Legacy sale-level scan: only sales with no invoice. A sale WITH
+        # invoices is reminded per invoice (actual ship date / maturity).
         rows = conn.execute("""
             SELECT s.id, s.client_name, s.maturity_date
             FROM sales s
             WHERE s.maturity_date IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM invoices i WHERE i.sale_id = s.id)
               AND COALESCE((SELECT ROUND(SUM(sp.payment_amount)::numeric, 2)::float8
                             FROM sale_payments sp
                             WHERE sp.sale_id = s.id), 0)
@@ -3309,7 +3319,7 @@ def api_cron_maturity_check():
                             WHERE si.sale_id = s.id), 0)
         """).fetchall()
         
-        notified = 0
+        sale_reminders = 0
         for row in rows:
             sale_id, client_name, maturity_date = row[0], row[1], row[2]
             # Parse maturity_date
@@ -3322,16 +3332,30 @@ def api_cron_maturity_check():
             if not mat:
                 continue
             if mat <= today:
-                notify_maturity_initial(conn, sale_id, client_name, maturity_date)
-                notified += 1
+                if notify_maturity_initial(conn, sale_id, client_name, maturity_date):
+                    sale_reminders += 1
                 if mat <= today - timedelta(days=7):
-                    notify_maturity_escalation(conn, sale_id, client_name, maturity_date, (today - mat).days)
-                    notified += 1
+                    if notify_maturity_escalation(conn, sale_id, client_name, maturity_date, (today - mat).days):
+                        sale_reminders += 1
+
+        invoice_reminders = reminders.run_invoice_reminders(conn, today)
+        emails_sent = 0
+        for item in invoice_reminders:
+            if mailer.send_email(item["email_subject"], item["email_body"]):
+                emails_sent += 1
+
         # This endpoint was the one mutating route that wrote no audit row, so
         # a run (or a silent no-op) left no trace. atomic=True commits here.
         log_audit_action(conn, "CRON_MATURITY_CHECK", "cron", None,
-                         new_value=f"checked={len(rows)} notified={notified}")
-        return jsonify({"success": True, "checked": len(rows), "notified": notified})
+                         new_value=f"checked={len(rows)} "
+                                   f"notified={sale_reminders} "
+                                   f"invoice_reminders={len(invoice_reminders)} "
+                                   f"emails={emails_sent}")
+        return jsonify({"success": True, "checked": len(rows),
+                        "notified": sale_reminders,
+                        "sale_reminders": sale_reminders,
+                        "invoice_reminders": len(invoice_reminders),
+                        "emails_sent": emails_sent})
     except Exception as e:
         # Roll back before returning 500. A failed run leaves statements this
         # handler issued after the last committing `notify()` still open; without
