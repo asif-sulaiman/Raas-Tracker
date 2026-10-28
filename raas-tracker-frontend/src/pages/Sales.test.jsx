@@ -54,17 +54,12 @@ function lcMeta(overrides = {}) {
   };
 }
 
-function installFetch({ sales = [], lcs = [], readiness = null, invoices = [] } = {}) {
+function installFetch({ sales = [], lcs = [], invoices = [] } = {}) {
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
     const u = String(url);
     const method = options?.method || 'GET';
     if (u.includes('/api/auth/me')) {
       return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
-    }
-    if (u.includes('/api/lcs/') && u.includes('/readiness')) {
-      return jsonResponse(readiness || {
-        invoices_ok: true, recipes_ok: true, produced_ok: true, booked_ok: true, detail: {},
-      });
     }
     if (u.includes('/api/lcs') && method === 'GET') {
       return jsonResponse(lcs);
@@ -116,16 +111,21 @@ function renderPage() {
 }
 
 describe('Sales board LC action honesty (INV-link Phase B)', () => {
-  it('offers no move action on an LC card sitting in PI Issued', async () => {
+  it('keeps a lagging PI visible while its LC sits in its own column', async () => {
     installFetch({ sales: [sale({ stage: 'pi_issued' })], lcs: [lcMeta()] });
     renderPage();
     await waitFor(() => {
       expect(screen.queryByText(/loading sales pipeline/i)).toBeNull();
     });
-    // The LC (stage lc_received) renders under its earliest PI in PI Issued.
-    expect(screen.getByText('LC-100')).toBeTruthy();
+    // The PI stays in PI Issued as its own card; the LC (stage lc_received)
+    // renders in its own column and also lists the PI as a nested row — so
+    // the PI is visible twice, never hidden.
+    expect(screen.getAllByText('PI-001')).toHaveLength(2);
+    // The standalone PI card mirrors the LC number and the LC card names it.
+    expect(screen.getAllByText('LC-100')).toHaveLength(2);
+    // Enter LC is retired with the legacy lc_number write.
     expect(screen.queryByRole('button', { name: 'Enter LC' })).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Start Shipment' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Start Shipment' })).toBeTruthy();
   });
 
   it('starts an LC shipment directly, with no readiness probe or invoice barrier', async () => {
@@ -168,63 +168,19 @@ describe('Sales board LC action honesty (INV-link Phase B)', () => {
     expect(toast.warning).not.toHaveBeenCalled();
   });
 
-  it('blocks the LC Payment Due move until an invoice is booked', async () => {
+  it('offers no manual LC move out of Shipment Ongoing', async () => {
     installFetch({
       sales: [sale({ stage: 'shipment_ongoing' })],
       lcs: [lcMeta({ stage: 'shipment_ongoing' })],
-      readiness: {
-        invoices_ok: false,
-        recipes_ok: true,
-        produced_ok: true,
-        booked_ok: false,
-        detail: {},
-      },
     });
     renderPage();
     await waitFor(() => {
       expect(screen.queryByText(/loading sales pipeline/i)).toBeNull();
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Move to Payment Due' }));
-    await waitFor(() => {
-      expect(toast.error).toHaveBeenCalled();
-    });
-    expect(String(toast.error.mock.calls[0][0])).toMatch(/book/i);
-    expect(postTo('/api/lcs/10/move')).toBeFalsy();
-  });
-
-  it('moves the LC to Payment Due once one invoice is booked', async () => {
-    installFetch({
-      sales: [sale({ stage: 'shipment_ongoing' })],
-      lcs: [lcMeta({ stage: 'shipment_ongoing' })],
-      readiness: {
-        invoices_ok: true, recipes_ok: false, produced_ok: false,
-        booked_ok: true, detail: {},
-      },
-    });
-    renderPage();
-    await waitFor(() => {
-      expect(screen.queryByText(/loading sales pipeline/i)).toBeNull();
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Move to Payment Due' }));
-    await waitFor(() => {
-      expect(postTo('/api/lcs/10/move')).toBeTruthy();
-    });
-    expect(JSON.parse(postTo('/api/lcs/10/move').body)).toEqual({
-      new_stage: 'payment_due',
-    });
-  });
-
-  it('keeps the shipment-column LC action intact', async () => {
-    installFetch({
-      sales: [sale({ stage: 'shipment_ongoing' })],
-      lcs: [lcMeta({ stage: 'shipment_ongoing' })],
-      readiness: { booked_ok: false, recipes_ok: false, produced_ok: false, detail: {} },
-    });
-    renderPage();
-    await waitFor(() => {
-      expect(screen.queryByText(/loading sales pipeline/i)).toBeNull();
-    });
-    expect(screen.getByRole('button', { name: 'Move to Payment Due' })).toBeTruthy();
+    // The LC advances when its last invoice gets an actual ship date
+    // (server-side rollup), so the column no longer offers a move button.
+    expect(screen.queryByRole('button', { name: 'Move to Payment Due' })).toBeNull();
+    expect(fetchCalls().some((c) => c.url.includes('/readiness'))).toBe(false);
   });
 });
 
@@ -251,17 +207,89 @@ describe('Sales board invoice-first stages', () => {
     expect(screen.queryByText('PI-001')).toBeNull();
   });
 
-  it('offers "Move to Payment Due" on a Shipment Ongoing card', async () => {
+  it('shows invoice rows instead of a manual move on a Shipment Ongoing card', async () => {
     installFetch({
-      sales: [sale({ id: 7, stage: 'shipment_ongoing', lc_id: null, lc_number: null })],
+      sales: [sale({
+        id: 7, stage: 'shipment_ongoing', lc_id: null, lc_number: null,
+        invoices: [{
+          invoice_id: 55, invoice_number: 'INV-55', status: 'booked',
+          amount: 600, paid_amount: 0, approx_ship_date: '2026-10-20',
+          payment_terms: 'at_sight', tenor_days: null,
+        }],
+      })],
     });
     renderPage();
     await settle();
-    expect(screen.queryByRole('button', { name: 'Mark Shipped' })).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: 'Move to Payment Due' }));
-    await waitFor(() => {
-      expect(postTo('/api/sales/7/move')).toBeTruthy();
+    // The sale advances when its invoice ships, not by a column move.
+    expect(screen.queryByRole('button', { name: 'Move to Payment Due' })).toBeNull();
+    expect(screen.getByText('INV-55')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Ship' })).toBeTruthy();
+    expect(postTo('/api/sales/7/move')).toBeFalsy();
+  });
+
+  it('ships from the card and asks about the uninvoiced remainder', async () => {
+    installFetch({
+      sales: [sale({
+        id: 7, stage: 'shipment_ongoing', lc_id: null, lc_number: null,
+        has_uninvoiced_remainder: true,
+        invoices: [{
+          invoice_id: 55, invoice_number: 'INV-55', status: 'booked',
+          amount: 600, paid_amount: 0, approx_ship_date: '2026-10-20',
+          payment_terms: 'at_sight', tenor_days: null,
+        }],
+      })],
     });
+    renderPage();
+    await settle();
+    fireEvent.click(screen.getByRole('button', { name: 'Ship' }));
+    fireEvent.change(screen.getByLabelText('Actual ship date'), {
+      target: { value: '2026-10-25' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save shipment' }));
+    await waitFor(() => {
+      expect(postTo('/api/sales/7/invoices/55/ship')).toBeTruthy();
+    });
+    expect(JSON.parse(postTo('/api/sales/7/invoices/55/ship').body)).toEqual({
+      actual_ship_date: '2026-10-25',
+      maturity_date: '2026-10-25',
+    });
+    // The PI still has quantity without an invoice: the operator is asked
+    // whether more invoices are coming before the LC rolls up.
+    await waitFor(() => {
+      expect(screen.getByText(/uninvoiced quantity/i)).toBeTruthy();
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Add invoice' }));
+    await waitFor(() => {
+      expect(fetchCalls().some((c) => c.url === '/api/sales/7')).toBe(true);
+    });
+  });
+
+  it('does not ask about more invoices once the PI is fully invoiced', async () => {
+    installFetch({
+      sales: [sale({
+        id: 7, stage: 'shipment_ongoing', lc_id: null, lc_number: null,
+        has_uninvoiced_remainder: false,
+        invoices: [{
+          invoice_id: 55, invoice_number: 'INV-55', status: 'booked',
+          amount: 600, paid_amount: 0, approx_ship_date: '2026-10-20',
+          payment_terms: 'at_sight', tenor_days: null,
+        }],
+      })],
+    });
+    renderPage();
+    await settle();
+    fireEvent.click(screen.getByRole('button', { name: 'Ship' }));
+    fireEvent.change(screen.getByLabelText('Actual ship date'), {
+      target: { value: '2026-10-25' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save shipment' }));
+    await waitFor(() => {
+      expect(postTo('/api/sales/7/invoices/55/ship')).toBeTruthy();
+    });
+    await waitFor(() => {
+      expect(toast.success).toHaveBeenCalledWith('Invoice shipped');
+    });
+    expect(screen.queryByText(/uninvoiced quantity/i)).toBeNull();
   });
 
   it('opens the sale editor from a Payment Due card instead of a payment form', async () => {
