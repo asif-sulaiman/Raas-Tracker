@@ -5,6 +5,62 @@
 
 ---
 
+## 2026-10-28 — INVOICE-MATURITY Phase 6 (report UI: Prod. Date, per-row money)
+
+Worktree `O:/Projects/Raas-Tracker-worktrees/invoice-shipment-gate`, branch
+`feat/invoice-start-at-shipment`. Phase 6 of the approved 7-phase plan: the
+report UI now renders the Phase 5 rows as they are.
+
+### What shipped
+
+- **`CommercialTable.jsx`.** `Prod. Date` sits after `Total ($)` in the detail
+  header, rows and grouped drill-down; the skeleton header and cells are 21.
+  Received/Due/Maturity/Status come from each row, so two rows of one sale show
+  different money.
+- **`Reports.jsx`.** `dedupeSales` is gone. The detail KPI fallback sums
+  `received_amount`/`due_amount` over rows and counts overdue rows; captions say
+  `report rows` (whole-filter) or `report rows (this page)` (fallback). The
+  legend now says a provisional row is the **uninvoiced remainder** of a PI
+  line and an invoice row replaces that quantity.
+- **Tests.** `CommercialTable.test.jsx` pins the header, the 21-cell skeleton,
+  per-row money on a split sale and the drill-down date; `Reports.test.jsx`
+  pins row-summed KPIs (60 received / 140 due from three rows, not deduped) and
+  the new captions/legend.
+
+### Decisions made & why
+
+- **The client never re-allocates money.** The API's row is the unit of truth;
+  deduping or re-spreading in React would recreate the sale-level bug fixed in
+  Phase 5.
+- **The fallback is honest.** It only runs when the summary is unavailable, and
+  its caption says `this page` so a partial page can never pass as the total.
+- **`Prod. Date` is display-only.** It is not filterable or editable here;
+  production records own it.
+
+### Gate (all green)
+
+| Gate | Result |
+|---|---|
+| Frontend `npx vitest run` | **358 passed / 40 files** in 88.71s (was 356) |
+| `npx oxlint` | 0 errors / 0 warnings |
+| `npx vite build` | succeeded (chunk-size warning only) |
+| Backend | untouched in this phase |
+
+### Not run
+
+- No browser pass yet. The plan defers the Playwright walkthrough (Prod. Date +
+  per-row money) to **Phase 7**, alongside the full pytest/ruff/pyright run and
+  the isolated-Postgres E2E; this phase is verified by component tests, lint and
+  a production build.
+
+### Next
+
+Phase 7: docs close-out (PRD/SPEC/plan/handoff already largely updated) and the
+full gate — pytest, ruff, pyright, vitest, oxlint, vite build — plus the
+browser and isolated-Postgres checks.
+
+---
+
 ## 2026-10-28 — INVOICE-MATURITY Phase 5 (sheet-like report rows, per-row money, recipe prod date)
 
 Worktree `O:/Projects/Raas-Tracker-worktrees/invoice-shipment-gate`, branch

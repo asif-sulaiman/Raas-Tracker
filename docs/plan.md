@@ -635,6 +635,30 @@ changed hunks; pyright **6 errors / 18 warnings** = baseline. Frontend is
 untouched in this phase (Phase 6 is the report UI), so vitest/oxlint/build are
 unchanged from Phase 4.
 
+### Phase 6 — report UI: Prod. Date, per-row money, row captions ✅ 2026-10-28
+
+The table now renders the Phase 5 rows as the operator sees them in the sheet:
+a `Prod. Date` column and each row's own money, with KPI captions that talk
+about rows instead of deduping them to sales.
+
+| # | Slice | Scope | State |
+|---|---|---|---|
+| 1 | **Detail table** | `CommercialTable.jsx` gains `Prod. Date` after `Total ($)`; Received/Due/Maturity/Status are read from the row (no sale-level repetition); skeleton header and cells move 20 → 21; the grouped drill-down carries the same production-date cell | ✅ `CommercialTable.test.jsx` (headers, per-row money on two rows of one sale, skeleton 21, drill-down date) |
+| 2 | **KPI fallback** | `Reports.jsx`: `dedupeSales` deleted; the page fallback sums `received_amount`/`due_amount` over **rows** and counts overdue rows, matching the whole-filter summary; captions read `report rows` (whole) / `report rows (this page)` (fallback) on gross/received/due, and `past-maturity rows (this page)` for overdue | ✅ `Reports.test.jsx` (same-sale rows sum 60/140, not 50; captions) |
+| 3 | **Legend** | Legend explains the provisional **remainder** row and that an invoice row replaces that quantity; completed-sale retention sentence kept | ✅ `Reports.test.jsx` |
+
+**Locked decisions:** the table renders the API's per-row money verbatim (no
+client-side dedupe or re-allocation); the fallback exists only when the summary
+is unavailable and says so in its caption; `Prod. Date` is display-only.
+
+**Constraints:** no API change; no new columns beyond `Prod. Date`; the
+skeleton must stay column-identical to the real table.
+
+**Gate run (2026-10-28):** frontend **358 passed / 40 files** (was 356; 2 net
+new assertions in `CommercialTable.test.jsx` and `Reports.test.jsx` rewritten
+for row money); `npx oxlint` **0 errors / 0 warnings**; `npx vite build` OK
+(chunk-size warning only). Backend untouched in this phase.
+
 ---
 
 ## 🧾 Phase INV-UNIFY: PI-faithful invoice editor (completed 2026-10-22)
