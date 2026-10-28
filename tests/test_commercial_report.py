@@ -6,6 +6,8 @@ from datetime import date
 import flask_app
 import pytest
 
+from raas_tracker.sales import create_invoice
+
 
 # Exact contract keys the API must emit per sale-item row.
 CONTRACT_KEYS = {
@@ -1237,3 +1239,29 @@ def test_sales_csv_export_still_includes_completed(admin_client, db):
     assert r.status_code == 200
     parsed = list(csv.reader(io.StringIO(r.get_data(as_text=True))))
     assert {"PI-LIST-ACTIVE", "PI-LIST-DONE"} <= {row[2] for row in parsed[1:]}
+
+
+def test_late_invoice_on_a_completed_sale_turns_its_line_final(admin_client, db):
+    """A completed PI can still be invoiced; the row leaves provisional and the
+    sale reopens to Payment Due."""
+    sid = _sale(db, "PI-LATE-REP", items=[
+        {"product_name": "Late", "quantity": 10, "unit_price": 10}],
+        invoice_lines=None)
+    db.execute("UPDATE sales SET stage = 'completed' WHERE id = %s", (sid,))
+    db.commit()
+    assert _of(_rows(admin_client), sid)[0]["is_provisional"] is True
+
+    item_id = db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id",
+        (sid,)).fetchone()[0]
+    create_invoice(db, sid, "INV-LATE-REP",
+                   lines=[{"sale_item_id": item_id, "quantity": 3}],
+                   invoice_date="2026-02-01")
+
+    row = _of(_rows(admin_client), sid)[0]
+    assert row["quantity"] == 3
+    assert row["total_price"] == 30
+    assert row["is_provisional"] is False
+    assert row["invoice_date"] == "2026-02-01"
+    assert db.execute("SELECT stage FROM sales WHERE id = %s",
+                      (sid,)).fetchone()[0] == "payment_due"
