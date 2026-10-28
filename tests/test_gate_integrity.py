@@ -7,8 +7,8 @@ These tests verify:
 Phase 3-A:
 1. lc_received -> shipment_ongoing requires no invoice (invoices are created
    in Shipment Ongoing)
-2. shipment_ongoing -> payment_due requires at least one invoice that has been
-   booked (booking is where production is proven)
+2. shipment_ongoing -> payment_due requires at least one invoice that has
+   shipped (an actual ship date starts the payment clock)
 3. Direct move on LC-linked sale to shipment_ongoing is refused (via_lc=False)
 
 Phase 3-B:
@@ -148,8 +148,8 @@ def test_move_to_shipment_ongoing_with_invoice_allowed(db):
     assert stage == "shipment_ongoing"
 
 
-def test_move_to_payment_due_without_a_booked_invoice_rejected(db):
-    """An invoice that was never booked cannot carry the sale to payment_due."""
+def test_move_to_payment_due_without_a_shipped_invoice_rejected(db):
+    """An invoice that was never shipped cannot carry the sale to payment_due."""
     co = _company(db)
     sid = _sale(db, co)
     move_sale_to_stage(db, sid, "lc_received")
@@ -162,8 +162,8 @@ def test_move_to_payment_due_without_a_booked_invoice_rejected(db):
     assert stage == "shipment_ongoing"
 
 
-def test_move_to_payment_due_with_a_booked_invoice_allowed(db):
-    """A booked invoice clears the Payment Due gate."""
+def test_move_to_payment_due_with_a_shipped_invoice_allowed(db):
+    """A shipped invoice clears the Payment Due gate."""
     co = _company(db)
     sid = _sale(db, co, product="Product X")
     move_sale_to_stage(db, sid, "lc_received")
@@ -171,14 +171,16 @@ def test_move_to_payment_due_with_a_booked_invoice_allowed(db):
     move_sale_to_stage(db, sid, "shipment_ongoing")
     # Add recipe with ingredient
     _recipe(db, co, "Product X")
-    # Record production run linked to the invoice, then book it.
+    # Record production run linked to the invoice, book it, then ship it.
     inv_row = db.execute("SELECT id FROM invoices WHERE sale_id = %s", (sid,)).fetchone()
     invoice_id = inv_row[0]
     _production_run(db, co, f"Recipe-Product X", 100, [invoice_id])
     assert book_invoice(db, invoice_id, "2026-11-01") is True
+    # Status-only ship keeps this test on the gate, not on ship_invoice.
+    _ship_invoice(db, invoice_id)
     # Now move to payment_due should succeed
     result = move_sale_to_stage(db, sid, "payment_due")
-    assert result is True, "Should allow move with a booked invoice"
+    assert result is True, "Should allow move with a shipped invoice"
     stage = db.execute("SELECT stage FROM sales WHERE id = %s", (sid,)).fetchone()[0]
     assert stage == "payment_due"
 
@@ -210,10 +212,10 @@ def test_direct_move_via_lc_true_allowed(db):
     assert stage == "shipment_ongoing"
 
 
-def test_one_booked_invoice_is_enough_while_a_sibling_stays_behind(db):
-    """Invoices advance independently: one booked invoice opens Payment Due.
+def test_one_shipped_invoice_is_enough_while_a_sibling_stays_behind(db):
+    """Invoices advance independently: one shipped invoice opens Payment Due.
 
-    An unbooked sibling stays in Shipment Ongoing; it does not hold the sale
+    An unshipped sibling stays in Shipment Ongoing; it does not hold the sale
     back and it does not travel with it.
     """
     co = _company(db)
@@ -238,17 +240,18 @@ def test_one_booked_invoice_is_enough_while_a_sibling_stays_behind(db):
     _recipe(db, co, "Product A")
     _production_run(db, co, "Recipe-Product A", 100, [inv_a])
     assert book_invoice(db, inv_a, "2026-11-01") is True
+    _ship_invoice(db, inv_a)
     assert db.execute("SELECT status FROM invoices WHERE id = %s",
                       (inv_b,)).fetchone()[0] == "planned"
 
-    # A's invoice is booked; B's is not. The sale may move on.
+    # A's invoice is shipped; B's is not. The sale may move on.
     assert move_sale_to_stage(db, sid, "payment_due") is True
     assert db.execute("SELECT stage FROM sales WHERE id = %s",
                       (sid,)).fetchone()[0] == "payment_due"
 
 
 def test_advance_sale_respects_barriers(db):
-    """advance_sale should respect the booked-invoice payment barrier."""
+    """advance_sale should respect the shipped-invoice payment barrier."""
     co = _company(db)
     sid = _sale(db, co)
     move_sale_to_stage(db, sid, "lc_received")
@@ -257,18 +260,19 @@ def test_advance_sale_respects_barriers(db):
     assert result == "shipment_ongoing"
     stage = db.execute("SELECT stage FROM sales WHERE id = %s", (sid,)).fetchone()[0]
     assert stage == "shipment_ongoing"
-    # Payment Due requires a booked invoice; an invoice alone is not enough.
+    # Payment Due requires a shipped invoice; an invoice alone is not enough.
     _invoice(db, sid)
     with pytest.raises(SaleNotReadyPastShipment):
         advance_sale(db, sid)
     stage = db.execute("SELECT stage FROM sales WHERE id = %s", (sid,)).fetchone()[0]
     assert stage == "shipment_ongoing"
-    # Once booked, the same advance succeeds.
+    # Once shipped, the same advance succeeds.
     _recipe(db, co, "Product A")
     invoice_id = db.execute(
         "SELECT id FROM invoices WHERE sale_id = %s", (sid,)).fetchone()[0]
     _production_run(db, co, "Recipe-Product A", 100, [invoice_id])
     assert book_invoice(db, invoice_id, "2026-11-01") is True
+    _ship_invoice(db, invoice_id)
     assert advance_sale(db, sid) == "payment_due"
 
 

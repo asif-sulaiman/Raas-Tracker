@@ -93,8 +93,9 @@ def _invoice(db, sale_id, number):
 def _book_invoice_direct(db, sale_id, number):
     """Create and book an invoice without the production dance.
 
-    Payment Due (Phase 2) needs a booked invoice. These tests are about numeric
-    guards, not the booking gate, so the status is set directly.
+    Payment Due (Phase 2) needs a shipped invoice. These tests are about
+    numeric guards, not the booking/shipping gates, so statuses are set
+    directly.
     """
     inv = _invoice(db, sale_id, number)["invoice_id"]
     db.execute("UPDATE invoices SET status = 'booked', approx_ship_date = %s"
@@ -115,7 +116,7 @@ def _ship_invoice_direct(db, sale_id, number):
 def _sale_at_payment_due(db):
     """A sale parked in ``payment_due`` — the state the cascade completes FROM."""
     sid = _sale(db)
-    _book_invoice_direct(db, sid, "INV-DUE")
+    _ship_invoice_direct(db, sid, "INV-DUE")
     move_sale_to_stage(db, sid, "payment_due", "test")
     return sid
 
