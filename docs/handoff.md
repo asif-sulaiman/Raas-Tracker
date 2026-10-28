@@ -5,6 +5,97 @@
 
 ---
 
+## 2026-10-28 — INVOICE-MATURITY Phase 2 (per-invoice Payment Due + board visibility)
+
+Worktree `O:/Projects/Raas-Tracker-worktrees/invoice-shipment-gate`, branch
+`feat/invoice-start-at-shipment`. Phase 2 of the approved 7-phase plan
+(`~/.qoder/plans/warm-cave-stag.md`): the **actual ship date** — not the booking —
+is what opens Payment Due, and invoices are visible on the board.
+
+### What shipped
+
+- **Sale gate = ≥1 shipped invoice.** `shipped_invoice_readiness(conn, sale_ids)`
+  in `sales.py` returns `shipped_ok` (any non-void invoice `shipped`/`paid`),
+  `all_shipped_ok` (every non-void invoice `shipped`/`paid`) and a detail count.
+  Moving a sale into `payment_due` (explicitly or via `move_sale_to_stage`)
+  raises `SaleNotReadyPastShipment` → **409** unless `shipped_ok`. A
+  booked-but-unshipped invoice no longer qualifies.
+- **`ship_invoice` auto-advances.** After the shipment INSERT and the two
+  audits (`SHIPMENT_RECORD`, `INVOICE_SHIP`), a sale still in
+  `shipment_ongoing` is moved to `payment_due` through `move_sale_to_stage`,
+  which writes the stage history and the `SALE_MOVE` audit. Shipping one
+  invoice does **not** wait for its siblings. A sale with no LC advances on its
+  own ship.
+- **LC is a container.** `check_lc_shipment_ready` now returns `shipped_ok` and
+  `all_shipped_ok`; the LC payment_due gate (`move_lc_stage`, Flask's LC move
+  route, and both 409 payloads) uses **`all_shipped_ok`** and the missing-item
+  text `invoices: every invoice must ship first`. `_sync_lc_payment_due` runs
+  after a ship and advances the LC only when every non-void invoice under it has
+  shipped, moves any child PI still behind with the LC (stage history
+  "Every invoice under the LC has shipped" + `SALE_MOVE`), and leaves PIs with
+  uninvoiced quantity untouched — they carry forward.
+- **`GET /api/sales` attaches invoices.** `_attach_invoice_summaries` joins the
+  LC terms and the paid total, so each row gains
+  `invoices[{invoice_id, invoice_number, status, amount, paid_amount,
+  maturity_date, payment_terms, tenor_days}]` (LC rows too, through the
+  nesting) plus `has_uninvoiced_remainder` (PI quantity > invoiced quantity).
+- **Board UI.** `SaleCard` renders an invoice section (number, status chip,
+  amount, `paid $X`, maturity + rose **Overdue** chip, per-invoice next-action
+  button, inline form). `InvoiceStepForm` is the shared book/ship/pay form,
+  extracted from `InvoicePanel`; `utils/invoices.js` holds the status→label and
+  status→next-step maps that `InvoicePanel` now reuses. `utils/sales.js` drops
+  the sale-level action for `shipment_ongoing` (`actionLabel: null`), so there
+  is no "Move to Payment Due" button. `Sales.jsx` posts the three invoice
+  routes, refetches, and on a ship with `has_uninvoiced_remainder` asks
+  "Create more invoices?" before opening the sale's invoice panel.
+
+### Decisions made & why
+
+- **Ship, not booking, opens Payment Due** — the plan's core rule: a booking can
+  slip, an actual ship date cannot.
+- **The LC gate is stricter than the approved plan** (plan said "one shipped
+  invoice"; we use every-invoice-shipped). Per the product rule, the LC is a
+  container whose PIs must not move forward until all invoices created on that
+  basis have real ship dates. The sale-level gate stays "≥1" — a PI advances on
+  its own shipment.
+- **No force-move path.** The gate refuses rather than warns; the UI removed the
+  manual button, so the only way into Payment Due is a real shipment.
+- **Asymmetric advancement is a rendering problem, solved globally.** Board
+  grouping runs once for the whole list (`groupSalesByLc`), the LC card renders
+  in its own column, and advanced or lagging PIs that are not in the LC's column
+  render as standalone `SaleCard`s — so a PI can never disappear off the board.
+- **Invoice summaries carry the LC terms** so the board's Ship form prefills
+  deferred maturity without a second fetch; the server still recomputes.
+
+### Known follow-up
+
+- **Invoices on a PI still nested under its LC card are not rendered inline.**
+  The LC card's nested PI rows keep the LC's own affordances; those invoices are
+  reached through the LC's **Manage invoices** action. Inline rows there need a
+  shared invoice-rows extraction out of `SaleCard` — recorded in `PRD`/`SPEC` as
+  a tracked follow-up, deliberately not done in this phase.
+
+### Gate (all green)
+
+| Gate | Result |
+|---|---|
+| Full backend `python -m pytest tests/ -q` | **1311 passed, 8 skipped** in 1613.58s, exit 0 |
+| New tests | `tests/test_invoice_payment_due.py` (**9**), `SaleCard.test.jsx` (**7**) |
+| `python -m ruff check .` | 63 findings repo-wide, all pre-existing; unchanged from the Phase 1 baseline and none in the changed hunks |
+| `python -m pyright` | 6 errors / 18 warnings — identical to baseline |
+| Frontend `npm test` | **355 passed / 40 files** |
+| `npx oxlint` | 0 errors / 0 warnings |
+| `npx vite build` | succeeded (chunk-size warning only) |
+
+### Next
+
+Phase 3 of the approved plan: the daily reminder cron (at sight +7 days,
+deferred at maturity; in-app bell + email to `NOTIFY_EMAILS` directors only,
+deduped, one 7-day escalation). Phase 4's "late invoicing reopens a completed
+sale" and Phase 5's report grain come after.
+
+---
+
 ## 2026-10-27 — INVOICE-MATURITY Phase 1 (LC terms + per-invoice maturity)
 
 Worktree `O:/Projects/Raas-Tracker-worktrees/invoice-shipment-gate`, branch
