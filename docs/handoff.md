@@ -5,6 +5,87 @@
 
 ---
 
+## 2026-10-28 — INVOICE-MATURITY Phase 5 (sheet-like report rows, per-row money, recipe prod date)
+
+Worktree `O:/Projects/Raas-Tracker-worktrees/invoice-shipment-gate`, branch
+`feat/invoice-start-at-shipment`. Phase 5 of the approved 7-phase plan, revised
+mid-phase by the user: `Prod. Date` comes from **recipe production**, not from
+the invoice.
+
+### What shipped
+
+- **Row grain.** `_commercial_report_base_sql` now returns one row per non-void
+  `invoice_items` line plus one `is_provisional` **remainder** row per PI line
+  where `PI qty − invoiced qty > 0`. A line split across two invoices renders
+  two rows; an over-invoiced line has no remainder; a legacy invoice line with
+  `sale_item_id IS NULL` is its own row and does not reduce a remainder.
+- **Per-row money.** An invoice's payments walk that invoice's lines in
+  `invoice_items.id` order and the last line absorbs the overpayment; a payment
+  with no `invoice_id` walks the sale's rows (`sale_item_id NULLS LAST,
+  invoice_date NULLS LAST, item_id NULLS LAST, is_provisional, product_name`)
+  with the last row absorbing the residue. `due = max(row total − row received,
+  0)` and `payment_status` is decided per row, so one row can be Paid while a
+  sibling still owes.
+- **Row dates.** Invoice rows carry `COALESCE(actual, approx)` as latest ship,
+  the invoice's actual ship date and `COALESCE(invoice maturity, actual ship,
+  sale maturity)`; remainder rows use the sale's shipments and maturity.
+- **`Prod. Date` from recipe production.** `MAX(production_runs.production_date)`
+  over `production_run_links`/`production_runs`/`recipes` for this **sale**,
+  matching the run's `sale_item_id` or the recipe's `company_id` + `product_name`.
+  `production_run_links.invoice_id` is never read.
+- **KPIs on row money.** Summary sums the same rows (`SUM(total_price)`,
+  `SUM(received_amount)`, `SUM(max(total − received, 0))`, overdue restricted to
+  owing past-maturity rows, `COUNT(DISTINCT sale_id)`); the drill-down returns
+  the flat report's rows.
+- **CSV.** 21 columns: `Prod. Date` after `Total Price ($)`, trailing
+  `Provisional`.
+
+### Decisions made & why
+
+- **Production is connected to the recipe batch, not the invoice** (user
+  correction, 2026-10-28). Locked decision #8 of the approved plan said
+  invoice-linked runs set the date. The user overrode it: a run linked to an
+  invoice for another product must not set `Prod. Date`, and one sale's
+  production must not leak into another row. Runs are therefore matched to the
+  **sale** and its product.
+- **The sheet is the contract.** The operator keeps one line per shipment
+  invoice, so the report renders invoice lines as rows and shows uninvoiced
+  quantity as a provisional remainder, rather than collapsing a PI line into a
+  single mixed row.
+- **Allocation is deterministic and total-preserving.** Invoice-first, then
+  legacy sale-level, with the last line/row absorbing the residue, so
+  `SUM(received_amount)` always equals the payments recorded and no cent is
+  double-counted by a multi-line invoice.
+- **A row's money is its own.** Sale-level status could not answer “which
+  invoice is unpaid”; per-row money makes `Paid`/`Partial`/`Overdue` a property
+  of the row that actually carries the receivable.
+
+### Gate (all green)
+
+| Gate | Result |
+|---|---|
+| Full backend `python -m pytest tests/ -q` | **1347 passed, 8 skipped** in 1205.16s, exit 0 |
+| Report suites on the final code | `test_commercial_report.py` + `test_commercial_report_kpis.py` **84 passed** in 105.38s |
+| `python -m ruff check .` | 63 repo-wide findings, unchanged baseline; nothing in the changed hunks |
+| `python -m pyright` | 6 errors / 18 warnings = baseline |
+| Frontend | **not touched** in this phase (Phase 6 is the report UI); vitest/oxlint/build unchanged from Phase 4 |
+
+### Not run
+
+- No frontend change, so no vitest/oxlint/build run and no browser pass in this
+  phase. The report UI still renders the 20-column table without
+  `Prod. Date` and repeats sale-level money until **Phase 6**.
+
+### Next
+
+Phase 6 (report UI): `CommercialTable` gains a `Prod. Date` column and renders
+the per-row money it already receives; skeleton/empty/pagination colspans move
+to 21; the legend and Provisional badge stay; `Reports.jsx` KPIs come from the
+row-level summary. Then Phase 7: docs close-out and the full gate including
+frontend.
+
+---
+
 ## 2026-10-28 — INVOICE-MATURITY Phase 4 (late invoicing reopens the sale)
 
 Worktree `O:/Projects/Raas-Tracker-worktrees/invoice-shipment-gate`, branch

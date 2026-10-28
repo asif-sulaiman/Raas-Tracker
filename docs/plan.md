@@ -595,6 +595,46 @@ frozen on a completed sale.
 **Constraints:** no schema change; the reconciliation runs before the caller's
 commit so the invoice, its audits and the stage move land together.
 
+### Phase 5 — sheet-like report rows, per-row money, recipe prod date ✅ 2026-10-28
+
+The report now mirrors the operator's spreadsheet: every invoice line is a row,
+an uninvoiced remainder is its own provisional row, and the money follows the
+row instead of being repeated at sale level. `Prod. Date` is the latest
+**recipe production** for that sale's product.
+
+| # | Slice | Scope | State |
+|---|---|---|---|
+| 1 | **Row grain** | `_commercial_report_base_sql` rebuilt: `inv_lines` (one row per non-void `invoice_items` line) `UNION ALL` `remainders` (one row per PI line where `PI qty − invoiced qty > 0`, `is_provisional`); over-invoiced lines have no remainder; a legacy line with `sale_item_id IS NULL` is its own row and does not reduce a remainder | ✅ `test_split_pi_line_renders_invoice_row_plus_remainder`, `test_two_lines_on_one_invoice_render_as_two_rows`, `test_line_split_across_two_invoices_renders_both_invoice_rows`, `test_over_invoiced_line_has_no_remainder_row`, `test_legacy_invoice_line_without_sale_item_is_its_own_row` |
+| 2 | **Per-row money** | Invoice payments allocate across that invoice's lines in `invoice_items.id` order (last line absorbs the overpayment); `invoice_id IS NULL` payments allocate across the sale's rows (`sale_item_id NULLS LAST, invoice_date NULLS LAST, item_id NULLS LAST, is_provisional, product_name`, last row absorbs the residue); `due_amount = GREATEST(total_price − received_amount, 0)` per row; `payment_status` is decided per row | ✅ `test_invoice_payments_allocate_to_its_lines`, `test_partial_invoice_payment_allocates_in_line_order_and_last_line_absorbs`, `test_sale_level_legacy_payment_allocates_across_rows`, `test_invoice_row_carries_its_own_money_and_allocation`, `test_due_clamped_at_zero_with_overpayment_on_invoice` |
+| 3 | **Row dates** | Invoice rows: `latest_ship_date = COALESCE(actual, approx)`, invoice actual ship, `maturity = COALESCE(invoice maturity, actual ship, sale maturity)`; remainder rows: sale shipments/shipment date + sale maturity | ✅ `test_row_shape_contract_keys`, `test_report_row_maturity_prefers_the_invoice_maturity` |
+| 4 | **`Prod. Date` from recipe production** | Subquery: `MAX(production_runs.production_date)` over `production_run_links`/`production_runs`/`recipes` for this **sale**, matching the run's `sale_item_id` or the recipe's `company_id`+`product_name`. `production_run_links.invoice_id` is ignored | ✅ `test_prod_date_comes_from_recipe_production_not_the_invoice`, `test_provisional_row_uses_the_sale_product_production_date`, `test_production_for_another_sale_does_not_leak_into_this_row` |
+| 5 | **KPIs on row money** | Summary aggregates the same `base` rows: `SUM(total_price)`, `SUM(received_amount)`, `SUM(GREATEST(total − received, 0))`, overdue restricted to past-maturity owing rows, `COUNT(DISTINCT sale_id)`; drill-down rows equal the flat report | ✅ `test_summary_kpis_use_displayed_row_totals`, `test_report_kpi_received_equals_sum_of_row_payments`, `test_report_kpi_due_equals_row_totals_minus_received`, `test_mixed_sale_kpis_and_detail_use_displayed_line_totals` |
+| 6 | **CSV** | 21 columns: `Prod. Date` after `Total Price ($)`, trailing `Provisional` | ✅ `test_export_marks_provisional_rows`, `test_export_carries_the_production_date` |
+
+**Revision of the approved plan (user decision, 2026-10-28):** locked decision
+#8 said `Prod. Date` came from "runs linked to the invoice matching the line
+product, falling back to the sale's production." The user corrected this:
+production is connected to **recipe production**, not to an invoice. The
+implemented rule matches runs to the **sale** (by `sale_item_id` or by
+`recipes.company_id` + `product_name`) and never reads
+`production_run_links.invoice_id`, so an invoice-linked run for a different
+product cannot set the date and one sale's production cannot leak into another.
+
+**Locked decisions:** the row grain is the invoice line plus one remainder;
+money is per row with invoice-first allocation and last-line residue
+absorption; a payment never needs an invoice to be reported; `Prod. Date` is
+recipe-produced for the sale's product.
+
+**Constraints:** no schema change; parameterised SQL only; the report keeps its
+filters/pagination/export contract, with the CSV at 21 columns.
+
+**Gate run (2026-10-28):** backend **1347 passed / 8 skipped** in 1205.16s
+(13 net-new report tests; the existing report suites were rewritten for the new
+grain); ruff **63** repo-wide findings, the unchanged baseline, nothing in the
+changed hunks; pyright **6 errors / 18 warnings** = baseline. Frontend is
+untouched in this phase (Phase 6 is the report UI), so vitest/oxlint/build are
+unchanged from Phase 4.
+
 ---
 
 ## 🧾 Phase INV-UNIFY: PI-faithful invoice editor (completed 2026-10-22)
