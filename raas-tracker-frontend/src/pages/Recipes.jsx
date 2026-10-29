@@ -721,7 +721,16 @@ const [showCreateModal, setShowCreateModal] = useState(false);
           onClose={() => setShowProductionRun(false)}
           recipe={selectedRecipe}
           recipeItems={recipeItems}
-          onSaved={() => setShowProductionRun(false)}
+          onSaved={() => {
+            setShowProductionRun(false);
+            // The run is now on the record: re-read the recipe so run_count,
+            // the items and the product lock reflect it. The list alone does
+            // not carry run_count, so it would leave Edit offering a product
+            // change the server refuses with 409.
+            if (selectedRecipe) {
+              fetchRecipeDetail(selectedRecipe.name, selectedRecipe.company_id);
+            }
+          }}
         />
       </div>
     );

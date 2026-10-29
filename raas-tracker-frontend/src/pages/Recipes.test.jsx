@@ -82,6 +82,13 @@ function jsonResponse(data, ok = true, status = 200) {
 const recipeNameFromUrl = (url) =>
   decodeURIComponent(String(url).match(/\/api\/recipes\/([^?]+)/)[1]);
 
+const SALES = [
+  {
+    id: 5, company_id: 7, pi_number: 'PI-2026-014', client_name: 'Globex',
+    stage: 'shipment_ongoing',
+  },
+];
+
 function installFetch({
   lcs = OPEN_LCS,
   lcDetail = LC_DETAIL,
@@ -93,11 +100,18 @@ function installFetch({
   putError = null,
 } = {}) {
   const state = { recipes: [...recipes] };
+  // A run created from the production modal changes what the detail reports;
+  // tests can watch the page re-read it instead of trusting a stale row.
+  let runs = runCount;
   const fetchMock = vi.fn(async (url, options) => {
     const u = String(url);
     const method = options?.method || 'GET';
     if (u.includes('/api/auth/me')) {
       return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
+    }
+    if (u.includes('/produce') && method === 'POST') {
+      runs = Math.max(runs, 1);
+      return jsonResponse({ success: true });
     }
     if (u.includes('/api/recipes') && method === 'POST') {
       const body = JSON.parse(options.body);
@@ -128,15 +142,22 @@ function installFetch({
     if (u.includes('/api/recipes') && method === 'GET' && u.includes('?company_id=')) {
       const name = recipeNameFromUrl(u);
       const rec = state.recipes.find((r) => r.name === name) || { name };
-      return jsonResponse({ recipe: { ...rec, run_count: runCount }, items: recipeItems });
+      return jsonResponse({ recipe: { ...rec, run_count: runs }, items: recipeItems });
     }
     if (u.includes('/api/recipes')) return jsonResponse(state.recipes);
     if (u.includes('/api/chemicals')) return jsonResponse([]);
     if (u.includes('/api/companies')) return jsonResponse(COMPANIES);
+    if (u.includes('/api/production-source')) {
+      return jsonResponse({ products: [{ item_no: 'M-1001', quantity: 120 }] });
+    }
     if (/\/api\/lcs\/\d+/.test(u)) return jsonResponse(lcDetail);
     if (u.includes('/api/lcs')) return jsonResponse(lcs);
     if (/\/api\/sales\/\d+\/invoices/.test(u)) return jsonResponse(invoices);
     if (/\/api\/invoices\/\d+\/items/.test(u)) return jsonResponse(invoiceItems);
+    if (u.includes('/api/sales')) {
+      // The real route is paginated; the production modal must read this shape.
+      return jsonResponse({ sales: SALES, total: SALES.length });
+    }
     return jsonResponse({});
   });
   vi.stubGlobal('fetch', fetchMock);
@@ -408,5 +429,30 @@ describe('Recipe revision', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /Go for Production/ }));
     expect(await screen.findByText('PI-2026-014 - Renamed · 1 ingredient')).toBeTruthy();
+  });
+
+  it('re-reads the recipe after a production run so the product locks', async () => {
+    renderRecipes({
+      recipes: [RECIPE_ROW],
+      recipeItems: [{ chemical_name: 'Caustic Soda', percentage: 40 }],
+    });
+    await openRecipeDetail();
+    fireEvent.click(screen.getByRole('button', { name: /Go for Production/ }));
+
+    // The company is preset from the recipe; the PI is the operator's choice.
+    fireEvent.change(await screen.findByLabelText('PI / Sale'), { target: { value: '5' } });
+    await waitFor(() => expect(
+      screen.getByLabelText('Invoice number').querySelector('option[value="9"]'),
+    ).toBeTruthy());
+    fireEvent.click(screen.getByRole('button', { name: /Start Production/ }));
+
+    // The run is real now. Without re-reading, Edit still offers a product
+    // change the server refuses with 409 because run_count never moved.
+    await waitFor(() => expect(
+      screen.queryByRole('heading', { name: 'Go for Production' }),
+    ).toBeNull());
+    await openEditRecipe();
+    await waitFor(() => expect(screen.getByLabelText(/^Product/).disabled).toBe(true));
+    expect(screen.getByText(/Production has run — the product is fixed/)).toBeTruthy();
   });
 });
