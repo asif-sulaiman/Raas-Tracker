@@ -235,11 +235,16 @@ const [showCreateModal, setShowCreateModal] = useState(false);
     setNewYield(match ? String(match.quantity) : '');
   };
 
-  const fetchRecipeDetail = async (name, companyId) => {
+  // The list hands out the row id, so detail reads key off it: a (company,
+  // name) pair that drifted would 404 on a recipe the list is showing. Older
+  // payloads without an id still resolve by name.
+  const fetchRecipeDetail = async (recipe) => {
+    const path = recipe?.id != null
+      ? '/api/recipes/by-id/' + encodeURIComponent(recipe.id)
+      : '/api/recipes/' + encodeURIComponent(recipe.name) +
+        '?company_id=' + encodeURIComponent(recipe.company_id);
     try {
-      const res = await apiFetch(
-        '/api/recipes/' + encodeURIComponent(name) + '?company_id=' + encodeURIComponent(companyId)
-      );
+      const res = await apiFetch(path);
       const data = await res.json();
       if (data.recipe) {
         setSelectedRecipe(data.recipe);
@@ -247,6 +252,13 @@ const [showCreateModal, setShowCreateModal] = useState(false);
         setShowDetail(true);
       }
     } catch (err) {
+      if (err.status === 404) {
+        // Someone deleted it while the list still had the row.
+        toast.error('That recipe no longer exists — the list has been refreshed');
+        setLoading(true);
+        fetchData();
+        return;
+      }
       toast.error(err.message || 'Could not load recipe');
     }
   };
@@ -373,7 +385,7 @@ const [showCreateModal, setShowCreateModal] = useState(false);
       toast.success(finalName !== oldName
         ? `Recipe renamed to "${finalName}"`
         : 'Recipe updated');
-      fetchRecipeDetail(finalName, selectedRecipe.company_id);
+      fetchRecipeDetail({ ...selectedRecipe, name: finalName });
       setLoading(true);
       fetchData();
     } catch (err) {
@@ -396,7 +408,7 @@ const [showCreateModal, setShowCreateModal] = useState(false);
         setAddChemical('');
         setAddPct('');
         toast.success('Ingredient added');
-        fetchRecipeDetail(selectedRecipe.name, selectedRecipe.company_id);
+        fetchRecipeDetail(selectedRecipe);
       } else {
         toast.error('Failed to add ingredient');
       }
@@ -420,7 +432,7 @@ const [showCreateModal, setShowCreateModal] = useState(false);
         setEditItemId(null);
         setEditItemPct('');
         toast.success('Ingredient updated');
-        fetchRecipeDetail(selectedRecipe.name, selectedRecipe.company_id);
+        fetchRecipeDetail(selectedRecipe);
       }
     } catch (err) {
       toast.error(err.message || 'Could not update ingredient');
@@ -443,7 +455,7 @@ const [showCreateModal, setShowCreateModal] = useState(false);
       const data = await res.json();
       if (data.success) {
         toast.success('Ingredient removed');
-        fetchRecipeDetail(selectedRecipe.name, selectedRecipe.company_id);
+        fetchRecipeDetail(selectedRecipe);
       }
     } catch (err) {
       toast.error(err.message || 'Could not remove ingredient');
@@ -734,7 +746,7 @@ const [showCreateModal, setShowCreateModal] = useState(false);
             // not carry run_count, so it would leave Edit offering a product
             // change the server refuses with 409.
             if (selectedRecipe) {
-              fetchRecipeDetail(selectedRecipe.name, selectedRecipe.company_id);
+              fetchRecipeDetail(selectedRecipe);
             }
           }}
         />
@@ -795,7 +807,7 @@ const [showCreateModal, setShowCreateModal] = useState(false);
                 <td className="px-4 py-3 text-slate-500 dark:text-slate-400 text-xs">{recipe.created || '—'}</td>
                 <td className="px-4 py-3">
                   <div className="flex items-center justify-end gap-1.5">
-                    <Button variant="ghost" size="sm" icon={Eye} onClick={() => fetchRecipeDetail(recipe.name, recipe.company_id)}>
+                    <Button variant="ghost" size="sm" icon={Eye} onClick={() => fetchRecipeDetail(recipe)}>
                       View
                     </Button>
                     {isAdmin && (

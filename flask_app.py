@@ -141,8 +141,8 @@ print("ProxyFix: X-Forwarded-For trust "
 
 from chem_stock import (
     get_connection, get_all_chemicals, update_stock, add_chemical, set_reorder_level,
-    add_recipe, get_recipe_by_name, add_recipe_item, list_recipes, find_recipe,
-    list_recipe_items, update_recipe, update_recipe_item, delete_recipe_item,
+    add_recipe, get_recipe_by_name, get_recipe_by_id, add_recipe_item, list_recipes, find_recipe,
+    list_recipe_items, list_recipe_items_by_id, update_recipe, update_recipe_item, delete_recipe_item,
     delete_recipe, generate_report, generate_multi_recipe_report, export_report_to_csv,
     compare_stock_upload, save_upload, get_upload_history, get_upload_results,
     get_unit_conversion, convert_quantity, get_all_unit_conversions, add_unit_conversion,
@@ -1398,6 +1398,26 @@ def api_recipe_detail(name):
         recipe["run_count"] = conn.execute(
             "SELECT COUNT(*) FROM production_runs WHERE recipe_id = %s",
             (recipe["id"],)).fetchone()[0]
+    conn.close()
+    if not recipe:
+        return jsonify({"error": "Recipe not found"}), 404
+    return jsonify({"recipe": recipe, "items": items})
+
+
+@app.route("/api/recipes/by-id/<int:recipe_id>")
+def api_recipe_detail_by_id(recipe_id):
+    # The list already hands out the row id, and it is globally unique, so a
+    # detail read cannot miss on a stale (company_id, name) pair. The payload
+    # is the same shape as the name route.
+    conn = get_db()
+    recipe = get_recipe_by_id(conn, recipe_id)
+    if recipe:
+        items = list_recipe_items_by_id(conn, recipe_id)
+        recipe["run_count"] = conn.execute(
+            "SELECT COUNT(*) FROM production_runs WHERE recipe_id = %s",
+            (recipe_id,)).fetchone()[0]
+    else:
+        items = []
     conn.close()
     if not recipe:
         return jsonify({"error": "Recipe not found"}), 404

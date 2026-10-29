@@ -5,6 +5,7 @@ import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/re
 import { MemoryRouter } from 'react-router-dom';
 import { AuthProvider } from '../context/AuthContext';
 import { ConfirmProvider } from '../context/ConfirmContext';
+import { toast } from 'sonner';
 import Recipes from './Recipes';
 
 vi.mock('sonner', () => {
@@ -97,6 +98,7 @@ function installFetch({
   recipes = [],
   recipeItems = [],
   runCount = 0,
+  detailMissing = false,
   putError = null,
 } = {}) {
   const state = { recipes: [...recipes] };
@@ -138,6 +140,14 @@ function installFetch({
         };
       }
       return jsonResponse({ success: true, name: nextName });
+    }
+    const byId = u.match(/\/api\/recipes\/by-id\/(\d+)/);
+    if (byId && method === 'GET') {
+      const rec = state.recipes.find((r) => String(r.id) === byId[1]);
+      if (!rec || detailMissing) {
+        return jsonResponse({ error: 'Recipe not found' }, false, 404);
+      }
+      return jsonResponse({ recipe: { ...rec, run_count: runs }, items: recipeItems });
     }
     if (u.includes('/api/recipes') && method === 'GET' && u.includes('?company_id=')) {
       const name = recipeNameFromUrl(u);
@@ -379,6 +389,45 @@ async function openEditRecipe() {
   return screen.findByRole('heading', { name: 'Edit Recipe' });
 }
 
+describe('Recipe detail lookup', () => {
+  it('opens the detail by row id, not by company and name', async () => {
+    const { fetchMock } = renderRecipes({ recipes: [RECIPE_ROW] });
+    await openRecipeDetail();
+
+    await waitFor(() => expect(called(fetchMock, '/api/recipes/by-id/3')).toBe(true));
+    // The name route misses whenever the pair drifts — the live 404 — so the
+    // detail must not depend on it while a row id is available.
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('?company_id=')))
+      .toBe(false);
+  });
+
+  it('refreshes the list when the recipe was deleted before View', async () => {
+    const { fetchMock } = renderRecipes({ recipes: [RECIPE_ROW], detailMissing: true });
+    const listCalls = () => fetchMock.mock.calls.filter(
+      ([url, options]) => String(url).endsWith('/api/recipes') && (options?.method || 'GET') === 'GET',
+    ).length;
+    const before = listCalls();
+
+    fireEvent.click(await screen.findByRole('button', { name: /View/ }));
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(
+      expect.stringContaining('no longer exists'),
+    ));
+    // A 404 by id means the row is gone, not that the request was wrong.
+    await waitFor(() => expect(listCalls()).toBeGreaterThan(before));
+  });
+
+  it('falls back to the name route for a row without an id', async () => {
+    const { fetchMock } = renderRecipes({ recipes: [{ ...RECIPE_ROW, id: undefined }] });
+    await openRecipeDetail();
+
+    await waitFor(() => expect(
+      called(fetchMock,
+        '/api/recipes/PI-2026-014%20-%20Caustic%20Soda%2050%25?company_id=7')
+    ).toBe(true));
+  });
+});
+
 describe('Recipe revision', () => {
   it('renames from the edit form and follows the server-returned name', async () => {
     const { fetchMock } = renderRecipes({ recipes: [RECIPE_ROW] });
@@ -403,11 +452,9 @@ describe('Recipe revision', () => {
     });
 
     // The detail view follows the returned name, so the next item call cannot
-    // hit the old one.
+    // hit the old one. It re-reads by row id, which a rename cannot move.
     await screen.findByRole('heading', { name: 'PI-2026-014 - Renamed' });
-    await waitFor(() => expect(
-      called(fetchMock, '/api/recipes/PI-2026-014%20-%20Renamed?company_id=7')
-    ).toBe(true));
+    await waitFor(() => expect(called(fetchMock, '/api/recipes/by-id/3')).toBe(true));
 
     // And the list row is no longer under the old name.
     fireEvent.click(screen.getByRole('button', { name: /Back to recipes/ }));

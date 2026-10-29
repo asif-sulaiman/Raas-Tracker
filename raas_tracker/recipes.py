@@ -100,19 +100,40 @@ def add_recipe(conn: psycopg.Connection, name: str, total_quantity: float = 1, w
         return False
 
 
+_RECIPE_COLUMNS = (
+    "r.id, r.name, r.total_quantity, r.water_percentage, r.created_date, "
+    "r.company_id, r.product_name, c.name"
+)
+
+
+def _recipe_dict(row) -> Dict[str, Any]:
+    return {"id": row[0], "name": row[1], "total_quantity": row[2], "water_percentage": row[3], "created": row[4],
+            "company_id": row[5], "product_name": row[6], "company_name": row[7]}
+
+
 def get_recipe_by_name(conn: psycopg.Connection, company_id: int, name: str) -> Optional[Dict[str, Any]]:
     """Get recipe info by name for a specific company."""
     cursor = conn.execute(
-        "SELECT r.id, r.name, r.total_quantity, r.water_percentage, r.created_date, "
-        "r.company_id, r.product_name, c.name FROM recipes r "
+        "SELECT " + _RECIPE_COLUMNS + " FROM recipes r "
         "LEFT JOIN companies c ON c.id = r.company_id WHERE r.company_id = %s AND lower(r.name) = lower(%s)",
         (company_id, name)
     )
     row = cursor.fetchone()
-    if row:
-        return {"id": row[0], "name": row[1], "total_quantity": row[2], "water_percentage": row[3], "created": row[4],
-                "company_id": row[5], "product_name": row[6], "company_name": row[7]}
-    return None
+    return _recipe_dict(row) if row else None
+
+
+def get_recipe_by_id(conn: psycopg.Connection, recipe_id: int) -> Optional[Dict[str, Any]]:
+    """Get recipe info by row id.
+
+    The id is the identity the recipe list hands the UI, so a detail read
+    cannot miss on a stale (company_id, name) pair.
+    """
+    row = conn.execute(
+        "SELECT " + _RECIPE_COLUMNS + " FROM recipes r "
+        "LEFT JOIN companies c ON c.id = r.company_id WHERE r.id = %s",
+        (recipe_id,)
+    ).fetchone()
+    return _recipe_dict(row) if row else None
 
 
 def find_recipe(conn: psycopg.Connection, company_id: int, name: str) -> Optional[Dict[str, Any]]:
@@ -233,7 +254,11 @@ def list_recipe_items(conn: psycopg.Connection, company_id: int, recipe_name: st
     if not recipe:
         logger.warning("Recipe '%s' not found for company %s.", recipe_name, company_id)
         return []
-    
+    return list_recipe_items_by_id(conn, recipe["id"])
+
+
+def list_recipe_items_by_id(conn: psycopg.Connection, recipe_id: int) -> List[Dict[str, Any]]:
+    """List a recipe's chemicals by row id (id route; name route delegates here)."""
     cursor = conn.execute("""
         SELECT r.name as recipe_name, r.total_quantity, 
                c.name as chemical_name, c.current_qty, c.unit,
@@ -243,7 +268,7 @@ def list_recipe_items(conn: psycopg.Connection, company_id: int, recipe_name: st
           JOIN chemicals c ON ri.chemical_id = c.id
           WHERE ri.recipe_id = %s
           ORDER BY c.name
-      """, (recipe["id"],))
+      """, (recipe_id,))
     
     items = []
     for row in cursor.fetchall():
