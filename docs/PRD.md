@@ -37,7 +37,7 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 ### Must-have (MVP)
 1. **Chemical Inventory:** CRUD, unit conversion, reorder levels, stock delta updates
 2. **Monthly Reconciliation:** PDF/Excel upload → parse → DB compare → mismatch flag → approve → apply to stock
-3. **Recipe Management:** Recipe CRUD, items (chemical + %), water %, total quantity, production reports (CSV/Excel)
+3. **Recipe Management:** Recipe CRUD sourced from the live pipeline (running LC → open PI → invoice in production → product), user-typed names with the PI/product as a hint, revision of name, product, total quantity and water after creation, items (chemical + %), production reports (CSV/Excel)
 4. **Sales Pipeline:** Stages (PI → LC → shipment → payment → completed), PI parse (PDF/`.docx`), LC/shipment/payment entry, CSV export
 5. **Unit Conversions:** Custom factor bidirectional conversions, default seeds (KG↔G, L↔ML, DRUM↔L/KG…)
 6. **Audit Log:** Log all important actions (who, what, when, old/new values)
@@ -79,10 +79,21 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 5. PIs under one LC start together, but once an invoice ships ahead of its siblings a PI can leave its LC's column: the board still shows one LC card (with its PIs nested) in the LC's own stage, and an advanced PI renders as its own sale card in the later stage until the LC catches up
 6. The board shows the **four live stages only** (PI Issued, LC Received, Shipment Ongoing, Payment Due). Completed sales leave the board but stay in the commercial report, where they can be corrected. **Every sale card lists its invoices** at every stage where invoices exist — number, state (`Payment due` for shipped, `Completed` for paid), amount/paid, maturity and an **Overdue** chip — each with its own next action and inline form (book, ship with actual date, record payment) so the operator never has to open the modal. A PI still nested inside its LC card stays reachable through that LC's **Manage Invoices** action. Shipment Ongoing has no sale-level action (shipping the invoice is the action); Payment Due keeps **Manage Invoices**, opening that sale's invoice editor. After shipping an invoice whose PI still has uninvoiced quantity, the board asks whether more invoices will be created.
 
-### Flow 4: Recipe/Production Reports
-1. User goes to **Reports** → selects recipes → enters production quantity → **Generate**
-2. System calculates chemical quantities per recipe item % for the batch
-3. **Export CSV** → file downloads
+### Flow 4: Recipe Creation, Revision & Reports
+1. **New Recipe** → Company → **LC** → **PI** → **Invoice** → **Product** → name → total quantity / water %
+   - The LC list is server-filtered to LCs with at least one **open child PI** (`GET /api/lcs?open_only=true`). A paid/closed LC never appears, and neither does a stale `lc_received` LC whose PIs are all completed; completion is derived from the children, not the LC's own stage.
+   - The PI list drops completed PIs. A PI with no invoice in `planned`/`produced` stays visible but disabled.
+   - The invoice list is `planned`/`produced` only: `booked`, `shipped` and `paid` are past production.
+   - Products come from the selected invoice's lines; a product that already has a company recipe is marked `· recipe exists`.
+   - The name is **typed by the user**, never auto-filled. One recipe covers **one product**, so a PI with several products gets several recipes, each named by the user; the selected PI and product appear beneath the field as a hint.
+   - Total Quantity prefills from the selected product's invoiced quantity. It is the batch basis for displays and reports, **not a production cap**: the production quantity is entered when producing. Water % is metadata — it is never deducted from stock.
+2. **Revise** → recipe detail → **Edit**: name, product, total quantity and water.
+   - Rename is always allowed: production runs and stock history link by `recipe_id`, so the past keeps its old name in audit and stock reasons while the recipe moves.
+   - Names are unique per company **ignoring case** (the DB index compares exact bytes) — a clash is a 409 shown inline in the form.
+   - The product may be rebound before any production run exists, to any product on the company's PI **or** invoice lines (invoice lines are snapshots, so a renamed PI line can leave the old product there). After a run the product is fixed (409): readiness and the commercial report key off `recipes.product_name`.
+3. User goes to **Reports** → selects recipes → enters production quantity → **Generate**
+4. System calculates chemical quantities per recipe item % for the batch
+5. **Export CSV** → file downloads
 
 ### Flow 5: Admin Setup & User Management
 1. First run → `/setup` page → enter setup token printed to console → first admin created
@@ -101,7 +112,7 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
    - **Book** (approx. ship date) → `booked`
    - **Ship** (actual date) → `shipped` + shipment record carrying the invoice's own `invoice_date`, and its maturity stamped from the LC terms. **Shipping moves the sale from Shipment Ongoing to Payment Due in the same transaction**; an unshipped sibling stays behind and advances on its own later. When the LC's last invoice ships, the LC advances too and carries any PI still waiting on an invoice. Shipping a `planned` or `produced` invoice is refused (**409**, "book first").
    - **Pay** → `paid` once payments cover the amount — `paid` never reverts, and a payment on a `paid` invoice is refused (**409**). Partial payments keep the invoice `shipped` until covered. Paying a `planned`, `produced`, or `booked` invoice is refused (**409**, "ship first").
-   - **Production before booking:** `Book` is refused (409) until every product on the invoice has a company recipe **and** a production run made from the **recipe page** and linked to **that** invoice. Booking commits to a real shipment, so an unproduced invoice cannot be booked.
+   - **Production before booking:** `Book` is refused (409) until every product on the invoice has **at least one of the company's recipes** (any recipe for that product counts — two recipes for one product are normal) **and** a production run made from the **recipe page** and linked to **that** invoice. Booking commits to a real shipment, so an unproduced invoice cannot be booked.
    - The check is **per invoice**, so sibling invoices proceed independently — one being produced neither blocks nor unlocks another.
    - It is re-checked at both `planned` and `produced`, because the `produced` flag alone is set by the *first* linked run and would read satisfied on a multi-product invoice whose later products are still unbuilt. The panel therefore renders `Book` from the server's `can_book` / `book_blocked_reason` (`GET /api/sales/<id>/invoices`) rather than from the status, so a disabled button and a server refusal always agree.
 9. **Completion is defined by invoices, not the PI.** A sale in Payment Due completes the moment it has at least one invoice and every one of them is `paid`; the money compared is `SUM(invoice_items.line_total)`, so an invoice set that bills less than the PI still settles the sale. A payment edit, a payment delete, or an invoice void that leaves an invoice unpaid reopens the completed sale to Payment Due. **Late invoicing reopens too:** adding an invoice — one at a time or as a batch — to a completed sale reopens it immediately, because the new `planned` invoice is money still to be collected; the parent LC reverts with it, and the late invoice then walks the normal Book → Ship → Pay path so the sale can complete again. Creating an invoice on a sale in Shipment Ongoing or Payment Due changes nothing about its stage. A sale with no invoices cannot complete (**409**, "no invoices").
@@ -133,7 +144,7 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 | Table | Key Columns | Purpose |
 |---|---|---|
 | `chemicals` | id, name (unique, case-insensitive idx), current_qty, balance_last_month, unit, last_updated, reorder_level | Chemical master data |
-| `recipes` | id, name (unique), total_quantity, water_percentage, created_date | Recipe header |
+| `recipes` | id, company_id (FK), name, product_name, total_quantity, water_percentage, created_date | Recipe header. One recipe per product; `UNIQUE (company_id, name)` (case-sensitive index, all lookups are `lower()`), so a rename checks uniqueness ignoring case. `product_name` is what readiness and the commercial report key off |
 | `recipe_items` | id, recipe_id (FK), chemical_id (FK), percentage, required_qty_per_unit | Recipe ingredients |
 | `uploads` | id, filename, upload_date, file_type, status, total_chemicals, matched, mismatches..., match_percentage | Upload metadata |
 | `upload_rows` | id, upload_id (FK), chemical_name, batch_number, expiry_date, upload_unit, balance_last_month, balance_this_month, matched_in_db, unit_match | Upload detail rows |

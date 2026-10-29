@@ -725,6 +725,43 @@ parameterised SQL only; frontend routes `entity_type='lc'` to `/sales`.
 
 ---
 
+### Phase 9 — recipe sourcing from running LCs + revision ✅ 2026-10-29
+
+The **Create New Recipe** dialog listed every LC of the company — including paid,
+completed ones — labelled with raw stage codes, and every invoice of a PI,
+including `booked`/`shipped`/`paid`. A recipe is a production formula for an
+**invoice product**, so the only meaningful cascade is: LC still running →
+PI with an invoice in production → invoice in `planned`/`produced` → product.
+The name is user-typed (the PI and product are a hint; one recipe per product).
+A recipe created by mistake is revisable afterwards.
+
+| # | Slice | Scope | Commit |
+|---|---|---|---|
+| 1 | **LC + invoice sourcing** | `list_lcs(open_only)` keyed on **open child PIs** (never the LC's own stage — completion is derived and lags) + grouped `open_pi_count`/`producible_pi_count`; `get_lc(open_only)` with `client_name`/`company_id`/`producible_invoice_count`; `list_invoices(producible_only)` with public `BOOKABLE_STATUSES`; route params `open_only`/`producible` | `a8f0878` |
+| 2 | **Readiness across recipes** | `production_readiness`/`invoice_production_readiness` select **all** recipe ids for the product and accept a run from any of them (the old `fetchone()` picked one recipe, so a sibling recipe could block booking forever). `missing_recipes` still means "none at all" | `61cc694` |
+| 3 | **Create modal** | Company → LC → PI → Invoice → Product → name → quantity/water; zero-work options visible but disabled; `· recipe exists`; quantity prefills from the invoice line (batch basis, not a cap); LC/PI/invoice stay selected after create; `/sales` empty-state link | `c58863c` |
+| 4 | **Revision backend** | `PUT /api/recipes/<name>` accepts `new_name`/`product_name`; resolve once, update by `id`; `list_recipe_items` by `recipe_id` (case-only rename used to lose ingredients); `lower(name)` uniqueness + `IntegrityError` backstop → `RecipeNameConflict` (409); product frozen after a run → `RecipeProductLocked` (409), checked before registration; audit records old → new name + changed fields; detail gains `run_count` | `71f49d5` |
+| 5 | **Revision UI + name consumers** | Edit Recipe: name, product (disabled when `run_count > 0`), quantity, water; adopts the server-returned name in `selectedRecipe`, the list row, the follow-up detail fetch and the re-keyed `ProductionRunModal`; 409 inline with the form open; the modal no longer synthesises an option for a stale name | `38d6902` |
+| 6 | **Docs + gate** | PRD/SPEC/plan; full pytest + ruff + pyright + vitest + oxlint + vite build → `react_frontend/` | this commit |
+
+**Locked decisions:** `open_only` is child-based, because `_sync_lc_completion`
+only runs on sale moves, `attach_pis` allows late attaches and `detach_pi` never
+resyncs — an LC-stage filter would show paid LCs and hide live ones. `producible`
+is `planned`/`produced`: `booked` is past production and `shipped`/`paid` are
+already refused by the service. A rename does not rewrite history — runs link by
+`recipe_id`, frozen items carry chemical names, audit/stock reasons are text. The
+product is frozen after a run because readiness and the commercial report key off
+`recipes.product_name`.
+
+**Constraints:** no schema change; `production_runs.sale_item_id` stays NULL
+(name-based matching remains a documented limitation); production quantity stays
+free of `total_quantity`; water is metadata. Out of scope and flagged:
+`ProductionRunModal` still offers all company recipes rather than product-matched
+ones; `Reports.jsx` posts bare recipe names; `DELETE` of a produced recipe still
+500s on FK RESTRICT; legacy `lc_number`-only PIs are not in the cascade.
+
+---
+
 ## 🧾 Phase INV-UNIFY: PI-faithful invoice editor (completed 2026-10-22)
 
 One invoice-entry surface instead of two divergent ones (`InvoiceCreateForm`
