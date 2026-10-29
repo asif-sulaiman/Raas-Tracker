@@ -773,6 +773,16 @@ create, rename propagation into the list/detail/production modal, product rebind
 before a run, product lock after it, and set-based readiness (a run on a sibling
 recipe made INV-014 bookable while the first recipe still had 0 runs).
 
+**Detail lookup by row id (2026-10-29).** Live View reported "Recipe not found"
+for a recipe the list was showing; the backend, the row and the list response
+(`company_id` included) were all correct, so the miss was a client-supplied
+`(company_id, name)` pair that did not match. Detail reads now key off
+`GET /api/recipes/by-id/<id>` — the id the list already hands out — and the
+`(company, name)` route stays as the fallback for payloads without one. A 404
+now means the row is gone: the list refreshes. Mutations still address the
+recipe by name (the detail carries the server's name), and runs link by
+`recipe_id`, so renames stay surgical.
+
 ---
 
 ## 🧾 Phase INV-UNIFY: PI-faithful invoice editor (completed 2026-10-22)

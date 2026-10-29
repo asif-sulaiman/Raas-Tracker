@@ -318,6 +318,49 @@ def test_route_put_product_after_run_is_409(admin_client, db):
     assert r.status_code == 409, r.get_json()
 
 
+def test_route_detail_by_id_resolves_without_the_company_pair(admin_client, db):
+    """The row id is the identity the list hands out.
+
+    The live "Recipe not found" on View was a detail read whose
+    (company_id, name) pair did not match the row (the backend, the data and
+    the list were all correct). Addressing the row by id makes that class of
+    miss impossible, and the payload keeps the same shape.
+    """
+    co = _company(db)
+    _sale(db, co)
+    recipe = _create_recipe_row(db, co, "PI-REV-1 - By Id")
+    other = _company(db, "Other Co")
+
+    by_id = admin_client.get(f"/api/recipes/by-id/{recipe['id']}")
+    assert by_id.status_code == 200, by_id.get_json()
+    body = by_id.get_json()
+    assert body["recipe"]["id"] == recipe["id"]
+    assert body["recipe"]["name"] == "PI-REV-1 - By Id"
+    assert body["recipe"]["company_id"] == co
+    assert body["recipe"]["run_count"] == 0
+    assert body["items"] == []
+
+    # The name route still scopes by company; only the id route crosses it.
+    assert admin_client.get(
+        f"/api/recipes/PI-REV-1 - By Id?company_id={other}").status_code == 404
+    assert admin_client.get("/api/recipes/by-id/999999").status_code == 404
+
+
+def test_route_detail_by_id_reports_items_and_run_count(admin_client, db):
+    co = _company(db)
+    sale = _sale(db, co)
+    recipe = _create_recipe_row(db, co, "PI-REV-1 - By Id Items")
+    _chemical(db)
+    assert recipesmod.add_recipe_item(db, co, "PI-REV-1 - By Id Items",
+                                      "Caustic Flake", 40)
+    _run(db, recipe["id"], sale)
+
+    body = admin_client.get(f"/api/recipes/by-id/{recipe['id']}").get_json()
+    assert body["recipe"]["run_count"] == 1
+    assert [i["chemical_name"] for i in body["items"]] == ["Caustic Flake"]
+    assert float(body["items"][0]["percentage"]) == 40
+
+
 def test_route_detail_reports_run_count(admin_client, db):
     co = _company(db)
     sale = _sale(db, co)
