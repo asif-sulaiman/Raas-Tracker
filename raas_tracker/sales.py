@@ -3174,12 +3174,15 @@ def production_readiness(conn: psycopg.Connection, company_id: int,
     missing_recipes: List[str] = []
     missing_production: List[str] = []
     for product in sorted(products):
-        recipe = conn.execute(
+        # Every recipe for the product counts, not one arbitrary row: PI-based
+        # names put the same product on several PIs, and a run of the sibling
+        # recipe satisfies the same product just as well.
+        recipe_ids = [r[0] for r in conn.execute(
             """SELECT id FROM recipes
                 WHERE company_id = %s
                   AND lower(product_name) = lower(%s)""",
-            (company_id, product)).fetchone()
-        if not recipe:
+            (company_id, product)).fetchall()]
+        if not recipe_ids:
             missing_recipes.append(product)
             # A product with no recipe cannot have been produced for that
             # recipe either, so produced_ok must also be False for it.
@@ -3190,9 +3193,10 @@ def production_readiness(conn: psycopg.Connection, company_id: int,
                  FROM production_runs pr
                  JOIN production_run_links prl ON prl.run_id = pr.id
                  JOIN invoices i ON i.id = prl.invoice_id
-                WHERE pr.recipe_id = %s
-                  AND i.sale_id = ANY(%s)""",
-            (recipe[0], sale_ids)).fetchall()
+                WHERE pr.recipe_id = ANY(%s)
+                  AND i.sale_id = ANY(%s)
+                LIMIT 1""",
+            (recipe_ids, sale_ids)).fetchone()
         if not run_rows:
             missing_production.append(product)
     return {
@@ -3234,12 +3238,14 @@ def invoice_production_readiness(conn: psycopg.Connection, company_id: int,
     missing_recipes: List[str] = []
     missing_production: List[str] = []
     for product in sorted(products):
-        recipe = conn.execute(
+        # All recipes for the product count (see production_readiness): a run
+        # of the sibling recipe must unlock this invoice too.
+        recipe_ids = [r[0] for r in conn.execute(
             """SELECT id FROM recipes
                 WHERE company_id = %s
                   AND lower(product_name) = lower(%s)""",
-            (company_id, product)).fetchone()
-        if not recipe:
+            (company_id, product)).fetchall()]
+        if not recipe_ids:
             missing_recipes.append(product)
             # No recipe means it cannot have been produced for one either.
             missing_production.append(product)
@@ -3248,10 +3254,10 @@ def invoice_production_readiness(conn: psycopg.Connection, company_id: int,
             """SELECT pr.id
                  FROM production_runs pr
                  JOIN production_run_links prl ON prl.run_id = pr.id
-                WHERE pr.recipe_id = %s
+                WHERE pr.recipe_id = ANY(%s)
                   AND prl.invoice_id = %s
                 LIMIT 1""",
-            (recipe[0], invoice_id)).fetchone()
+            (recipe_ids, invoice_id)).fetchone()
         if not run:
             missing_production.append(product)
     return {
