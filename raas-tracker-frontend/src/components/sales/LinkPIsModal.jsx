@@ -33,6 +33,7 @@ export default function LinkPIsModal({
   const [lcId, setLcId] = useState('');
   const [lcNumber, setLcNumber] = useState('');
   const [lcDate, setLcDate] = useState('');
+  const [shipmentDeadline, setShipmentDeadline] = useState('');
   const [paymentTerms, setPaymentTerms] = useState('at_sight');
   const [tenorDays, setTenorDays] = useState('');
   const [saving, setSaving] = useState(false);
@@ -49,6 +50,7 @@ export default function LinkPIsModal({
       setLcId('');
       setLcNumber('');
       setLcDate('');
+      setShipmentDeadline('');
       setPaymentTerms('at_sight');
       setTenorDays('');
       setError(null);
@@ -168,6 +170,7 @@ export default function LinkPIsModal({
             company_id: companyId,
             lc_number: lcNumber.trim(),
             lc_date: lcDate || null,
+            expiry_date: shipmentDeadline || null,
             payment_terms: paymentTerms,
             tenor_days: paymentTerms === 'deferred' ? Number(tenorDays) : null,
           }),
@@ -359,6 +362,18 @@ export default function LinkPIsModal({
                   type="date"
                   value={lcDate || ''}
                   onChange={(e) => setLcDate(e.target.value)}
+                  className={inputCls}
+                />
+              </div>
+              <div>
+                <label className="text-xs font-medium text-slate-600 dark:text-slate-300">
+                  Latest Date of Shipment
+                </label>
+                <input
+                  aria-label="Latest date of shipment"
+                  type="date"
+                  value={shipmentDeadline || ''}
+                  onChange={(e) => setShipmentDeadline(e.target.value)}
                   className={inputCls}
                 />
               </div>

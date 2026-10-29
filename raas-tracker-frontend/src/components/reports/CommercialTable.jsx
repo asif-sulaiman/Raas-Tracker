@@ -72,9 +72,14 @@ function DetailSkeleton() {
               <th className={TH}>Total ($)</th>
               <th className={TH}>Prod. Date</th>
               <th className={TH}>Invoice Date</th>
-              <th className={TH}>Latest Ship</th>
-              <th className={TH}>Actual Ship</th>
-              <th className={TH}>Maturity</th>
+              <th
+                className={TH}
+                title="LC latest date of shipment — shipment is invalid after this date"
+              >
+                Latest Ship Date
+              </th>
+              <th className={TH}>Actual Ship Date</th>
+              <th className={TH}>Maturity Date</th>
               <th className={TH}>Receive Date</th>
               <th className={TH}>Received ($)</th>
               <th className={TH}>Due ($)</th>
@@ -167,9 +172,14 @@ function DetailTable({ rows, currentPage, pageSize, totalRows, onPageChange, onE
               <th className={TH}>Total ($)</th>
               <th className={TH}>Prod. Date</th>
               <th className={TH}>Invoice Date</th>
-              <th className={TH}>Latest Ship</th>
-              <th className={TH}>Actual Ship</th>
-              <th className={TH}>Maturity</th>
+              <th
+                className={TH}
+                title="LC latest date of shipment — shipment is invalid after this date"
+              >
+                Latest Ship Date
+              </th>
+              <th className={TH}>Actual Ship Date</th>
+              <th className={TH}>Maturity Date</th>
               <th className={TH}>Receive Date</th>
               <th className={TH}>Received ($)</th>
               <th className={TH}>Due ($)</th>

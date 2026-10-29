@@ -116,6 +116,28 @@ describe('LcDetailModal edit + guards', () => {
   });
 });
 
+describe('LcDetailModal latest date of shipment', () => {
+  it('names the deadline in view and edit and still saves expiry_date', async () => {
+    const puts = [];
+    renderDetail({ lc: lcRow([]), puts });
+
+    expect(await screen.findByRole('heading', { name: /LC-100/ })).toBeTruthy();
+    expect(screen.getByText('Latest Date of Shipment')).toBeTruthy();
+    expect(screen.queryByText('Expiry Date')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit LC' }));
+    const input = await screen.findByLabelText('Latest date of shipment');
+    expect(screen.getAllByText(/Shipment after this date is invalid/).length)
+      .toBeGreaterThan(0);
+
+    fireEvent.change(input, { target: { value: '2027-01-15' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }));
+
+    await waitFor(() => expect(puts).toHaveLength(1));
+    expect(puts[0]).toMatchObject({ expiry_date: '2027-01-15' });
+  });
+});
+
 describe('LcDetailModal payment terms', () => {
   it('shows at sight for an LC that carries no tenor', async () => {
     renderDetail({ lc: lcRow([]) });

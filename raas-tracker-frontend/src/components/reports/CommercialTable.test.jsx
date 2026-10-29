@@ -152,9 +152,9 @@ describe('CommercialTable - Detail Mode (groupBy=none)', () => {
     // Phase 6: production date comes from recipe production, not the invoice.
     expect(screen.getByText('Prod. Date')).toBeTruthy();
     expect(screen.getByText('Invoice Date')).toBeTruthy();
-    expect(screen.getByText('Latest Ship')).toBeTruthy();
-    expect(screen.getByText('Actual Ship')).toBeTruthy();
-    expect(screen.getByText('Maturity')).toBeTruthy();
+    expect(screen.getByText('Latest Ship Date')).toBeTruthy();
+    expect(screen.getByText('Actual Ship Date')).toBeTruthy();
+    expect(screen.getByText('Maturity Date')).toBeTruthy();
     expect(screen.getByText('Receive Date')).toBeTruthy();
     expect(screen.getByText('Received ($)')).toBeTruthy();
     expect(screen.getByText('Due ($)')).toBeTruthy();

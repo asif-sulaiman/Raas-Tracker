@@ -236,14 +236,19 @@ export default function LcDetailModal({ lcId, isOpen, onClose, onSaved, onViewPI
                 />
               </div>
               <div>
-                <label className="text-xs font-medium text-slate-600 dark:text-slate-300">Expiry Date</label>
+                <label className="text-xs font-medium text-slate-600 dark:text-slate-300">
+                  Latest Date of Shipment
+                </label>
                 <input
-                  aria-label="Expiry date"
+                  aria-label="Latest date of shipment"
                   type="date"
                   value={expiryDate || ''}
                   onChange={(e) => setExpiryDate(e.target.value)}
                   className={inputCls}
                 />
+                <p className="mt-1 text-[11px] text-slate-400 dark:text-slate-500">
+                  Shipment after this date is invalid — amend the LC to extend it.
+                </p>
               </div>
               <div>
                 <label className="text-xs font-medium text-slate-600 dark:text-slate-300">Bank Reference</label>
@@ -300,7 +305,7 @@ export default function LcDetailModal({ lcId, isOpen, onClose, onSaved, onViewPI
           ) : (
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
               <Field label="LC Date" value={formatDate(lc.lc_date)} />
-              <Field label="Expiry Date" value={formatDate(lc.expiry_date)} />
+              <Field label="Latest Date of Shipment" value={formatDate(lc.expiry_date)} />
               <Field label="Bank Ref" value={lc.bank_ref} mono />
               <Field label="Notes" value={lc.notes} />
               <Field

@@ -48,6 +48,8 @@ describe('entityRoute', () => {
     expect(entityRoute({ entity_type: 'upload' })).toBe('/upload');
     expect(entityRoute({ entity_type: 'chemical' })).toBe('/chemicals');
     expect(entityRoute({ entity_type: 'sale' })).toBe('/sales');
+    // LC shipment-deadline warnings land on the sales board where LCs live.
+    expect(entityRoute({ entity_type: 'lc' })).toBe('/sales');
   });
 
   it('returns null for unknown or missing entities', () => {
