@@ -137,11 +137,22 @@ def create_lc(conn: psycopg.Connection, company_id: int, lc_number: str,
     return lc
 
 
-def get_lc(conn: psycopg.Connection, lc_id: int) -> Optional[dict]:
+def get_lc(conn: psycopg.Connection, lc_id: int,
+           open_only: bool = False) -> Optional[dict]:
     """Return an LC with its linked PIs, or None when missing.
 
-    ``pis`` lists ``{id, pi_number, stage}`` for linked sales, oldest first.
+    ``pis`` lists ``{id, pi_number, stage, client_name, company_id,
+    producible_invoice_count}`` for linked sales, oldest first.
+    ``producible_invoice_count`` counts invoices still in production scope
+    (``planned``/``produced``).
+
+    ``open_only`` drops PIs whose own stage is ``completed``: their work is
+    done, so no recipe can come from them. A PI with zero producible invoices
+    is kept (count ``0``) so the caller can show it disabled rather than hide
+    it — its invoices may simply be past production.
     """
+    from .sales import BOOKABLE_STATUSES
+
     row = conn.execute(
         f"SELECT {_LC_COLS} FROM letters_of_credit WHERE id = %s",
         (lc_id,)).fetchone()
@@ -149,17 +160,36 @@ def get_lc(conn: psycopg.Connection, lc_id: int) -> Optional[dict]:
         return None
     lc = _row_to_dict(row)
     lc["pis"] = [
-        {"id": r[0], "pi_number": r[1], "stage": r[2]}
+        {"id": r[0], "pi_number": r[1], "stage": r[2], "client_name": r[3],
+         "company_id": r[4], "producible_invoice_count": r[5]}
         for r in conn.execute(
-            "SELECT id, pi_number, stage FROM sales WHERE lc_id = %s "
-            "ORDER BY id",
-            (lc_id,)).fetchall()
+            """SELECT s.id, s.pi_number, s.stage, s.client_name, s.company_id,
+                      (SELECT COUNT(*) FROM invoices i
+                        WHERE i.sale_id = s.id AND i.status = ANY(%s))
+                 FROM sales s
+                WHERE s.lc_id = %s AND (%s = FALSE OR s.stage <> %s)
+                ORDER BY s.id""",
+            (list(BOOKABLE_STATUSES), lc_id, open_only, "completed")).fetchall()
     ]
     return lc
 
 
-def list_lcs(conn: psycopg.Connection, company_id=None) -> list:
-    """List LCs (optionally one company's), each with a ``pi_count``."""
+def list_lcs(conn: psycopg.Connection, company_id=None,
+             open_only: bool = False) -> list:
+    """List LCs (optionally one company's), with PI counts per LC.
+
+    Every row carries ``pi_count`` (all linked PIs), ``open_pi_count`` (PIs
+    whose stage is not ``completed``) and ``producible_pi_count`` (PIs with at
+    least one invoice in ``planned``/``produced``).
+
+    ``open_only`` keeps an LC only when it has an open child PI. Completion of
+    an LC is derived and lags — it is synced on sale moves only, late attach
+    can leave an open PI under a ``completed`` LC, and the startup backfill
+    can stamp ``lc_received`` on a group whose PIs are all done — so the
+    children, never the LC's own stage, decide whether work is left.
+    """
+    from .sales import BOOKABLE_STATUSES
+
     if company_id is None:
         rows = conn.execute(
             f"SELECT {_LC_COLS} FROM letters_of_credit ORDER BY id"
@@ -169,12 +199,33 @@ def list_lcs(conn: psycopg.Connection, company_id=None) -> list:
             f"SELECT {_LC_COLS} FROM letters_of_credit "
             "WHERE company_id = %s ORDER BY id",
             (company_id,)).fetchall()
+    if not rows:
+        return []
+    counts = {
+        r[0]: {"pi_count": r[1], "open_pi_count": r[2],
+               "producible_pi_count": r[3]}
+        for r in conn.execute(
+            """SELECT lc_id,
+                      COUNT(*) AS pi_count,
+                      COUNT(*) FILTER (WHERE stage <> %s) AS open_pi_count,
+                      COUNT(*) FILTER (
+                          WHERE EXISTS (SELECT 1 FROM invoices i
+                                         WHERE i.sale_id = s.id
+                                           AND i.status = ANY(%s))
+                      ) AS producible_pi_count
+                 FROM sales s
+                WHERE lc_id = ANY(%s)
+                GROUP BY lc_id""",
+            ("completed", list(BOOKABLE_STATUSES), [r[0] for r in rows])
+        ).fetchall()
+    }
     out = []
     for row in rows:
         lc = _row_to_dict(row)
-        lc["pi_count"] = conn.execute(
-            "SELECT COUNT(*) FROM sales WHERE lc_id = %s", (lc["id"],)
-        ).fetchone()[0]
+        lc.update(counts.get(lc["id"], {"pi_count": 0, "open_pi_count": 0,
+                                        "producible_pi_count": 0}))
+        if open_only and not lc["open_pi_count"]:
+            continue
         out.append(lc)
     return out
 

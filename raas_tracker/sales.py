@@ -2770,13 +2770,21 @@ def _production_blocked_message(missing: List[str]) -> str:
 
 
 # Statuses from which booking is still a legal next step. Anything past these
-# is closed: not bookable, and no production check is worth running.
-_BOOKABLE_STATUSES = ("planned", "produced")
+# is closed: not bookable, and no production check is worth running. They are
+# also exactly the statuses still in production scope — the recipe modal
+# sources invoices from here, because ``booked`` is already past production.
+BOOKABLE_STATUSES = ("planned", "produced")
+_BOOKABLE_STATUSES = BOOKABLE_STATUSES  # legacy private alias
 
 
 def list_invoices(conn: psycopg.Connection, sale_id: int,
-                  with_readiness: bool = False) -> List[Dict[str, Any]]:
+                  with_readiness: bool = False,
+                  producible_only: bool = False) -> List[Dict[str, Any]]:
     """List all invoices for a sale, with amount + paid-to-date per invoice.
+
+    ``producible_only`` narrows the rows to :data:`BOOKABLE_STATUSES`
+    (``planned``/``produced``) — the invoices a recipe can still be built for.
+    Default ``False`` keeps the full history (invoice panel, sale detail).
 
     ``with_readiness`` adds ``can_book`` + ``book_blocked_reason`` so the
     invoice panel can disable its Book action from server truth instead of
@@ -2808,8 +2816,11 @@ def list_invoices(conn: psycopg.Connection, sale_id: int,
                       notes, invoice_date, created_at, maturity_date, amount,
                       (SELECT COALESCE(ROUND(SUM(sp.payment_amount)::numeric, 2)::float8, 0)
                        FROM sale_payments sp WHERE sp.invoice_id = invoices.id) AS paid_amount
-               FROM invoices WHERE sale_id = %s ORDER BY id""",
-            (sale_id,)
+               FROM invoices
+              WHERE sale_id = %s
+                AND (%s = FALSE OR status = ANY(%s))
+              ORDER BY id""",
+            (sale_id, producible_only, list(BOOKABLE_STATUSES))
         ).fetchall()
     ]
     if not with_readiness:
@@ -2819,7 +2830,7 @@ def list_invoices(conn: psycopg.Connection, sale_id: int,
         "SELECT company_id FROM sales WHERE id = %s", (sale_id,)).fetchone()
     company_id = company_row[0] if company_row else None
     for row in rows:
-        if row["status"] not in _BOOKABLE_STATUSES:
+        if row["status"] not in BOOKABLE_STATUSES:
             row["can_book"] = False
             row["book_blocked_reason"] = None
             continue
