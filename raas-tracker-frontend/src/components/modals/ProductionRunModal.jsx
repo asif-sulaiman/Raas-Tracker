@@ -319,15 +319,6 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
   const companyRecipes = recipes.filter((rec) => String(rec.company_id) === companyId);
   const totalProductQty = products.reduce((sum, p) => sum + (Number(p.quantity) || 0), 0);
 
-  // Keep the row's current value selectable even when it belongs to another company.
-  const rowOptions = (row) => {
-    const opts = companyRecipes.slice();
-    if (row.recipe_name && !opts.some((rec) => rec.name === row.recipe_name)) {
-      opts.unshift({ name: row.recipe_name });
-    }
-    return opts;
-  };
-
   return (
     <Modal
       isOpen={isOpen}
@@ -545,7 +536,10 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
                   className={inputCls}
                 >
                   <option value="">Select recipe…</option>
-                  {rowOptions(row).map((rec) => (
+                  {/* A stale name is never offered as a synthetic option: the
+                      parent re-keys this modal on the recipe name and reloads
+                      the list, so a missing row means pick the recipe again. */}
+                  {companyRecipes.map((rec) => (
                     <option key={rec.name} value={rec.name}>{rec.name}</option>
                   ))}
                 </select>

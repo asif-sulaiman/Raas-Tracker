@@ -59,8 +59,12 @@ const [showCreateModal, setShowCreateModal] = useState(false);
   const [loadingPis, setLoadingPis] = useState(false);
   const [loadingInvoiceItems, setLoadingInvoiceItems] = useState(false);
 
+  const [editName, setEditName] = useState('');
+  const [editProduct, setEditProduct] = useState('');
   const [editYield, setEditYield] = useState('');
   const [editWater, setEditWater] = useState('');
+  const [editError, setEditError] = useState(null);
+  const [savingMeta, setSavingMeta] = useState(false);
 
   const [addChemical, setAddChemical] = useState('');
   const [addPct, setAddPct] = useState('');
@@ -301,28 +305,75 @@ const [showCreateModal, setShowCreateModal] = useState(false);
     }
   };
 
+  const openEditMeta = () => {
+    if (!selectedRecipe) return;
+    setEditName(selectedRecipe.name);
+    setEditProduct(selectedRecipe.product_name || '');
+    setEditYield(String(selectedRecipe.total_quantity ?? ''));
+    setEditWater(String(selectedRecipe.water_percentage ?? 0));
+    setEditError(null);
+    setShowEditMeta(true);
+  };
+
   const handleUpdateMeta = async () => {
     if (!selectedRecipe) return;
+    const oldName = selectedRecipe.name;
+    const trimmedName = editName.trim();
+    if (!trimmedName) {
+      setEditError('Recipe name is required');
+      return;
+    }
+    const body = {
+      company_id: selectedRecipe.company_id,
+      total_quantity: parseFloat(editYield) || selectedRecipe.total_quantity,
+      water_percentage: parseFloat(editWater) || selectedRecipe.water_percentage,
+    };
+    if (trimmedName !== oldName) body.new_name = trimmedName;
+    const product = editProduct.trim();
+    if (product && product.toLowerCase() !== (selectedRecipe.product_name || '').toLowerCase()) {
+      body.product_name = product;
+    }
+    setSavingMeta(true);
+    setEditError(null);
     try {
-      const res = await apiFetch('/api/recipes/' + encodeURIComponent(selectedRecipe.name), {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          company_id: selectedRecipe.company_id,
-          total_quantity: parseFloat(editYield) || selectedRecipe.total_quantity,
-          water_percentage: parseFloat(editWater) || selectedRecipe.water_percentage
-        })
-      });
-      const data = await res.json();
-      if (data.success) {
-        setShowEditMeta(false);
-        toast.success('Recipe updated');
-        fetchRecipeDetail(selectedRecipe.name, selectedRecipe.company_id);
-        setLoading(true);
-        fetchData();
+      const res = await apiFetch(
+        '/api/recipes/' + encodeURIComponent(oldName) +
+          '?company_id=' + encodeURIComponent(selectedRecipe.company_id),
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        // A name clash (409) or a frozen product stays here: the form is the
+        // only place the user can correct it.
+        setEditError(data?.error || `Could not update recipe (${res.status})`);
+        return;
       }
+      // The name is the URL key and the key everything else in this page keys
+      // off, so adopt the server's answer everywhere instead of the input.
+      const finalName = data.name || trimmedName;
+      const patch = {
+        name: finalName,
+        total_quantity: body.total_quantity,
+        water_percentage: body.water_percentage,
+        product_name: body.product_name ?? selectedRecipe.product_name,
+      };
+      setRecipes(prev => prev.map(r => (r.id === selectedRecipe.id ? { ...r, ...patch } : r)));
+      setSelectedRecipe(prev => (prev ? { ...prev, ...patch } : prev));
+      setShowEditMeta(false);
+      toast.success(finalName !== oldName
+        ? `Recipe renamed to "${finalName}"`
+        : 'Recipe updated');
+      fetchRecipeDetail(finalName, selectedRecipe.company_id);
+      setLoading(true);
+      fetchData();
     } catch (err) {
-      toast.error(err.message || 'Could not update recipe');
+      setEditError(err.message || 'Could not update recipe');
+    } finally {
+      setSavingMeta(false);
     }
   };
 
@@ -411,11 +462,15 @@ const [showCreateModal, setShowCreateModal] = useState(false);
   if (showDetail && selectedRecipe) {
     const sumPct = recipeItems.reduce((s, i) => s + (i.percentage || 0), 0);
     const waterPct = selectedRecipe.water_percentage || (100 - sumPct);
+    // Readiness and the commercial report key off recipes.product_name, so a
+    // rebind after production would re-attribute history that already ran.
+    const productLocked = (selectedRecipe.run_count || 0) > 0;
 
     return (
       <div className="space-y-6 max-w-7xl mx-auto">
         <div className="flex items-center gap-4">
           <button
+            aria-label="Back to recipes"
             onClick={() => { setShowDetail(false); setSelectedRecipe(null); setLoading(true); fetchData(); }}
             className="p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
           >
@@ -432,11 +487,7 @@ const [showCreateModal, setShowCreateModal] = useState(false);
             </p>
           </div>
 <div className="flex gap-2">
-            <Button variant="secondary" size="sm" icon={Edit3} onClick={() => {
-              setEditYield(String(selectedRecipe.total_quantity));
-              setEditWater(String(selectedRecipe.water_percentage));
-              setShowEditMeta(true);
-            }}>Edit</Button>
+            <Button variant="secondary" size="sm" icon={Edit3} onClick={openEditMeta}>Edit</Button>
             {isAdmin && (
               <Button variant="danger" size="sm" icon={Trash2} onClick={() => handleDelete(selectedRecipe.name, selectedRecipe.company_id)}>Delete</Button>
             )}
@@ -599,14 +650,46 @@ const [showCreateModal, setShowCreateModal] = useState(false);
           footer={
             <>
               <Button variant="secondary" size="sm" onClick={() => setShowEditMeta(false)}>Cancel</Button>
-              <Button variant="primary" size="sm" onClick={handleUpdateMeta}>Save</Button>
+              <Button variant="primary" size="sm" onClick={handleUpdateMeta} loading={savingMeta} disabled={savingMeta}>Save</Button>
             </>
           }
         >
           <div className="space-y-4">
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              Renaming keeps the ingredients and the run history — they follow the
+              recipe, not its label.
+            </p>
             <div>
-              <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Total Quantity</label>
+              <label htmlFor="edit-recipe-name" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Recipe Name *</label>
               <input
+                id="edit-recipe-name"
+                type="text"
+                value={editName}
+                onChange={e => setEditName(e.target.value)}
+                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              />
+            </div>
+            <div>
+              <label htmlFor="edit-recipe-product" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Product</label>
+              <input
+                id="edit-recipe-product"
+                type="text"
+                value={editProduct}
+                onChange={e => setEditProduct(e.target.value)}
+                disabled={productLocked}
+                aria-describedby="edit-recipe-product-help"
+                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-60"
+              />
+              <p id="edit-recipe-product-help" className="mt-1 text-xs text-slate-400 dark:text-slate-500">
+                {productLocked
+                  ? 'Production has run — the product is fixed.'
+                  : 'Must be a product on one of this company’s PIs or invoices.'}
+              </p>
+            </div>
+            <div>
+              <label htmlFor="edit-recipe-total" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Total Quantity</label>
+              <input
+                id="edit-recipe-total"
                 type="number"
                 value={editYield}
                 onChange={e => setEditYield(e.target.value)}
@@ -614,8 +697,9 @@ const [showCreateModal, setShowCreateModal] = useState(false);
               />
             </div>
             <div>
-              <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Water Percentage</label>
+              <label htmlFor="edit-recipe-water" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Water Percentage</label>
               <input
+                id="edit-recipe-water"
                 type="number"
                 step="0.01"
                 value={editWater}
@@ -623,10 +707,16 @@ const [showCreateModal, setShowCreateModal] = useState(false);
                 className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               />
             </div>
+            {editError && (
+              <p role="alert" className="text-xs font-medium text-rose-600 dark:text-rose-400">
+                {editError}
+              </p>
+            )}
           </div>
         </Modal>
 
         <ProductionRunModal
+          key={selectedRecipe.name}
           isOpen={showProductionRun}
           onClose={() => setShowProductionRun(false)}
           recipe={selectedRecipe}
