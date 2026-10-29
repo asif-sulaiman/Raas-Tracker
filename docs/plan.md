@@ -760,6 +760,19 @@ free of `total_quantity`; water is metadata. Out of scope and flagged:
 ones; `Reports.jsx` posts bare recipe names; `DELETE` of a produced recipe still
 500s on FK RESTRICT; legacy `lc_number`-only PIs are not in the cascade.
 
+**Walkthrough (isolated Postgres, built SPA).** Two defects surfaced and were
+fixed. `ProductionRunModal` read `GET /api/sales` as an array although it
+answers `{sales, total}`, so the PI dropdown was always empty and no run could
+be started from the UI (`f3c2910`). A run saved from that modal left the detail's
+`run_count` stale, so the next Edit still offered a product change the server
+refuses with 409 (`8b15da9`). Verified live: child-based `open_only` (LC-2026-003
+listed with a `completed` LC stage and a planned child; paid-child LCs hidden),
+`producible` excluding a paid invoice, disabled zero-work LC and PI, the
+PI/product hint with an empty name, quantity prefill, selections retained after
+create, rename propagation into the list/detail/production modal, product rebind
+before a run, product lock after it, and set-based readiness (a run on a sibling
+recipe made INV-014 bookable while the first recipe still had 0 runs).
+
 ---
 
 ## 🧾 Phase INV-UNIFY: PI-faithful invoice editor (completed 2026-10-22)
