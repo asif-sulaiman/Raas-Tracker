@@ -185,6 +185,20 @@ def clear_invoice_reminders(conn: psycopg.Connection, invoice_id: int) -> None:
     )
 
 
+def clear_lc_shipment_reminders(conn: psycopg.Connection, lc_id: int) -> None:
+    """Drop an LC's shipment-deadline warning and passed alerts.
+
+    Amending the latest date of shipment (or the engine seeing that the date
+    is still more than a week out) re-arms the warning. Deliberately does not
+    commit: the caller owns the transaction (the LC update holds the row lock)
+    and a commit here would release it before the new date lands.
+    """
+    conn.execute(
+        "DELETE FROM notifications WHERE dedupe_key IN (%s, %s)",
+        (f"lc:{lc_id}:ship:7", f"lc:{lc_id}:ship:0"),
+    )
+
+
 def _row_to_dict(row: Any) -> Dict[str, Any]:
     return {
         "id": row[0], "type": row[1], "title": row[2], "body": row[3],
