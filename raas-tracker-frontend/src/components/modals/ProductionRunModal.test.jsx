@@ -428,4 +428,17 @@ describe('ProductionRunModal', () => {
     expect(company.value).toBe('7');
     expect(screen.queryByText('Could not load companies')).toBeNull();
   });
+
+  it('reads the paginated sales envelope instead of expecting a bare array', async () => {
+    // GET /api/sales answers {sales, total}. Treating it as an array left the
+    // PI list empty ("No PIs found") for a company that has plenty.
+    installFetch({ sales: { sales: SALES, total: SALES.length } });
+    renderModal();
+    fireEvent.change(await screen.findByLabelText('Company'), { target: { value: '7' } });
+
+    const option = await screen.findByRole('option', { name: /PI-9/ });
+    expect(option).toBeTruthy();
+    expect(screen.queryByText('No PIs found for this company yet.')).toBeNull();
+    expect(screen.queryByRole('option', { name: /PI-10/ })).toBeNull();
+  });
 });
