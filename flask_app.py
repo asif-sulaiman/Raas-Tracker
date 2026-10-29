@@ -1392,6 +1392,12 @@ def api_recipe_detail(name):
     conn = get_db()
     recipe = get_recipe_by_name(conn, company_id, name)
     items = list_recipe_items(conn, company_id, name)
+    if recipe:
+        # run_count lets the UI freeze the product field: a rebind after
+        # production would re-attribute history that keys off product_name.
+        recipe["run_count"] = conn.execute(
+            "SELECT COUNT(*) FROM production_runs WHERE recipe_id = %s",
+            (recipe["id"],)).fetchone()[0]
     conn.close()
     if not recipe:
         return jsonify({"error": "Recipe not found"}), 404
@@ -1511,6 +1517,14 @@ def api_update_recipe(name):
                      else _req_float(data, "water_percentage", 0))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    # Revision fields: absent means "keep". A supplied name must be a
+    # non-empty string; trimming and uniqueness are the service's job.
+    new_name = data.get("new_name")
+    if new_name is not None and not isinstance(new_name, str):
+        return jsonify({"error": "new_name must be a string"}), 400
+    product_name = data.get("product_name")
+    if product_name is not None and not isinstance(product_name, str):
+        return jsonify({"error": "product_name must be a string"}), 400
     company_id = data.get("company_id")
     if company_id is None:
         return jsonify({"error": "company_id is required"}), 400
@@ -1520,14 +1534,19 @@ def api_update_recipe(name):
         return jsonify({"error": "company_id must be an integer"}), 400
     conn = get_db()
     try:
-        success = update_recipe(conn, company_id, name, total_quantity=total_qty, water_percentage=water_pct)
+        success = update_recipe(conn, company_id, name, total_quantity=total_qty,
+                                water_percentage=water_pct, new_name=new_name,
+                                product_name=product_name)
     except ValueError as e:
-        conn.close()
-        return jsonify({"error": str(e)}), 400
+        _rollback_close(conn)
+        # Status comes from the exception TYPE: a name clash (409), a product
+        # frozen by production (409), an unregistered product (400).
+        return jsonify({"error": str(e)}), status_for(e)
     conn.close()
     if not success:
         return jsonify({"error": "Recipe not found"}), 404
-    return jsonify({"success": True})
+    final_name = new_name.strip() if new_name is not None else name
+    return jsonify({"success": True, "name": final_name})
 
 
 @app.route("/api/recipes/<path:name>/items/<chem>", methods=["PUT"])
