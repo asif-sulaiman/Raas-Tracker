@@ -2522,10 +2522,14 @@ def api_create_invoices_batch(sale_id):
 
 @app.route("/api/sales/<int:sale_id>/invoices")
 def api_list_invoices(sale_id):
+    # producible: only planned/produced invoices (the recipe modal's source).
+    producible = request.args.get(
+        "producible", "").strip().lower() in ("1", "true", "yes")
     conn = get_db()
     # with_readiness: the panel needs can_book / book_blocked_reason to render
     # the Book action honestly. Only this route asks for them.
-    invoices = list_invoices(conn, sale_id, with_readiness=True)
+    invoices = list_invoices(conn, sale_id, with_readiness=True,
+                             producible_only=producible)
     conn.close()
     return jsonify(invoices)
 
@@ -3613,9 +3617,12 @@ def api_list_lcs():
         company_id = request.args.get("company_id", type=int)
         if company_id is None:
             return jsonify({"error": "company_id must be an integer"}), 400
+    # Opt-in: only LCs with an open child PI (the recipe modal's source).
+    open_only = request.args.get(
+        "open_only", "").strip().lower() in ("1", "true", "yes")
     conn = get_db()
     try:
-        rows = list_lcs(conn, company_id)
+        rows = list_lcs(conn, company_id, open_only=open_only)
     finally:
         conn.close()
     return jsonify(rows)
@@ -3662,9 +3669,11 @@ def api_create_lc():
 
 @app.route("/api/lcs/<int:lc_id>")
 def api_get_lc(lc_id):
+    open_only = request.args.get(
+        "open_only", "").strip().lower() in ("1", "true", "yes")
     conn = get_db()
     try:
-        lc = get_lc(conn, lc_id)
+        lc = get_lc(conn, lc_id, open_only=open_only)
     finally:
         conn.close()
     if not lc:
