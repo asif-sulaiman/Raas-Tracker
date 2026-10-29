@@ -59,6 +59,9 @@ export function entityRoute(notification) {
       return '/chemicals';
     case 'sale':
       return '/sales';
+    // LC shipment-deadline warnings: LCs live on the sales board.
+    case 'lc':
+      return '/sales';
     default:
       return null;
   }

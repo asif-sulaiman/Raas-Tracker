@@ -183,6 +183,20 @@ describe('LinkPIsModal payment terms', () => {
     });
   });
 
+  it('creates a new LC with its latest date of shipment', async () => {
+    const creates = [];
+    renderLink({ unlinkedSales: [PI_ACME_1], existingLcs: [] }, { creates });
+    await fillNewLc();
+
+    fireEvent.change(await screen.findByLabelText('Latest date of shipment'), {
+      target: { value: '2027-01-15' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Link 1 PI' }));
+
+    await waitFor(() => expect(creates).toHaveLength(1));
+    expect(creates[0]).toMatchObject({ expiry_date: '2027-01-15' });
+  });
+
   it('creates a deferred LC with its tenor', async () => {
     const creates = [];
     renderLink(
