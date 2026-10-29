@@ -141,6 +141,30 @@ class LcNotReadyForCompletion(LifecycleConflict):
 
 
 # --------------------------------------------------------------------------- #
+# Recipe revision conditions
+# --------------------------------------------------------------------------- #
+
+
+class RecipeNameConflict(LifecycleConflict):
+    """409 — another recipe in this company already owns that name.
+
+    The DB index is case-sensitive while every lookup is case-insensitive, so
+    a rename is pre-checked on ``lower(name)``; the unique-index race raises
+    the same class so the two paths cannot disagree about the status.
+    """
+
+
+class RecipeProductLocked(LifecycleConflict):
+    """409 — the product cannot be rebound once production has run.
+
+    ``recipes.product_name`` is what readiness and the commercial report key
+    off. A run snapshots its formula and links by ``recipe_id``, so moving the
+    product afterwards would silently re-attribute past production. Rename and
+    metadata stay editable; the product is the one field that is frozen.
+    """
+
+
+# --------------------------------------------------------------------------- #
 # 404 conditions
 # --------------------------------------------------------------------------- #
 
