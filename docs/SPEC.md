@@ -683,6 +683,8 @@ future call sites are covered without opting in:
 | POST | `/api/lcs/<id>/move` | Admin (15/min) | Move the LC stage; **one barrier** — crossing into `payment_due` requires **every non-void invoice across the LC's child PIs to be shipped** (`shipped`/`paid`, `shipped_invoice_readiness.all_shipped_ok`); an LC with no invoices cannot advance. Crossing into `shipment_ongoing` requires **no invoice** (2026-10-26: invoices are created in Shipment Ongoing). Shipping the LC's last invoice performs this move automatically (`_sync_lc_payment_due`). Barrier enforced under row locks; stage propagated to all child PIs in one transaction |
 | GET | `/api/lcs/<id>/readiness` | Session/Key | Readiness snapshot — `invoices_ok` is **informational** (shipment entry needs no invoice); `all_shipped_ok` is the Payment Due gate (every non-void invoice under the LC shipped); `shipped_ok` is informational for the board (one shipped invoice anywhere); `booked_ok`/`recipes_ok`/`produced_ok` stay informational. `detail` carries `invoice_count`, `booked_count`, `shipped_count` + `missing_recipes`/`missing_production`, plus the linked `pis` |
 
+**Legacy `expiry_date` values.** Validation applies to writes only: a row stored before 2026-10-29 may hold free text or a blank string. Blank reads as `NULL` (no deadline, no reminder); a non-ISO value is left untouched by the cron (it cannot be parsed, so nothing is due) and renders as an empty date input in the LC modal until someone saves it — saving with the field empty clears the deadline. No migration rewrites these rows.
+
 ### Invoice Lines
 | Method | Path | Auth | Description |
 |---|---|---|---|
