@@ -276,6 +276,37 @@ describe('Create New Recipe sourcing', () => {
     expect(screen.getByText(/2 of 3 products on this invoice have a recipe/)).toBeTruthy();
   });
 
+  it('clears the quantity prefill when the PI or the invoice changes', async () => {
+    renderRecipes();
+    await openCreateModal();
+    fireEvent.change(screen.getByLabelText(/^Company/), { target: { value: '7' } });
+    fireEvent.change(screen.getByLabelText(/^LC/), { target: { value: '1' } });
+    await screen.findByRole('option', { name: /PI-2026-014/ });
+    fireEvent.change(screen.getByLabelText(/^PI/), { target: { value: '5' } });
+    await screen.findByRole('option', { name: /INV-014/ });
+    fireEvent.change(screen.getByLabelText(/^Invoice/), { target: { value: '9' } });
+    await screen.findByRole('option', { name: /Caustic Soda 50%/ });
+    fireEvent.change(screen.getByLabelText(/^Product/), {
+      target: { value: 'Caustic Soda 50%' },
+    });
+    expect(screen.getByLabelText(/^Total Quantity/).value).toBe('200');
+
+    // A different invoice has different products: the old prefill would lie
+    // about a product that is no longer selected.
+    fireEvent.change(screen.getByLabelText(/^Invoice/), { target: { value: '' } });
+    expect(screen.getByLabelText(/^Total Quantity/).value).toBe('');
+
+    fireEvent.change(screen.getByLabelText(/^Invoice/), { target: { value: '9' } });
+    await screen.findByRole('option', { name: /Caustic Soda 50%/ });
+    fireEvent.change(screen.getByLabelText(/^Product/), {
+      target: { value: 'Caustic Soda 50%' },
+    });
+    expect(screen.getByLabelText(/^Total Quantity/).value).toBe('200');
+
+    fireEvent.change(screen.getByLabelText(/^PI/), { target: { value: '6' } });
+    expect(screen.getByLabelText(/^Total Quantity/).value).toBe('');
+  });
+
   it('keeps the LC, PI and invoice selected after creating, and advances progress', async () => {
     const { fetchMock } = renderRecipes({
       recipes: [{
