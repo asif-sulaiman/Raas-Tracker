@@ -230,7 +230,8 @@ def test_provisional_pi_lines_count_in_kpis(db):
     assert kpis["gross_sales"] == 250
     assert kpis["received"] == 100
     assert kpis["due"] == 150
-    assert kpis["overdue"] == 150
+    # No invoice means no maturity date, so nothing here can be overdue.
+    assert kpis["overdue"] == 0
     assert kpis["order_count"] == 1
 
 

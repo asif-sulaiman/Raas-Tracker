@@ -167,8 +167,22 @@ def test_live_report_200_admin_json_list(admin_client, db):
 
 
 # ------------------------- row contract -------------------------
+def _lc(db, number, expiry_date, company_name="LC Co"):
+    """Company + LC with a latest date of shipment (``expiry_date``)."""
+    cid = db.execute(
+        "INSERT INTO companies (name) VALUES (%s) RETURNING id",
+        (company_name,)).fetchone()[0]
+    lc_id = db.execute(
+        "INSERT INTO letters_of_credit (lc_number, company_id, lc_date, expiry_date) "
+        "VALUES (%s, %s, '2026-01-10', %s) RETURNING id",
+        (number, cid, expiry_date)).fetchone()[0]
+    db.commit()
+    return cid, lc_id
+
+
 def test_row_shape_contract_keys(admin_client, db):
-    sid = _sale(db, "PI-SHAPE", client_name="Shape Co",
+    _, lc_id = _lc(db, "LC-SHAPE", "2026-04-15")
+    sid = _sale(db, "PI-SHAPE", client_name="Shape Co", lc_id=lc_id,
                 items=[{"product_name": "Acid", "quantity": 2, "unit_price": 25,
                         "unit": "DRUM"}],
                 maturity_date="2099-12-31", comments="  needs LC  ",
@@ -192,14 +206,60 @@ def test_row_shape_contract_keys(admin_client, db):
     assert row["prod_date"] is None
     # invoice_date is the invoice's own date, not the shipment's copy.
     assert row["invoice_date"] == "2026-02-01"
-    # Shipment dates follow the invoice row, not the sale header.
-    assert row["latest_ship_date"] == "2026-03-10"
+    # Latest ship is the LC's deadline, independent of the invoice.
+    assert row["latest_ship_date"] == "2026-04-15"
+    # Actual ship / maturity follow the invoice, not the sale header.
     assert row["actual_ship_date"] == "2026-03-10"
-    # Maturity prefers the invoice's own date over the sale header.
     assert row["maturity_date"] == "2026-04-09"
     assert row["receive_date"] == "2026-03-20"
     assert row["payment_comment"] == "needs LC"
     assert row["is_provisional"] is False
+
+
+def test_latest_ship_is_the_lc_latest_shipment_date(admin_client, db):
+    """Every row of the sale carries the LC deadline; the invoice owns the rest."""
+    _, lc_id = _lc(db, "LC-REPORT-1", "2026-12-30")
+    sid = _sale(db, "PI-LC-REPORT", lc_id=lc_id, lc_number="LC-REPORT-1",
+                lc_date="2026-01-10",
+                items=[{"product_name": "A", "quantity": 10, "unit_price": 10}],
+                invoice_lines=[{"sale_item_index": 0, "quantity": 6}])
+    db.execute(
+        "UPDATE invoices SET actual_ship_date = '2026-03-10', "
+        "maturity_date = '2026-04-09' WHERE sale_id = %s", (sid,))
+    db.commit()
+
+    rows = _of(_rows(admin_client), sid)
+    invoice_row = next(r for r in rows if not r["is_provisional"])
+    remainder = next(r for r in rows if r["is_provisional"])
+
+    assert invoice_row["latest_ship_date"] == "2026-12-30"
+    assert remainder["latest_ship_date"] == "2026-12-30", (
+        "the LC date belongs to the sale, not to a specific invoice")
+    assert invoice_row["actual_ship_date"] == "2026-03-10"
+    assert invoice_row["maturity_date"] == "2026-04-09"
+    # An uninvoiced line has neither an actual ship nor a maturity date.
+    assert remainder["actual_ship_date"] is None
+    assert remainder["maturity_date"] is None
+
+
+def test_latest_ship_is_null_without_an_lc_deadline(admin_client, db):
+    sid = _sale(db, "PI-NO-LC", shipment_date="2026-03-15")
+    rows = _of(_rows(admin_client), sid)
+    assert rows[0]["latest_ship_date"] is None
+
+
+def test_provisional_rows_have_no_actual_ship_or_maturity(admin_client, db):
+    sid = _sale(db, "PI-PROV-DATES", maturity_date="2020-01-01",
+                shipment_date="2026-03-15", invoice_lines=None)
+
+    row = _of(_rows(admin_client), sid)[0]
+
+    assert row["is_provisional"] is True
+    assert row["actual_ship_date"] is None
+    assert row["maturity_date"] is None
+    assert row["payment_status"] == "Pending", (
+        "no invoice means nothing can be due or overdue")
+    assert row["due_amount"] == row["total_price"]
 
 
 def test_rows_ordered_by_created_at_desc(admin_client, db):
@@ -920,14 +980,17 @@ def test_summary_kpis_use_displayed_row_totals(admin_client, db):
     assert jan["kpis"]["gross_sales"] == 100   # 60 invoiced + 40 remainder
     assert jan["kpis"]["received"] == 20
     assert jan["kpis"]["due"] == 80
-    assert jan["kpis"]["overdue"] == 80
+    # Only the invoiced 60 carries a maturity; the 40 remainder is uninvoiced
+    # and cannot be overdue, so 40 (60 invoiced - 20 paid) is due.
+    assert jan["kpis"]["overdue"] == 40
     assert jan["kpis"]["order_count"] == 1
 
     feb = next(p for p in periods if p["period_start"] == "2026-02-01")
     assert feb["kpis"]["gross_sales"] == 200   # 100 invoiced + 100 remainder
     assert feb["kpis"]["received"] == 0
     assert feb["kpis"]["due"] == 200
-    assert feb["kpis"]["overdue"] == 200
+    # Only the 100 invoiced is overdue; the remainder has no maturity date.
+    assert feb["kpis"]["overdue"] == 100
     assert feb["kpis"]["order_count"] == 1
 
 
@@ -1223,8 +1286,12 @@ def test_filters_apply_to_provisional_rows(admin_client, db):
         admin_client, {"customer_name": "fresh"})} == {sid}
     assert {r["sale_id"] for r in _filtered_rows(
         admin_client, {"stage": "pi_issued"})} == {sid}
+    # No invoice means no maturity, so the row is Pending even though the PI
+    # header carries a date.
     assert {r["sale_id"] for r in _filtered_rows(
-        admin_client, {"payment_status": "Due"})} == {sid}
+        admin_client, {"payment_status": "Pending"})} == {sid}
+    assert {r["sale_id"] for r in _filtered_rows(
+        admin_client, {"payment_status": "Due"})} == set()
 
 
 def test_export_marks_provisional_rows(admin_client, db):
@@ -1476,7 +1543,7 @@ def test_sale_level_legacy_payment_allocates_across_rows(admin_client, db):
 
 
 def test_report_row_maturity_prefers_the_invoice_maturity(admin_client, db):
-    """Each invoice row carries its own maturity; a remainder uses the sale's."""
+    """Each invoice row carries its own maturity; an uninvoiced line has none."""
     sid = _sale(db, "PI-MATURITY", maturity_date="2099-12-31", items=[
         {"product_name": "A", "quantity": 5, "unit_price": 10},
         {"product_name": "B", "quantity": 5, "unit_price": 10},
@@ -1502,7 +1569,10 @@ def test_report_row_maturity_prefers_the_invoice_maturity(admin_client, db):
     assert by_product["A"]["maturity_date"] == "2026-05-01"
     assert by_product["A"]["actual_ship_date"] == "2026-04-01"
     assert by_product["B"]["maturity_date"] == "2026-06-01"
-    assert by_product["C"]["maturity_date"] == "2099-12-31"
+    # C was never invoiced, so it has no maturity of its own — the sale
+    # header's date does not stand in for one.
+    assert by_product["C"]["maturity_date"] is None
+    assert by_product["C"]["actual_ship_date"] is None
     assert by_product["C"]["is_provisional"] is True
 
 
