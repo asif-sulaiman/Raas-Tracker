@@ -1,4 +1,5 @@
-﻿import { useState, useEffect, useCallback } from 'react';
+﻿import { useState, useEffect, useCallback, useMemo } from 'react';
+import { Link } from 'react-router-dom';
 import {
   BookOpen,
   FlaskConical,
@@ -19,6 +20,7 @@ import Button from '../components/ui/Button';
 import Modal from '../components/modals/Modal';
 import KpiCard from '../components/cards/KpiCard';
 import { formatNumber } from '../utils/format';
+import { INVOICE_STATUS_LABELS } from '../utils/invoices';
 import { useAuth } from '../context/AuthContext';
 import { useConfirm } from '../context/ConfirmContext';
 import { toast } from 'sonner';
@@ -44,16 +46,17 @@ const [showCreateModal, setShowCreateModal] = useState(false);
   const [newYield, setNewYield] = useState('');
   const [newWater, setNewWater] = useState('');
   const [companies, setCompanies] = useState([]);
-  const [allSales, setAllSales] = useState([]);
   const [allLcs, setAllLcs] = useState([]);
   const [companyId, setCompanyId] = useState('');
   const [lcId, setLcId] = useState('');
+  const [lcPis, setLcPis] = useState([]);
   const [saleId, setSaleId] = useState('');
   const [invoices, setInvoices] = useState([]);
   const [invoiceId, setInvoiceId] = useState('');
   const [invoiceItems, setInvoiceItems] = useState([]);
   const [productName, setProductName] = useState('');
   const [loadingRefs, setLoadingRefs] = useState(false);
+  const [loadingPis, setLoadingPis] = useState(false);
   const [loadingInvoiceItems, setLoadingInvoiceItems] = useState(false);
 
   const [editYield, setEditYield] = useState('');
@@ -93,26 +96,62 @@ const [showCreateModal, setShowCreateModal] = useState(false);
     (async () => {
       setLoadingRefs(true);
       try {
-        const [coRes, saleRes, lcRes] = await Promise.all([
+        // Only LCs with an open child PI — a closed LC has nothing left to
+        // produce, so it must never be an option here.
+        const [coRes, lcRes] = await Promise.all([
           apiFetch('/api/companies'),
-          apiFetch('/api/sales?page_size=1000'),
-          apiFetch('/api/lcs'),
+          apiFetch('/api/lcs?open_only=true'),
         ]);
-        const [cos, salesBody, lcs] = await Promise.all([coRes.json(), saleRes.json(), lcRes.json()]);
+        const [cos, lcs] = await Promise.all([coRes.json(), lcRes.json()]);
         setCompanies(Array.isArray(cos) ? cos : []);
-        setAllSales(Array.isArray(salesBody) ? salesBody : Array.isArray(salesBody?.sales) ? salesBody.sales : []);
         setAllLcs(Array.isArray(lcs) ? lcs : []);
       } catch (err) {
-        toast.error(err?.message || 'Could not load companies and PIs');
+        toast.error(err?.message || 'Could not load running LCs');
       } finally {
         setLoadingRefs(false);
       }
     })();
   }, [showCreateModal, apiFetch]);
 
+  const companyLcs = useMemo(
+    () => allLcs.filter(l => String(l.company_id) === String(companyId)),
+    [allLcs, companyId]
+  );
+
+  // Distinct products on the selected invoice, with the quantity each line
+  // carries (the recipe's batch basis prefill, never a production cap).
+  const invoiceProducts = useMemo(() => {
+    const byName = new Map();
+    for (const item of invoiceItems) {
+      const name = (item.product_name || '').trim();
+      if (!name) continue;
+      const entry = byName.get(name) || { name, unit: item.unit || 'KG', quantity: 0 };
+      entry.quantity += Number(item.quantity) || 0;
+      byName.set(name, entry);
+    }
+    return [...byName.values()];
+  }, [invoiceItems]);
+
+  const recipeProducts = useMemo(() => new Set(
+    recipes
+      .filter(r => String(r.company_id) === String(companyId) && r.product_name)
+      .map(r => r.product_name.trim().toLowerCase())
+  ), [recipes, companyId]);
+
+  const productsWithRecipe = invoiceProducts.filter(
+    p => recipeProducts.has(p.name.toLowerCase())
+  ).length;
+
+  const selectedPi = lcPis.find(p => String(p.id) === String(saleId));
+  const piLabel = selectedPi?.pi_number || (saleId ? `PI #${saleId}` : '');
+  const namePlaceholder = piLabel && productName
+    ? `e.g. ${piLabel} — ${productName}`
+    : 'e.g. PI-2026-014 — Caustic Soda 50%';
+
   const handleCompanyChange = (value) => {
     setCompanyId(value);
     setLcId('');
+    setLcPis([]);
     setSaleId('');
     setInvoices([]);
     setInvoiceId('');
@@ -120,13 +159,28 @@ const [showCreateModal, setShowCreateModal] = useState(false);
     setProductName('');
   };
 
-  const handleLcChange = (value) => {
+  const handleLcChange = async (value) => {
     setLcId(value);
+    setLcPis([]);
     setSaleId('');
     setInvoices([]);
     setInvoiceId('');
     setInvoiceItems([]);
     setProductName('');
+    if (!value) return;
+    setLoadingPis(true);
+    try {
+      // open_only drops completed PIs; a PI with no producible invoice stays
+      // visible with a count of 0 so it can be shown disabled, not hidden.
+      const res = await apiFetch(`/api/lcs/${encodeURIComponent(value)}?open_only=true`);
+      const data = await res.json();
+      setLcPis(Array.isArray(data?.pis) ? data.pis : []);
+    } catch (err) {
+      setLcPis([]);
+      toast.error(err?.message || 'Could not load PIs for this LC');
+    } finally {
+      setLoadingPis(false);
+    }
   };
 
   const handleSaleChange = async (value) => {
@@ -137,7 +191,10 @@ const [showCreateModal, setShowCreateModal] = useState(false);
     setProductName('');
     if (!value) return;
     try {
-      const res = await apiFetch(`/api/sales/${encodeURIComponent(value)}/invoices`);
+      // booked/shipped/paid invoices are past production.
+      const res = await apiFetch(
+        `/api/sales/${encodeURIComponent(value)}/invoices?producible=true`
+      );
       const invs = await res.json();
       setInvoices(Array.isArray(invs) ? invs : []);
     } catch {
@@ -160,6 +217,12 @@ const [showCreateModal, setShowCreateModal] = useState(false);
     } finally {
       setLoadingInvoiceItems(false);
     }
+  };
+
+  const handleProductChange = (value) => {
+    setProductName(value);
+    const match = invoiceProducts.find(p => p.name === value);
+    setNewYield(match ? String(match.quantity) : '');
   };
 
   const fetchRecipeDetail = async (name, companyId) => {
@@ -199,16 +262,11 @@ const [showCreateModal, setShowCreateModal] = useState(false);
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || `Failed to create recipe (${res.status})`);
-      setShowCreateModal(false);
+      // Keep the LC/PI/invoice selection: a PI with several products needs one
+      // recipe per product, so the next one should be one click away.
       setNewName('');
       setNewYield('');
       setNewWater('');
-      setCompanyId('');
-      setLcId('');
-      setSaleId('');
-      setInvoices([]);
-      setInvoiceId('');
-      setInvoiceItems([]);
       setProductName('');
       toast.success(`Recipe "${newName.trim()}" created`);
       setLoading(true);
@@ -671,20 +729,15 @@ const [showCreateModal, setShowCreateModal] = useState(false);
         }
       >
         <div className="space-y-4">
-          <div>
-            <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Recipe Name *</label>
-            <input
-              type="text"
-              value={newName}
-              onChange={e => setNewName(e.target.value)}
-              placeholder="e.g. Product name"
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-            />
-          </div>
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            A recipe is the production formula for one product on an invoice.
+            Only LCs with open PIs, and invoices still in production, are listed.
+          </p>
           <div className="grid grid-cols-1 gap-3">
             <div>
-              <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Company *</label>
+              <label htmlFor="recipe-company" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Company *</label>
               <select
+                id="recipe-company"
                 value={companyId}
                 onChange={e => handleCompanyChange(e.target.value)}
                 className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
@@ -696,86 +749,139 @@ const [showCreateModal, setShowCreateModal] = useState(false);
               </select>
             </div>
             <div>
-              <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">LC *</label>
+              <label htmlFor="recipe-lc" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">LC *</label>
               <select
+                id="recipe-lc"
                 value={lcId}
                 onChange={e => handleLcChange(e.target.value)}
                 disabled={!companyId}
+                aria-describedby="recipe-lc-help"
                 className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-60"
               >
                 <option value="">{companyId ? 'Select LC…' : 'Select a company first'}</option>
-                {companyId && allLcs
-                  .filter(l => String(l.company_id) === companyId)
-                  .map(l => (
-                    <option key={l.id} value={l.id}>
-                      {l.lc_number}{l.stage ? ` — ${l.stage}` : ''}
+                {companyId && companyLcs.map(l => {
+                  const count = l.producible_pi_count ?? 0;
+                  return (
+                    <option key={l.id} value={l.id} disabled={count === 0}>
+                      {l.lc_number} · {count === 0
+                        ? 'no invoices in production'
+                        : `${count} PI${count === 1 ? '' : 's'} in production`}
                     </option>
-                  ))}
+                  );
+                })}
               </select>
+              <p id="recipe-lc-help" aria-live="polite" className="mt-1 text-xs text-slate-400 dark:text-slate-500">
+                {companyId && !loadingRefs && companyLcs.length === 0
+                  ? (
+                    <>No running LCs for this company. PIs without a linked LC are not shown here — link them from <Link to="/sales" className="text-blue-600 dark:text-blue-400 underline">Sales</Link>.</>
+                  )
+                  : 'Only LCs with open PIs are listed.'}
+              </p>
             </div>
             <div>
-              <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">PI / Sale *</label>
+              <label htmlFor="recipe-pi" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">PI / Sale *</label>
               <select
+                id="recipe-pi"
                 value={saleId}
                 onChange={e => handleSaleChange(e.target.value)}
-                disabled={!companyId || !lcId}
+                disabled={!lcId || loadingPis}
                 className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-60"
               >
-                <option value="">{companyId && lcId ? 'Select PI/Sale…' : !companyId ? 'Select a company first' : 'Select an LC first'}</option>
-                {companyId && lcId && allSales
-                  .filter(s => String(s.company_id) === companyId && String(s.lc_id) === lcId)
-                  .map(s => (
-                    <option key={s.id} value={s.id}>
-                      {s.pi_number || `PI #${s.id}`}{s.client_name ? ` — ${s.client_name}` : ''}
+                <option value="">{!lcId ? 'Select an LC first' : loadingPis ? 'Loading PIs…' : 'Select PI/Sale…'}</option>
+                {lcId && lcPis.map(s => {
+                  const count = s.producible_invoice_count ?? 0;
+                  return (
+                    <option key={s.id} value={s.id} disabled={count === 0}>
+                      {s.pi_number || `PI #${s.id}`}{s.client_name ? ` — ${s.client_name}` : ''} · {count === 0
+                        ? 'no invoices in production'
+                        : `${count} invoice${count === 1 ? '' : 's'} in production`}
                     </option>
-                  ))}
+                  );
+                })}
               </select>
             </div>
             <div>
-              <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Invoice *</label>
+              <label htmlFor="recipe-invoice" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Invoice *</label>
               <select
+                id="recipe-invoice"
                 value={invoiceId}
                 onChange={e => handleInvoiceChange(e.target.value)}
                 disabled={!saleId}
                 className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-60"
               >
                 <option value="">{saleId ? 'Select invoice…' : 'Select a PI first'}</option>
-                {invoices.map(inv => (
-                  <option key={inv.invoice_id ?? inv.id} value={inv.invoice_id ?? inv.id}>
-                    {inv.invoice_number || `Invoice #${inv.invoice_id ?? inv.id}`}
-                  </option>
-                ))}
+                {invoices.map(inv => {
+                  const id = inv.invoice_id ?? inv.id;
+                  return (
+                    <option key={id} value={id}>
+                      {inv.invoice_number || `Invoice #${id}`} · {INVOICE_STATUS_LABELS[inv.status] || inv.status}
+                    </option>
+                  );
+                })}
               </select>
             </div>
             <div>
-              <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Product *</label>
+              <label htmlFor="recipe-product" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Product *</label>
               <select
+                id="recipe-product"
                 value={productName}
-                onChange={e => setProductName(e.target.value)}
+                onChange={e => handleProductChange(e.target.value)}
                 disabled={!invoiceId || loadingInvoiceItems}
+                aria-describedby="recipe-product-help"
                 className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-60"
               >
                 <option value="">{loadingInvoiceItems ? 'Loading items…' : invoiceId ? 'Select product…' : 'Select an invoice first'}</option>
-                {[...new Set(invoiceItems.map(i => i.product_name))].map((name, i) => (
-                  <option key={i} value={name}>{name}</option>
+                {invoiceProducts.map(p => (
+                  <option key={p.name} value={p.name}>
+                    {p.name} · {formatNumber(p.quantity)} {p.unit}
+                    {recipeProducts.has(p.name.toLowerCase()) ? ' · recipe exists' : ''}
+                  </option>
                 ))}
               </select>
+              <p id="recipe-product-help" aria-live="polite" className="mt-1 text-xs text-slate-400 dark:text-slate-500">
+                {invoiceProducts.length > 0
+                  ? `${productsWithRecipe} of ${invoiceProducts.length} products on this invoice have a recipe`
+                  : 'Products come from the selected invoice.'}
+              </p>
             </div>
+          </div>
+          <div>
+            <label htmlFor="recipe-name" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Recipe Name *</label>
+            <input
+              id="recipe-name"
+              type="text"
+              value={newName}
+              onChange={e => setNewName(e.target.value)}
+              placeholder={namePlaceholder}
+              aria-describedby="recipe-name-help"
+              className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            />
+            <p id="recipe-name-help" className="mt-1 text-xs text-slate-400 dark:text-slate-500">
+              {piLabel && productName
+                ? <>Selected: {piLabel} · {productName}</>
+                : 'Name it yourself — the PI and product appear here once chosen.'}
+            </p>
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Total Quantity</label>
+              <label htmlFor="recipe-total" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Total Quantity</label>
               <input
+                id="recipe-total"
                 type="number"
                 value={newYield}
                 onChange={e => setNewYield(e.target.value)}
                 placeholder="15630"
+                aria-describedby="recipe-total-help"
                 className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
               />
+              <p id="recipe-total-help" className="mt-1 text-xs text-slate-400 dark:text-slate-500">
+                Batch basis — production quantity is entered when producing.
+              </p>
             </div>
             <div>
-              <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Water % (optional)</label>
+              <label htmlFor="recipe-water" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Water % (optional)</label>
               <input
+                id="recipe-water"
                 type="number"
                 step="0.01"
                 value={newWater}
