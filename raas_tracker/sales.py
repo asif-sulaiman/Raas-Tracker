@@ -1460,20 +1460,18 @@ def _commercial_report_base_sql(date_anchor_expr: str) -> str:
             r.total_price::float8 AS total_price,
             r.is_provisional,
             r.invoice_date,
-            CASE WHEN r.invoice_id IS NOT NULL
-                 THEN COALESCE(r.actual_ship_date, r.approx_ship_date)
-                 ELSE COALESCE((SELECT MAX(sh.ship_date)
-                                  FROM shipments sh WHERE sh.sale_id = s.id),
-                               s.shipment_date)
-            END AS latest_ship_date,
+            -- Latest ship is the LC's latest date of shipment: it belongs to
+            -- the credit, not to any invoice, so every row of the sale shows
+            -- the same deadline (and NULL when the sale has no LC).
+            lc.expiry_date AS latest_ship_date,
+            -- Actual ship and maturity are invoice facts. An uninvoiced PI
+            -- line has neither: it is not shipped and nothing is due on it.
             CASE WHEN r.invoice_id IS NOT NULL
                  THEN r.actual_ship_date
-                 ELSE s.shipment_date
             END AS actual_ship_date,
             CASE WHEN r.invoice_id IS NOT NULL
                  THEN COALESCE(r.invoice_maturity, r.actual_ship_date,
                                s.maturity_date)
-                 ELSE s.maturity_date
             END AS maturity_date,
             r.receive_date,
             r.received_amount,
@@ -1494,6 +1492,7 @@ def _commercial_report_base_sql(date_anchor_expr: str) -> str:
         FROM rows_money r
         JOIN sales s ON s.id = r.sale_id
         LEFT JOIN companies c ON c.id = s.company_id
+        LEFT JOIN letters_of_credit lc ON lc.id = s.lc_id
     """
 
 
