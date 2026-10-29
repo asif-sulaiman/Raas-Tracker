@@ -161,6 +161,9 @@ const [showCreateModal, setShowCreateModal] = useState(false);
     setInvoiceId('');
     setInvoiceItems([]);
     setProductName('');
+    // The product is gone, so its invoice quantity must not linger as a
+    // prefill for whatever gets picked next.
+    setNewYield('');
   };
 
   const handleLcChange = async (value) => {
@@ -171,6 +174,7 @@ const [showCreateModal, setShowCreateModal] = useState(false);
     setInvoiceId('');
     setInvoiceItems([]);
     setProductName('');
+    setNewYield('');
     if (!value) return;
     setLoadingPis(true);
     try {
@@ -193,6 +197,7 @@ const [showCreateModal, setShowCreateModal] = useState(false);
     setInvoiceId('');
     setInvoiceItems([]);
     setProductName('');
+    setNewYield('');
     if (!value) return;
     try {
       // booked/shipped/paid invoices are past production.
@@ -210,6 +215,7 @@ const [showCreateModal, setShowCreateModal] = useState(false);
     setInvoiceId(value);
     setInvoiceItems([]);
     setProductName('');
+    setNewYield('');
     if (!value) return;
     setLoadingInvoiceItems(true);
     try {
