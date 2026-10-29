@@ -5,6 +5,74 @@
 
 ---
 
+## 2026-10-29 — LATEST DATE OF SHIPMENT (LC label, LC deadline bell, report dates)
+
+`letters_of_credit.expiry_date` now means the **latest date of shipment**
+(shipment after it is invalid). The column and the wire key stayed; the label,
+the report column and a new reminder changed.
+
+### What shipped
+
+- **Labels.** LC detail (edit + view) reads `Latest Date of Shipment` with the
+  helper *"Shipment after this date is invalid — amend the LC to extend it."*;
+  `LinkPIsModal` accepts it when creating an LC. Payload key is still
+  `expiry_date`.
+- **Report dates (supersedes Phase 5 "Row dates").**
+  `latest_ship_date = letters_of_credit.expiry_date` on **every** row of a sale
+  (NULL without an LC). `actual_ship_date` and `maturity_date` are invoice-only;
+  a provisional row now has **both blank** and its status is `Pending`, so the
+  old invoice `COALESCE(actual, approx)` and the sale's `shipment_date` /
+  `maturity_date` fallbacks are gone. Headers: `Latest Ship Date`,
+  `Actual Ship Date`, `Maturity Date` (skeleton and real table).
+- **Bell only, no email, no ship blocking.** `reminders.run_lc_shipment_reminders`:
+  ≤ 7 days to the deadline → `lc_shipment_deadline` (warning,
+  `lc:{id}:ship:7`); past it → `lc_shipment_deadline_passed` (critical,
+  `lc:{id}:ship:0`). Blank/unparseable dates are silent (no `lc_date`
+  fallback). Stops when every attached PI is `completed`; an LC with zero PIs
+  still warns; > 7 days out deletes both keys so an out-of-band edit
+  self-heals. `entity_type='lc'` routes the bell to `/sales`.
+- **Cron GET (production fix).** Vercel Cron invokes GET; the route was
+  POST-only, so the reminder never ran in production (405). Both verbs are
+  registered and in `_PUBLIC_API`; the Bearer check is unchanged. Response and
+  `CRON_MATURITY_CHECK` audit gain `lc_reminders`.
+- **Amending re-arms.** `POST/PUT /api/lcs` validate `expiry_date` as ISO
+  `YYYY-MM-DD` (**400** otherwise, blank → NULL — it was free text before, so a
+  typo silently never reminded). A changing `expiry_date` deletes both LC keys
+  in the same transaction as the UPDATE + `LC_UPDATE` audit, under
+  `FOR UPDATE`.
+
+### Gate (all green)
+
+| Gate | Result |
+|---|---|
+| Backend `pytest` | **1368 passed / 8 skipped** in 1244.42s (exit 0; +21 net new) |
+| Backend `ruff` | 18 findings — all pre-existing (F401/F811/F841/E741), none in changed hunks |
+| Backend `pyright` | 0 errors / 11 warnings — unchanged baseline |
+| Frontend `npm test` | **360 passed / 40 files** |
+| `npx oxlint` | 0 errors / 0 warnings |
+| `npx vite build` | OK (chunk-size warning only); `dist/` copied to the gitignored `react_frontend/` |
+
+### Tests added
+
+`tests/test_lc_shipment_reminders.py` (12: window edges, dedupe, critical after
+the deadline, completed PIs stop, one open PI keeps the LC scanned, zero-PI LC
+still warns, blank date silent, extending re-arms, > 7 days clears, cron GET
+creates + still requires the Bearer). `tests/test_lc_api.py` (+6: ISO-only
+create/PUT, blank clears, expiry change clears the keys, unrelated change keeps
+them). `tests/test_commercial_report.py` (+3 date tests; provisional rows blank;
+KPIs follow). `tests/test_commercial_report_kpis.py` and
+`tests/test_invoice_reminders.py` adjusted. Frontend: `LcDetailModal`,
+`LinkPIsModal`, `CommercialTable`, `notifications`.
+
+### Not run
+
+No browser pass this session (no live server): the reminder path is exercised
+end-to-end against real Postgres by the backend suites above, and the UI by
+vitest. Production still needs a post-deploy check that a GET cron run returns
+`lc_reminders` and the bell shows the alert.
+
+---
+
 ## 2026-10-28 — INVOICE-MATURITY Phase 7 (full gate, isolated-Postgres E2E, browser pass)
 
 Worktree `O:/Projects/Raas-Tracker-worktrees/invoice-shipment-gate`, branch
@@ -165,7 +233,9 @@ the invoice.
   with the last row absorbing the residue. `due = max(row total − row received,
   0)` and `payment_status` is decided per row, so one row can be Paid while a
   sibling still owes.
-- **Row dates.** Invoice rows carry `COALESCE(actual, approx)` as latest ship,
+- **Row dates.** *(Superseded 2026-10-29 — see the latest entry: Latest Ship
+  Date is the LC's latest date of shipment, and provisional rows carry no
+  actual ship or maturity.)* Invoice rows carried `COALESCE(actual, approx)` as latest ship,
   the invoice's actual ship date and `COALESCE(invoice maturity, actual ship,
   sale maturity)`; remainder rows use the sale's shipments and maturity.
 - **`Prod. Date` from recipe production.** `MAX(production_runs.production_date)`

@@ -606,7 +606,7 @@ row instead of being repeated at sale level. `Prod. Date` is the latest
 |---|---|---|---|
 | 1 | **Row grain** | `_commercial_report_base_sql` rebuilt: `inv_lines` (one row per non-void `invoice_items` line) `UNION ALL` `remainders` (one row per PI line where `PI qty − invoiced qty > 0`, `is_provisional`); over-invoiced lines have no remainder; a legacy line with `sale_item_id IS NULL` is its own row and does not reduce a remainder | ✅ `test_split_pi_line_renders_invoice_row_plus_remainder`, `test_two_lines_on_one_invoice_render_as_two_rows`, `test_line_split_across_two_invoices_renders_both_invoice_rows`, `test_over_invoiced_line_has_no_remainder_row`, `test_legacy_invoice_line_without_sale_item_is_its_own_row` |
 | 2 | **Per-row money** | Invoice payments allocate across that invoice's lines in `invoice_items.id` order (last line absorbs the overpayment); `invoice_id IS NULL` payments allocate across the sale's rows (`sale_item_id NULLS LAST, invoice_date NULLS LAST, item_id NULLS LAST, is_provisional, product_name`, last row absorbs the residue); `due_amount = GREATEST(total_price − received_amount, 0)` per row; `payment_status` is decided per row | ✅ `test_invoice_payments_allocate_to_its_lines`, `test_partial_invoice_payment_allocates_in_line_order_and_last_line_absorbs`, `test_sale_level_legacy_payment_allocates_across_rows`, `test_invoice_row_carries_its_own_money_and_allocation`, `test_due_clamped_at_zero_with_overpayment_on_invoice` |
-| 3 | **Row dates** | Invoice rows: `latest_ship_date = COALESCE(actual, approx)`, invoice actual ship, `maturity = COALESCE(invoice maturity, actual ship, sale maturity)`; remainder rows: sale shipments/shipment date + sale maturity | ✅ `test_row_shape_contract_keys`, `test_report_row_maturity_prefers_the_invoice_maturity` |
+| 3 | **Row dates** | Invoice rows: `latest_ship_date = COALESCE(actual, approx)`, invoice actual ship, `maturity = COALESCE(invoice maturity, actual ship, sale maturity)`; remainder rows: sale shipments/shipment date + sale maturity. **Superseded by Phase 8 (2026-10-29):** `latest_ship_date` is now the LC's latest date of shipment, and provisional rows carry no actual ship or maturity | ✅ `test_row_shape_contract_keys`, `test_report_row_maturity_prefers_the_invoice_maturity` (Phase 8 tests carry the current rule) |
 | 4 | **`Prod. Date` from recipe production** | Subquery: `MAX(production_runs.production_date)` over `production_run_links`/`production_runs`/`recipes` for this **sale**, matching the run's `sale_item_id` or the recipe's `company_id`+`product_name`. `production_run_links.invoice_id` is ignored | ✅ `test_prod_date_comes_from_recipe_production_not_the_invoice`, `test_provisional_row_uses_the_sale_product_production_date`, `test_production_for_another_sale_does_not_leak_into_this_row` |
 | 5 | **KPIs on row money** | Summary aggregates the same `base` rows: `SUM(total_price)`, `SUM(received_amount)`, `SUM(GREATEST(total − received, 0))`, overdue restricted to past-maturity owing rows, `COUNT(DISTINCT sale_id)`; drill-down rows equal the flat report | ✅ `test_summary_kpis_use_displayed_row_totals`, `test_report_kpi_received_equals_sum_of_row_payments`, `test_report_kpi_due_equals_row_totals_minus_received`, `test_mixed_sale_kpis_and_detail_use_displayed_line_totals` |
 | 6 | **CSV** | 21 columns: `Prod. Date` after `Total Price ($)`, trailing `Provisional` | ✅ `test_export_marks_provisional_rows`, `test_export_carries_the_production_date` |
@@ -698,6 +698,30 @@ network.
 
 **Constraints:** the E2E never reads or writes the production `DATABASE_URL`;
 harness files live outside the repo; no schema, API, or gate changes.
+
+### Phase 8 — latest date of shipment, LC deadline bell, report dates ✅ 2026-10-29
+
+The LC's `expiry_date` is the **latest date of shipment** (shipment after it is
+invalid). The field keeps its legacy column and wire key; only the label, the
+report column and a new reminder changed. This section **supersedes** the
+Phase 5 "Row dates" bullet above: `latest_ship_date` no longer comes from an
+invoice.
+
+| # | Slice | Scope | State |
+|---|---|---|---|
+| 1 | **Labels** | `LcDetailModal` edit + view call `expiry_date` "Latest Date of Shipment" (helper: shipment after this date is invalid, amend the LC); `LinkPIsModal` can set it when creating an LC | ✅ `LcDetailModal.test.jsx`, `LinkPIsModal.test.jsx` |
+| 2 | **Report dates** | `latest_ship_date = letters_of_credit.expiry_date` on **every** row of the sale (NULL without an LC); `actual_ship_date`/`maturity_date` are invoice-only and **blank on provisional rows**, whose status is `Pending`; headers read `Latest Ship Date` / `Actual Ship Date` / `Maturity Date` | ✅ `test_latest_ship_is_the_lc_latest_shipment_date`, `test_latest_ship_is_null_without_an_lc_deadline`, `test_provisional_rows_have_no_actual_ship_or_maturity`, `CommercialTable.test.jsx` |
+| 3 | **Bell warnings** | `reminders.run_lc_shipment_reminders`: 7 days out → `lc_shipment_deadline` (warning, `lc:{id}:ship:7`); after the deadline → `lc_shipment_deadline_passed` (critical, `lc:{id}:ship:0`). Bell only, **never email, never blocks shipping**. Silent without a parseable deadline (no `lc_date` fallback). Stops when every attached PI is completed; a zero-PI LC still warns; > 7 days out clears both keys | ✅ `tests/test_lc_shipment_reminders.py` (12) |
+| 4 | **Cron GET** | Vercel Cron invokes GET; the route was POST-only (production 405). Both verbs registered, both in `_PUBLIC_API`, same Bearer gate. Response gains `lc_reminders`; the audit line records it | ✅ `test_cron_get_creates_lc_reminders`, `test_cron_get_still_requires_the_bearer_secret` |
+| 5 | **Amend re-arms** | `PUT /api/lcs/<id>` validates `expiry_date` as ISO `YYYY-MM-DD` (400 otherwise, blank → NULL) and, when it changes, deletes both LC keys under `FOR UPDATE` in the same transaction as the update + `LC_UPDATE` audit | ✅ `test_lc_put_expiry_change_clears_lc_reminders`, `test_lc_put_unrelated_change_keeps_lc_reminders`, `test_lc_put_rejects_non_iso_expiry_date` |
+
+**Locked decisions:** the latest ship date belongs to the credit, not an
+invoice ("আর লেটেষ্ট শিপ ডেটের সাথে ইনভইসের কোন রিলেশন নাই"); a provisional row
+has no actual ship and no maturity because it has no invoice; reminders are
+bell-only so the operator can amend the LC and extend the deadline.
+
+**Constraints:** no schema change (`expiry_date` kept); no ship blocking;
+parameterised SQL only; frontend routes `entity_type='lc'` to `/sales`.
 
 ---
 
