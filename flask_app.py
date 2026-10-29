@@ -192,7 +192,8 @@ from chem_stock import (get_session_user, validate_api_key,
                         set_password, issue_reset_token, redeem_reset_token)
 from raas_tracker.notifications import (
     list_notifications_for, unread_count, mark_read, mark_read_all_for,
-    notify_reorder_status, notify_maturity_initial, notify_maturity_escalation
+    notify_reorder_status, notify_maturity_initial, notify_maturity_escalation,
+    clear_lc_shipment_reminders
 )
 # Modules (not bare functions) so tests can stub the mailer without touching
 # the reminder logic, and so an import-time SMTP probe never runs.
@@ -209,6 +210,7 @@ _PUBLIC_API = {
     ("POST", "/api/auth/setup"),
     ("POST", "/api/auth/logout"),
     ("GET", "/api/auth/status"),
+    ("GET", "/api/cron/maturity-check"),
     ("POST", "/api/cron/maturity-check"),
     ("POST", "/api/auth/forgot-password"),
     ("POST", "/api/auth/reset-password"),
@@ -3281,17 +3283,22 @@ def api_delete_item(sale_id, item_id):
 
 
 # ==================== API: CRON JOBS ====================
-@app.route("/api/cron/maturity-check", methods=["POST"])
+@app.route("/api/cron/maturity-check", methods=["GET", "POST"])
 def api_cron_maturity_check():
     """Daily cron job: invoice payment reminders plus legacy sale maturities.
 
     Auth: Requires Authorization: Bearer <CRON_SECRET> header.
 
+    Accepts GET because Vercel Cron invokes the configured path with GET;
+    a POST-only route answered 405 there and no reminder ever ran in
+    production. The bearer check is identical for both methods.
+
     Invoices own the payment clock now, so the sale-level maturity scan only
     covers sales that have no invoice at all (legacy rows); a sale with
     invoices would otherwise be reminded twice for the same money. Each newly
     created invoice reminder sends one email to the directors in NOTIFY_EMAILS
-    — an unconfigured mailer is a no-op and never fails the run.
+    — an unconfigured mailer is a no-op and never fails the run. LC
+    shipment-deadline warnings are bell-only: no email, no ship gating.
     """
     cron_secret = os.getenv("CRON_SECRET")
     auth_header = request.headers.get("Authorization", "")
@@ -3345,17 +3352,23 @@ def api_cron_maturity_check():
             if mailer.send_email(item["email_subject"], item["email_body"]):
                 emails_sent += 1
 
+        # LC deadlines are bell-only: an amendment is the operator's action,
+        # and the bell is where they will look for it.
+        lc_reminders = reminders.run_lc_shipment_reminders(conn, today)
+
         # This endpoint was the one mutating route that wrote no audit row, so
         # a run (or a silent no-op) left no trace. atomic=True commits here.
         log_audit_action(conn, "CRON_MATURITY_CHECK", "cron", None,
                          new_value=f"checked={len(rows)} "
                                    f"notified={sale_reminders} "
                                    f"invoice_reminders={len(invoice_reminders)} "
+                                   f"lc_reminders={len(lc_reminders)} "
                                    f"emails={emails_sent}")
         return jsonify({"success": True, "checked": len(rows),
                         "notified": sale_reminders,
                         "sale_reminders": sale_reminders,
                         "invoice_reminders": len(invoice_reminders),
+                        "lc_reminders": len(lc_reminders),
                         "emails_sent": emails_sent})
     except Exception as e:
         # Roll back before returning 500. A failed run leaves statements this
@@ -3412,12 +3425,34 @@ def _lc_terms_error(payment_terms, tenor_days):
     return None
 
 
+def _iso_date_or_none(value):
+    """Validate an optional ISO date (``YYYY-MM-DD``); blank becomes NULL.
+
+    ``expiry_date`` is the LC's latest date of shipment. Free text here was
+    accepted silently before, so a typo simply never reminded anybody; a 400
+    at the boundary makes the filter that reads it trustworthy.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError:
+        raise ValueError("must be an ISO date (YYYY-MM-DD)")
+
+
 def _lc_update_fields(conn, lc_id, fields):
     allowed = ("lc_date", "expiry_date", "bank_ref", "notes",
                "payment_terms", "tenor_days")
     clean = {k: v for k, v in fields.items() if k in allowed}
-    if not conn.execute("SELECT 1 FROM letters_of_credit WHERE id = %s",
-                        (lc_id,)).fetchone():
+    # Lock the row: the expiry comparison below decides whether a live bell
+    # reminder is cleared, so it must read the value this UPDATE replaces.
+    current = conn.execute(
+        "SELECT expiry_date FROM letters_of_credit WHERE id = %s FOR UPDATE",
+        (lc_id,)).fetchone()
+    if not current:
         return False
     if clean:
         try:
@@ -3431,6 +3466,12 @@ def _lc_update_fields(conn, lc_id, fields):
                     "UPDATE sales SET lc_date = %s, updated_at = %s"
                     " WHERE lc_id = %s",
                     (clean["lc_date"], _now_str(), lc_id))
+            if "expiry_date" in clean:
+                # Amending the deadline re-arms the warning: the old bell is
+                # about a date that no longer governs the LC. No commit here —
+                # this is the same transaction as the UPDATE and the audit row.
+                if (clean["expiry_date"] or "").strip() != (current[0] or "").strip():
+                    clear_lc_shipment_reminders(conn, lc_id)
             log_audit_action(conn, "LC_UPDATE", "lc", lc_id,
                              new_value=json.dumps(clean, default=str),
                              atomic=False)
@@ -3512,6 +3553,8 @@ class LcCreateIn(_StrippedModel):
     payment_terms: str | None = None
     tenor_days: int | None = None
 
+    _valid_expiry = field_validator("expiry_date")(_iso_date_or_none)
+
 
 class LcUpdateIn(BaseModel):
     """Mutable LC fields only — lc_number/company_id are immutable."""
@@ -3522,6 +3565,8 @@ class LcUpdateIn(BaseModel):
     notes: str | None = None
     payment_terms: str | None = None
     tenor_days: int | None = None
+
+    _valid_expiry = field_validator("expiry_date")(_iso_date_or_none)
 
 
 class LcAttachIn(_StrippedModel):

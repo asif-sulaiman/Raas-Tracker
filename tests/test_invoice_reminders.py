@@ -248,6 +248,7 @@ def test_cron_creates_reminders_and_emails_each_new_one(
         "SELECT new_value FROM audit_logs WHERE action = 'CRON_MATURITY_CHECK' "
         "ORDER BY id DESC LIMIT 1").fetchone()
     assert "invoice_reminders=1" in row[0]
+    assert "lc_reminders=0" in row[0], "no LC carries a deadline in this fixture"
     assert "emails=1" in row[0]
 
 

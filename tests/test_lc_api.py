@@ -13,7 +13,11 @@ import uuid
 
 import pytest
 
+from datetime import date, timedelta
+
 from chem_stock import add_recipe, add_sale
+from raas_tracker.notifications import list_notifications_for
+from raas_tracker.reminders import run_lc_shipment_reminders
 from raas_tracker.sales import book_invoice, create_invoice
 
 
@@ -136,6 +140,96 @@ def test_lc_put_immutable_rejected(admin_client, db):
         json={"company_id": 123}).status_code == 400
     assert admin_client.put("/api/lcs/999999",
                             json={"notes": "x"}).status_code == 404
+
+
+def _keys(db):
+    return {n["dedupe_key"] for n in list_notifications_for(db, 1, "admin")}
+
+
+def _lc_with_deadline(admin_client, db, days_out, tag):
+    """An LC with one attached PI and a shipment deadline ``days_out`` away."""
+    co = _company(db, f"LC Deadline {tag}")
+    expiry = (date.today() + timedelta(days=days_out)).isoformat()
+    created = _mk_lc(admin_client, co, f"LC-DEAD-{tag}", expiry_date=expiry)
+    sid = _sale(db, f"PI-DEAD-{tag}", company_id=co)
+    r = admin_client.post(f"/api/lcs/{created['id']}/pis",
+                          json={"sale_ids": [sid]})
+    assert r.status_code == 200, r.get_json()
+    return created, expiry, sid
+
+
+def test_lc_create_rejects_non_iso_expiry_date(admin_client, db):
+    co = _company(db, f"LC ISO {_tag()}")
+    r = admin_client.post("/api/lcs", json={
+        "company_id": co, "lc_number": f"LC-ISO-{_tag()}",
+        "expiry_date": "30/12/2026"})
+
+    assert r.status_code == 400, r.get_json()
+    details = r.get_json()["details"]
+    assert [d["field"] for d in details] == ["expiry_date"]
+
+
+def test_lc_put_rejects_non_iso_expiry_date(admin_client, db):
+    co = _company(db, f"LC ISO P {_tag()}")
+    created = _mk_lc(admin_client, co, f"LC-ISOP-{_tag()}",
+                     expiry_date="2026-12-30")
+
+    r = admin_client.put(f"/api/lcs/{created['id']}",
+                         json={"expiry_date": "December 30, 2026"})
+
+    assert r.status_code == 400, r.get_json()
+    assert [d["field"] for d in r.get_json()["details"]] == ["expiry_date"]
+    assert admin_client.get(
+        f"/api/lcs/{created['id']}").get_json()["expiry_date"] == "2026-12-30"
+
+
+def test_lc_put_accepts_an_iso_expiry_date(admin_client, db):
+    co = _company(db, f"LC ISO OK {_tag()}")
+    created = _mk_lc(admin_client, co, f"LC-ISOK-{_tag()}")
+
+    r = admin_client.put(f"/api/lcs/{created['id']}",
+                         json={"expiry_date": "2027-01-15"})
+
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json()["expiry_date"] == "2027-01-15"
+
+
+def test_lc_put_blank_expiry_clears_the_deadline(admin_client, db):
+    """The UI's empty date box sends '' — stored as NULL, not a fake date."""
+    co = _company(db, f"LC ISO Blank {_tag()}")
+    created = _mk_lc(admin_client, co, f"LC-ISOB-{_tag()}",
+                     expiry_date="2026-12-30")
+
+    r = admin_client.put(f"/api/lcs/{created['id']}", json={"expiry_date": ""})
+
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json()["expiry_date"] is None
+
+
+def test_lc_put_expiry_change_clears_lc_reminders(admin_client, db):
+    tag = _tag()
+    created, _, _ = _lc_with_deadline(admin_client, db, 5, tag)
+    run_lc_shipment_reminders(db, date.today())
+    assert _keys(db) >= {f"lc:{created['id']}:ship:7"}
+
+    r = admin_client.put(f"/api/lcs/{created['id']}",
+                         json={"expiry_date": "2027-06-30"})
+
+    assert r.status_code == 200, r.get_json()
+    assert f"lc:{created['id']}:ship:7" not in _keys(db), (
+        "amending the deadline must re-arm the warning")
+
+
+def test_lc_put_unrelated_change_keeps_lc_reminders(admin_client, db):
+    tag = _tag()
+    created, _, _ = _lc_with_deadline(admin_client, db, 5, tag)
+    run_lc_shipment_reminders(db, date.today())
+
+    r = admin_client.put(f"/api/lcs/{created['id']}", json={"notes": "bank ok"})
+
+    assert r.status_code == 200, r.get_json()
+    assert f"lc:{created['id']}:ship:7" in _keys(db), (
+        "editing an unrelated field must not silence a live warning")
 
 
 def test_lc_delete_flows(admin_client, db):

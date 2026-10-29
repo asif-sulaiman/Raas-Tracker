@@ -11,6 +11,11 @@ escalation 7 days later. Dedupe keys ``invoice:{id}:due`` and
 clears them (``notifications.clear_invoice_reminders``). Only reminders that
 were actually inserted are returned, so the cron sends one email per new
 reminder and never re-mails a condition it already reported.
+
+The same cron also warns about LCs whose **latest date of shipment**
+(``letters_of_credit.expiry_date``) is within a week — after it the LC is
+invalid and must be amended. Those alerts are bell-only; amending the date
+clears the keys so the warning re-arms for the new deadline.
 """
 
 from datetime import date, timedelta
@@ -18,10 +23,11 @@ from typing import Any, Dict, List, Optional
 
 import psycopg
 
-from .notifications import notify
+from .notifications import clear_lc_shipment_reminders, notify
 
 AT_SIGHT_GRACE_DAYS = 7
 ESCALATION_AFTER_DAYS = 7
+LC_WINDOW_DAYS = 7
 CURRENCY = "USD"
 
 
@@ -121,5 +127,73 @@ def run_invoice_reminders(conn: psycopg.Connection,
                 "email_subject": (f"Invoice {invoice_number} payment overdue — "
                                   f"{client_name} ({_usd(outstanding)} {CURRENCY})"),
                 "email_body": body,
+            })
+    return created
+
+
+def _lc_body(lc_number: Optional[str], expiry: date, days_left: int) -> str:
+    number = f"LC {lc_number}" if lc_number else "The LC"
+    if days_left < 0:
+        when = f"was {expiry.isoformat()} ({-days_left} days ago)"
+    else:
+        when = f"is {expiry.isoformat()}"
+    return (f"{number} latest date of shipment {when}. Shipment after that "
+            "date is invalid — amend the LC to extend it.")
+
+
+def run_lc_shipment_reminders(conn: psycopg.Connection,
+                              today: date) -> List[Dict[str, Any]]:
+    """Warn about LCs whose latest shipment date is near or past; return new.
+
+    Scanned: an LC with at least one linked PI still open, plus an LC with no
+    PIs at all (it still lapses). An LC whose PIs are all completed is settled
+    and silent. Blank or unparseable dates are skipped — nothing to warn
+    about — and a date more than a week out clears any stale keys so an
+    out-of-band extension re-arms the warning.
+    """
+    rows = conn.execute(
+        """SELECT lc.id, lc.lc_number, lc.lc_date, lc.expiry_date, c.name,
+                  (SELECT COUNT(*) FROM sales s
+                    WHERE s.lc_id = lc.id AND s.stage <> 'completed') AS open_pis,
+                  (SELECT COUNT(*) FROM sales s WHERE s.lc_id = lc.id) AS all_pis
+             FROM letters_of_credit lc
+             LEFT JOIN companies c ON c.id = lc.company_id
+            ORDER BY lc.id""").fetchall()
+
+    created: List[Dict[str, Any]] = []
+    for (lc_id, lc_number, lc_date, expiry_date, company_name,
+         open_pis, all_pis) in rows:
+        deadline = _as_date(expiry_date)
+        if deadline is None:
+            continue
+        if all_pis and not open_pis:
+            # Every PI under this LC is completed: the deadline no longer bites.
+            clear_lc_shipment_reminders(conn, lc_id)
+            conn.commit()
+            continue
+        days_left = (deadline - today).days
+        if days_left > LC_WINDOW_DAYS:
+            clear_lc_shipment_reminders(conn, lc_id)
+            conn.commit()
+            continue
+        if days_left < 0:
+            type_, severity = "lc_shipment_deadline_passed", "critical"
+            title = f"LC latest shipment date passed: {company_name}"
+            key = f"lc:{lc_id}:ship:0"
+        else:
+            type_, severity = "lc_shipment_deadline", "warning"
+            when = ("today" if days_left == 0 else f"in {days_left} days")
+            title = f"LC shipment deadline {when}: {company_name}"
+            key = f"lc:{lc_id}:ship:7"
+        body = _lc_body(lc_number, deadline, days_left)
+        notification_id = notify(
+            conn, type=type_, title=title, body=body, severity=severity,
+            entity_type="lc", entity_id=lc_id, dedupe_key=key)
+        if notification_id is not None:
+            created.append({
+                "lc_id": lc_id, "lc_number": lc_number,
+                "company_name": company_name, "lc_date": lc_date,
+                "expiry_date": deadline.isoformat(), "days_left": days_left,
+                "severity": severity, "title": title, "body": body,
             })
     return created
