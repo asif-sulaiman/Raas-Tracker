@@ -80,7 +80,15 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
         const [cos, recs, sales] = await Promise.all([coRes.json(), recRes.json(), saleRes.json()]);
         setCompanies(Array.isArray(cos) ? cos : []);
         setRecipes(Array.isArray(recs) ? recs : []);
-        setAllSales(Array.isArray(sales) ? sales : []);
+        // GET /api/sales is paginated ({sales, total}); an older array shape is
+        // still accepted so the modal cannot silently lose every PI again.
+        setAllSales(
+          Array.isArray(sales)
+            ? sales
+            : Array.isArray(sales?.sales)
+              ? sales.sales
+              : [],
+        );
       } catch (err) {
         // Empty lists are indistinguishable from an empty master, so record the
         // failure — the empty-state messages below stay reserved for a real
