@@ -12,6 +12,8 @@ psycopg = pytest.importorskip("psycopg")
 
 from raas_tracker import sales as salesmod  # noqa: E402
 from raas_tracker import lcs as lcsmod  # noqa: E402
+from raas_tracker import recipes as recipesmod  # noqa: E402
+from raas_tracker import stock as stockmod  # noqa: E402
 
 
 def _tag() -> str:
@@ -59,13 +61,14 @@ def _invoice(conn, sale_id, number=None):
         invoice_date="2026-01-15")["invoice_id"]
 
 
-def _recipe(conn, company_id, product, name=None):
-    name = name or f"R-{_tag()}"
-    conn.execute(
-        "INSERT INTO recipes (name, company_id, product_name) VALUES (%s, %s, %s)",
-        (name, company_id, product),
-    )
-    conn.commit()
+def _recipe(conn, company_id, invoice_id, product, name=None):
+    """One invoice-scoped recipe with a single formulated product."""
+    recipe = recipesmod.add_recipe(
+        conn, name or f"R-{_tag()}", company_id, invoice_id)
+    chemical = f"Chem-{_tag()}"
+    stockmod.add_chemical(conn, chemical, 500, "KG")
+    recipesmod.add_recipe_item(conn, recipe["id"], product, chemical, 10)
+    return recipe
 
 
 # --------------------------------------------------------------------------- #
@@ -201,19 +204,6 @@ def test_shipment_ready_neither(db):
     assert "detail" in out
 
 
-def test_shipment_ready_recipe_only(db):
-    tag = _tag()
-    co = _company(db, f"Gate R {_tag()}")
-    prod = f"RProd-{tag}"
-    lc_id, _ = _lc_with_sale(db, co, product=prod)
-    _recipe(db, co, prod)
-    out = salesmod.check_lc_shipment_ready(db, lc_id)
-    # No invoicing yet, so no product is invoice-scoped: recipe/produced are
-    # vacuously ok, and the invoice barrier is still what blocks the move.
-    assert out["recipes_ok"] is True
-    assert out["invoices_ok"] is False
-
-
 def test_shipment_ready_invoice_only(db):
     co = _company(db, f"Gate I {_tag()}")
     lc_id, sid = _lc_with_sale(db, co, product=f"IProd-{_tag()}")
@@ -232,13 +222,14 @@ def test_shipment_ready_both(db):
     co = _company(db, f"Gate B {_tag()}")
     prod = f"BProd-{tag}"
     lc_id, sid = _lc_with_sale(db, co, product=prod)
-    _recipe(db, co, prod)
-    _invoice(db, sid)
+    inv = _invoice(db, sid)
+    _recipe(db, co, inv, prod)
     out = salesmod.check_lc_shipment_ready(db, lc_id)
     assert out["recipes_ok"] is True
     assert out["invoices_ok"] is True
-    # Recipe+big invoices exist, but no production run is linked yet.
+    # The plan and its formulation exist, but no production run is linked yet.
     assert out["produced_ok"] is False
+    assert out["detail"]["missing_production"] == [prod]
 
 
 # --------------------------------------------------------------------------- #
@@ -274,41 +265,6 @@ def test_invoice_amount_derived_cache(db):
     row = db.execute(
         "SELECT amount FROM invoices WHERE id = %s", (inv,)).fetchone()
     assert float(row[0]) == pytest.approx(30.0)
-
-
-def test_legacy_recipe_without_product_link_does_not_satisfy_the_gate(db):
-    """Strict product match — the NULL-product_name fallback is gone (7a7ae73).
-
-    This used to pass vacuously: the header-only invoice carried no lines, so
-    no product was invoice-scoped and the recipe check never ran. The invoice
-    now carries its line, so the gate sees the product and reports the missing
-    product-linked recipe; only a matching ``recipes.product_name`` satisfies
-    the barrier.
-    """
-    tag = _tag()
-    co = _company(db, f"Gate Legacy {_tag()}")
-    prod = f"LegacyProd-{tag}"
-    lc_id, sid = _lc_with_sale(db, co, product=prod)
-    _invoice(db, sid)
-    # legacy-style recipe: no product link at all
-    db.execute(
-        "INSERT INTO recipes (name, company_id, product_name)"
-        " VALUES (%s, %s, NULL)",
-        (f"Legacy-R-{tag}", co),
-    )
-    db.commit()
-    out = salesmod.check_lc_shipment_ready(db, lc_id)
-    assert out["invoices_ok"] is True
-    assert out["recipes_ok"] is False, (
-        "strict match: a NULL product_name is not a recipe for the product")
-    assert prod in out["detail"]["missing_recipes"]
-
-    # The product-linked recipe satisfies the recipe barrier; production is
-    # still owed, so the produced barrier keeps blocking.
-    _recipe(db, co, prod)
-    out = salesmod.check_lc_shipment_ready(db, lc_id)
-    assert out["recipes_ok"] is True
-    assert out["produced_ok"] is False
 
 
 

@@ -18,7 +18,12 @@ import uuid
 
 import pytest
 
-from chem_stock import add_recipe
+from chem_stock import (
+    add_chemical,
+    add_recipe,
+    add_recipe_item,
+    create_production_run,
+)
 from raas_tracker import lcs as lcsmod
 from raas_tracker._exceptions import (
     LcNotReadyForCompletion,
@@ -451,23 +456,14 @@ def test_late_invoice_books_ships_pays_and_recompletes(db):
     assert _stage(db, sid) == "payment_due"
 
     # Booking reads production content, not the invoice status: build the
-    # recipe and the run linked to THIS invoice, as the recipe page does.
-    sale_item_id = db.execute(
-        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id",
-        (sid,)).fetchone()[0]
-    assert add_recipe(db, f"R-LATE-{tag}", 100, 0, company_id, product) is not False
-    recipe_id = db.execute(
-        "SELECT id FROM recipes WHERE company_id = %s AND lower(name) = lower(%s)",
-        (company_id, f"R-LATE-{tag}")).fetchone()[0]
-    run_id = db.execute(
-        "INSERT INTO production_runs (recipe_id, sale_item_id, order_number,"
-        " batch_number, production_date, qty_produced, created_by)"
-        " VALUES (%s, %s, NULL, NULL, NULL, 2.0, NULL) RETURNING id",
-        (recipe_id, sale_item_id)).fetchone()[0]
-    db.execute(
-        "INSERT INTO production_run_links (run_id, sale_id, invoice_id)"
-        " VALUES (%s, %s, %s)", (run_id, sid, late))
-    db.commit()
+    # invoice's recipe, formulate its product and record the run, as the
+    # recipe page does. A recipe belongs to THIS invoice, so its run can only
+    # ever unlock THIS invoice.
+    add_chemical(db, f"Chem-{tag}", 50, "KG")
+    recipe = add_recipe(db, f"R-LATE-{tag}", company_id, late)
+    assert add_recipe_item(db, recipe["id"], product, f"Chem-{tag}", 40.0)
+    create_production_run(db, company_id, recipe["id"],
+                          [{"product_name": product, "quantity": 2.0}])
 
     assert book_invoice(db, late, "2026-11-01") is True
     ship_invoice(db, late, "2026-10-20", invoice_number=f"LATE-SHIP-{tag}")

@@ -1381,30 +1381,37 @@ def _company(db, label):
     return co
 
 
-def _production_run(db, company_id, product, production_date, sale_id=None,
-                    invoice_id=None, sale_item_id=None):
-    """A recipe production run for ``product``, linked to a sale or an invoice.
+def _production_run(db, company_id, product, production_date, invoice_id):
+    """A production run output for ``product`` under ``invoice_id``'s recipe.
 
-    The recipe's ``product_name`` is what ties production to a report line;
-    ``sale_item_id`` is left NULL exactly like ``create_production_run`` does.
+    A recipe is the plan for one invoice, so every run on that invoice reuses
+    its one recipe row. The run records the invoice link — and with it the
+    sale — exactly like ``create_production_run`` does, so a provisional
+    remainder row of the same sale and product carries the same date while a
+    different invoice never does.
     """
     tag = uuid.uuid4().hex[:8]
-    recipe_id = db.execute(
-        "INSERT INTO recipes (company_id, name, product_name, total_quantity, "
-        "water_percentage) VALUES (%s, %s, %s, 1, 0) RETURNING id",
-        (company_id, f"R-{tag}", product)).fetchone()[0]
+    existing = db.execute(
+        "SELECT id FROM recipes WHERE invoice_id = %s", (invoice_id,)).fetchone()
+    if existing is None:
+        recipe_id = db.execute(
+            "INSERT INTO recipes (company_id, name, invoice_id) "
+            "VALUES (%s, %s, %s) RETURNING id",
+            (company_id, f"R-{tag}", invoice_id)).fetchone()[0]
+    else:
+        recipe_id = existing[0]
     run_id = db.execute(
         "INSERT INTO production_runs (recipe_id, sale_item_id, production_date, "
-        "qty_produced) VALUES (%s, %s, %s, 1) RETURNING id",
-        (recipe_id, sale_item_id, production_date)).fetchone()[0]
-    if sale_id is not None:
-        db.execute("INSERT INTO production_run_links (run_id, sale_id) "
-                   "VALUES (%s, %s)", (run_id, sale_id))
-    if invoice_id is not None:
-        sale_of_invoice = db.execute(
-            "SELECT sale_id FROM invoices WHERE id = %s", (invoice_id,)).fetchone()[0]
-        db.execute("INSERT INTO production_run_links (run_id, sale_id, invoice_id) "
-                   "VALUES (%s, %s, %s)", (run_id, sale_of_invoice, invoice_id))
+        "qty_produced) VALUES (%s, NULL, %s, 1) RETURNING id",
+        (recipe_id, production_date)).fetchone()[0]
+    db.execute(
+        "INSERT INTO production_run_outputs "
+        "(run_id, product_name, unit, qty_produced) VALUES (%s, %s, 'KG', 1)",
+        (run_id, product))
+    sale_of_invoice = db.execute(
+        "SELECT sale_id FROM invoices WHERE id = %s", (invoice_id,)).fetchone()[0]
+    db.execute("INSERT INTO production_run_links (run_id, sale_id, invoice_id) "
+               "VALUES (%s, %s, %s)", (run_id, sale_of_invoice, invoice_id))
     db.commit()
     return run_id
 
@@ -1414,11 +1421,11 @@ def _attach_company(db, sid, company_id):
     db.commit()
 
 
-def test_prod_date_comes_from_recipe_production_not_the_invoice(admin_client, db):
-    """A sale-linked run of the line's recipe sets Prod. Date.
+def test_prod_date_comes_from_the_invoice_output_for_that_product(admin_client, db):
+    """The latest run output for this invoice AND this product sets Prod. Date.
 
-    The invoice link is irrelevant: a newer run linked to the invoice but for a
-    different product must not touch this line.
+    A newer run on the same invoice but for a different product must not touch
+    this line.
     """
     sid = _sale(db, "PI-PROD-1", items=[
         {"product_name": "Acid", "quantity": 5, "unit_price": 10}])
@@ -1427,7 +1434,7 @@ def test_prod_date_comes_from_recipe_production_not_the_invoice(admin_client, db
     invoice_id = db.execute(
         "SELECT id FROM invoices WHERE sale_id = %s", (sid,)).fetchone()[0]
 
-    _production_run(db, co, "Acid", "2026-03-01", sale_id=sid)
+    _production_run(db, co, "Acid", "2026-03-01", invoice_id=invoice_id)
     _production_run(db, co, "Other", "2026-09-01", invoice_id=invoice_id)
 
     row = _of(_rows(admin_client), sid)[0]
@@ -1436,33 +1443,38 @@ def test_prod_date_comes_from_recipe_production_not_the_invoice(admin_client, db
 
 
 def test_provisional_row_uses_the_sale_product_production_date(admin_client, db):
-    """An uninvoiced PI line still carries its recipe production date."""
+    """An uninvoiced remainder row still carries its product's production date.
+
+    Production always happens under an invoice, so the remainder row is dated
+    by the run of the same sale + product that covered the invoiced portion.
+    """
     sid = _sale(db, "PI-PROD-2", items=[
         {"product_name": "Acid", "quantity": 5, "unit_price": 10}],
-        invoice_lines=None)
+        invoice_lines=[{"sale_item_index": 0, "quantity": 3}])
     co = _company(db, "ProdCo")
     _attach_company(db, sid, co)
+    invoice_id = db.execute(
+        "SELECT id FROM invoices WHERE sale_id = %s", (sid,)).fetchone()[0]
 
-    _production_run(db, co, "Acid", "2026-03-05", sale_id=sid)
+    _production_run(db, co, "Acid", "2026-03-05", invoice_id=invoice_id)
 
-    row = _of(_rows(admin_client), sid)[0]
-    assert row["is_provisional"] is True
-    assert row["prod_date"] == "2026-03-05"
+    provisional = next(r for r in _rows(admin_client) if r["is_provisional"])
+    assert provisional["prod_date"] == "2026-03-05"
 
 
 def test_production_for_another_sale_does_not_leak_into_this_row(admin_client, db):
-    """Production is sale-scoped: another sale's batch is not this row's date."""
+    """Production is invoice/sale-scoped: another sale's batch is not this row's date."""
     sid = _sale(db, "PI-PROD-3", items=[
-        {"product_name": "Acid", "quantity": 5, "unit_price": 10}],
-        invoice_lines=None)
+        {"product_name": "Acid", "quantity": 5, "unit_price": 10}])
     other = _sale(db, "PI-PROD-3-OTHER", items=[
-        {"product_name": "Acid", "quantity": 5, "unit_price": 10}],
-        invoice_lines=None)
+        {"product_name": "Acid", "quantity": 5, "unit_price": 10}])
     co = _company(db, "ProdCo")
     _attach_company(db, sid, co)
     _attach_company(db, other, co)
+    other_invoice = db.execute(
+        "SELECT id FROM invoices WHERE sale_id = %s", (other,)).fetchone()[0]
 
-    _production_run(db, co, "Acid", "2026-07-01", sale_id=other)
+    _production_run(db, co, "Acid", "2026-07-01", invoice_id=other_invoice)
 
     assert _of(_rows(admin_client), sid)[0]["prod_date"] is None
     assert _of(_rows(admin_client), other)[0]["prod_date"] == "2026-07-01"
@@ -1621,7 +1633,9 @@ def test_export_carries_the_production_date(admin_client, db):
         {"product_name": "Acid", "quantity": 5, "unit_price": 10}])
     co = _company(db, "ProdCo")
     _attach_company(db, sid, co)
-    _production_run(db, co, "Acid", "2026-03-01", sale_id=sid)
+    invoice_id = db.execute(
+        "SELECT id FROM invoices WHERE sale_id = %s", (sid,)).fetchone()[0]
+    _production_run(db, co, "Acid", "2026-03-01", invoice_id=invoice_id)
 
     r = admin_client.post("/api/reports/live/export", json={})
     assert r.status_code == 200

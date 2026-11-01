@@ -35,8 +35,8 @@ from raas_tracker.sales import (
     book_invoice,
 )
 from raas_tracker._exceptions import SaleNotReadyPastShipment
-from raas_tracker.recipes import create_production_run, add_recipe_item
 from raas_tracker import lcs as lcsmod
+from raas_tracker import recipes as recipesmod
 
 
 def _company(db, name="Test Co"):
@@ -64,20 +64,19 @@ def _attach_pi(db, lc_id, sale_ids):
     lcsmod.attach_pis(db, lc_id, sale_ids)
 
 
-def _recipe(db, company_id, product_name):
-    """Create a recipe for a product with a dummy ingredient."""
-    db.execute(
-        "INSERT INTO recipes (name, company_id, product_name) VALUES (%s, %s, %s)",
-        (f"Recipe-{product_name}", company_id, product_name)
-    )
+def _recipe(db, company_id, invoice_id, product_name):
+    """Create the invoice's recipe with a dummy 100% ingredient."""
+    name = f"Recipe-{product_name}"
+    recipe = recipesmod.add_recipe(db, name, company_id, invoice_id)
     # Ensure Water chemical exists with sufficient stock
     db.execute(
         "INSERT INTO chemicals (name, unit, current_qty, reorder_level) VALUES ('Water', 'KG', 10000, 0) "
         "ON CONFLICT (name) DO UPDATE SET current_qty = GREATEST(chemicals.current_qty, 10000)"
     )
     # Add a dummy ingredient so production can run (percentage = 100%)
-    add_recipe_item(db, company_id, f"Recipe-{product_name}", "Water", 100.0)
+    recipesmod.add_recipe_item(db, recipe["id"], product_name, "Water", 100.0)
     db.commit()
+    return recipe
 
 
 def _invoice(db, sale_id, invoice_number="INV-001"):
@@ -97,13 +96,13 @@ def _invoice_explicit(db, sale_id, invoice_number, lines):
     return result["invoice_id"]
 
 
-def _production_run(db, company_id, recipe_name, production_qty, invoice_ids):
-    """Create a production run linked to invoices."""
-    result = create_production_run(
-        db, company_id, recipe_name, production_qty,
-        invoice_ids=invoice_ids, atomic=True
+def _production_run(db, company_id, recipe, product_name, production_qty):
+    """Record one run for the recipe's own invoice."""
+    return recipesmod.create_production_run(
+        db, company_id, recipe["id"],
+        [{"product_name": product_name, "quantity": production_qty}],
+        atomic=True,
     )
-    return result
 
 
 def _void_invoice(db, invoice_id):
@@ -167,14 +166,12 @@ def test_move_to_payment_due_with_a_shipped_invoice_allowed(db):
     co = _company(db)
     sid = _sale(db, co, product="Product X")
     move_sale_to_stage(db, sid, "lc_received")
-    _invoice(db, sid)
+    invoice_id = _invoice(db, sid)
     move_sale_to_stage(db, sid, "shipment_ongoing")
-    # Add recipe with ingredient
-    _recipe(db, co, "Product X")
-    # Record production run linked to the invoice, book it, then ship it.
-    inv_row = db.execute("SELECT id FROM invoices WHERE sale_id = %s", (sid,)).fetchone()
-    invoice_id = inv_row[0]
-    _production_run(db, co, f"Recipe-Product X", 100, [invoice_id])
+    # Add the invoice's recipe with its ingredient...
+    recipe = _recipe(db, co, invoice_id, "Product X")
+    # ...then record production run, book it, and ship it.
+    _production_run(db, co, recipe, "Product X", 100)
     assert book_invoice(db, invoice_id, "2026-11-01") is True
     # Status-only ship keeps this test on the gate, not on ship_invoice.
     _ship_invoice(db, invoice_id)
@@ -237,8 +234,8 @@ def test_one_shipped_invoice_is_enough_while_a_sibling_stays_behind(db):
                               [{"sale_item_id": item_b_id, "quantity": 5}])
     move_sale_to_stage(db, sid, "shipment_ongoing")
 
-    _recipe(db, co, "Product A")
-    _production_run(db, co, "Recipe-Product A", 100, [inv_a])
+    recipe = _recipe(db, co, inv_a, "Product A")
+    _production_run(db, co, recipe, "Product A", 100)
     assert book_invoice(db, inv_a, "2026-11-01") is True
     _ship_invoice(db, inv_a)
     assert db.execute("SELECT status FROM invoices WHERE id = %s",
@@ -261,16 +258,14 @@ def test_advance_sale_respects_barriers(db):
     stage = db.execute("SELECT stage FROM sales WHERE id = %s", (sid,)).fetchone()[0]
     assert stage == "shipment_ongoing"
     # Payment Due requires a shipped invoice; an invoice alone is not enough.
-    _invoice(db, sid)
+    invoice_id = _invoice(db, sid)
     with pytest.raises(SaleNotReadyPastShipment):
         advance_sale(db, sid)
     stage = db.execute("SELECT stage FROM sales WHERE id = %s", (sid,)).fetchone()[0]
     assert stage == "shipment_ongoing"
     # Once shipped, the same advance succeeds.
-    _recipe(db, co, "Product A")
-    invoice_id = db.execute(
-        "SELECT id FROM invoices WHERE sale_id = %s", (sid,)).fetchone()[0]
-    _production_run(db, co, "Recipe-Product A", 100, [invoice_id])
+    recipe = _recipe(db, co, invoice_id, "Product A")
+    _production_run(db, co, recipe, "Product A", 100)
     assert book_invoice(db, invoice_id, "2026-11-01") is True
     _ship_invoice(db, invoice_id)
     assert advance_sale(db, sid) == "payment_due"

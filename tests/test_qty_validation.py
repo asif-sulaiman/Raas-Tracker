@@ -37,32 +37,18 @@ def _assert_rejected(r):
     assert r.get_json().get("error")
 
 
-def test_produce_rejects_nan_recipe_qty(admin_client):
+def test_produce_rejects_nan_output_quantity(admin_client):
     r = _produce(admin_client, {
-        "production_qty": 5, "company_id": 1,
-        "recipes": [{"recipe_name": "Any", "qty": float("nan")}],
+        "company_id": 1,
+        "outputs": [{"product_name": "Any", "quantity": float("nan")}],
     })
     _assert_rejected(r)
 
 
-def test_produce_rejects_infinite_recipe_qty(admin_client):
+def test_produce_rejects_infinite_output_quantity(admin_client):
     r = _produce(admin_client, {
-        "production_qty": 5, "company_id": 1,
-        "recipes": [{"recipe_name": "Any", "qty": float("inf")}],
-    })
-    _assert_rejected(r)
-
-
-def test_produce_rejects_nan_production_qty(admin_client):
-    r = _produce(admin_client, {
-        "production_qty": float("nan"), "company_id": 1,
-    })
-    _assert_rejected(r)
-
-
-def test_produce_rejects_infinite_production_qty(admin_client):
-    r = _produce(admin_client, {
-        "production_qty": float("inf"), "company_id": 1,
+        "company_id": 1,
+        "outputs": [{"product_name": "Any", "quantity": float("inf")}],
     })
     _assert_rejected(r)
 
@@ -100,18 +86,12 @@ def test_export_rejects_nan_qty(admin_client):
 # JSON body.
 
 
-@pytest.mark.parametrize("model_name,payload", [
-    ("ProductionRecipeIn", {"qty": 0.0}),
-    ("ProductionRunCreateIn", {"production_qty": 0.0}),
-])
 @pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")],
                          ids=["inf", "-inf", "nan"])
-def test_production_models_reject_non_finite_at_the_schema(model_name, payload, bad):
-    model = getattr(flask_app, model_name)
-    body = dict(payload)
-    body[next(f for f in body)] = bad
+def test_production_output_model_rejects_non_finite_at_the_schema(bad):
     with pytest.raises(ValidationError):
-        model.model_validate(body)
+        flask_app.ProductionOutputIn.model_validate(
+            {"product_name": "Any", "quantity": bad})
 
 
 @pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan"),
@@ -183,81 +163,99 @@ def test_reorder_route_rejects_bare_1e309_number_token(admin_client, db):
                       ("Rdq",)).fetchone()[0] == 0
 
 
-# ---- the same hole on PUT /api/recipes/<name> ----
+# ---- the same hole on the recipe item routes ----
 #
-# Found while sweeping `flask_app.py` for the reorder defect: `total_quantity`
-# and `water_percentage` are read straight out of the raw dict and handed to
-# `update_recipe` with no coercion at all. `total_quantity` had no guard of any
-# kind; `water_percentage` had `0 <= v <= 100`, which `inf` trips by accident
-# (`inf > 100`) but `nan` walks straight through — both comparisons are False.
+# Found while sweeping `flask_app.py` for the reorder defect: the name-based
+# item aliases read `percentage` straight out of the raw dict. They now go
+# through `_req_float`, which rejects every non-finite form; the by-id routes
+# are model-backed instead (`RecipeItemIn` / `RecipePercentageIn`).
 
 def _seed_recipe(admin_client, db, name="NFRec"):
     admin_client.post("/api/companies", json={"name": "NFCo"})
     cid = db.execute("SELECT id FROM companies WHERE name = %s",
                      ("NFCo",)).fetchone()[0]
-    # A master recipe can only be created for a product already registered to
-    # the company, and a sale is what registers one.
     r = admin_client.post("/api/sales", json={
         "sale": {"pi_number": "PI-NF", "client_name": "x", "company_id": cid},
         "items": [{"product_name": "C1", "quantity": 10, "unit_price": 5}]})
     assert r.status_code == 201, r.get_json()
+    sale_id = db.execute("SELECT id FROM sales WHERE pi_number = %s",
+                         ("PI-NF",)).fetchone()[0]
+    item_id = db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id LIMIT 1",
+        (sale_id,)).fetchone()[0]
+    invoice_id = flask_app.create_invoice(
+        db, sale_id, "INV-NF",
+        lines=[{"sale_item_id": item_id, "quantity": 10}],
+        invoice_date="2026-01-15")["invoice_id"]
     r = admin_client.post("/api/recipes", json={
-        "name": name, "yield": 5, "company_id": cid, "product_name": "C1"})
+        "name": name, "company_id": cid, "invoice_id": invoice_id})
     assert r.status_code == 201, r.get_json()
     return cid
 
 
-@pytest.mark.parametrize("field", ["total_quantity", "water_percentage"])
 @pytest.mark.parametrize("bad", _NON_FINITE_RAW, ids=_NON_FINITE_RAW)
-def test_recipe_update_route_rejects_non_finite_and_writes_nothing(
-        admin_client, db, field, bad):
+def test_recipe_item_routes_reject_non_finite_and_write_nothing(
+        admin_client, db, bad):
     cid = _seed_recipe(admin_client, db)
-    col = "water_percentage" if field == "water_percentage" else "total_quantity"
-    before = db.execute(f"SELECT {col} FROM recipes WHERE name = %s",
-                        ("NFRec",)).fetchone()[0]
-    r = admin_client.put("/api/recipes/NFRec", json={"company_id": cid, field: bad})
+    for name in ("Water", "Salt"):
+        admin_client.post("/api/chemicals",
+                          json={"name": name, "qty": 100, "unit": "KG"})
+    r = admin_client.post("/api/recipes/NFRec/items", json={
+        "company_id": cid, "chemical": "Water", "percentage": 10})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    before = db.execute("SELECT percentage FROM recipe_items").fetchone()[0]
+
+    r = admin_client.post("/api/recipes/NFRec/items", json={
+        "company_id": cid, "chemical": "Salt", "percentage": bad})
     assert r.status_code == 400, r.get_data(as_text=True)
     assert r.is_json and r.get_json().get("error")
-    assert db.execute(f"SELECT {col} FROM recipes WHERE name = %s",
-                      ("NFRec",)).fetchone()[0] == before
+
+    r = admin_client.put("/api/recipes/NFRec/items/Water",
+                         json={"company_id": cid, "percentage": bad})
+    assert r.status_code == 400, r.get_data(as_text=True)
+    assert r.is_json and r.get_json().get("error")
+
+    assert db.execute("SELECT percentage FROM recipe_items").fetchone()[0] == before
+    assert db.execute("SELECT count(*) FROM recipe_items").fetchone()[0] == 1
 
 
-def test_recipe_update_route_still_accepts_a_finite_value(admin_client, db):
+def test_recipe_item_routes_still_accept_a_finite_value(admin_client, db):
     cid = _seed_recipe(admin_client, db)
-    r = admin_client.put("/api/recipes/NFRec", json={
-        "company_id": cid, "total_quantity": 120, "water_percentage": 10})
+    for name in ("Water", "Salt"):
+        admin_client.post("/api/chemicals",
+                          json={"name": name, "qty": 100, "unit": "KG"})
+    r = admin_client.post("/api/recipes/NFRec/items", json={
+        "company_id": cid, "chemical": "Water", "percentage": 10})
     assert r.status_code == 200, r.get_data(as_text=True)
-    row = db.execute("SELECT total_quantity, water_percentage FROM recipes "
-                     "WHERE name = %s", ("NFRec",)).fetchone()
-    assert row == (120, 10)
-
-
-def test_recipe_update_route_omitted_field_keeps_the_current_value(admin_client, db):
-    """`None` means "leave alone" on this route — the frontend relies on it."""
-    cid = _seed_recipe(admin_client, db)
-    r = admin_client.put("/api/recipes/NFRec", json={
-        "company_id": cid, "total_quantity": 90})
+    r = admin_client.put("/api/recipes/NFRec/items/Water",
+                         json={"company_id": cid, "percentage": 25})
     assert r.status_code == 200, r.get_data(as_text=True)
-    r = admin_client.put("/api/recipes/NFRec", json={"company_id": cid})
+    r = admin_client.post("/api/recipes/NFRec/items", json={
+        "company_id": cid, "chemical": "Salt", "percentage": 5})
     assert r.status_code == 200, r.get_data(as_text=True)
-    assert db.execute("SELECT total_quantity FROM recipes WHERE name = %s",
-                      ("NFRec",)).fetchone()[0] == 90
+    rows = dict(db.execute(
+        "SELECT chemical_id, percentage FROM recipe_items").fetchall())
+    assert sorted(rows.values()) == [5, 25]
 
 
-@pytest.mark.parametrize("method,path", [
-    ("post", "/api/recipes/NFRec/items"),
-    ("put", "/api/recipes/NFRec"),
-    ("put", "/api/recipes/NFRec/items/C1"),
-    ("post", "/api/recipes/NFRec/produce"),
+@pytest.mark.parametrize("method,path,body", [
+    ("post", "/api/recipes/NFRec/items",
+     '{"company_id": 1e309, "chemical": "Water", "percentage": 10}'),
+    ("put", "/api/recipes/NFRec",
+     '{"company_id": 1e309, "new_name": "NFRec2"}'),
+    ("put", "/api/recipes/NFRec/items/Water",
+     '{"company_id": 1e309, "percentage": 10}'),
+    ("post", "/api/recipes/NFRec/produce",
+     '{"company_id": 1e309, "outputs": [{"product_name": "C1", "quantity": 1}]}'),
 ])
 def test_raw_dict_int_coercion_rejects_an_overflowing_company_id(
-        admin_client, db, method, path):
+        admin_client, db, method, path, body):
     """`int(float('inf'))` raises `OverflowError`, not `TypeError`/`ValueError`.
 
     A non-finite `company_id` therefore skipped the 400 and hit the catch-all
     `Exception` handler as a 500 — the same unhandled-body-defect shape the 400
-    handler exists to prevent. All four recipe routes read `company_id` out of
-    the raw dict and coerce it the same way.
+    handler exists to prevent. Every recipe alias route reads `company_id` out
+    of the raw dict and coerces it the same way.
 
     `1e309` is the payload because it is the form that actually gets through: a
     bare `Infinity` is refused by the parser, but `1e309` is valid JSON that
@@ -265,20 +263,16 @@ def test_raw_dict_int_coercion_rejects_an_overflowing_company_id(
     """
     _seed_recipe(admin_client, db)
     r = getattr(admin_client, method)(
-        path, content_type="application/json",
-        data='{"company_id": 1e309}')
+        path, content_type="application/json", data=body)
     assert r.status_code == 400, r.get_data(as_text=True)
     assert r.is_json and r.get_json().get("error")
 
 
-def test_create_production_run_service_guard_rejects_nan(db):
-    with pytest.raises(ValueError, match="must be positive"):
-        create_production_run(db, 1, "nope", float("nan"), atomic=True)
-
-
-def test_create_production_run_service_guard_rejects_inf(db):
-    with pytest.raises(ValueError, match="must be positive"):
-        create_production_run(db, 1, "nope", float("inf"), atomic=True)
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")], ids=["nan", "inf"])
+def test_create_production_run_service_guard_rejects_non_finite(db, bad):
+    with pytest.raises(ValueError, match="must be finite and > 0"):
+        create_production_run(
+            db, 1, 1, [{"product_name": "X", "quantity": bad}], atomic=True)
 
 
 # ==================== Phase 2-A: model-level finite guard ====================
@@ -296,8 +290,8 @@ _NON_FINITE_CASES = [
      {"name": "C1", "qty": 0.0, "reorder_level": 0.0}),
     ("ChemicalCreateIn", "reorder_level",
      {"name": "C1", "qty": 0.0, "reorder_level": 0.0}),
-    ("RecipeCreateIn", "yield_qty",
-     {"name": "R1", "company_id": 1, "product_name": "P1", "yield_qty": 1.0}),
+    ("ProductionOutputIn", "quantity",
+     {"product_name": "P1", "quantity": 1.0}),
     ("InvoiceBatchLineIn", "quantity",
      {"sale_item_id": 1, "quantity": 1.0}),
     ("InvoicePayIn", "payment_amount",

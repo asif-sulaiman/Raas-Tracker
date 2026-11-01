@@ -36,8 +36,8 @@ def _company(conn, name="Knit Concern LTD"):
 
 
 def _register_product(conn, company_id, product=PRODUCT):
-    """add_recipe only accepts a product the company already sells."""
-    salesmod.add_sale(
+    """A recipe needs an invoice; invoicing needs a PI line first."""
+    return salesmod.add_sale(
         conn,
         {"pi_number": "PI-WSGI-1", "client_name": "Buyer",
          "company_id": company_id},
@@ -45,12 +45,19 @@ def _register_product(conn, company_id, product=PRODUCT):
     )
 
 
-def _recipe(conn, company_id, name=NAME, total=1000, water=5):
-    _register_product(conn, company_id)
-    assert recipesmod.add_recipe(conn, name, total_quantity=total,
-                                 water_percentage=water, company_id=company_id,
-                                 product_name=PRODUCT)
-    return recipesmod.get_recipe_by_name(conn, company_id, name)
+def _invoice(conn, sale_id, number="INV-WSGI-1"):
+    lines = [{"sale_item_id": r[0], "quantity": float(r[1])}
+             for r in conn.execute(
+                 "SELECT id, quantity FROM sale_items WHERE sale_id = %s "
+                 "ORDER BY id", (sale_id,)).fetchall()]
+    return salesmod.create_invoice(conn, sale_id, number, lines=lines,
+                                   invoice_date="2026-01-15")["invoice_id"]
+
+
+def _recipe(conn, company_id, name=NAME):
+    sale_id = _register_product(conn, company_id)
+    inv = _invoice(conn, sale_id)
+    return recipesmod.add_recipe(conn, name, company_id, inv)
 
 
 def _chemical(conn, name="Soda Ash"):
@@ -119,19 +126,17 @@ def test_leaves_an_invalid_escape_untouched():
 def test_put_resolves_a_percent_encoded_recipe_name(admin_client, db, encoded_path_host):
     """The Edit dialog's save: PUT /api/recipes/<encoded name>."""
     co = _company(db)
-    _recipe(db, co, total=1000, water=5)
+    _recipe(db, co)
 
     r = admin_client.put(ENC, json={
-        "company_id": co, "total_quantity": 1200, "water_percentage": 10,
+        "company_id": co, "name": "Production KNIT 500",
     }, environ_overrides={"PATH_INFO": ENC})
     assert r.status_code == 200, r.get_json()
-    assert r.get_json() == {"success": True, "name": NAME}
+    assert r.get_json() == {"success": True, "name": "Production KNIT 500"}
 
-    total, water = db.execute(
-        "SELECT total_quantity, water_percentage FROM recipes WHERE company_id = %s",
-        (co,)).fetchone()
-    assert float(total) == 1200
-    assert float(water) == 10
+    stored = db.execute(
+        "SELECT name FROM recipes WHERE company_id = %s", (co,)).fetchone()[0]
+    assert stored == "Production KNIT 500"
     assert db.execute(
         "SELECT COUNT(*) FROM audit_logs WHERE action = 'RECIPE_UPDATE'"
         " AND entity_id = %s", (_recipe_id(db, co),)).fetchone()[0] == 1
@@ -151,9 +156,9 @@ def test_detail_resolves_a_percent_encoded_recipe_name(admin_client, db, encoded
 def test_item_update_resolves_encoded_name_and_chemical(admin_client, db, encoded_path_host):
     """Both path segments are names: the recipe and the chemical."""
     co = _company(db)
-    _recipe(db, co)
+    recipe = _recipe(db, co)
     _chemical(db, "Soda Ash")
-    assert recipesmod.add_recipe_item(db, co, NAME, "Soda Ash", 50)
+    recipesmod.add_recipe_item(db, recipe["id"], PRODUCT, "Soda Ash", 50)
 
     path = ENC + "/items/Soda%20Ash"
     r = admin_client.put(path, json={"percentage": 40, "company_id": co},
@@ -161,20 +166,23 @@ def test_item_update_resolves_encoded_name_and_chemical(admin_client, db, encode
     assert r.status_code == 200, r.get_json()
     assert float(db.execute(
         "SELECT ri.percentage FROM recipe_items ri"
-        " JOIN recipes r ON r.id = ri.recipe_id"
+        " JOIN recipe_products rp ON rp.id = ri.recipe_product_id"
+        " JOIN recipes r ON r.id = rp.recipe_id"
         " JOIN chemicals c ON c.id = ri.chemical_id"
         " WHERE r.company_id = %s AND c.name = 'Soda Ash'", (co,)).fetchone()[0]) == 40
 
 
 def test_produce_resolves_a_percent_encoded_recipe_name(admin_client, db, encoded_path_host):
     co = _company(db)
-    _recipe(db, co)
+    recipe = _recipe(db, co)
     _chemical(db, "Soda Ash")
-    assert recipesmod.add_recipe_item(db, co, NAME, "Soda Ash", 40)
+    recipesmod.add_recipe_item(db, recipe["id"], PRODUCT, "Soda Ash", 40)
 
     path = ENC + "/produce"
-    r = admin_client.post(path, json={"production_qty": 2, "company_id": co},
-                          environ_overrides={"PATH_INFO": path})
+    r = admin_client.post(path, json={
+        "company_id": co,
+        "outputs": [{"product_name": PRODUCT, "quantity": 2}],
+    }, environ_overrides={"PATH_INFO": path})
     assert r.status_code == 201, r.get_json()
     assert db.execute(
         "SELECT COUNT(*) FROM production_runs WHERE recipe_id = %s",
@@ -197,10 +205,11 @@ def test_encoded_host_decodes_a_literal_escape_exactly_once(admin_client, db,
     _recipe(db, co, name="Batch%20A")
 
     path = "/api/recipes/Batch%2520A"
-    r = admin_client.put(path, json={"company_id": co, "total_quantity": 11},
+    r = admin_client.put(path, json={"company_id": co,
+                                     "name": "Batch%20A v2"},
                          environ_overrides={"PATH_INFO": path})
     assert r.status_code == 200, r.get_json()
-    assert r.get_json()["name"] == "Batch%20A"
+    assert r.get_json()["name"] == "Batch%20A v2"
 
 
 def test_compliant_host_keeps_a_literal_escape_in_the_name(admin_client, db):
@@ -209,9 +218,9 @@ def test_compliant_host_keeps_a_literal_escape_in_the_name(admin_client, db):
     _recipe(db, co, name="Batch%20A")
 
     r = admin_client.put("/api/recipes/Batch%2520A",
-                         json={"company_id": co, "total_quantity": 11})
+                         json={"company_id": co, "name": "Batch%20A v2"})
     assert r.status_code == 200, r.get_json()
-    assert r.get_json()["name"] == "Batch%20A"
+    assert r.get_json()["name"] == "Batch%20A v2"
 
 
 def test_encoded_traversal_stays_blocked(client, db, encoded_path_host):

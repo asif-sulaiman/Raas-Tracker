@@ -112,12 +112,24 @@ def test_refused_invoiced_pi_line_delete_writes_no_audit_row(admin_client, db):
     assert _count(db, "SALE_ITEM_DELETE") == 0
 
 
-def _recipe_id(admin_client, db, name="DelRecipe"):
+def _recipe_id(admin_client, db, sale_id, name="DelRecipe"):
+    """Create an invoice-scoped recipe via the API and return its id.
+
+    The invoice covers the sale's LAST line, so the line this test deletes
+    (the first one) stays un-invoiced and therefore deletable.
+    """
+    from raas_tracker.sales import create_invoice
     cid = db.execute("SELECT id FROM companies WHERE name = 'DelCo'").fetchone()[0]
+    item_id = db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id DESC LIMIT 1",
+        (sale_id,)).fetchone()[0]
+    invoice_id = create_invoice(
+        db, sale_id, f"INV-{name}",
+        lines=[{"sale_item_id": item_id, "quantity": 50}],
+        invoice_date="2026-01-15")["invoice_id"]
     r = admin_client.post("/api/recipes", json={
-        "name": name, "yield": 5, "company_id": cid, "product_name": "Acetone"})
+        "name": name, "company_id": cid, "invoice_id": invoice_id})
     assert r.status_code == 201, r.get_json()
-    # The create response does not carry an id, so read it back.
     return db.execute("SELECT id FROM recipes WHERE name = %s", (name,)).fetchone()[0]
 
 
@@ -141,7 +153,7 @@ def test_sale_item_delete_records_destroyed_production_runs(admin_client, db):
     count is the only surviving record that this happened.
     """
     sale_id, item_id = _sale_with_item(db, "PI-DEL-RUNS")
-    recipe_id = _recipe_id(admin_client, db)
+    recipe_id = _recipe_id(admin_client, db, sale_id)
     db.execute(
         "INSERT INTO production_runs (recipe_id, sale_item_id, order_number, "
         "batch_number, production_date, qty_produced) "

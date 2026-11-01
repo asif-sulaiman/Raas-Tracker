@@ -193,7 +193,7 @@ from raas_tracker.sales import (
     create_invoices_batch, list_sale_invoice_lines,
     # Per-invoice production gate for GET /api/invoices/<id>/readiness, plus the
     # shared blocked-message so the readiness hint and book_invoice's 409 agree.
-    invoice_production_readiness, _production_blocked_message,
+    invoice_production_readiness, _readiness_blocked_reason,
     # Maturity readiness inherits the same LC terms the ship service uses.
     invoice_terms_for_sale,
 )
@@ -3835,6 +3835,8 @@ def _shipment_missing_names(readiness):
     detail = readiness.get("detail") or {}
     names = [f"recipes: {p}"
              for p in detail.get("missing_recipes", [])]
+    names += [f"formulation: {p}"
+              for p in detail.get("missing_formulation", [])]
     names += [f"production: {p}"
               for p in detail.get("missing_production", [])]
     if (not readiness.get("produced_ok")
@@ -4050,16 +4052,16 @@ def api_invoice_readiness(invoice_id):
             "can_book": can_book,
             "can_ship": can_ship,
             "can_pay": can_pay,
-            "recipes_ok": not ready["missing_recipes"],
+            "recipes_ok": not ready["missing_recipe"],
             "produced_ok": ready["ok"],
             "book_blocked_reason": (
                 None if can_book or status not in ("planned", "produced")
-                else _production_blocked_message(
-                    ready["missing_recipes"] or ready["missing_production"])
+                else _readiness_blocked_reason(ready)
             ),
             "detail": {
                 "products": ready["products"],
-                "missing_recipes": ready["missing_recipes"],
+                "missing_recipe": ready["missing_recipe"],
+                "missing_formulation": ready["missing_formulation"],
                 "missing_production": ready["missing_production"],
             },
         })

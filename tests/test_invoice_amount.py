@@ -591,8 +591,8 @@ def test_produce_on_paid_refused(admin_client, db, produce_for):
     assert _status(db, inv) == "paid"
 
     r = admin_client.post("/api/recipes/GateRecipe-IntProdPaid/produce", json={
-        "production_qty": 5, "company_id": cid,
-        "sale_ids": [sid], "invoice_ids": [inv]})
+        "company_id": cid,
+        "outputs": [{"product_name": "ProdAmt", "quantity": 5}]})
     assert r.status_code == 409, r.get_json()
     assert "invoice already paid" in r.get_json()["error"]
     assert _status(db, inv) == "paid"
