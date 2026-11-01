@@ -109,6 +109,10 @@ resolvable option exists, the input shows that option's label; when open, it
 shows the query. If `value` changes from the parent while the input is focused
 (the cascade resetting a child), the query is cleared.
 
+**Focusing an existing pick.** Focus lists every option (the current label does
+not act as a filter) and selects the label text, so the first keystroke replaces
+it and searches afresh instead of appending to the old name.
+
 **Filtering.** Case-insensitive substring match on `label`; an empty query lists
 all options. Disabled options are listed (greyed) and never skipped by the
 filter, so the reason they are disabled stays visible.

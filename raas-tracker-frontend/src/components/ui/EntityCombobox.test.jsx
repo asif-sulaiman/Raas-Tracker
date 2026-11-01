@@ -36,6 +36,22 @@ describe('EntityCombobox', () => {
     expect(screen.getAllByRole('option').map((o) => o.textContent)).toEqual(['Beta']);
   });
 
+  it('lists every option on focus even when one is already picked', () => {
+    render(<Controlled initial="1" />);
+    fireEvent.focus(screen.getByLabelText('Company'));
+    expect(screen.getAllByRole('option').map((o) => o.textContent)).toEqual([
+      'Acme', 'Beta', 'Gamma',
+    ]);
+  });
+
+  it('selects the picked label on focus so the first keystroke searches afresh', () => {
+    render(<Controlled initial="1" />);
+    const input = screen.getByLabelText('Company');
+    fireEvent.focus(input);
+    expect(input.selectionStart).toBe(0);
+    expect(input.selectionEnd).toBe('Acme'.length);
+  });
+
   it('commits a value when an option is clicked', () => {
     const onChange = vi.fn();
     render(<Controlled onChange={onChange} />);
