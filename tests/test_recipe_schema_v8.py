@@ -23,15 +23,15 @@ def _indexes(conn):
     }
 
 
-def test_schema_version_is_eight():
-    assert dbmod._SCHEMA_VERSION == 8
+def test_schema_version_is_nine():
+    assert dbmod._SCHEMA_VERSION == 9
 
 
-def test_v8_recipe_shape_is_invoice_scoped(db):
+def test_v9_recipe_shape_is_invoice_scoped(db):
     assert _columns(db, "recipes") == {
         "id", "name", "created_date", "company_id", "invoice_id"}
     assert _columns(db, "recipe_products") == {
-        "id", "recipe_id", "product_name", "unit"}
+        "id", "recipe_id", "product_name", "unit", "water_percentage"}
     assert _columns(db, "recipe_items") == {
         "id", "recipe_product_id", "chemical_id", "percentage"}
     assert _columns(db, "production_run_outputs") == {
@@ -101,7 +101,7 @@ def test_recipe_product_slot_names_are_unique_ignoring_case(db):
     db.rollback()
 
 
-def test_migration_is_idempotent_on_a_v8_database(pg_dsn):
+def test_migration_is_idempotent_on_a_v9_database(pg_dsn):
     conn = dbmod.get_connection(pg_dsn)
     try:
         dbmod._create_tables(conn)
@@ -110,7 +110,7 @@ def test_migration_is_idempotent_on_a_v8_database(pg_dsn):
             "id", "name", "created_date", "company_id", "invoice_id"}
         assert conn.execute(
             "SELECT value FROM app_settings WHERE key = %s",
-            (dbmod._SCHEMA_VERSION_KEY,)).fetchone()[0] == "8"
+            (dbmod._SCHEMA_VERSION_KEY,)).fetchone()[0] == "9"
     finally:
         conn.rollback()
         conn.close()
