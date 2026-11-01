@@ -876,6 +876,34 @@ against the deployed v8 before the demo data is rebuilt.
 
 ---
 
+## 🧾 Phase PRODUCT-CATALOG: product-name suggestions (completed 2026-11-01)
+
+Operators typed product names freehand in three places, so the same SKU could
+arrive with different spellings from a parsed PI and from manual entry. The 2026
+product list (`List Of Product 2026.pdf`, 70 SKUs) is now a **suggestion list**
+behind every editable product-name field. It is deliberately not a hard select:
+parsed PIs and products not yet on the list must still be able to save.
+
+| # | Phase | Scope | Commit |
+|---|---|---|---|
+| 1 | **Catalog + combobox** | `src/data/products.js` (`PRODUCT_CATALOG` with `name`/`category`/`hs_code`, `PRODUCT_NAMES`); `src/components/ui/ProductInput.jsx` — a native `<input list>` + `<datalist>` with a `useId()` list id per instance, drop-in for a text input | this commit |
+| 2 | **Call sites** | `MultiPICreateModal` (per-document row, keeps its `Product name document N row R` label), `SaleDetailModal` edit rows (`Product name row N`), `ReviewModal` parsed-PI rows. No other editable product field exists: invoice, recipe and report product names are derived from invoice lines, and `CommercialFilters` carries unused `product_name` URL state with no rendered input | this commit |
+| 3 | **Tests + docs** | `ProductInput.test.jsx` (70 unique options, valid HS-code shape, free text `onChange`, distinct ids for two instances), one dropdown-presence assertion each in `SaleDetailModal.test.jsx` and `ReviewModal.test.jsx`; SPEC/PRD notes | this commit |
+
+**Locked decisions.** The catalog is code-owned, not a DB table: no admin CRUD
+was requested, and shipping a table would mean a migration, seed and API for a
+list that changes once a year. It is a UI affordance only — the API keeps
+`product_name` as free text, so nothing downstream changes. Product names are
+matched case-insensitively where the schema says so (`recipe_products`,
+`production_run_outputs`), which means a near-miss spelling from the list is
+still tolerated without a data migration.
+
+**Verification.** Frontend gate: **382 passed across 42 files**, `oxlint` 0
+warnings / 0 errors, `vite build` green, `dist/` copied to `react_frontend/`.
+Backend untouched — no API, schema or test change.
+
+---
+
 ## 🧾 Phase INV-UNIFY: PI-faithful invoice editor (completed 2026-10-22)
 
 One invoice-entry surface instead of two divergent ones (`InvoiceCreateForm`

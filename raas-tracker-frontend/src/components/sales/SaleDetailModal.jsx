@@ -3,6 +3,7 @@ import { Pencil, Trash2, Check, X, Plus, Loader2 } from 'lucide-react';
 import Modal from '../modals/Modal';
 import Badge from '../ui/Badge';
 import Button from '../ui/Button';
+import ProductInput from '../ui/ProductInput';
 import InvoicePanel from './InvoicePanel';
 import InvoiceEditor from './InvoiceEditor';
 import { formatNumber, formatDate, formatDateTime, sumLineTotals, lineTotal } from '../../utils/format';
@@ -419,10 +420,15 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                   {editing ? (
-                    editItems.map((i) => (
+                    editItems.map((i, idx) => (
                       <tr key={i.key}>
                         <td className="px-2.5 py-1.5">
-                          <input value={i.product_name} onChange={(e) => updateEditItem(i.key, 'product_name', e.target.value)} className={inputCls} />
+                          <ProductInput
+                            aria-label={`Product name row ${idx + 1}`}
+                            value={i.product_name}
+                            onChange={(e) => updateEditItem(i.key, 'product_name', e.target.value)}
+                            className={inputCls}
+                          />
                         </td>
                         <td className="px-2.5 py-1.5">
                           <input type="number" min="0.001" step="any" value={i.quantity} onChange={(e) => updateEditItem(i.key, 'quantity', e.target.value)} className={inputCls} />

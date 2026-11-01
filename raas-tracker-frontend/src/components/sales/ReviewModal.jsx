@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { Plus, Trash2, AlertTriangle, Loader2 } from 'lucide-react';
 import Modal from '../modals/Modal';
 import Button from '../ui/Button';
+import ProductInput from '../ui/ProductInput';
 import { formatNumber, sumLineTotals, lineTotal } from '../../utils/format';
 import { COMMON_UNITS } from '../../utils/units';
 import { useAuth } from '../../context/AuthContext';
@@ -292,7 +293,7 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
                   items.map((item) => (
                     <tr key={item.key}>
                       <td className="px-2.5 py-1.5">
-                        <input
+                        <ProductInput
                           value={item.product_name}
                           onChange={(e) => updateItem(item.key, 'product_name', e.target.value)}
                           className={inputCls}
