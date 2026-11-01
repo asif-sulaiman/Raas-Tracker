@@ -27,16 +27,19 @@ export default function EntityCombobox({
   const emittedRef = useRef(undefined);
   const focusValueRef = useRef('');
   const [query, setQuery] = useState('');
+  const [searching, setSearching] = useState(false);
   const [open, setOpen] = useState(false);
   const [invalid, setInvalid] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
 
   const selected = options.find((option) => String(option.value) === String(value));
   const filtered = useMemo(() => {
-    const needle = normalize(query);
+    // Focusing a field that already holds a pick lists every option; only typed
+    // text narrows the list.
+    const needle = normalize(searching ? query : '');
     if (!needle) return options;
     return options.filter((option) => normalize(option.label).includes(needle));
-  }, [options, query]);
+  }, [options, query, searching]);
 
   // A parent reset (the recipe cascade clearing a child) must not leave stale text.
   // Echoes of our own picks are skipped; any other value change wins over the query.
@@ -46,6 +49,7 @@ export default function EntityCombobox({
       return;
     }
     setQuery('');
+    setSearching(false);
     setOpen(false);
     setInvalid(false);
   }, [value]);
@@ -69,6 +73,7 @@ export default function EntityCombobox({
     if (!option || option.disabled) return;
     emit(option.value);
     setQuery('');
+    setSearching(false);
     setInvalid(false);
     setOpen(false);
     setActiveIndex(-1);
@@ -85,6 +90,7 @@ export default function EntityCombobox({
   function handleChange(event) {
     const text = event.target.value;
     setQuery(text);
+    setSearching(true);
     setOpen(true);
     setInvalid(false);
 
@@ -107,12 +113,16 @@ export default function EntityCombobox({
     if (inputProps.disabled) return;
     focusValueRef.current = String(value);
     setQuery(selected ? selected.label : invalid ? query : '');
+    setSearching(false);
     setOpen(true);
     setActiveIndex(-1);
+    // Select the picked label so the first keystroke replaces it and searches.
+    inputRef.current?.select();
   }
 
   function handleBlur() {
     const text = query;
+    setSearching(false);
     const exact = options.filter(
       (option) => !option.disabled && normalize(option.label) === normalize(text),
     );
@@ -171,6 +181,7 @@ export default function EntityCombobox({
       setOpen(false);
       setInvalid(false);
       setQuery('');
+      setSearching(false);
       // Typing cleared the value; Escape puts the focus-time pick back.
       if (focusValueRef.current !== '' && String(value) === '') {
         emit(focusValueRef.current);

@@ -915,7 +915,7 @@ shapes, and no request body changed.
 | # | Phase | Scope | Commit |
 |---|---|---|---|
 | 1 | **`SuggestionInput`** | Extracted from `ProductInput`: `<input list>` + `<datalist>` over `options: string[]`, free text always accepted; `ProductInput` becomes a thin wrapper over the catalog | this branch |
-| 2 | **`EntityCombobox`** | Hand-rolled ARIA combobox over `{ value, label, disabled }`: filters on type, commits on click/Enter/exact label, emits `''` and shows a hint for unmatched text, skips disabled rows, Escape restores the pick, a parent value change wins over stale text | this branch |
+| 2 | **`EntityCombobox`** | Hand-rolled ARIA combobox over `{ value, label, disabled }`: filters on type, commits on click/Enter/exact label, emits `''` and shows a hint for unmatched text, skips disabled rows, Escape restores the pick, focusing a field that already holds a pick lists every option and selects the label so the first keystroke searches afresh, a parent value change wins over stale text | this branch |
 | 3 | **Free text** | Units in `MultiPICreateModal`, `ReviewModal`, `Chemicals` (add) and `UnitMapping` (target unit); the stock-adjustment reason (120-char cap kept) | this branch |
 | 4 | **Record picks** | Company in `MultiPICreateModal` / `ReviewModal`; existing LC in `LinkPIsModal`; target invoice in `SaleDetailModal`; the recipe create cascade (company → LC → PI → invoice) and the chemical field (name-valued) in `Recipes` | this branch |
 
@@ -926,7 +926,7 @@ only emit an id (or, for chemicals, a name) that exists in their option list,
 so referential integrity is preserved in the component rather than at the API.
 No backend change: form state stays ids/strings and every payload is identical.
 
-**Verification.** Frontend gate: **400 passed across 44 files**, `oxlint` 0
+**Verification.** Frontend gate: **402 passed across 44 files**, `oxlint` 0
 warnings / 0 errors, `vite build` green, `dist/` copied to `react_frontend/`.
 Backend untouched — no API, schema or test change.
 
