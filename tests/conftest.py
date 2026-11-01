@@ -27,8 +27,9 @@ _TABLES = (
     "api_key_rate_limits api_keys approval_workflow audit_logs "
     "chemicals companies invoices invoice_items letters_of_credit login_attempts "
     "notification_reads notifications reason_codes "
-    "recipe_items recipes reconciliation_periods production_run_items production_run_links "
-    "production_runs sale_items sale_payments sales sales_stage_history sessions shipments "
+    "recipe_items recipe_products recipes reconciliation_periods production_run_items "
+    "production_run_links production_run_outputs production_runs "
+    "sale_items sale_payments sales sales_stage_history sessions shipments "
     "unit_conversions upload_rows uploads users"
 ).split()
 # app_settings is deliberately NOT truncated: it carries the schema version
