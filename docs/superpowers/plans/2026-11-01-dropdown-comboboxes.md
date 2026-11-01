@@ -33,7 +33,7 @@
 - Produces: `SuggestionInput({ options = [], className = '', ...inputProps })` — renders `<input list>` + `<datalist>`; free text always allowed.
 - Consumes: nothing from earlier tasks.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```jsx
 // raas-tracker-frontend/src/components/ui/SuggestionInput.test.jsx
@@ -92,12 +92,12 @@ describe('SuggestionInput', () => {
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `npx vitest run src/components/ui/SuggestionInput.test.jsx`
 Expected: FAIL — `Failed to resolve import "./SuggestionInput"`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```jsx
 // raas-tracker-frontend/src/components/ui/SuggestionInput.jsx
@@ -144,12 +144,12 @@ export default function ProductInput(props) {
 }
 ```
 
-- [ ] **Step 4: Run both suites**
+- [x] **Step 4: Run both suites**
 
 Run: `npx vitest run src/components/ui/SuggestionInput.test.jsx src/components/ui/ProductInput.test.jsx`
 Expected: PASS, 10 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add raas-tracker-frontend/src/components/ui/SuggestionInput.jsx \
@@ -170,7 +170,7 @@ git commit -m "refactor(ui): extract SuggestionInput from ProductInput"
 - Produces: `EntityCombobox({ options, value, onChange, className, placeholder, emptyMessage, hint, id, ...inputProps })` where `options: Array<{ value: string|number, label: string, disabled?: boolean }>`. Emits `String(option.value)` on a pick and `''` on an unmatched pick.
 - Consumes: nothing from earlier tasks.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```jsx
 // raas-tracker-frontend/src/components/ui/EntityCombobox.test.jsx
@@ -309,12 +309,12 @@ describe('EntityCombobox', () => {
 });
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `npx vitest run src/components/ui/EntityCombobox.test.jsx`
 Expected: FAIL — cannot resolve `./EntityCombobox`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 ```jsx
 // raas-tracker-frontend/src/components/ui/EntityCombobox.jsx
@@ -567,12 +567,12 @@ export default function EntityCombobox({
 
 Note: `handleChange` calls `filteredFor(text)` because the `filtered` memo still reflects the previous query on that render.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `npx vitest run src/components/ui/EntityCombobox.test.jsx`
 Expected: PASS, 10 tests. If the disabled-skip test lands on the wrong option, assert on `input.getAttribute('aria-activedescendant')` before Enter rather than changing the component.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add raas-tracker-frontend/src/components/ui/EntityCombobox.jsx \
@@ -596,7 +596,7 @@ git commit -m "feat(ui): add a must-match EntityCombobox"
 - Consumes: `SuggestionInput` from Task 1.
 - Produces: no new interface; these fields keep their current state (`item.unit`, `addUnit`, `adjustReason`, `f.target`).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to `MultiPICreateModal.test.jsx`:
 
@@ -641,7 +641,7 @@ Run both:
 
 Expected: the new unit test FAILS (native `<select>` ignores `PALLET` and keeps `KG`); the reason test FAILS (no such `<option>`).
 
-- [ ] **Step 2: Replace the four unit controls**
+- [x] **Step 2: Replace the four unit controls**
 
 `MultiPICreateModal.jsx` — add `import SuggestionInput from '../ui/SuggestionInput';`, then:
 
@@ -727,12 +727,12 @@ Then replace the adjust-reason select:
 />
 ```
 
-- [ ] **Step 3: Run the suites**
+- [x] **Step 3: Run the suites**
 
 Run: `npx vitest run src/components/sales/MultiPICreateModal.test.jsx src/components/sales/ReviewModal.test.jsx src/pages/Chemicals.test.jsx src/components/forms/UnitMapping.test.jsx`
 Expected: PASS. The old `fireEvent.change(..., { value: 'L' })` / `'DRUM'` tests keep working because the control is now a text input.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add raas-tracker-frontend/src/components/sales/MultiPICreateModal.jsx \
@@ -761,7 +761,7 @@ PI → invoice cascade, so this commit leaves every suite green.
 - Consumes: `EntityCombobox` from Task 2.
 - Produces: company state stays a string id; `handleCompanyChange` / `setCompanyId` unchanged.
 
-- [ ] **Step 1: Migrate the tests first (they must fail)**
+- [x] **Step 1: Migrate the tests first (they must fail)**
 
 `MultiPICreateModal.test.jsx:87,108,136` — replace `{ target: { value: '7' } }` with `{ target: { value: 'Acme' } }` (exact label auto-commits).
 
@@ -804,7 +804,7 @@ Add one new test to `ReviewModal.test.jsx`:
 Run: `npx vitest run src/components/sales/MultiPICreateModal.test.jsx src/components/sales/ReviewModal.test.jsx`
 Expected: FAIL — the fields are still `<select>`s, so typing a name yields no id and the save payload/company id is missing.
 
-- [ ] **Step 2: Replace the two company selects**
+- [x] **Step 2: Replace the two company selects**
 
 `MultiPICreateModal.jsx` (import `EntityCombobox`):
 
@@ -840,12 +840,12 @@ Expected: FAIL — the fields are still `<select>`s, so typing a name yields no 
 />
 ```
 
-- [ ] **Step 3: Run the suites**
+- [x] **Step 3: Run the suites**
 
 Run: `npx vitest run src/components/sales/MultiPICreateModal.test.jsx src/components/sales/ReviewModal.test.jsx`
 Expected: PASS. `Recipes.jsx` keeps its company `<select>` until Task 5 converts the whole cascade in one commit, so `Recipes.test.jsx` stays green and untouched here.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add raas-tracker-frontend/src/components/sales/MultiPICreateModal.jsx \
@@ -871,7 +871,7 @@ git commit -m "feat(sales): searchable company pickers"
 - Consumes: `EntityCombobox` from Task 2.
 - Produces: `companyId`, `lcId`, `saleId`, `invoiceId`, `targetId`, `lcId` (LinkPIs) stay string ids; the cascade handlers are untouched.
 
-- [ ] **Step 1: Migrate the tests first**
+- [x] **Step 1: Migrate the tests first**
 
 `LinkPIsModal.test.jsx:91`:
 
@@ -989,7 +989,7 @@ Then rewrite the option-inspection tests so the list is open before querying it,
 Run: `npx vitest run src/components/sales/LinkPIsModal.test.jsx src/components/sales/SaleDetailModal.test.jsx src/pages/Recipes.test.jsx`
 Expected: FAIL — the controls are still selects.
 
-- [ ] **Step 2: Replace the six controls**
+- [x] **Step 2: Replace the six controls**
 
 `LinkPIsModal.jsx`:
 
@@ -1102,12 +1102,12 @@ Invoice:
 />
 ```
 
-- [ ] **Step 3: Run the suites**
+- [x] **Step 3: Run the suites**
 
 Run: `npx vitest run src/components/sales/LinkPIsModal.test.jsx src/components/sales/SaleDetailModal.test.jsx src/pages/Recipes.test.jsx`
 Expected: PASS. If a test queries an option before its list is open, add `fireEvent.focus(...)` on that field rather than removing the assertion.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add raas-tracker-frontend/src/components/sales/LinkPIsModal.jsx \
@@ -1131,7 +1131,7 @@ git commit -m "feat(sales): searchable LC, PI and invoice pickers"
 - Consumes: `EntityCombobox` from Task 2.
 - Produces: the formulation card's `chemical` state stays the chemical **name**; the POST body is unchanged (`{ chemical, percentage }`).
 
-- [ ] **Step 1: Add the failing test**
+- [x] **Step 1: Add the failing test**
 
 In `Recipes.test.jsx`, after "adds an ingredient to a specific product", add:
 
@@ -1162,7 +1162,7 @@ In `Recipes.test.jsx`, after "adds an ingredient to a specific product", add:
 Run: `npx vitest run src/pages/Recipes.test.jsx -t "refuses a chemical"`
 Expected: FAIL — no `role="status"` in the card.
 
-- [ ] **Step 2: Replace the select**
+- [x] **Step 2: Replace the select**
 
 ```jsx
 <EntityCombobox
@@ -1189,12 +1189,12 @@ The `<label htmlFor={...}>Chemical</label>` stays; `id` on the combobox input la
 />
 ```
 
-- [ ] **Step 3: Run the suite**
+- [x] **Step 3: Run the suite**
 
 Run: `npx vitest run src/pages/Recipes.test.jsx`
 Expected: PASS. The existing "adds an ingredient" test still types `NaOH`, which is an exact label and commits.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add raas-tracker-frontend/src/pages/Recipes.jsx \
@@ -1215,7 +1215,7 @@ git commit -m "feat(recipes): searchable chemical picker"
 - Consumes: all earlier tasks.
 - Produces: no code interface.
 
-- [ ] **Step 1: Update the docs**
+- [x] **Step 1: Update the docs**
 
 `docs/SPEC.md`, Frontend (Vitest) section: add to the coverage parenthetical
 
@@ -1251,7 +1251,7 @@ green, `dist/` copied to `react_frontend/`.
 Record those two totals from `/tmp/vitest_combo_gate.log`; the section must not
 ship with the earlier phase's counts.
 
-- [ ] **Step 2: Run the full frontend gate**
+- [x] **Step 2: Run the full frontend gate**
 
 ```bash
 npx vitest run > /tmp/vitest_combo_gate.log 2>&1; echo "EXIT:$?"; grep -E "Test Files|Tests " /tmp/vitest_combo_gate.log
@@ -1261,7 +1261,7 @@ npx vite build
 
 Expected: 0 failures, oxlint 0/0, build green. If a suite fails, fix the call site or the test — never weaken an assertion to pass.
 
-- [ ] **Step 3: Copy the build and commit docs**
+- [x] **Step 3: Copy the build and commit docs**
 
 ```bash
 cd ..
