@@ -1,1062 +1,978 @@
-"""Recipes plus production reports."""
+"""Invoice-scoped recipes and production reports.
+
+A recipe is the production plan for **one invoice**. Its products are the
+invoice's products, and each one gets its own formulation slot
+(``recipe_products`` + ``recipe_items``). Production records one output per
+product per run, and readiness asks whether every invoiced product has a
+formulation *and* an output on a run linked to that invoice.
+
+Water/solvent is whatever is not formulated: a slot's percentages may sum to
+anything from 0 to 100, and only the listed chemicals are deducted. There is
+no batch basis on the recipe any more; the quantity is entered at production
+time and prefilled from the invoice.
+"""
 
 import math
-import psycopg
-from .audit import log_audit_action
 import os
 import re
-from typing import Optional, List, Dict, Any
+from datetime import date
+from typing import Any, Dict, List, Optional
 
+import psycopg
+
+from .audit import log_audit_action
 from .db import get_connection, logger
-from .stock import get_all_chemicals
+from .stock import (
+    convert_quantity,
+    get_all_chemicals,
+    sync_reorder_notifications,
+    update_stock,
+)
 from ._numeric import finite_values
 from ._exceptions import (
     InvoiceAlreadyAdvanced,
-    LinkedInvoiceNotFound,
-    LinkedSaleNotFound,
+    InvoiceNotFound,
+    LifecycleConflict,
+    RecipeHasRuns,
+    RecipeInvoiceConflict,
+    RecipeItemConflict,
     RecipeNameConflict,
-    RecipeProductLocked,
+    ResourceMissing,
 )
 from .uploads import csv_safe
 
 
-def _require_registered_product(conn: psycopg.Connection, company_id: int,
-                                product_name: str) -> str:
-    """Return the trimmed product name when this company has it on a PI line
-    **or** an invoice line; raise ``ValueError`` when it has neither.
+# --------------------------------------------------------------------------- #
+# reads
+# --------------------------------------------------------------------------- #
 
-    Invoice lines are snapshots taken at create time, so renaming a PI line
-    does not rewrite them. A product visibly sitting on an invoice must
-    therefore be acceptable for a recipe even when the PI has moved on.
-    """
-    product_name = (product_name or "").strip() if isinstance(product_name, str) else ""
-    if not product_name:
-        raise ValueError("product_name is required")
-    registered = conn.execute(
-        """SELECT 1 FROM sale_items si JOIN sales s ON s.id = si.sale_id
-            WHERE s.company_id = %s AND lower(si.product_name) = lower(%s)
-           UNION ALL
-           SELECT 1 FROM invoice_items ii
-             JOIN invoices i ON i.id = ii.invoice_id
-             JOIN sales s ON s.id = i.sale_id
-            WHERE s.company_id = %s AND lower(ii.product_name) = lower(%s)
-           LIMIT 1""",
-        (company_id, product_name, company_id, product_name)).fetchone()
-    if not registered:
-        raise ValueError(f"product '{product_name}' is not registered for this company")
-    return product_name
-
-def add_recipe(conn: psycopg.Connection, name: str, total_quantity: float = 1, water_percentage: float = 0,
-             company_id: int = None, product_name: str = None) -> bool:
-    """Create a new recipe.
-
-    Args:
-        conn: Database connection
-        name: Recipe name (e.g. "Liquid Soap Batch A")
-        total_quantity: Total quantity this recipe produces (e.g. 1000 liters, 15000 KG)
-        water_percentage: Optional water percentage (default 0, calculated as 100 - sum(ingredient %) if left at 0)
-        company_id: Owning company from the register (required for new masters)
-        product_name: Registered product name for that company
-
-    Returns:
-        True if created, False if recipe already exists
-    """
-    # Phase 2-B: `water_percentage < 0 or > 100` is False for nan, and
-    # total_quantity has no check at all. `cli.py` reaches both with
-    # `float(sys.argv[...])`, and a poisoned yield_qty / percentage becomes a
-    # frozen formula snapshot every later production run multiplies by.
-    finite_values(total_quantity, water_percentage)
-    if water_percentage < 0 or water_percentage > 100:
-        raise ValueError("water_percentage must be between 0 and 100")
-    name = (name or "").strip()
-    if not name:
-        raise ValueError("name is required")
-    if company_id is None:
-        raise ValueError("company_id is required")
-    company = conn.execute("SELECT id FROM companies WHERE id = %s",
-                           (company_id,)).fetchone()
-    if not company:
-        raise ValueError("unknown company")
-    product_name = _require_registered_product(conn, company_id, product_name)
-    try:
-        cursor = conn.execute(
-            "INSERT INTO recipes (name, total_quantity, water_percentage, company_id, product_name) VALUES (%s, %s, %s, %s, %s) RETURNING id",
-            (name, total_quantity, water_percentage, company_id, product_name)
-        )
-        recipe_id = cursor.fetchone()[0]
-        logger.info("Created recipe: '%s' (total quantity: %s)", name, total_quantity)
-        # atomic=False, commit below: INSERT and RECIPE_CREATE are one unit, so
-        # a failing audit INSERT cannot leave a recipe nobody can account for.
-        log_audit_action(conn, "RECIPE_CREATE", "recipe", recipe_id,
-                         new_value=name, atomic=False)
-        conn.commit()
-        return True
-    except psycopg.IntegrityError:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        logger.warning("Recipe '%s' already exists.", name)
-        return False
-
-
-_RECIPE_COLUMNS = (
-    "r.id, r.name, r.total_quantity, r.water_percentage, r.created_date, "
-    "r.company_id, r.product_name, c.name"
-)
+_RECIPE_SELECT = """
+    SELECT r.id, r.name, r.created_date, r.company_id, c.name,
+           r.invoice_id, i.invoice_number, i.status, i.sale_id,
+           s.pi_number, s.client_name, s.lc_id, lc.lc_number,
+           (SELECT COUNT(*) FROM recipe_products rp WHERE rp.recipe_id = r.id),
+           (SELECT COUNT(*) FROM recipe_products rp
+             WHERE rp.recipe_id = r.id
+               AND EXISTS (SELECT 1 FROM recipe_items ri
+                            WHERE ri.recipe_product_id = rp.id)),
+           (SELECT COUNT(*) FROM production_runs pr WHERE pr.recipe_id = r.id)
+      FROM recipes r
+      LEFT JOIN companies c ON c.id = r.company_id
+      JOIN invoices i ON i.id = r.invoice_id
+      JOIN sales s ON s.id = i.sale_id
+      LEFT JOIN letters_of_credit lc ON lc.id = s.lc_id
+"""
 
 
 def _recipe_dict(row) -> Dict[str, Any]:
-    return {"id": row[0], "name": row[1], "total_quantity": row[2], "water_percentage": row[3], "created": row[4],
-            "company_id": row[5], "product_name": row[6], "company_name": row[7]}
+    return {
+        "id": row[0], "name": row[1], "created": row[2],
+        "company_id": row[3], "company_name": row[4],
+        "invoice_id": row[5], "invoice_number": row[6],
+        "invoice_status": row[7], "sale_id": row[8],
+        "pi_number": row[9], "client_name": row[10],
+        "lc_id": row[11], "lc_number": row[12],
+        "product_count": row[13], "formulated_count": row[14],
+        "run_count": row[15],
+    }
 
 
-def get_recipe_by_name(conn: psycopg.Connection, company_id: int, name: str) -> Optional[Dict[str, Any]]:
-    """Get recipe info by name for a specific company."""
-    cursor = conn.execute(
-        "SELECT " + _RECIPE_COLUMNS + " FROM recipes r "
-        "LEFT JOIN companies c ON c.id = r.company_id WHERE r.company_id = %s AND lower(r.name) = lower(%s)",
-        (company_id, name)
-    )
-    row = cursor.fetchone()
-    return _recipe_dict(row) if row else None
+def list_recipes(conn: psycopg.Connection, company_id: Optional[int] = None,
+                 invoice_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    query = _RECIPE_SELECT
+    clauses = []
+    params: list = []
+    if company_id is not None:
+        clauses.append("r.company_id = %s")
+        params.append(company_id)
+    if invoice_id is not None:
+        clauses.append("r.invoice_id = %s")
+        params.append(invoice_id)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY r.name"
+    return [_recipe_dict(row) for row in conn.execute(query, params).fetchall()]
 
 
-def get_recipe_by_id(conn: psycopg.Connection, recipe_id: int) -> Optional[Dict[str, Any]]:
-    """Get recipe info by row id.
-
-    The id is the identity the recipe list hands the UI, so a detail read
-    cannot miss on a stale (company_id, name) pair.
-    """
+def get_recipe_by_id(conn: psycopg.Connection,
+                     recipe_id: int) -> Optional[Dict[str, Any]]:
     row = conn.execute(
-        "SELECT " + _RECIPE_COLUMNS + " FROM recipes r "
-        "LEFT JOIN companies c ON c.id = r.company_id WHERE r.id = %s",
-        (recipe_id,)
-    ).fetchone()
+        _RECIPE_SELECT + " WHERE r.id = %s", (recipe_id,)).fetchone()
     return _recipe_dict(row) if row else None
 
 
-def find_recipe(conn: psycopg.Connection, company_id: int, name: str) -> Optional[Dict[str, Any]]:
-    """Find a company's master recipe by name (for duplicate deep-links)."""
+def get_recipe_by_invoice(conn: psycopg.Connection,
+                          invoice_id: int) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        _RECIPE_SELECT + " WHERE r.invoice_id = %s", (invoice_id,)).fetchone()
+    return _recipe_dict(row) if row else None
+
+
+def get_recipe_by_name(conn: psycopg.Connection, company_id: int,
+                       name: str) -> Optional[Dict[str, Any]]:
+    """One-release name alias: the (company, name) pair still resolves."""
+    row = conn.execute(
+        _RECIPE_SELECT + " WHERE r.company_id = %s AND lower(r.name) = lower(%s)",
+        (company_id, (name or "").strip())).fetchone()
+    return _recipe_dict(row) if row else None
+
+
+def find_recipe(conn: psycopg.Connection, company_id: int,
+                name: str) -> Optional[Dict[str, Any]]:
     row = conn.execute(
         "SELECT id, name FROM recipes WHERE company_id = %s AND lower(name) = lower(%s)",
         (company_id, (name or "").strip())).fetchone()
-    if row:
-        return {"id": row[0], "name": row[1]}
-    return None
+    return {"id": row[0], "name": row[1]} if row else None
 
 
-def _check_percentage_total(conn: psycopg.Connection, recipe_id: int,
-                            water_percentage: float,
-                            items_total: float) -> None:
-    """Reject negative percentages and totals over 100% (water + items)."""
-    if water_percentage < 0 or items_total < 0:
-        raise ValueError("percentages must be 0 or greater")
-    if water_percentage + items_total > 100.0 + 1e-9:
-        raise ValueError(
-            f"water ({water_percentage:g}%) + ingredients ({items_total:g}%) "
-            f"exceed 100%")
+def _require_recipe(conn: psycopg.Connection,
+                    recipe_id: int) -> Dict[str, Any]:
+    recipe = get_recipe_by_id(conn, recipe_id)
+    if not recipe:
+        raise ResourceMissing(f"Recipe {recipe_id} not found")
+    return recipe
 
 
-def _items_percentage_total(conn: psycopg.Connection, recipe_id: int) -> float:
-    """Sum of item percentages for a recipe."""
-    row = conn.execute(
-        "SELECT COALESCE(SUM(percentage), 0) FROM recipe_items WHERE recipe_id = %s",
-        (recipe_id,)
-    ).fetchone()
-    return float(row[0] or 0)
+def _invoice_product_lines(conn: psycopg.Connection,
+                           invoice_id: int) -> List[Dict[str, Any]]:
+    """Group an invoice's lines by product, summing in the first line's unit.
 
-
-def add_recipe_item(conn: psycopg.Connection, company_id: int, recipe_name: str, chemical_name: str, 
-                    percentage: float) -> bool:
-    """Add a chemical to a recipe with percentage of total product yield.
-    
-    Args:
-        conn: Database connection
-        company_id: Company ID (required for isolation)
-        recipe_name: Recipe name
-        chemical_name: Chemical name
-        percentage: Percentage of total batch (e.g., 20.0 for 20%)
-    
-    Returns:
-        True if added successfully
+    Duplicate lines are normal (the same product invoiced twice). When their
+    units differ, each line is converted to the first line's unit; a missing
+    conversion is reported on the group instead of being mixed silently.
     """
-    # Check recipe exists
-    recipe = get_recipe_by_name(conn, company_id, recipe_name)
-    if not recipe:
-        logger.warning("Recipe '%s' not found for company %s. Create it first.", recipe_name, company_id)
-        return False
-    
-    # Check chemical exists
-    chemical = conn.execute(
-        "SELECT id FROM chemicals WHERE name = %s", (chemical_name,)
-    ).fetchone()
-    if not chemical:
-        logger.warning("Chemical '%s' not found in database.", chemical_name)
-        return False
-
-    # Check if item already exists in recipe
-    existing = conn.execute(
-        "SELECT id FROM recipe_items WHERE recipe_id = %s AND chemical_id = %s",
-        (recipe["id"], chemical[0])
-    ).fetchone()
-    if existing:
-        logger.warning("'%s' already in recipe '%s'. Use update_recipe_item instead.",
-                       chemical_name, recipe_name)
-        return False
-    
-    required_qty_per_unit = percentage / 100.0
-    # Phase 2-B: `percentage < 0` is False for both nan and inf, and the
-    # percentage becomes `recipe_items.required_qty_per_unit`.
-    finite_values(percentage)
-    if percentage < 0:
-        raise ValueError("percentage must be 0 or greater")
-    _check_percentage_total(conn, recipe["id"], recipe.get("water_percentage") or 0,
-                            _items_percentage_total(conn, recipe["id"]) + percentage)
-    cursor = conn.execute(
-        "INSERT INTO recipe_items (recipe_id, chemical_id, percentage, required_qty_per_unit) VALUES (%s, %s, %s, %s) RETURNING id",
-        (recipe["id"], chemical[0], percentage, required_qty_per_unit)
-    )
-    item_id = cursor.fetchone()[0]
-    logger.info("Added '%s' to recipe '%s': %s%%", chemical_name, recipe_name, percentage)
-    # atomic=False, commit below: see add_recipe.
-    log_audit_action(conn, "RECIPE_ITEM_ADD", "recipe_item", item_id,
-                     new_value=f"{recipe_name}:{chemical_name}:{percentage}",
-                     atomic=False)
-    conn.commit()
-    return True
+    rows = conn.execute(
+        "SELECT id, product_name, COALESCE(NULLIF(trim(unit), ''), 'KG'), quantity "
+        "FROM invoice_items WHERE invoice_id = %s ORDER BY id",
+        (invoice_id,)).fetchall()
+    groups: Dict[str, Dict[str, Any]] = {}
+    for _item_id, name, unit, qty in rows:
+        name = (name or "").strip() if isinstance(name, str) else ""
+        if not name:
+            continue
+        key = name.lower()
+        group = groups.get(key)
+        if group is None:
+            group = groups[key] = {
+                "key": key, "product_name": name, "unit": unit,
+                "lines": [], "invoiced_qty": 0.0, "unconverted": [],
+            }
+        group["lines"].append({"unit": unit, "quantity": float(qty or 0)})
+    for group in groups.values():
+        total = 0.0
+        for line in group["lines"]:
+            if line["unit"].upper() == group["unit"].upper():
+                total += line["quantity"]
+                continue
+            converted = convert_quantity(
+                conn, line["quantity"], line["unit"], group["unit"])
+            if converted is None:
+                group["unconverted"].append(
+                    {"from_unit": line["unit"], "to_unit": group["unit"]})
+            else:
+                total += converted
+        group["invoiced_qty"] = total
+    return list(groups.values())
 
 
-def list_recipes(conn: psycopg.Connection,
-                 company_id: Optional[int] = None) -> List[Dict[str, Any]]:
-    """List all recipes with owning company (optionally one company's only)."""
-    query = (
-        "SELECT r.id, r.name, r.total_quantity, r.water_percentage, "
-        "r.created_date, r.company_id, r.product_name, c.name "
-        "FROM recipes r LEFT JOIN companies c ON c.id = r.company_id "
-    )
-    params: list = []
-    if company_id is not None:
-        query += "WHERE r.company_id = %s "
-        params.append(company_id)
-    query += "ORDER BY r.name"
-    cursor = conn.execute(query, params)
-    return [
-        {"id": row[0], "name": row[1], "total_quantity": row[2], "water_percentage": row[3], "created": row[4],
-         "company_id": row[5], "product_name": row[6], "company_name": row[7]}
-        for row in cursor.fetchall()
-    ]
-
-
-def list_recipe_items(conn: psycopg.Connection, company_id: int, recipe_name: str) -> List[Dict[str, Any]]:
-    """List all chemicals in a recipe with percentages and required quantities."""
-    recipe = get_recipe_by_name(conn, company_id, recipe_name)
-    if not recipe:
-        logger.warning("Recipe '%s' not found for company %s.", recipe_name, company_id)
-        return []
-    return list_recipe_items_by_id(conn, recipe["id"])
-
-
-def list_recipe_items_by_id(conn: psycopg.Connection, recipe_id: int) -> List[Dict[str, Any]]:
-    """List a recipe's chemicals by row id (id route; name route delegates here)."""
-    cursor = conn.execute("""
-        SELECT r.name as recipe_name, r.total_quantity, 
-               c.name as chemical_name, c.current_qty, c.unit,
-               ri.required_qty_per_unit, ri.percentage
-          FROM recipe_items ri
-          JOIN recipes r ON ri.recipe_id = r.id
-          JOIN chemicals c ON ri.chemical_id = c.id
-          WHERE ri.recipe_id = %s
-          ORDER BY c.name
-      """, (recipe_id,))
-    
-    items = []
-    for row in cursor.fetchall():
-        (row_recipe, total_qty, chem_name, current_qty,
-         unit, req_unit, pct_value) = row
-        pct = pct_value if pct_value is not None else req_unit * 100
-        batch_qty = total_qty * req_unit
-        items.append({
-            "recipe_name": row_recipe,
-            "total_quantity": total_qty,
-            "chemical_name": chem_name,
-            "current_stock": current_qty,
-            "unit": unit,
-            "required_per_unit": req_unit,
-            "percentage": pct,
-            "batch_qty": batch_qty
+def _slot_items(conn: psycopg.Connection,
+                recipe_id: int) -> Dict[int, List[Dict[str, Any]]]:
+    rows = conn.execute(
+        """SELECT rp.id, ri.id, ri.percentage, c.id, c.name,
+                  c.current_qty, c.unit
+             FROM recipe_products rp
+             LEFT JOIN recipe_items ri ON ri.recipe_product_id = rp.id
+             LEFT JOIN chemicals c ON c.id = ri.chemical_id
+            WHERE rp.recipe_id = %s
+            ORDER BY rp.id, c.name""",
+        (recipe_id,)).fetchall()
+    items: Dict[int, List[Dict[str, Any]]] = {}
+    for slot_id, item_id, pct, chem_id, chem_name, current, unit in rows:
+        bucket = items.setdefault(slot_id, [])
+        if item_id is None:
+            continue
+        bucket.append({
+            "id": item_id, "chemical_id": chem_id,
+            "chemical_name": chem_name, "current_stock": current,
+            "unit": unit, "percentage": float(pct or 0),
+            "required_per_unit": (float(pct or 0) / 100.0),
         })
     return items
 
 
-def update_recipe_item(conn: psycopg.Connection, company_id: int, recipe_name: str, chemical_name: str,
-                       new_percentage: float) -> bool:
-    """Update the percentage of a chemical in a recipe."""
+def _produced_by_product(conn: psycopg.Connection,
+                         recipe_id: int) -> Dict[str, float]:
+    rows = conn.execute(
+        """SELECT lower(o.product_name), SUM(o.qty_produced)
+             FROM production_run_outputs o
+             JOIN production_runs pr ON pr.id = o.run_id
+            WHERE pr.recipe_id = %s
+            GROUP BY lower(o.product_name)""",
+        (recipe_id,)).fetchall()
+    return {row[0]: float(row[1] or 0) for row in rows}
+
+
+def list_recipe_products(conn: psycopg.Connection,
+                         recipe_id: int) -> List[Dict[str, Any]]:
+    """The invoice's products left-joined to their formulation slots.
+
+    Derived on read: a product added to the invoice after the recipe exists
+    appears immediately as a ghost (id null, formulated false) without a GET
+    writing anything. A slot whose invoice line was later removed stays
+    visible so its formulation is not silently orphaned.
+    """
+    recipe = _require_recipe(conn, recipe_id)
+    invoice_products = _invoice_product_lines(conn, recipe["invoice_id"])
+    slots = {}
+    for row in conn.execute(
+            "SELECT id, product_name, unit FROM recipe_products "
+            "WHERE recipe_id = %s ORDER BY id", (recipe_id,)).fetchall():
+        slots[(row[1] or "").strip().lower()] = {
+            "id": row[0], "product_name": row[1], "unit": row[2]}
+    items = _slot_items(conn, recipe_id)
+    produced = _produced_by_product(conn, recipe_id)
+
+    products: List[Dict[str, Any]] = []
+    seen = set()
+    for group in invoice_products:
+        slot = slots.get(group["key"])
+        seen.add(group["key"])
+        products.append(_product_row(group, slot, items, produced, on_invoice=True))
+    for key, slot in slots.items():
+        if key in seen:
+            continue
+        products.append(_product_row(
+            {"key": key, "product_name": slot["product_name"],
+             "unit": slot["unit"], "lines": [], "invoiced_qty": 0.0,
+             "unconverted": []}, slot, items, produced, on_invoice=False))
+    products.sort(key=lambda p: (p["product_name"] or "").lower())
+    return products
+
+
+def _product_row(group, slot, items, produced, on_invoice=True) -> Dict[str, Any]:
+    slot_items = items.get(slot["id"], []) if slot else []
+    invoiced = float(group.get("invoiced_qty") or 0)
+    built = float(produced.get(group["key"], 0))
+    return {
+        "id": slot["id"] if slot else None,
+        "on_invoice": on_invoice,
+        "product_name": group["product_name"],
+        "unit": (slot["unit"] if slot else group["unit"]) or "KG",
+        "invoiced_qty": invoiced,
+        "line_count": len(group.get("lines") or []),
+        "lines": group.get("lines") or [],
+        "unconverted": group.get("unconverted") or [],
+        "produced_qty": built,
+        "remaining_qty": max(invoiced - built, 0.0),
+        "formulated": bool(slot_items),
+        "percentage": sum(i["percentage"] for i in slot_items),
+        "items": slot_items,
+    }
+
+
+def get_recipe_detail(conn: psycopg.Connection,
+                      recipe_id: int) -> Dict[str, Any]:
+    recipe = _require_recipe(conn, recipe_id)
+    products = list_recipe_products(conn, recipe_id)
+    return {"recipe": recipe, "products": products}
+
+
+def get_invoice_production_source(conn: psycopg.Connection,
+                                  invoice_id: int) -> Dict[str, Any]:
+    """Prefill data for the production modal: remaining quantity per product."""
+    invoice = conn.execute(
+        "SELECT id, invoice_number FROM invoices WHERE id = %s",
+        (invoice_id,)).fetchone()
+    if not invoice:
+        raise InvoiceNotFound(f"Invoice {invoice_id} not found")
+    recipe = get_recipe_by_invoice(conn, invoice_id)
+    if recipe:
+        products = [p for p in list_recipe_products(conn, recipe["id"])
+                    if p["on_invoice"]]
+    else:
+        products = [
+            _product_row(group, None, {}, {})
+            for group in _invoice_product_lines(conn, invoice_id)
+        ]
+        products.sort(key=lambda p: (p["product_name"] or "").lower())
+    return {
+        "invoice_id": invoice[0],
+        "invoice_number": invoice[1],
+        "recipe": recipe,
+        "products": products,
+    }
+
+
+def list_recipe_items_by_id(conn: psycopg.Connection,
+                            recipe_id: int) -> List[Dict[str, Any]]:
+    """Flattened ingredients across every product (report/CLI compatibility)."""
+    out = []
+    for product in list_recipe_products(conn, recipe_id):
+        for item in product["items"]:
+            out.append({
+                "product_name": product["product_name"],
+                "recipe_id": recipe_id,
+                **item,
+            })
+    return out
+
+
+def list_recipe_items(conn: psycopg.Connection, company_id: int,
+                      recipe_name: str) -> List[Dict[str, Any]]:
     recipe = get_recipe_by_name(conn, company_id, recipe_name)
-    if not recipe:
-        logger.warning("Recipe '%s' not found for company %s.", recipe_name, company_id)
-        return False
-    
-    chemical = conn.execute("SELECT id FROM chemicals WHERE name = %s", (chemical_name,)).fetchone()
-    if not chemical:
-        logger.warning("Chemical '%s' not found.", chemical_name)
-        return False
+    return list_recipe_items_by_id(conn, recipe["id"]) if recipe else []
 
-    old = conn.execute(
-        "SELECT id, percentage FROM recipe_items WHERE recipe_id = %s AND chemical_id = %s",
-        (recipe["id"], chemical[0])
-    ).fetchone()
-    if not old:
-        logger.warning("'%s' not found in recipe '%s'.", chemical_name, recipe_name)
-        return False
 
-    new_qty_per_unit = new_percentage / 100.0
-    # Phase 2-B, same columns as add_recipe_item.
-    finite_values(new_percentage)
-    if new_percentage < 0:
+# --------------------------------------------------------------------------- #
+# writes
+# --------------------------------------------------------------------------- #
+
+
+def sync_recipe_products(conn: psycopg.Connection, recipe_id: int) -> int:
+    """Create a slot for every distinct product on the recipe's invoice.
+
+    Idempotent, and called inside the caller's transaction: creating the recipe,
+    adding an invoice line and producing all use the same slot mapping. The
+    expression index on ``lower(product_name)`` is what makes the upsert safe
+    under concurrency.
+    """
+    result = conn.execute(
+        """INSERT INTO recipe_products (recipe_id, product_name, unit)
+           SELECT %s, p.product_name, p.unit
+             FROM (
+                 SELECT DISTINCT ON (lower(ii.product_name))
+                        ii.product_name,
+                        COALESCE(NULLIF(trim(ii.unit), ''), 'KG') AS unit
+                   FROM invoice_items ii
+                   JOIN recipes r ON r.invoice_id = ii.invoice_id
+                  WHERE r.id = %s
+                    AND NULLIF(trim(ii.product_name), '') IS NOT NULL
+                  ORDER BY lower(ii.product_name), ii.id
+             ) p
+           ON CONFLICT (recipe_id, lower(product_name)) DO NOTHING""",
+        (recipe_id, recipe_id))
+    return result.rowcount
+
+
+def add_recipe(conn: psycopg.Connection, name: str, company_id: int,
+               invoice_id: int) -> Dict[str, Any]:
+    """Create the one recipe for an invoice, with a slot per product."""
+    name = (name or "").strip() if isinstance(name, str) else ""
+    if not name:
+        raise ValueError("name is required")
+    if company_id is None:
+        raise ValueError("company_id is required")
+    if invoice_id is None:
+        raise ValueError("invoice_id is required")
+    if not conn.execute("SELECT 1 FROM companies WHERE id = %s",
+                        (company_id,)).fetchone():
+        raise ValueError("unknown company")
+
+    invoice = conn.execute(
+        """SELECT i.id, i.status FROM invoices i
+             JOIN sales s ON s.id = i.sale_id
+            WHERE i.id = %s AND s.company_id = %s""",
+        (invoice_id, company_id)).fetchone()
+    if not invoice:
+        raise InvoiceNotFound(f"Invoice {invoice_id} not found for this company")
+    if invoice[1] not in ("planned", "produced"):
+        raise LifecycleConflict(
+            f"invoice is {invoice[1]}; a recipe is created while it is "
+            "planned or produced")
+    if conn.execute("SELECT 1 FROM recipes WHERE invoice_id = %s",
+                    (invoice_id,)).fetchone():
+        raise RecipeInvoiceConflict(
+            f"Invoice {invoice_id} already has a recipe")
+    if not conn.execute(
+            "SELECT 1 FROM invoice_items WHERE invoice_id = %s LIMIT 1",
+            (invoice_id,)).fetchone():
+        raise ValueError("invoice has no products to formulate")
+
+    try:
+        recipe_id = conn.execute(
+            "INSERT INTO recipes (name, company_id, invoice_id) "
+            "VALUES (%s, %s, %s) RETURNING id",
+            (name, company_id, invoice_id)).fetchone()[0]
+        sync_recipe_products(conn, recipe_id)
+        log_audit_action(conn, "RECIPE_CREATE", "recipe", recipe_id,
+                         new_value=f"{name} (invoice {invoice_id})",
+                         atomic=False)
+        conn.commit()
+    except psycopg.errors.UniqueViolation:
+        conn.rollback()
+        raise RecipeInvoiceConflict(
+            f"Invoice {invoice_id} already has a recipe")
+    logger.info("Created recipe '%s' for invoice %s", name, invoice_id)
+    # Re-read for the derived counts; the row was committed just above.
+    return _require_recipe(conn, recipe_id)
+
+
+def _chemical(conn: psycopg.Connection, name: str):
+    name = (name or "").strip() if isinstance(name, str) else ""
+    if not name:
+        raise ValueError("chemical is required")
+    row = conn.execute(
+        "SELECT id, name, unit, current_qty FROM chemicals "
+        "WHERE lower(name) = lower(%s)", (name,)).fetchone()
+    if not row:
+        raise ValueError(f"chemical '{name}' not found")
+    return row
+
+
+def _slot_for_product(conn: psycopg.Connection, recipe: Dict[str, Any],
+                      product_name: str) -> int:
+    product_name = (product_name or "").strip() if isinstance(product_name, str) else ""
+    if not product_name:
+        raise ValueError("product_name is required")
+    on_invoice = conn.execute(
+        """SELECT 1 FROM invoice_items
+            WHERE invoice_id = %s AND lower(product_name) = lower(%s) LIMIT 1""",
+        (recipe["invoice_id"], product_name)).fetchone()
+    if not on_invoice:
+        raise ValueError(
+            f"product '{product_name}' is not on invoice "
+            f"{recipe['invoice_number']}")
+    unit = conn.execute(
+        """SELECT COALESCE(NULLIF(trim(unit), ''), 'KG')
+             FROM invoice_items
+            WHERE invoice_id = %s AND lower(product_name) = lower(%s)
+            ORDER BY id LIMIT 1""",
+        (recipe["invoice_id"], product_name)).fetchone()[0]
+    conn.execute(
+        """INSERT INTO recipe_products (recipe_id, product_name, unit)
+           VALUES (%s, %s, %s)
+           ON CONFLICT (recipe_id, lower(product_name)) DO NOTHING""",
+        (recipe["id"], product_name, unit))
+    return conn.execute(
+        "SELECT id FROM recipe_products "
+        "WHERE recipe_id = %s AND lower(product_name) = lower(%s)",
+        (recipe["id"], product_name)).fetchone()[0]
+
+
+def _slot_percentage_total(conn: psycopg.Connection,
+                           recipe_product_id: int) -> float:
+    row = conn.execute(
+        "SELECT COALESCE(SUM(percentage), 0) FROM recipe_items "
+        "WHERE recipe_product_id = %s", (recipe_product_id,)).fetchone()
+    return float(row[0] or 0)
+
+
+def add_recipe_item(conn: psycopg.Connection, recipe_id: int, product_name: str,
+                    chemical_name: str, percentage: float) -> bool:
+    """Add (or replace) one chemical in one product's formulation."""
+    finite_values(percentage)
+    if percentage < 0:
         raise ValueError("percentage must be 0 or greater")
-    current_total = _items_percentage_total(conn, recipe["id"])
-    _check_percentage_total(conn, recipe["id"], recipe.get("water_percentage") or 0,
-                            current_total - (old[1] or 0) + new_percentage)
-    result = conn.execute(
-        "UPDATE recipe_items SET percentage = %s, required_qty_per_unit = %s WHERE recipe_id = %s AND chemical_id = %s",
-        (new_percentage, new_qty_per_unit, recipe["id"], chemical[0])
-    )
+    recipe = _require_recipe(conn, recipe_id)
+    # Resolve the chemical before touching a slot: an unknown chemical must not
+    # leave an uncommitted ghost-slot INSERT for the caller's close() to commit.
+    chem = _chemical(conn, chemical_name)
+    slot_id = _slot_for_product(conn, recipe, product_name)
 
-    if result.rowcount > 0:
-        logger.info("Updated '%s' in '%s': now %s%%", chemical_name, recipe_name, new_percentage)
-        # atomic=False, commit below: the UPDATE and its audit row are one unit.
-        log_audit_action(conn, "RECIPE_ITEM_UPDATE", "recipe_item", old[0],
-                         old_value=str(old[1]), new_value=str(new_percentage),
-                         atomic=False)
-        conn.commit()
-        return True
-    else:
-        logger.warning("'%s' not found in recipe '%s'.", chemical_name, recipe_name)
-        return False
+    existing = conn.execute(
+        "SELECT id FROM recipe_items WHERE recipe_product_id = %s AND chemical_id = %s",
+        (slot_id, chem[0])).fetchone()
+    if existing:
+        raise RecipeItemConflict(
+            f"'{chem[1]}' is already in the {product_name} formulation")
+    total = _slot_percentage_total(conn, slot_id) + percentage
+    if total > 100.0 + 1e-9:
+        raise ValueError(
+            f"ingredients for {product_name} total {total:g}% - the maximum is 100%")
 
-
-def delete_recipe_item(conn: psycopg.Connection, company_id: int, recipe_name: str, chemical_name: str) -> bool:
-    """Remove a chemical from a recipe."""
-    recipe = get_recipe_by_name(conn, company_id, recipe_name)
-    if not recipe:
-        logger.warning("Recipe '%s' not found for company %s.", recipe_name, company_id)
-        return False
-    
-    chemical = conn.execute("SELECT id FROM chemicals WHERE name = %s", (chemical_name,)).fetchone()
-    if not chemical:
-        logger.warning("Chemical '%s' not found.", chemical_name)
-        return False
-
-    old = conn.execute(
-        "SELECT id, percentage FROM recipe_items WHERE recipe_id = %s AND chemical_id = %s",
-        (recipe["id"], chemical[0])
-    ).fetchone()
-    if not old:
-        logger.warning("'%s' was not in recipe '%s'.", chemical_name, recipe_name)
-        return False
-
-    result = conn.execute(
-        "DELETE FROM recipe_items WHERE recipe_id = %s AND chemical_id = %s",
-        (recipe["id"], chemical[0])
-    )
-
-    if result.rowcount > 0:
-        logger.info("Removed '%s' from recipe '%s'", chemical_name, recipe_name)
-        # atomic=False, commit below. A delete destroys its own evidence, so a
-        # committed delete with no audit row is the worst of both: the row is
-        # gone and nothing records that it ever existed.
-        log_audit_action(conn, "RECIPE_ITEM_DELETE", "recipe_item", old[0],
-                         old_value=f"{recipe_name}:{chemical_name}:{old[1]}",
-                         atomic=False)
-        conn.commit()
-        return True
-    else:
-        logger.warning("'%s' was not in recipe '%s'.", chemical_name, recipe_name)
-        return False
-
-
-def delete_recipe(conn: psycopg.Connection, company_id: int, name: str) -> bool:
-    """Delete a recipe and all its items."""
-    recipe = get_recipe_by_name(conn, company_id, name)
-    if not recipe:
-        logger.warning("Recipe '%s' not found for company %s.", name, company_id)
-        return False
-    
-    conn.execute("DELETE FROM recipe_items WHERE recipe_id = %s", (recipe["id"],))
-    conn.execute("DELETE FROM recipes WHERE id = %s", (recipe["id"],))
-    logger.info("Deleted recipe '%s' and all its items.", name)
-    # atomic=False, commit below: both DELETEs and the audit row are one unit.
-    log_audit_action(conn, "RECIPE_DELETE", "recipe", recipe["id"],
-                     old_value=name, atomic=False)
+    item_id = conn.execute(
+        "INSERT INTO recipe_items (recipe_product_id, chemical_id, percentage) "
+        "VALUES (%s, %s, %s) RETURNING id",
+        (slot_id, chem[0], percentage)).fetchone()[0]
+    log_audit_action(
+        conn, "RECIPE_ITEM_ADD", "recipe_item", item_id,
+        new_value=f"{recipe['name']}:{product_name}:{chem[1]}:{percentage}",
+        atomic=False)
     conn.commit()
     return True
 
 
-def update_recipe(conn: psycopg.Connection, company_id: int, name: str,
-                  total_quantity: float = None, water_percentage: float = None,
-                  new_name: str = None, product_name: str = None) -> bool:
-    """Revise a recipe: name, product, batch quantity and water percentage.
-
-    Args:
-        conn: Database connection
-        company_id: Company ID (required for isolation)
-        name: Current recipe name (case-insensitive)
-        total_quantity: New total quantity (or None to keep current)
-        water_percentage: New water percentage (or None to keep current)
-        new_name: New name (or None to keep current); trimmed, non-empty,
-            unique per company ignoring case — a clash is
-            ``RecipeNameConflict`` (409). Renaming after production is allowed:
-            runs link by ``recipe_id`` and their frozen items carry chemical
-            names, so history follows the row, not the label.
-        product_name: New product (or None to keep current), validated against
-            this company's PI **and** invoice lines. Refused with
-            ``RecipeProductLocked`` (409) once a production run exists, because
-            readiness and the commercial report key off this column.
-
-    The row is resolved once and updated **by id**, so a rename and a field
-    change in the same call cannot disagree about which row they mean.
-
-    Returns:
-        True if updated, False if recipe not found
-    """
-    recipe = get_recipe_by_name(conn, company_id, name)
-    if not recipe:
-        logger.warning("Recipe '%s' not found for company %s.", name, company_id)
+def update_recipe_item(conn: psycopg.Connection, recipe_id: int, item_id: int,
+                       new_percentage: float) -> bool:
+    finite_values(new_percentage)
+    if new_percentage < 0:
+        raise ValueError("percentage must be 0 or greater")
+    _require_recipe(conn, recipe_id)
+    row = conn.execute(
+        """SELECT ri.id, ri.percentage, ri.recipe_product_id
+             FROM recipe_items ri
+             JOIN recipe_products rp ON rp.id = ri.recipe_product_id
+            WHERE ri.id = %s AND rp.recipe_id = %s""",
+        (item_id, recipe_id)).fetchone()
+    if not row:
         return False
-
-    updates = []
-    params = []
-    changed = []
-    final_name = recipe["name"]
-    # Phase 2-B: total_quantity had no check at all, and the water range check
-    # below is False for nan.
-    finite_values(total_quantity, water_percentage)
-
-    if new_name is not None:
-        final_name = new_name.strip() if isinstance(new_name, str) else ""
-        if not final_name:
-            raise ValueError("name is required")
-        if final_name != recipe["name"]:
-            # The unique index is case-sensitive; every lookup is not.
-            dup = conn.execute(
-                "SELECT id FROM recipes WHERE company_id = %s"
-                " AND lower(name) = lower(%s) AND id <> %s",
-                (company_id, final_name, recipe["id"])).fetchone()
-            if dup:
-                raise RecipeNameConflict(
-                    f"Recipe '{final_name}' already exists for this company")
-            updates.append("name = %s")
-            params.append(final_name)
-            changed.append("name")
-
-    if product_name is not None:
-        final_product = (product_name.strip()
-                         if isinstance(product_name, str) else "")
-        if not final_product:
-            raise ValueError("product_name is required")
-        if final_product.lower() != (recipe["product_name"] or "").lower():
-            # Lock first, validate second. Once a run exists the answer is 409
-            # whatever the target is; running the registration check first let
-            # an unregistered target downgrade that into a 400.
-            has_runs = conn.execute(
-                "SELECT 1 FROM production_runs WHERE recipe_id = %s LIMIT 1",
-                (recipe["id"],)).fetchone()
-            if has_runs:
-                raise RecipeProductLocked(
-                    "production has run — the product is fixed")
-            final_product = _require_registered_product(
-                conn, company_id, final_product)
-            updates.append("product_name = %s")
-            params.append(final_product)
-            changed.append("product_name")
-
-    if total_quantity is not None:
-        updates.append("total_quantity = %s")
-        params.append(total_quantity)
-        changed.append("total_quantity")
-    if water_percentage is not None:
-        if water_percentage < 0 or water_percentage > 100:
-            raise ValueError("water_percentage must be between 0 and 100")
-        _check_percentage_total(conn, recipe["id"], water_percentage,
-                                _items_percentage_total(conn, recipe["id"]))
-        updates.append("water_percentage = %s")
-        params.append(water_percentage)
-        changed.append("water_percentage")
-
-    if not updates:
-        return True
-
-    params.append(recipe["id"])
-    try:
-        conn.execute(f"UPDATE recipes SET {', '.join(updates)} WHERE id = %s", params)
-    except psycopg.errors.IntegrityError:
-        # Race backstop: another request took the name between the pre-check
-        # and this UPDATE. Same class, so the status cannot disagree.
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-        raise RecipeNameConflict(
-            f"Recipe '{final_name}' already exists for this company")
-    logger.info("Updated recipe '%s' (now '%s'): %s", recipe["name"],
-                final_name, ",".join(changed))
-    # atomic=False, commit below: the UPDATE and its audit row are one unit.
-    # Both names are recorded: a rename is only meaningful as old -> new.
-    log_audit_action(conn, "RECIPE_UPDATE", "recipe", recipe["id"],
-                     old_value=recipe["name"],
-                     new_value=f"{final_name} ({','.join(changed)})",
+    total = (_slot_percentage_total(conn, row[2]) - float(row[1] or 0)
+             + new_percentage)
+    if total > 100.0 + 1e-9:
+        raise ValueError(
+            f"ingredients for this product total {total:g}% - "
+            "the maximum is 100%")
+    conn.execute(
+        "UPDATE recipe_items SET percentage = %s WHERE id = %s",
+        (new_percentage, item_id))
+    log_audit_action(conn, "RECIPE_ITEM_UPDATE", "recipe_item", item_id,
+                     old_value=str(row[1]), new_value=str(new_percentage),
                      atomic=False)
     conn.commit()
     return True
 
 
-# ============================================================
-# PHASE 3: PRODUCTION REPORT GENERATION
-# ============================================================
+def delete_recipe_item(conn: psycopg.Connection, recipe_id: int,
+                       item_id: int) -> bool:
+    _require_recipe(conn, recipe_id)
+    row = conn.execute(
+        """SELECT ri.id, ri.percentage, ri.chemical_id, c.name
+             FROM recipe_items ri
+             JOIN recipe_products rp ON rp.id = ri.recipe_product_id
+             JOIN chemicals c ON c.id = ri.chemical_id
+            WHERE ri.id = %s AND rp.recipe_id = %s""",
+        (item_id, recipe_id)).fetchone()
+    if not row:
+        return False
+    conn.execute("DELETE FROM recipe_items WHERE id = %s", (item_id,))
+    log_audit_action(conn, "RECIPE_ITEM_DELETE", "recipe_item", item_id,
+                     old_value=f"{row[3]}:{row[1]}", atomic=False)
+    conn.commit()
+    return True
 
 
-def generate_report(conn: psycopg.Connection, company_id: int, recipe_name: str, production_qty: float) -> List[Dict[str, Any]]:
-    """Generate a production report showing have vs need for each chemical.
-    
-    Args:
-        conn: Database connection
-        company_id: Company ID (required for isolation)
-        recipe_name: Name of the recipe to report on
-        production_qty: How many units to produce
-    
-    Returns:
-        List of dicts with:
-        - chemical_name: str
-        - current_stock: float (what we have)
-        - required_total: float (total needed for production_qty)
-        - unit: str (KG or PCS)
-        - shortage: float (negative = not enough, positive = surplus)
-        - status: str ("OK", "SHORTAGE", "EXACT", "SURPLUS")
+def update_recipe(conn: psycopg.Connection, recipe_id: int,
+                  new_name: str) -> bool:
+    """Rename a recipe. The invoice it belongs to is not editable."""
+    recipe = _require_recipe(conn, recipe_id)
+    if new_name is None:
+        return True
+    final_name = new_name.strip() if isinstance(new_name, str) else ""
+    if not final_name:
+        raise ValueError("name is required")
+    if final_name == recipe["name"]:
+        return True
+    dup = conn.execute(
+        "SELECT id FROM recipes WHERE company_id = %s "
+        "AND lower(name) = lower(%s) AND id <> %s",
+        (recipe["company_id"], final_name, recipe_id)).fetchone()
+    if dup:
+        raise RecipeNameConflict(
+            f"Recipe '{final_name}' already exists for this company")
+    try:
+        conn.execute("UPDATE recipes SET name = %s WHERE id = %s",
+                     (final_name, recipe_id))
+    except psycopg.errors.UniqueViolation:
+        conn.rollback()
+        raise RecipeNameConflict(
+            f"Recipe '{final_name}' already exists for this company")
+    log_audit_action(conn, "RECIPE_UPDATE", "recipe", recipe_id,
+                     old_value=recipe["name"], new_value=final_name,
+                     atomic=False)
+    conn.commit()
+    return True
+
+
+def delete_recipe(conn: psycopg.Connection, recipe_id: int) -> bool:
+    """Delete a recipe that has never produced. Runs block the delete (409)."""
+    recipe = _require_recipe(conn, recipe_id)
+    if conn.execute("SELECT 1 FROM production_runs WHERE recipe_id = %s LIMIT 1",
+                    (recipe_id,)).fetchone():
+        raise RecipeHasRuns(
+            "production has run from this recipe; it cannot be deleted")
+    conn.execute("DELETE FROM recipes WHERE id = %s", (recipe_id,))
+    log_audit_action(conn, "RECIPE_DELETE", "recipe", recipe_id,
+                     old_value=recipe["name"], atomic=False)
+    conn.commit()
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# production
+# --------------------------------------------------------------------------- #
+
+
+def _normalized_outputs(outputs) -> List[Dict[str, Any]]:
+    if not isinstance(outputs, list) or not outputs:
+        raise ValueError("outputs must list at least one product")
+    normalized = []
+    seen = set()
+    for raw in outputs:
+        if not isinstance(raw, dict):
+            raise ValueError("each output must be an object")
+        name = (raw.get("product_name") or "").strip() \
+            if isinstance(raw.get("product_name"), str) else ""
+        qty = raw.get("quantity")
+        if not name:
+            raise ValueError("each output needs a product_name")
+        if not isinstance(qty, (int, float)) or not math.isfinite(qty) or qty <= 0:
+            raise ValueError(f"quantity for '{name}' must be finite and > 0")
+        key = name.lower()
+        if key in seen:
+            raise ValueError(f"product '{name}' appears twice in outputs")
+        seen.add(key)
+        normalized.append({"product_name": name, "quantity": float(qty)})
+    return normalized
+
+
+def _aggregate_requirements(conn: psycopg.Connection, recipe: Dict[str, Any],
+                            outputs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert per-product needs into one row per chemical, in stock units.
+
+    A product's formulation percentages apply to that product's quantity. Each
+    need is converted from the slot's unit to the chemical's stock unit before
+    the products are summed, so giving two products the same chemical produces
+    exactly one deduction. A missing conversion is a 400 naming both units:
+    guessing KG would silently over- or under-deduct.
     """
-    recipe = get_recipe_by_name(conn, company_id, recipe_name)
-    if not recipe:
-        return []
-    
-    items = list_recipe_items(conn, company_id, recipe_name)
-    if not items:
-        return []
-    
+    products = {p["product_name"].lower(): p
+                for p in list_recipe_products(conn, recipe["id"])}
+    aggregated: Dict[int, Dict[str, Any]] = {}
+    for output in outputs:
+        product = products.get(output["product_name"].lower())
+        if not product or not product["on_invoice"]:
+            raise ValueError(
+                f"product '{output['product_name']}' is not on invoice "
+                f"{recipe['invoice_number']}")
+        if not product["formulated"]:
+            raise ValueError(
+                f"'{product['product_name']}' has no formulation yet")
+        if product["unconverted"]:
+            pairs = ", ".join(
+                f"{u['from_unit']} -> {u['to_unit']}"
+                for u in product["unconverted"])
+            raise ValueError(
+                f"invoice lines for '{product['product_name']}' need a unit "
+                f"conversion ({pairs}) - add it in Unit Conversions")
+        for item in product["items"]:
+            required = (item["percentage"] / 100.0) * output["quantity"]
+            converted = convert_quantity(
+                conn, required, product["unit"], item["unit"])
+            if converted is None:
+                raise ValueError(
+                    f"no unit conversion from {product['unit']} to "
+                    f"{item['unit']} for chemical '{item['chemical_name']}' "
+                    f"on '{product['product_name']}' - add it in "
+                    "Unit Conversions")
+            row = aggregated.setdefault(item["chemical_id"], {
+                "chemical_id": item["chemical_id"],
+                "chemical_name": item["chemical_name"],
+                "unit": item["unit"],
+                "current_stock": item["current_stock"],
+                "required_qty": 0.0,
+                "products": [],
+            })
+            row["required_qty"] += converted
+            row["products"].append({
+                "product_name": product["product_name"],
+                "quantity": output["quantity"],
+                "percentage": item["percentage"],
+                "required_qty": converted,
+            })
+    return sorted(aggregated.values(), key=lambda r: r["chemical_name"])
+
+
+def generate_report(conn: psycopg.Connection, company_id: int, recipe_id: int,
+                    outputs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Have/need per chemical for the given per-product production quantities."""
+    recipe = _require_recipe(conn, recipe_id)
+    if recipe["company_id"] != company_id:
+        raise ResourceMissing(f"Recipe {recipe_id} not found for this company")
+    normalized = _normalized_outputs(outputs)
     report = []
-    for item in items:
-        current = item["current_stock"]
-        required = item["required_per_unit"] * production_qty
-        shortage = current - required  # negative = not enough
-        
-        if shortage < 0:
-            status = "SHORTAGE"
-        elif shortage == 0:
-            status = "EXACT"
-        else:
-            status = "SURPLUS"
-        
+    for row in _aggregate_requirements(conn, recipe, normalized):
+        required = row["required_qty"]
+        shortage = row["current_stock"] - required
         report.append({
-            "chemical_name": item["chemical_name"],
-            "current_stock": current,
+            "chemical_name": row["chemical_name"],
+            "current_stock": row["current_stock"],
             "required_total": required,
-            "unit": item["unit"],
+            "unit": row["unit"],
             "shortage": shortage,
-            "status": status
+            "status": ("SHORTAGE" if shortage < 0
+                       else "EXACT" if shortage == 0 else "SURPLUS"),
+            "products": row["products"],
         })
-    
     return report
 
 
-def generate_multi_recipe_report(conn: psycopg.Connection, recipe_selections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Generate a combined production report for multiple recipes.
-    
-    Args:
-        conn: Database connection
-        recipe_selections: List of dicts with {"company_id": int, "recipe_name": str, "production_qty": float}
-    
-    Returns:
-        Combined list of report items with same chemicals merged together.
+def generate_multi_recipe_report(conn: psycopg.Connection,
+                                 selections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Combine several recipes into one chemical report.
+
+    ``selections`` are ``{recipe_id, outputs}``; each row keeps the per-recipe
+    breakdown so the CSV can show where a chemical is used.
     """
-    combined = {}
-    
-    for selection in recipe_selections:
-        company_id = selection["company_id"]
-        recipe_name = selection["recipe_name"]
-        production_qty = selection["production_qty"]
-        
-        items = list_recipe_items(conn, company_id, recipe_name)
-        for item in items:
-            chem_name = item["chemical_name"]
-            required = item["required_per_unit"] * production_qty
-            
-            if chem_name in combined:
-                combined[chem_name]["required_total"] += required
-            else:
-                combined[chem_name] = {
-                    "chemical_name": chem_name,
-                    "current_stock": item["current_stock"],
-                    "required_total": required,
-                    "unit": item["unit"],
-                    "recipes": []
-                }
-            
-            combined[chem_name]["recipes"].append({
-                "recipe_name": recipe_name,
-                "production_qty": production_qty,
-                "percentage": item["percentage"],
-                "qty_from_this_recipe": required
+    combined: Dict[tuple, Dict[str, Any]] = {}
+    for selection in selections:
+        recipe = _require_recipe(conn, selection["recipe_id"])
+        outputs = _normalized_outputs(selection.get("outputs") or [])
+        for row in _aggregate_requirements(conn, recipe, outputs):
+            key = (row["chemical_name"].lower(), row["unit"].upper())
+            target = combined.setdefault(key, {
+                "chemical_name": row["chemical_name"],
+                "current_stock": row["current_stock"],
+                "required_total": 0.0,
+                "unit": row["unit"],
+                "recipes": [],
+                "products": [],
             })
-    
+            target["required_total"] += row["required_qty"]
+            target["recipes"].append({
+                "recipe_id": recipe["id"],
+                "recipe_name": recipe["name"],
+                "qty_from_this_recipe": row["required_qty"],
+            })
+            target["products"].extend(row["products"])
+
     report = []
-    for chem_name, data in combined.items():
+    for data in combined.values():
         shortage = data["current_stock"] - data["required_total"]
-        if shortage < 0:
-            status = "SHORTAGE"
-        elif shortage == 0:
-            status = "EXACT"
-        else:
-            status = "SURPLUS"
-        
         report.append({
-            "chemical_name": data["chemical_name"],
-            "current_stock": data["current_stock"],
-            "required_total": data["required_total"],
-            "unit": data["unit"],
+            **data,
             "shortage": shortage,
-            "status": status,
-            "recipes": data["recipes"]
+            "status": ("SHORTAGE" if shortage < 0
+                       else "EXACT" if shortage == 0 else "SURPLUS"),
         })
     report.sort(key=lambda x: x["chemical_name"])
     return report
 
 
-def _owned_sale_ids(conn: psycopg.Connection, company_id: int,
-                    sale_ids: List[int]) -> List[int]:
-    """Fail closed unless every referenced sale belongs to ``company_id``.
-
-    ``production_run_links`` writes drive a customer-visible status flip
-    (``sales.shipment_status``), so an unscoped id from the request body would
-    let a run for customer A advance customer B's pipeline. Mirrors the recipe
-    lookup discipline (``get_recipe_by_name`` is scoped by company_id).
-    """
-    owned: List[int] = []
-    for sale_id in dict.fromkeys(sale_ids):
-        row = conn.execute(
-            "SELECT id FROM sales WHERE id = %s AND company_id = %s",
-            (sale_id, company_id)
-        ).fetchone()
-        if not row:
-            raise LinkedSaleNotFound(
-                f"linked sale {sale_id} not found for this company")
-        owned.append(row[0])
-    return owned
-
-
-def _owned_invoice_ids(conn: psycopg.Connection, company_id: int,
-                       invoice_ids: List[int]) -> List[int]:
-    """Fail closed unless every referenced invoice belongs to ``company_id``."""
-    owned: List[int] = []
-    for invoice_id in dict.fromkeys(invoice_ids):
-        row = conn.execute(
-            """SELECT i.id, i.sale_id FROM invoices i
-               JOIN sales s ON s.id = i.sale_id
-               WHERE i.id = %s AND s.company_id = %s""",
-            (invoice_id, company_id)
-        ).fetchone()
-        if not row:
-            raise LinkedInvoiceNotFound(
-                f"linked invoice {invoice_id} not found for this company")
-        owned.append(row[0])
-    return owned
-
-
 def create_production_run(
     conn: psycopg.Connection,
     company_id: int,
-    recipe_name: str,
-    production_qty: float,
-    order_number: str = None,
-    batch_number: str = None,
-    production_date: str = None,
-    material_number: str = None,
-    packing: str = None,
-    invoice_number: str = None,
-    sale_ids: list[int] | None = None,
-    invoice_ids: list[int] | None = None,
-    notes: str = None,
-    created_by: int = None,
+    recipe_id: int,
+    outputs: List[Dict[str, Any]],
+    order_number: Optional[str] = None,
+    batch_number: Optional[str] = None,
+    production_date: Optional[str] = None,
+    material_number: Optional[str] = None,
+    packing: Optional[str] = None,
+    invoice_number: Optional[str] = None,
+    notes: Optional[str] = None,
+    created_by: Optional[int] = None,
     atomic: bool = True,
-    deferred_reorder: list[str] | None = None,
-) -> dict:
+    deferred_reorder: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Record one run: per-product outputs, one deduction per chemical.
+
+    The links to the sale and invoice are derived from the recipe's own
+    invoice — the request cannot name another invoice, so a run on invoice A
+    can never unlock invoice B. The whole run is one transaction: the
+    production_runs row, outputs, links, status flips and every deduction
+    commit together or not at all.
     """
-    Create a production run by snapshotting the recipe formula and deducting stock.
-
-    The whole run — the ``production_runs`` row, every ``production_run_links``
-    row, the linked invoice/sale status flips and EVERY ingredient deduction —
-    is ONE transaction. Nothing is committed until the last ingredient is
-    written, so a shortage on the Nth ingredient leaves no partially deducted
-    batch and no orphan run behind (the caller retries cleanly).
-
-    Args:
-        conn: Database connection
-        company_id: Company ID (required for isolation)
-        recipe_name: Name of the recipe to produce
-        production_qty: Quantity to produce
-        order_number: Optional order reference (e.g., sale order number)
-        batch_number: Optional batch number
-        production_date: Production date (ISO format, defaults to today)
-        notes: Optional notes
-        created_by: User ID who initiated the run
-        sale_ids: Sales to link — must belong to ``company_id`` or the call fails
-        invoice_ids: Invoices to link — must belong to ``company_id`` or the call fails.
-            Producing advances an invoice ONLY forward (``planned`` ->
-            ``produced``); an invoice already at or past ``produced``
-            (``produced``/``booked``) keeps its status and ``shipped``/``paid``
-            refuse the run outright (``ValueError`` -> 409).
-        atomic: True (default) commits the run itself and flushes its reorder
-            notifications. False leaves the transaction to the caller (the
-            multi-recipe produce route commits once for the whole request);
-            with False the caller MUST supply ``deferred_reorder`` (a list) and
-            flush it with sync_reorder_notifications() after its own commit.
-
-    Returns:
-        Dict with run_id, shortage_report, and any warnings
-    """
-    from datetime import date as _date
-    from raas_tracker.stock import update_stock, sync_reorder_notifications
-    from raas_tracker.sales import _now_str, _INVOICE_STATUS_ORDER
-
     if not atomic and deferred_reorder is None:
         raise ValueError("atomic=False requires a deferred_reorder list")
+    normalized = _normalized_outputs(outputs)
 
-    # Validate inputs (isfinite first: NaN passes every "<= 0" comparison,
-    # and +inf would deduct infinite stock downstream).
-    if not math.isfinite(production_qty) or production_qty <= 0:
-        raise ValueError("production_qty must be positive")
+    recipe = _require_recipe(conn, recipe_id)
+    if recipe["company_id"] != company_id:
+        raise ResourceMissing(f"Recipe {recipe_id} not found for this company")
 
-    # Get recipe
-    recipe = get_recipe_by_name(conn, company_id, recipe_name)
-    if not recipe:
-        raise ValueError(f"Recipe '{recipe_name}' not found for company {company_id}")
+    from raas_tracker.sales import _INVOICE_STATUS_ORDER, _now_str
 
-    # Get recipe items for snapshotting
-    items = list_recipe_items(conn, company_id, recipe_name)
-    if not items:
-        raise ValueError(f"Recipe '{recipe_name}' has no ingredients")
+    invoice_id = recipe["invoice_id"]
+    sale_id = recipe["sale_id"]
+    invoice_row = conn.execute(
+        "SELECT status FROM invoices WHERE id = %s FOR UPDATE",
+        (invoice_id,)).fetchone()
+    if not invoice_row:
+        raise InvoiceNotFound(f"Invoice {invoice_id} not found")
+    current = invoice_row[0]
+    if current in ("shipped", "paid"):
+        raise InvoiceAlreadyAdvanced(f"invoice already {current}")
 
-    # Fail early on an invalid recipe/stock state before any writes; the final
-    # report is regenerated after deduction.
-    generate_report(conn, company_id, recipe_name, production_qty)
-
-    # Calculate required quantities for each ingredient
-    run_items = []
-    total_required = 0
-    for item in list_recipe_items(conn, company_id, recipe_name):
-        required_qty = item["required_per_unit"] * production_qty
-        total_required += required_qty
-        run_items.append({
-            "chemical_id": item.get("chemical_id"),
-            "chemical_name": item["chemical_name"],
-            "required_qty": required_qty,
-            "unit": item["unit"],
-        })
-
-    # Fail closed on cross-company links BEFORE any write happens, so a
-    # rejected request never touches stock, runs or links.
-    verified_sale_ids = _owned_sale_ids(conn, company_id, sale_ids or [])
-    verified_invoice_ids = _owned_invoice_ids(conn, company_id, invoice_ids or [])
+    requirements = _aggregate_requirements(conn, recipe, normalized)
 
     try:
-        # Create production run record
-        prod_date = production_date or _date.today().isoformat()
-        cursor = conn.execute(
+        prod_date = production_date or date.today().isoformat()
+        total_qty = sum(o["quantity"] for o in normalized)
+        run_id = conn.execute(
             """INSERT INTO production_runs
-               (recipe_id, order_number, batch_number, production_date, qty_produced, notes, created_by,
-                material_number, packing, invoice_number)
+               (recipe_id, order_number, batch_number, production_date,
+                qty_produced, notes, created_by, material_number, packing,
+                invoice_number)
                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
-            (recipe["id"], order_number, batch_number, prod_date, production_qty, notes, created_by,
-             material_number, packing, invoice_number)
-        )
-        run_id = cursor.fetchone()[0]
+            (recipe_id, order_number, batch_number, prod_date, total_qty,
+             notes, created_by, material_number, packing,
+             invoice_number or recipe["invoice_number"])).fetchone()[0]
 
-        # Link production run to sales and invoices (company-scoped ids only)
-        linked_sale_ids: List[int] = []
-        for sale_id in verified_sale_ids:
+        products = {p["product_name"].lower(): p
+                    for p in list_recipe_products(conn, recipe_id)}
+        for output in normalized:
+            product = products[output["product_name"].lower()]
             conn.execute(
-                """INSERT INTO production_run_links (run_id, sale_id)
-                   VALUES (%s, %s)""",
-                (run_id, sale_id)
-            )
-            if sale_id not in linked_sale_ids:
-                linked_sale_ids.append(sale_id)
-        linked_invoice_ids: List[int] = []
-        for invoice_id in verified_invoice_ids:
-            # sale_id is derived from the invoice row itself — never guessed.
-            invoice_row = conn.execute(
-                "SELECT sale_id FROM invoices WHERE id = %s", (invoice_id,)
-            ).fetchone()
-            if not invoice_row:
-                logger.warning("Invoice %s not found; skipping production run link", invoice_id)
-                continue
-            sale_id = invoice_row[0]
-            conn.execute(
-                """INSERT INTO production_run_links (run_id, sale_id, invoice_id)
-                   VALUES (%s, %s, %s)""",
-                (run_id, sale_id, invoice_id)
-            )
-            if sale_id not in linked_sale_ids:
-                linked_sale_ids.append(sale_id)
-            linked_invoice_ids.append(invoice_id)
-            # Forward-only, same ordering the rest of the lifecycle uses
-            # (raas_tracker.sales._INVOICE_STATUS_ORDER). Producing marks the
-            # batch built; it must never drag an invoice BACKWARDS:
-            #   planned  -> produced  (the one move produce owns)
-            #   produced -> no-op     (re-run, already at that step)
-            #   booked   -> no-op     (booking is later than producing; the
-            #                             production fact lives on the sale's
-            #                             shipment_status, see below)
-            #   shipped/paid -> refused 409 (terminal, unchanged behaviour)
-            inv_row = conn.execute(
-                "SELECT status FROM invoices WHERE id = %s FOR UPDATE",
-                (invoice_id,)
-            ).fetchone()
-            current = inv_row[0] if inv_row else None
-            if current in ("shipped", "paid"):
-                raise InvoiceAlreadyAdvanced(f"invoice already {current}")
-            if current in _INVOICE_STATUS_ORDER and \
-                    _INVOICE_STATUS_ORDER.index(current) < _INVOICE_STATUS_ORDER.index("produced"):
-                conn.execute(
-                    "UPDATE invoices SET status = %s WHERE id = %s",
-                    ("produced", invoice_id)
-                )
-            else:
-                logger.info(
-                    "Invoice %s is already at '%s'; production recorded without "
-                    "moving its lifecycle status (forward-only).", invoice_id, current)
+                """INSERT INTO production_run_outputs
+                   (run_id, recipe_product_id, product_name, unit, qty_produced)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (run_id, product["id"], product["product_name"],
+                 product["unit"], output["quantity"]))
 
-        # Production finished: advance shipment_status to production_done.
-        # CASE keeps later states (production_done, ship_booked, ...) intact.
-        if linked_sale_ids:
-            conn.execute(
-                """UPDATE sales
-                      SET shipment_status = CASE
-                            WHEN shipment_status IS NULL
-                              OR shipment_status = 'production_running'
-                            THEN 'production_done'
-                            ELSE shipment_status END,
-                        updated_at = %s
-                    WHERE id = ANY(%s)""",
-                (_now_str(), linked_sale_ids)
-            )
+        conn.execute(
+            """INSERT INTO production_run_links (run_id, sale_id, invoice_id)
+               VALUES (%s, %s, %s)""",
+            (run_id, sale_id, invoice_id))
+        if current in _INVOICE_STATUS_ORDER and \
+                _INVOICE_STATUS_ORDER.index(current) < \
+                _INVOICE_STATUS_ORDER.index("produced"):
+            conn.execute("UPDATE invoices SET status = 'produced' WHERE id = %s",
+                         (invoice_id,))
+        conn.execute(
+            """UPDATE sales
+                  SET shipment_status = CASE
+                        WHEN shipment_status IS NULL
+                          OR shipment_status = 'production_running'
+                        THEN 'production_done'
+                        ELSE shipment_status END,
+                      updated_at = %s
+                WHERE id = %s""",
+            (_now_str(), sale_id))
 
-        # Snapshot formula and deduct stock — every deduction in this
-        # transaction (atomic=False), never one commit per ingredient.
-        for item in run_items:
-            chem_name = item["chemical_name"]
-
-            # Deduce stock (fail-closed: any shortage rejects the whole run)
-            success = update_stock(conn, chem_name, -item["required_qty"],
-                                   reason=f"Production {batch_number or run_id} for {recipe_name}",
-                                   atomic=False)
+        for row in requirements:
+            success = update_stock(
+                conn, row["chemical_name"], -row["required_qty"],
+                unit=row["unit"],
+                reason=f"Production {batch_number or run_id} for {recipe['name']}",
+                atomic=False)
             if not success:
-                logger.warning("Chemical '%s' not found for deduction", chem_name)
-                # Still record with deducted=0
-                deducted = 0
-            else:
-                deducted = item["required_qty"]
-
-            # Snapshot the formula (required and actual deducted)
+                raise ValueError(
+                    f"chemical '{row['chemical_name']}' disappeared during production")
             conn.execute(
                 """INSERT INTO production_run_items
-                   (run_id, chemical_id, chemical_name, required_qty, deducted_qty, unit)
+                   (run_id, chemical_id, chemical_name, required_qty,
+                    deducted_qty, unit)
                    VALUES (%s, %s, %s, %s, %s, %s)""",
-                (run_id, item.get("chemical_id"), item["chemical_name"],
-                 item["required_qty"], deducted, item["unit"])
-            )
+                (run_id, row["chemical_id"], row["chemical_name"],
+                 row["required_qty"], row["required_qty"], row["unit"]))
 
-        log_audit_action(conn, "PRODUCTION_RUN_CREATE", "production_run", run_id,
-                         new_value=f"{recipe_name} x{production_qty}", atomic=False)
+        log_audit_action(
+            conn, "PRODUCTION_RUN_CREATE", "production_run", run_id,
+            new_value=(f"{recipe['name']} "
+                       + ", ".join(f"{o['product_name']} x{o['quantity']:g}"
+                                   for o in normalized)),
+            atomic=False)
     except Exception:
-        # Nothing above was committed: drop the whole run.
         conn.rollback()
         raise
 
     if atomic:
         conn.commit()
-        # Committed: the reorder alerts for the touched ingredients can go out.
-        sync_reorder_notifications(conn, [i["chemical_name"] for i in run_items])
+        sync_reorder_notifications(
+            conn, [row["chemical_name"] for row in requirements])
     else:
-        # Caller-owned transaction: hand the names over so the caller can flush
-        # them once, after it commits (or drop them with a rollback).
-        deferred_reorder.extend(i["chemical_name"] for i in run_items)
+        deferred_reorder.extend(
+            row["chemical_name"] for row in requirements)
 
-    # Re-generate shortage report after deduction for accuracy
-    final_shortage_report = generate_report(conn, company_id, recipe_name, production_qty)
-
-    logger.info("Created production run %s for recipe '%s' (qty: %s)",
-                run_id, recipe_name, production_qty)
-
+    final_report = generate_report(conn, company_id, recipe_id, normalized)
+    logger.info("Created production run %s for recipe '%s' (%s outputs)",
+                run_id, recipe["name"], len(normalized))
     return {
         "run_id": run_id,
-        "recipe_name": recipe_name,
-        "production_qty": production_qty,
-        "material_number": material_number,
-        "packing": packing,
-        "invoice_number": invoice_number,
-        "sale_ids": linked_sale_ids,
-        "invoice_ids": linked_invoice_ids,
-        "shortage_report": final_shortage_report,
-        "warnings": [item for item in final_shortage_report if item["status"] == "SHORTAGE"],
+        "recipe_id": recipe_id,
+        "recipe_name": recipe["name"],
+        "invoice_id": invoice_id,
+        "sale_id": sale_id,
+        "invoice_ids": [invoice_id],
+        "sale_ids": [sale_id],
+        "outputs": normalized,
+        "production_qty": sum(o["quantity"] for o in normalized),
+        "shortage_report": final_report,
+        "warnings": [r for r in final_report if r["status"] == "SHORTAGE"],
     }
 
 
-def print_report(report_data: List[Dict[str, Any]], recipe_name: str, production_qty: float) -> None:
-    """Pretty print the production report to console."""
+# --------------------------------------------------------------------------- #
+# presentation helpers (CLI/CSV)
+# --------------------------------------------------------------------------- #
+
+
+def print_report(report_data: List[Dict[str, Any]], recipe_name: str,
+                 production_qty) -> None:
     if not report_data:
         print("No report data available.")
         return
-    
     print()
     print("=" * 72)
     print(f"  PRODUCTION REPORT: {recipe_name}")
-    print(f"  Production Quantity: {production_qty} units")
+    print(f"  Quantities: {production_qty}")
     print("=" * 72)
     print()
     print(f"  {'Chemical':<30} {'Have':>10} {'Need':>10} {'Diff':>10} {'Status':<10}")
     print("-" * 72)
-    
     total_shortage = 0
     shortage_count = 0
-    
     for item in report_data:
         unit = item["unit"]
-        have = item["current_stock"]
-        need = item["required_total"]
         diff = item["shortage"]
-        status = item["status"]
-        
-        # Format diff with sign
-        if diff >= 0:
-            diff_str = f"+{diff:.1f}"
-        else:
-            diff_str = f"{diff:.1f}"
-        
-        # Status indicator
-        if status == "SHORTAGE":
+        if item["status"] == "SHORTAGE":
             status_str = "[SHORTAGE]"
             total_shortage += abs(diff)
             shortage_count += 1
-        elif status == "EXACT":
+        elif item["status"] == "EXACT":
             status_str = "[EXACT]"
         else:
             status_str = "[SURPLUS]"
-        
-        print(f"  {item['chemical_name']:<30} {have:>8.1f} {unit} {need:>8.1f} {unit} {diff_str:>8} {unit} {status_str:<10}")
-    
+        print(f"  {item['chemical_name']:<30} {item['current_stock']:>8.1f} {unit} "
+              f"{item['required_total']:>8.1f} {unit} {diff:>+8.1f} {unit} {status_str:<10}")
     print("-" * 72)
-    print()
-    
-    # Summary
-    chemicals_ok = len(report_data) - shortage_count
-    print("  SUMMARY:")
-    print(f"  - Total chemicals in recipe: {len(report_data)}")
-    print(f"  - Chemicals sufficient: {chemicals_ok}")
-    print(f"  - Chemicals with shortage: {shortage_count}")
-    if shortage_count > 0:
-        print(f"  - Total shortage amount: {total_shortage:.1f} KG")
-    print()
-    
-    if shortage_count > 0:
-        print("  [!] ACTION REQUIRED: Order missing chemicals before production!")
-    else:
-        print("  [OK] All chemicals sufficient for this production run.")
-    print()
+    print(f"  chemicals: {len(report_data)}  shortage: {shortage_count}")
     print("=" * 72)
 
 
-def export_report_to_csv(report_data: List[Dict[str, Any]], recipe_name: str, 
-                        production_qty: float, output_path: str = None) -> str:
-    """Export production report to CSV file.
-    
-    Args:
-        report_data: List of report items from generate_report() or generate_multi_recipe_report()
-        recipe_name: Name of the recipe(s) - can be comma-separated for multi-recipe
-        production_qty: Production quantity
-        output_path: Optional custom path. If None, auto-generates filename.
-    
-    Returns:
-        Path to the created CSV file
-    """
+def export_report_to_csv(report_data: List[Dict[str, Any]], recipe_name: str,
+                         production_qty=None, output_path: str = None) -> str:
+    """Write the production report, including the per-product breakdown."""
     import csv
-    
+
     if output_path is None:
-        # Auto-generate filename (V4: strip traversal characters)
         safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", recipe_name)[:50] or "report"
-        output_path = os.path.join(os.path.dirname(__file__),
-                                   f"report_{safe_name}_{int(production_qty)}.csv")
-    
-    # Calculate summary stats
-    total_shortage = sum(abs(item["shortage"]) for item in report_data if item["shortage"] < 0)
+        output_path = os.path.join(
+            os.path.dirname(__file__), f"report_{safe_name}.csv")
+
+    total_shortage = sum(abs(item["shortage"]) for item in report_data
+                         if item["shortage"] < 0)
     shortage_count = sum(1 for item in report_data if item["shortage"] < 0)
-    
-    with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
+
+    with open(output_path, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
-        
-        # Header
         writer.writerow(["Production Report", "", "", "", "", "", ""])
         writer.writerow(["Recipe(s)", csv_safe(recipe_name), "", "", "", "", ""])
-        writer.writerow(["Production Quantity (per recipe)", production_qty, "", "", "", "", ""])
+        writer.writerow(["Quantities", csv_safe(str(production_qty)), "", "", "", "", ""])
         writer.writerow(["", "", "", "", "", "", ""])
-        
-        # Column headers
-        writer.writerow(["Chemical Name", "Current Stock", "Unit", "Required Total", "Shortage/Surplus", "Status", "Breakdown by Recipe"])
-        
-        # Data rows
+        writer.writerow(["Chemical Name", "Current Stock", "Unit",
+                         "Required Total", "Shortage/Surplus", "Status",
+                         "Breakdown by Product"])
         for item in report_data:
-            breakdown = ""
-            if "recipes" in item and item["recipes"]:
-                parts = []
-                for r in item["recipes"]:
-                    parts.append(f"{r['recipe_name']}: {r['qty_from_this_recipe']:.2f} {item['unit']}")
-                breakdown = " | ".join(parts)
-            
+            breakdown = " | ".join(
+                f"{p['product_name']}: {p['required_qty']:.2f} {item['unit']}"
+                for p in item.get("products") or [])
             writer.writerow([
-                csv_safe(item["chemical_name"]),
-                item["current_stock"],
-                csv_safe(item["unit"]),
-                item["required_total"],
-                item["shortage"],
-                csv_safe(item["status"]),
-                csv_safe(breakdown)
-            ])
-        
-        # Summary
+                csv_safe(item["chemical_name"]), item["current_stock"],
+                csv_safe(item["unit"]), item["required_total"],
+                item["shortage"], csv_safe(item["status"]),
+                csv_safe(breakdown)])
         writer.writerow(["", "", "", "", "", "", ""])
         writer.writerow(["SUMMARY", "", "", "", "", "", ""])
         writer.writerow(["Total unique chemicals", len(report_data), "", "", "", "", ""])
         writer.writerow(["Chemicals OK", len(report_data) - shortage_count, "", "", "", "", ""])
         writer.writerow(["Chemicals SHORTAGE", shortage_count, "", "", "", "", ""])
         if shortage_count > 0:
-            writer.writerow(["Total shortage amount", total_shortage, "KG", "", "", "", ""])
-    
+            writer.writerow(["Total shortage amount", total_shortage,
+                             "KG", "", "", "", ""])
     print(f"Report exported to: {output_path}")
     return output_path
 
 
 def list_chemicals_cli() -> None:
-    """CLI command to list all chemicals with current stock."""
     conn = get_connection()
     chemicals = get_all_chemicals(conn)
     conn.close()
-    
     if not chemicals:
         print("No chemicals in database.")
         return
-    
     print(f"\n{'Chemical Name':<30} {'Stock':>8} {'Unit':>6} {'Last Updated':>12}")
     print("-" * 58)
     for chem in chemicals:
-        print(f"{chem['name']:<30} {chem['qty']:>8} {chem['unit']:>6} {chem['last_updated']:>12}")
-
-
-# ==================== SALES TRACKER FUNCTIONS ====================
+        print(f"{chem['name']:<30} {chem['qty']:>8} {chem['unit']:>6} "
+              f"{chem['last_updated']:>12}")
