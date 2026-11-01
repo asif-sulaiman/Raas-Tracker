@@ -4,6 +4,7 @@ import Modal from '../modals/Modal';
 import Badge from '../ui/Badge';
 import Button from '../ui/Button';
 import ProductInput from '../ui/ProductInput';
+import EntityCombobox from '../ui/EntityCombobox';
 import InvoicePanel from './InvoicePanel';
 import InvoiceEditor from './InvoiceEditor';
 import { formatNumber, formatDate, formatDateTime, sumLineTotals, lineTotal } from '../../utils/format';
@@ -54,27 +55,27 @@ function InvoiceLinesSection({ saleId, sale, onChanged }) {
         <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">
           Add lines to invoice
         </label>
-        <select
+        <EntityCombobox
           aria-label="Target invoice"
+          options={openInvoices.map((inv) => ({
+            value: inv.invoice_id,
+            label: `${inv.invoice_number} — ${inv.status}`,
+          }))}
           value={targetId}
-          onChange={(e) => setTargetId(e.target.value)}
+          onChange={setTargetId}
           className={inputCls}
-        >
-          {openInvoices.map((inv) => (
-            <option key={inv.invoice_id} value={inv.invoice_id}>
-              {inv.invoice_number} — {inv.status}
-            </option>
-          ))}
-        </select>
+        />
       </div>
-      <InvoiceEditor
-        key={targetId}
-        mode="add-line"
-        saleId={saleId}
-        invoiceLabel={target?.invoice_number || ''}
-        targetInvoiceId={Number(targetId)}
-        onDone={onChanged}
-      />
+      {target && (
+        <InvoiceEditor
+          key={targetId}
+          mode="add-line"
+          saleId={saleId}
+          invoiceLabel={target.invoice_number || ''}
+          targetInvoiceId={Number(targetId)}
+          onDone={onChanged}
+        />
+      )}
     </div>
   );
 }

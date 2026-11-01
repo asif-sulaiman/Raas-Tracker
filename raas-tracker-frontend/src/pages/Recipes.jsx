@@ -15,6 +15,7 @@ import {
 import clsx from 'clsx';
 import Button from '../components/ui/Button';
 import Badge from '../components/ui/Badge';
+import EntityCombobox from '../components/ui/EntityCombobox';
 import Modal from '../components/modals/Modal';
 import KpiCard from '../components/cards/KpiCard';
 import { formatNumber } from '../utils/format';
@@ -924,40 +925,36 @@ export default function Recipes() {
           <div className="grid grid-cols-1 gap-3">
             <div>
               <label htmlFor="recipe-company" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Company *</label>
-              <select
+              <EntityCombobox
                 id="recipe-company"
+                options={companies.map(c => ({ value: c.id, label: c.name }))}
                 value={companyId}
-                onChange={e => handleCompanyChange(e.target.value)}
+                onChange={handleCompanyChange}
+                placeholder={loadingRefs ? 'Loading companies…' : 'Search companies…'}
                 className={inputCls}
-              >
-                <option value="">Select company…</option>
-                {loadingRefs ? <option disabled>Loading…</option> : companies.map(c => (
-                  <option key={c.id} value={c.id}>{c.name}</option>
-                ))}
-              </select>
+              />
             </div>
             <div>
               <label htmlFor="recipe-lc" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">LC *</label>
-              <select
+              <EntityCombobox
                 id="recipe-lc"
+                options={companyLcs.map(l => {
+                  const count = l.producible_pi_count ?? 0;
+                  return {
+                    value: l.id,
+                    label: `${l.lc_number} · ${count === 0
+                      ? 'no invoices in production'
+                      : `${count} PI${count === 1 ? '' : 's'} in production`}`,
+                    disabled: count === 0,
+                  };
+                })}
                 value={lcId}
-                onChange={e => handleLcChange(e.target.value)}
+                onChange={handleLcChange}
                 disabled={!companyId}
                 aria-describedby="recipe-lc-help"
+                placeholder={companyId ? 'Search LCs…' : 'Select a company first'}
                 className={clsx(inputCls, 'disabled:opacity-60')}
-              >
-                <option value="">{companyId ? 'Select LC…' : 'Select a company first'}</option>
-                {companyId && companyLcs.map(l => {
-                  const count = l.producible_pi_count ?? 0;
-                  return (
-                    <option key={l.id} value={l.id} disabled={count === 0}>
-                      {l.lc_number} · {count === 0
-                        ? 'no invoices in production'
-                        : `${count} PI${count === 1 ? '' : 's'} in production`}
-                    </option>
-                  );
-                })}
-              </select>
+              />
               <p id="recipe-lc-help" aria-live="polite" className="mt-1 text-xs text-slate-400 dark:text-slate-500">
                 {companyId && !loadingRefs && companyLcs.length === 0
                   ? (
@@ -968,45 +965,42 @@ export default function Recipes() {
             </div>
             <div>
               <label htmlFor="recipe-pi" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">PI / Sale *</label>
-              <select
+              <EntityCombobox
                 id="recipe-pi"
-                value={saleId}
-                onChange={e => handleSaleChange(e.target.value)}
-                disabled={!lcId || loadingPis}
-                className={clsx(inputCls, 'disabled:opacity-60')}
-              >
-                <option value="">{!lcId ? 'Select an LC first' : loadingPis ? 'Loading PIs…' : 'Select PI/Sale…'}</option>
-                {lcId && lcPis.map(s => {
+                options={lcPis.map(s => {
                   const count = s.producible_invoice_count ?? 0;
-                  return (
-                    <option key={s.id} value={s.id} disabled={count === 0}>
-                      {s.pi_number || `PI #${s.id}`}{s.client_name ? ` — ${s.client_name}` : ''} · {count === 0
-                        ? 'no invoices in production'
-                        : `${count} invoice${count === 1 ? '' : 's'} in production`}
-                    </option>
-                  );
+                  return {
+                    value: s.id,
+                    label: `${s.pi_number || `PI #${s.id}`}${s.client_name ? ` — ${s.client_name}` : ''} · ${count === 0
+                      ? 'no invoices in production'
+                      : `${count} invoice${count === 1 ? '' : 's'} in production`}`,
+                    disabled: count === 0,
+                  };
                 })}
-              </select>
+                value={saleId}
+                onChange={handleSaleChange}
+                disabled={!lcId || loadingPis}
+                placeholder={!lcId ? 'Select an LC first' : loadingPis ? 'Loading PIs…' : 'Search PIs…'}
+                className={clsx(inputCls, 'disabled:opacity-60')}
+              />
             </div>
             <div>
               <label htmlFor="recipe-invoice" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Invoice *</label>
-              <select
+              <EntityCombobox
                 id="recipe-invoice"
-                value={invoiceId}
-                onChange={e => handleInvoiceChange(e.target.value)}
-                disabled={!saleId}
-                className={clsx(inputCls, 'disabled:opacity-60')}
-              >
-                <option value="">{saleId ? 'Select invoice…' : 'Select a PI first'}</option>
-                {invoices.map(inv => {
+                options={invoices.map(inv => {
                   const id = inv.invoice_id ?? inv.id;
-                  return (
-                    <option key={id} value={id}>
-                      {inv.invoice_number || `Invoice #${id}`} · {INVOICE_STATUS_LABELS[inv.status] || inv.status}
-                    </option>
-                  );
+                  return {
+                    value: id,
+                    label: `${inv.invoice_number || `Invoice #${id}`} · ${INVOICE_STATUS_LABELS[inv.status] || inv.status}`,
+                  };
                 })}
-              </select>
+                value={invoiceId}
+                onChange={handleInvoiceChange}
+                disabled={!saleId}
+                placeholder={saleId ? 'Search invoices…' : 'Select a PI first'}
+                className={clsx(inputCls, 'disabled:opacity-60')}
+              />
             </div>
             {invoiceId && (
               <div className="rounded-lg border border-slate-200 dark:border-slate-700 px-3 py-2">

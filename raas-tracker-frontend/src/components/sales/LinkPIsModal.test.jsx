@@ -88,7 +88,10 @@ describe('LinkPIsModal attach wiring', () => {
     );
 
     fireEvent.click(await screen.findByLabelText('Select PI PI-001'));
-    fireEvent.change(screen.getByLabelText('Existing LC', { selector: 'select' }), { target: { value: '10' } });
+    const lc = screen.getByLabelText('Existing LC', { selector: 'input[role="combobox"]' });
+    fireEvent.focus(lc);
+    fireEvent.change(lc, { target: { value: 'LC-100' } });
+    fireEvent.keyDown(lc, { key: 'Enter' });
     fireEvent.click(screen.getByRole('button', { name: 'Link 1 PI' }));
 
     await waitFor(() => expect(attaches).toHaveLength(1));

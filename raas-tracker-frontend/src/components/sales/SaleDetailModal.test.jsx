@@ -285,12 +285,14 @@ describe('SaleDetailModal invoice lifecycle by stage', () => {
     ];
     renderDetail({ detail: { ...DETAIL, invoices }, invoices });
 
-    const select = await screen.findByLabelText('Target invoice');
-    const options = Array.from(select.querySelectorAll('option'));
+    const input = await screen.findByLabelText('Target invoice');
+    fireEvent.focus(input);
+    await waitFor(() => expect(screen.getAllByRole('option').length).toBeGreaterThan(0));
+    const options = screen.getAllByRole('option');
     // A booked invoice is frozen: lines may not be added behind its back.
     expect(options).toHaveLength(1);
-    expect(select.textContent).toContain('INV-PLAN');
-    expect(select.textContent).not.toContain('INV-BOOK');
+    expect(options[0].textContent).toContain('INV-PLAN');
+    expect(options[0].textContent).not.toContain('INV-BOOK');
   });
 });
 
