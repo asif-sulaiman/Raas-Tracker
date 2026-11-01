@@ -904,6 +904,34 @@ Backend untouched — no API, schema or test change.
 
 ---
 
+## 🔎 Phase ENTRY-COMBOS: every entry dropdown is type-or-pick (completed 2026-11-01)
+
+Product names gained a suggestion list, but the remaining entry dropdowns were
+still hard `<select>`s: a unit outside `COMMON_UNITS`, an adjustment reason
+outside the four presets, or a record that existed but was hard to find all
+meant leaving the form. Every data-entry dropdown now follows one of two
+shapes, and no request body changed.
+
+| # | Phase | Scope | Commit |
+|---|---|---|---|
+| 1 | **`SuggestionInput`** | Extracted from `ProductInput`: `<input list>` + `<datalist>` over `options: string[]`, free text always accepted; `ProductInput` becomes a thin wrapper over the catalog | this branch |
+| 2 | **`EntityCombobox`** | Hand-rolled ARIA combobox over `{ value, label, disabled }`: filters on type, commits on click/Enter/exact label, emits `''` and shows a hint for unmatched text, skips disabled rows, Escape restores the pick, a parent value change wins over stale text | this branch |
+| 3 | **Free text** | Units in `MultiPICreateModal`, `ReviewModal`, `Chemicals` (add) and `UnitMapping` (target unit); the stock-adjustment reason (120-char cap kept) | this branch |
+| 4 | **Record picks** | Company in `MultiPICreateModal` / `ReviewModal`; existing LC in `LinkPIsModal`; target invoice in `SaleDetailModal`; the recipe create cascade (company → LC → PI → invoice) and the chemical field (name-valued) in `Recipes` | this branch |
+
+**Locked decisions.** Fixed enums and every filter (report, audit, stock board,
+role, payment terms, page size, dates) stay native `<select>`s — they are not
+record picks and a free-text value would be meaningless. Record pickers can
+only emit an id (or, for chemicals, a name) that exists in their option list,
+so referential integrity is preserved in the component rather than at the API.
+No backend change: form state stays ids/strings and every payload is identical.
+
+**Verification.** Frontend gate: **400 passed across 44 files**, `oxlint` 0
+warnings / 0 errors, `vite build` green, `dist/` copied to `react_frontend/`.
+Backend untouched — no API, schema or test change.
+
+---
+
 ## 🧾 Phase INV-UNIFY: PI-faithful invoice editor (completed 2026-10-22)
 
 One invoice-entry surface instead of two divergent ones (`InvoiceCreateForm`
