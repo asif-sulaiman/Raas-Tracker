@@ -154,13 +154,33 @@ class RecipeNameConflict(LifecycleConflict):
     """
 
 
-class RecipeProductLocked(LifecycleConflict):
-    """409 — the product cannot be rebound once production has run.
+class RecipeInvoiceConflict(LifecycleConflict):
+    """409 — that invoice already has a recipe.
 
-    ``recipes.product_name`` is what readiness and the commercial report key
-    off. A run snapshots its formula and links by ``recipe_id``, so moving the
-    product afterwards would silently re-attribute past production. Rename and
-    metadata stay editable; the product is the one field that is frozen.
+    A recipe *is* the production plan for one invoice, so a second one would
+    leave two formulations competing for the same outputs and readiness would
+    have no way to pick. The unique index on ``recipes.invoice_id`` is the
+    authority; the pre-check exists only so the friendly message wins the
+    common case.
+    """
+
+
+class RecipeItemConflict(LifecycleConflict):
+    """409 — the chemical is already formulated for this product.
+
+    Updating it is a PUT on the existing row; adding it again would either
+    double-deduct or be silently ignored. The same chemical in *different*
+    products is fine and stays allowed.
+    """
+
+
+class RecipeHasRuns(LifecycleConflict):
+    """409 — production has already run from this recipe.
+
+    ``production_runs.recipe_id`` is RESTRICT, so deleting the header would
+    fail at the FK. The runs snapshot their own lines and outputs, but the
+    recipe row is what they are read through; deleting it would orphan the
+    history an operator may still need to audit.
     """
 
 

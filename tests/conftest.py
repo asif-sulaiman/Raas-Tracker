@@ -137,28 +137,44 @@ def user_client(pg_dsn, db, monkeypatch):
 
 @pytest.fixture()
 def produce_for(admin_client):
-    """Register recipe+chemical and run production linked to one invoice.
+    """Formulate and produce every product on one invoice.
 
-    Booking an invoice requires every invoiced product to be produced from the
-    recipe page, so any test that books must satisfy that first. Call as
-    ``produce_for(company_id, sale_id, invoice_id, tag, product)``.
+    A recipe is the production plan for ONE invoice, so booking needs every
+    invoiced product to be formulated *and* covered by a run linked to that
+    invoice. Call as ``produce_for(company_id, sale_id, invoice_id, tag, product)``;
+    the ``product`` argument is kept for call-site compatibility and asserted to
+    be on the invoice.
     """
+    from urllib.parse import quote
+
     def _produce(company_id, sale_id, invoice_id, tag, product):
         chem = f"GateChem-{tag}"
         recipe = f"GateRecipe-{tag}"
+        source = admin_client.get(
+            f"/api/invoices/{invoice_id}/production-source").get_json()
+        assert source and source["products"], source
+        names = [p["product_name"] for p in source["products"]]
+        assert product in names, (product, names)
+
         r = admin_client.post("/api/chemicals",
                               json={"name": chem, "qty": 500, "unit": "KG"})
         assert r.status_code == 200, r.get_json()
         r = admin_client.post("/api/recipes", json={
-            "name": recipe, "yield": 100, "company_id": company_id,
-            "product_name": product})
+            "name": recipe, "company_id": company_id,
+            "invoice_id": invoice_id})
         assert r.status_code == 201, r.get_json()
-        r = admin_client.post(f"/api/recipes/{recipe}/items", json={
-            "chemical": chem, "percentage": 40, "company_id": company_id})
-        assert r.status_code == 200, r.get_json()
-        r = admin_client.post(f"/api/recipes/{recipe}/produce", json={
-            "production_qty": 5, "company_id": company_id,
-            "sale_ids": [sale_id], "invoice_ids": [invoice_id]})
+        rid = r.get_json()["recipe"]["id"]
+        for name in names:
+            r = admin_client.post(
+                f"/api/recipes/by-id/{rid}/products/{quote(name)}/items",
+                json={"chemical": chem, "percentage": 40})
+            assert r.status_code == 200, r.get_json()
+
+        outputs = [{"product_name": p["product_name"],
+                    "quantity": max(float(p["remaining_qty"]), 0.0001)}
+                   for p in source["products"]]
+        r = admin_client.post(f"/api/recipes/by-id/{rid}/produce",
+                              json={"outputs": outputs})
         assert r.status_code == 201, r.get_json()
         return r.get_json()
     return _produce
