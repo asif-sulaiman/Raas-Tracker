@@ -184,9 +184,9 @@ describe('MultiPICreateModal batch wiring', () => {
       expect(add).toBeTruthy();
       expect(add.disabled).toBe(true);
       expect(add.getAttribute('title')).toContain(String(MAX_DOCS));
-      // Rendering 50 full document cards is legitimately slow; the default 5s is
-      // not enough once the suite runs many files in parallel.
-    }, 30000);
+      // Rendering 50 full document cards is legitimately slow (~6s alone, far more
+      // once the suite runs many files in parallel); the defaults are far too tight.
+    }, 120000);
 
     it('keeps the button enabled below the cap', async () => {
       renderModal();
@@ -214,6 +214,7 @@ describe('MultiPICreateModal batch wiring', () => {
       expect(screen.getByLabelText(`PI number document ${MAX_DOCS}`)).toBeTruthy();
       expect(screen.queryByLabelText(`PI number document ${MAX_DOCS + 1}`)).toBeNull();
       expect(posts).toHaveLength(0);
-    }, 30000);
+      // Same 50-card cost as the test above; see the note there.
+    }, 120000);
   });
 });
