@@ -4,6 +4,7 @@ import Modal from '../modals/Modal';
 import Button from '../ui/Button';
 import Badge from '../ui/Badge';
 import ProductInput from '../ui/ProductInput';
+import SuggestionInput from '../ui/SuggestionInput';
 import { formatNumber, sumLineTotals, lineTotal } from '../../utils/format';
 import { COMMON_UNITS } from '../../utils/units';
 import { useAuth } from '../../context/AuthContext';
@@ -446,20 +447,15 @@ export default function MultiPICreateModal({ isOpen, initialDocs, onClose, onSav
                               />
                             </td>
                             <td className="px-2.5 py-1.5">
-                              <select
+                              <SuggestionInput
                                 aria-label={`Unit document ${docIdx + 1} row ${rowIdx + 1}`}
+                                options={COMMON_UNITS}
                                 value={item.unit || 'KG'}
                                 onChange={(e) =>
                                   updateItem(doc.key, item.key, 'unit', e.target.value)
                                 }
                                 className={rowInputCls}
-                              >
-                                {COMMON_UNITS.map((u) => (
-                                  <option key={u} value={u}>
-                                    {u}
-                                  </option>
-                                ))}
-                              </select>
+                              />
                             </td>
                             <td className="px-2.5 py-1.5">
                               <input

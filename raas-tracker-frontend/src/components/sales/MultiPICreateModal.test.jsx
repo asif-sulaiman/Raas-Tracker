@@ -145,6 +145,24 @@ describe('MultiPICreateModal batch wiring', () => {
     await waitFor(() => expect(posts).toHaveLength(1));
     expect(onSaved).not.toHaveBeenCalled();
   });
+
+  it('accepts a unit that is not in the common list', async () => {
+    const posts = [];
+    const onSaved = vi.fn();
+    renderModal({ onSaved, postsOpts: { posts } });
+
+    const company = await screen.findByLabelText('Company');
+    fireEvent.change(company, { target: { value: '7' } });
+
+    await fillDoc(1, 'PI-UNIT-TEST');
+    fireEvent.change(screen.getByLabelText('Unit document 1 row 1'), {
+      target: { value: 'PALLET' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /Save 1 PI to PI Issued/ }));
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0].sales[0].items[0].unit).toBe('PALLET');
+  });
   // P1-B: the server caps a batch at 50 sales. Mirror the ceiling client-side so
   // the user cannot assemble a request that will hard-400 on save.
   describe('batch document cap', () => {
