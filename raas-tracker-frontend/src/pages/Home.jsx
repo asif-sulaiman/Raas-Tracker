@@ -257,12 +257,12 @@ export default function Home() {
           trendLabel={latestUpload ? formatDate(latestUpload.upload_date) : 'none yet'}
         />
         <KpiCard
-          title="Recipes"
+          title="Invoice Recipes"
           value={recipes.length}
-          subvalue="formulations"
+          subvalue="invoices"
           icon={BookOpen}
           color="blue"
-          trendLabel="Active recipes"
+          trendLabel="One recipe per invoice"
         />
       </div>
 

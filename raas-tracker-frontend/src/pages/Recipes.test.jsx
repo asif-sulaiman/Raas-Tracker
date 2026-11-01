@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import React from 'react';
-import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
+import {
+  render, screen, waitFor, cleanup, fireEvent, within,
+} from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { AuthProvider } from '../context/AuthContext';
 import { ConfirmProvider } from '../context/ConfirmContext';
@@ -75,13 +77,43 @@ const INVOICE_ITEMS = [
   },
 ];
 
+const CHEMICALS = [
+  { name: 'NaOH', current_qty: 500, unit: 'KG' },
+  { name: 'Caustic Flakes', current_qty: 20, unit: 'KG' },
+  { name: 'Soda Ash', current_qty: 10, unit: 'KG' },
+];
+
+const BASE_PRODUCTS = [
+  {
+    product_name: 'Caustic Soda 50%', unit: 'KG', invoiced_qty: 200,
+    produced_qty: 50, remaining_qty: 150, line_count: 2,
+    lines: [{ unit: 'KG', quantity: 120 }, { unit: 'KG', quantity: 80 }],
+    unconverted: [],
+  },
+  {
+    product_name: 'Soda Ash', unit: 'KG', invoiced_qty: 50,
+    produced_qty: 0, remaining_qty: 50, line_count: 1,
+    lines: [{ unit: 'KG', quantity: 50 }], unconverted: [],
+  },
+  {
+    product_name: 'Sodium Silicate', unit: 'KG', invoiced_qty: 30,
+    produced_qty: 0, remaining_qty: 30, line_count: 1,
+    lines: [{ unit: 'KG', quantity: 30 }], unconverted: [],
+  },
+];
+
+const RECIPE_ROW = {
+  id: 3, name: 'PI-2026-014 · INV-014', company_id: 7, company_name: 'Acme',
+  invoice_id: 9, invoice_number: 'INV-014', invoice_status: 'planned',
+  sale_id: 5, pi_number: 'PI-2026-014', client_name: 'Globex',
+  lc_id: 1, lc_number: 'LC-2026-001',
+  product_count: 3, formulated_count: 1, run_count: 0, created: '2026-10-29',
+};
+
 function jsonResponse(data, ok = true, status = 200) {
   // apiFetch reads Retry-After off the headers of a failed response.
   return { ok, status, json: async () => data, headers: { get: () => null } };
 }
-
-const recipeNameFromUrl = (url) =>
-  decodeURIComponent(String(url).match(/\/api\/recipes\/([^?]+)/)[1]);
 
 const SALES = [
   {
@@ -96,15 +128,43 @@ function installFetch({
   invoices = INVOICES,
   invoiceItems = INVOICE_ITEMS,
   recipes = [],
-  recipeItems = [],
-  runCount = 0,
   detailMissing = false,
   putError = null,
+  firstItem = { chemical_name: 'NaOH', percentage: 40 },
 } = {}) {
-  const state = { recipes: [...recipes] };
-  // A run created from the production modal changes what the detail reports;
-  // tests can watch the page re-read it instead of trusting a stale row.
-  let runs = runCount;
+  const state = {
+    recipes: [...recipes],
+    items: {
+      'Caustic Soda 50%': firstItem
+        ? [{ id: 101, chemical_id: 1, chemical_name: firstItem.chemical_name,
+          current_stock: 500, unit: 'KG', percentage: firstItem.percentage }]
+        : [],
+      'Soda Ash': [],
+      'Sodium Silicate': [],
+    },
+    runs: false,
+    nextId: 200,
+  };
+  const detailFor = (rec) => ({
+    recipe: { ...rec, run_count: state.runs ? 1 : (rec.run_count || 0) },
+    products: BASE_PRODUCTS.map((base) => {
+      const items = state.items[base.product_name] || [];
+      const invoiced = base.invoiced_qty;
+      const produced = state.runs ? invoiced : base.produced_qty;
+      return {
+        ...base,
+        id: 900 + BASE_PRODUCTS.findIndex((p) => p.product_name === base.product_name),
+        on_invoice: true,
+        produced_qty: produced,
+        remaining_qty: Math.max(invoiced - produced, 0),
+        formulated: items.length > 0,
+        percentage: items.reduce((sum, i) => sum + Number(i.percentage || 0), 0),
+        items,
+      };
+    }),
+    items: Object.values(state.items).flat(),
+  });
+  let runs = state.runs;
   const fetchMock = vi.fn(async (url, options) => {
     const u = String(url);
     const method = options?.method || 'GET';
@@ -112,70 +172,105 @@ function installFetch({
       return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
     }
     if (u.includes('/produce') && method === 'POST') {
-      runs = Math.max(runs, 1);
+      state.runs = true;
+      runs = true;
+      return jsonResponse({ runs: [] }, true, 201);
+    }
+    if (/\/api\/recipes\/by-id\/\d+\/items\/\d+$/.test(u)) {
+      const itemId = Number(u.match(/items\/(\d+)$/)[1]);
+      if (method === 'DELETE') {
+        for (const name of Object.keys(state.items)) {
+          state.items[name] = state.items[name].filter((i) => i.id !== itemId);
+        }
+        return jsonResponse({ success: true });
+      }
+      const body = JSON.parse(options.body);
+      for (const name of Object.keys(state.items)) {
+        state.items[name] = state.items[name].map((i) => (
+          i.id === itemId ? { ...i, percentage: body.percentage } : i
+        ));
+      }
       return jsonResponse({ success: true });
     }
-    if (u.includes('/api/recipes') && method === 'POST') {
+    const productItems = u.match(/\/api\/recipes\/by-id\/\d+\/products\/(.+)\/items$/);
+    if (productItems && method === 'POST') {
+      const product = decodeURIComponent(productItems[1]);
       const body = JSON.parse(options.body);
-      state.recipes = [...state.recipes, {
-        id: 99, name: body.name, company_id: body.company_id,
-        product_name: body.product_name, total_quantity: body.yield_qty,
-        water_percentage: body.water_percentage, created: '2026-10-29',
+      state.nextId += 1;
+      state.items[product] = [...(state.items[product] || []), {
+        id: state.nextId, chemical_id: 2, chemical_name: body.chemical,
+        current_stock: 100, unit: 'KG', percentage: body.percentage,
       }];
-      return jsonResponse({ success: true, name: body.name }, true, 201);
+      return jsonResponse({ success: true });
     }
-    if (u.includes('/api/recipes') && method === 'PUT') {
-      const oldName = recipeNameFromUrl(u);
-      const body = JSON.parse(options.body);
-      if (putError) return jsonResponse({ error: putError }, false, 409);
-      const nextName = body.new_name || oldName;
-      const idx = state.recipes.findIndex((r) => r.name === oldName);
-      if (idx >= 0) {
-        state.recipes[idx] = {
-          ...state.recipes[idx],
-          name: nextName,
-          product_name: body.product_name ?? state.recipes[idx].product_name,
-          total_quantity: body.total_quantity ?? state.recipes[idx].total_quantity,
-          water_percentage: body.water_percentage ?? state.recipes[idx].water_percentage,
-        };
-      }
-      return jsonResponse({ success: true, name: nextName });
-    }
-    const byId = u.match(/\/api\/recipes\/by-id\/(\d+)/);
-    if (byId && method === 'GET') {
+    const byId = u.match(/\/api\/recipes\/by-id\/(\d+)$/);
+    if (byId) {
       const rec = state.recipes.find((r) => String(r.id) === byId[1]);
+      if (method === 'PUT') {
+        const body = JSON.parse(options.body);
+        if (putError) return jsonResponse({ error: putError }, false, 409);
+        // Replace, never mutate: RECIPE_ROW is shared by every test.
+        if (rec) {
+          state.recipes = state.recipes.map(
+            (r) => (r.id === rec.id ? { ...r, name: body.name } : r),
+          );
+        }
+        return jsonResponse({ success: true, name: body.name });
+      }
+      if (method === 'DELETE') {
+        state.recipes = state.recipes.filter((r) => r.id !== rec?.id);
+        return jsonResponse({ success: true });
+      }
       if (!rec || detailMissing) {
         return jsonResponse({ error: 'Recipe not found' }, false, 404);
       }
-      return jsonResponse({ recipe: { ...rec, run_count: runs }, items: recipeItems });
+      return jsonResponse(detailFor(rec));
+    }
+    if (u.includes('/api/recipes') && method === 'POST') {
+      const body = JSON.parse(options.body);
+      const created = {
+        id: 99, name: body.name, company_id: body.company_id,
+        company_name: 'Acme', invoice_id: body.invoice_id,
+        invoice_number: 'INV-014', invoice_status: 'planned',
+        sale_id: 5, pi_number: 'PI-2026-014', client_name: 'Globex',
+        lc_id: 1, lc_number: 'LC-2026-001',
+        product_count: 3, formulated_count: 0, run_count: 0,
+        created: '2026-10-29',
+      };
+      state.recipes = [...state.recipes, created];
+      return jsonResponse({ success: true, name: created.name, recipe: created }, true, 201);
     }
     if (u.includes('/api/recipes') && method === 'GET' && u.includes('?company_id=')) {
-      const name = recipeNameFromUrl(u);
+      const name = decodeURIComponent(u.match(/\/api\/recipes\/([^?]+)/)[1]);
       const rec = state.recipes.find((r) => r.name === name) || { name };
-      return jsonResponse({ recipe: { ...rec, run_count: runs }, items: recipeItems });
+      return jsonResponse(detailFor(rec));
     }
     if (u.includes('/api/recipes')) return jsonResponse(state.recipes);
-    if (u.includes('/api/chemicals')) return jsonResponse([]);
+    if (u.includes('/api/chemicals')) return jsonResponse(CHEMICALS);
     if (u.includes('/api/companies')) return jsonResponse(COMPANIES);
-    if (u.includes('/api/production-source')) {
-      return jsonResponse({ products: [{ item_no: 'M-1001', quantity: 120 }] });
+    if (u.includes('/production-source')) {
+      const rec = state.recipes.find((r) => r.invoice_id === 9) || RECIPE_ROW;
+      const detail = detailFor(rec);
+      return jsonResponse({
+        invoice_id: 9, invoice_number: 'INV-014',
+        recipe: detail.recipe, products: detail.products,
+      });
     }
     if (/\/api\/lcs\/\d+/.test(u)) return jsonResponse(lcDetail);
     if (u.includes('/api/lcs')) return jsonResponse(lcs);
     if (/\/api\/sales\/\d+\/invoices/.test(u)) return jsonResponse(invoices);
     if (/\/api\/invoices\/\d+\/items/.test(u)) return jsonResponse(invoiceItems);
     if (u.includes('/api/sales')) {
-      // The real route is paginated; the production modal must read this shape.
       return jsonResponse({ sales: SALES, total: SALES.length });
     }
     return jsonResponse({});
   });
   vi.stubGlobal('fetch', fetchMock);
-  return fetchMock;
+  return { fetchMock, state, runs: () => runs };
 }
 
 function renderRecipes(opts = {}) {
-  const fetchMock = installFetch(opts);
+  const { fetchMock, state } = installFetch(opts);
   const utils = render(
     <MemoryRouter>
       <AuthProvider>
@@ -185,7 +280,7 @@ function renderRecipes(opts = {}) {
       </AuthProvider>
     </MemoryRouter>
   );
-  return { ...utils, fetchMock };
+  return { ...utils, fetchMock, state };
 }
 
 async function openCreateModal() {
@@ -195,6 +290,16 @@ async function openCreateModal() {
 
 const called = (fetchMock, needle) => fetchMock.mock.calls
   .some(([url]) => String(url).includes(needle));
+
+async function pickInvoice() {
+  fireEvent.change(screen.getByLabelText(/^Company/), { target: { value: '7' } });
+  fireEvent.change(screen.getByLabelText(/^LC/), { target: { value: '1' } });
+  await screen.findByRole('option', { name: /PI-2026-014/ });
+  fireEvent.change(screen.getByLabelText(/^PI/), { target: { value: '5' } });
+  await screen.findByRole('option', { name: /INV-014/ });
+  fireEvent.change(screen.getByLabelText(/^Invoice/), { target: { value: '9' } });
+  await screen.findByText('3 products on this invoice');
+}
 
 describe('Create New Recipe sourcing', () => {
   it('never reads the clamped sales list and asks for open LCs only', async () => {
@@ -253,115 +358,63 @@ describe('Create New Recipe sourcing', () => {
     expect(screen.queryByRole('option', { name: /INV-BOOKED/ })).toBeNull();
   });
 
-  it('hints the selected PI and product without filling the name', async () => {
-    renderRecipes({
-      recipes: [{
-        id: 3, name: 'PI-2026-000 - Caustic Soda 50%', company_id: 7,
-        product_name: 'Caustic Soda 50%', total_quantity: 1, water_percentage: 0,
-      }, {
-        id: 4, name: 'PI-2026-000 - Soda Ash', company_id: 7,
-        product_name: 'Soda Ash', total_quantity: 1, water_percentage: 0,
-      }],
-    });
-    await openCreateModal();
-    fireEvent.change(screen.getByLabelText(/^Company/), { target: { value: '7' } });
-    fireEvent.change(screen.getByLabelText(/^LC/), { target: { value: '1' } });
-    await screen.findByRole('option', { name: /PI-2026-014/ });
-    fireEvent.change(screen.getByLabelText(/^PI/), { target: { value: '5' } });
-    await screen.findByRole('option', { name: /INV-014/ });
-    fireEvent.change(screen.getByLabelText(/^Invoice/), { target: { value: '9' } });
-
-    const existing = await screen.findByRole('option', { name: /Caustic Soda 50%/ });
-    expect(existing.textContent).toContain('recipe exists');
-    expect(existing.textContent).toContain('200.00 KG');
-
-    fireEvent.change(screen.getByLabelText(/^Product/), {
-      target: { value: 'Caustic Soda 50%' },
-    });
-
-    expect(screen.getByLabelText(/^Recipe Name/).value).toBe('');
-    expect(screen.getByText(/Selected: PI-2026-014/).textContent)
-      .toContain('Caustic Soda 50%');
-    expect(screen.getByLabelText(/^Total Quantity/).value).toBe('200');
-    expect(screen.getByText(/2 of 3 products on this invoice have a recipe/)).toBeTruthy();
-  });
-
-  it('clears the quantity prefill when the PI or the invoice changes', async () => {
+  it('lists the invoice products read-only and drops product, quantity and water', async () => {
     renderRecipes();
     await openCreateModal();
-    fireEvent.change(screen.getByLabelText(/^Company/), { target: { value: '7' } });
-    fireEvent.change(screen.getByLabelText(/^LC/), { target: { value: '1' } });
-    await screen.findByRole('option', { name: /PI-2026-014/ });
-    fireEvent.change(screen.getByLabelText(/^PI/), { target: { value: '5' } });
-    await screen.findByRole('option', { name: /INV-014/ });
-    fireEvent.change(screen.getByLabelText(/^Invoice/), { target: { value: '9' } });
-    await screen.findByRole('option', { name: /Caustic Soda 50%/ });
-    fireEvent.change(screen.getByLabelText(/^Product/), {
-      target: { value: 'Caustic Soda 50%' },
-    });
-    expect(screen.getByLabelText(/^Total Quantity/).value).toBe('200');
+    await pickInvoice();
 
-    // A different invoice has different products: the old prefill would lie
-    // about a product that is no longer selected.
-    fireEvent.change(screen.getByLabelText(/^Invoice/), { target: { value: '' } });
-    expect(screen.getByLabelText(/^Total Quantity/).value).toBe('');
+    // Duplicate lines are merged for display: 120 + 80 KG.
+    const merged = screen.getByText('Caustic Soda 50%').closest('li');
+    expect(within(merged).getByText('200.00 KG')).toBeTruthy();
+    screen.getByText('Soda Ash');
+    screen.getByText('Sodium Silicate');
 
-    fireEvent.change(screen.getByLabelText(/^Invoice/), { target: { value: '9' } });
-    await screen.findByRole('option', { name: /Caustic Soda 50%/ });
-    fireEvent.change(screen.getByLabelText(/^Product/), {
-      target: { value: 'Caustic Soda 50%' },
-    });
-    expect(screen.getByLabelText(/^Total Quantity/).value).toBe('200');
-
-    fireEvent.change(screen.getByLabelText(/^PI/), { target: { value: '6' } });
-    expect(screen.getByLabelText(/^Total Quantity/).value).toBe('');
+    // The invoice, not the operator, defines the products and quantities.
+    expect(screen.queryByLabelText(/^Product/)).toBeNull();
+    expect(screen.queryByLabelText(/^Total Quantity/)).toBeNull();
+    expect(screen.queryByLabelText(/^Water/)).toBeNull();
   });
 
-  it('keeps the LC, PI and invoice selected after creating, and advances progress', async () => {
-    const { fetchMock } = renderRecipes({
-      recipes: [{
-        id: 3, name: 'old', company_id: 7, product_name: 'Soda Ash',
-        total_quantity: 1, water_percentage: 0,
-      }],
-    });
+  it('creates the invoice-scoped recipe with a minimal body and opens it', async () => {
+    const { fetchMock } = renderRecipes();
     await openCreateModal();
-    fireEvent.change(screen.getByLabelText(/^Company/), { target: { value: '7' } });
-    fireEvent.change(screen.getByLabelText(/^LC/), { target: { value: '1' } });
-    await screen.findByRole('option', { name: /PI-2026-014/ });
-    fireEvent.change(screen.getByLabelText(/^PI/), { target: { value: '5' } });
-    await screen.findByRole('option', { name: /INV-014/ });
-    fireEvent.change(screen.getByLabelText(/^Invoice/), { target: { value: '9' } });
-    await screen.findByRole('option', { name: /Caustic Soda 50%/ });
-    fireEvent.change(screen.getByLabelText(/^Product/), {
-      target: { value: 'Caustic Soda 50%' },
-    });
-    expect(screen.getByText(/1 of 3 products on this invoice have a recipe/)).toBeTruthy();
+    await pickInvoice();
 
     fireEvent.change(screen.getByLabelText(/^Recipe Name/), {
-      target: { value: 'PI-2026-014 - Caustic Soda 50%' },
+      target: { value: 'PI-2026-014 · INV-014' },
     });
     fireEvent.click(screen.getByRole('button', { name: /^Create$/ }));
 
     await waitFor(() => expect(called(fetchMock, '/api/recipes')).toBe(true));
     const post = fetchMock.mock.calls.find(
-      ([url, options]) => String(url).includes('/api/recipes') && options?.method === 'POST');
-    const body = JSON.parse(post[1].body);
-    expect(body).toMatchObject({
-      name: 'PI-2026-014 - Caustic Soda 50%',
+      ([url, options]) => String(url).includes('/api/recipes')
+        && options?.method === 'POST');
+    expect(JSON.parse(post[1].body)).toEqual({
+      name: 'PI-2026-014 · INV-014',
       company_id: 7,
-      product_name: 'Caustic Soda 50%',
-      yield_qty: 200,
+      invoice_id: 9,
     });
 
-    await waitFor(() => {
-      expect(screen.getByLabelText(/^LC/).value).toBe('1');
-      expect(screen.getByLabelText(/^PI/).value).toBe('5');
-      expect(screen.getByLabelText(/^Invoice/).value).toBe('9');
-      expect(screen.getByLabelText(/^Recipe Name/).value).toBe('');
-    });
-    await waitFor(() => {
-      expect(screen.getByText(/2 of 3 products on this invoice have a recipe/)).toBeTruthy();
-    });
+    // A new recipe is useless until its products are formulated, so the detail
+    // opens on the created row instead of leaving the list.
+    expect(await screen.findByRole('heading', {
+      name: 'PI-2026-014 · INV-014',
+    })).toBeTruthy();
+    await waitFor(() => expect(called(fetchMock, '/api/recipes/by-id/99')).toBe(true));
+  });
+
+  it('names the invoice that already has a recipe and disables Create', async () => {
+    const { fetchMock } = renderRecipes({ recipes: [RECIPE_ROW] });
+    await openCreateModal();
+    await pickInvoice();
+
+    expect((await screen.findByText(/already has a recipe/i)).textContent)
+      .toContain('INV-014');
+    // One recipe per invoice is the model, so the request is not sent.
+    expect(screen.getByRole('button', { name: /^Create$/ }).disabled).toBe(true);
+    expect(fetchMock.mock.calls.some(
+      ([url, options]) => String(url).includes('/api/recipes')
+        && options?.method === 'POST')).toBe(false);
   });
 
   it('offers a link to Sales when the company has no running LC', async () => {
@@ -374,20 +427,12 @@ describe('Create New Recipe sourcing', () => {
   });
 });
 
-const RECIPE_ROW = {
-  id: 3, name: 'PI-2026-014 - Caustic Soda 50%', company_id: 7,
-  product_name: 'Caustic Soda 50%', total_quantity: 200, water_percentage: 0,
-};
-
 async function openRecipeDetail() {
   fireEvent.click(await screen.findByRole('button', { name: /View/ }));
-  return screen.findByRole('heading', { name: 'PI-2026-014 - Caustic Soda 50%' });
+  return screen.findByRole('heading', { name: 'PI-2026-014 · INV-014' });
 }
 
-async function openEditRecipe() {
-  fireEvent.click(await screen.findByRole('button', { name: /^Edit$/ }));
-  return screen.findByRole('heading', { name: 'Edit Recipe' });
-}
+const card = (name) => screen.getByLabelText(`${name} formulation`);
 
 describe('Recipe detail lookup', () => {
   it('opens the detail by row id, not by company and name', async () => {
@@ -423,114 +468,183 @@ describe('Recipe detail lookup', () => {
 
     await waitFor(() => expect(
       called(fetchMock,
-        '/api/recipes/PI-2026-014%20-%20Caustic%20Soda%2050%25?company_id=7')
+        '/api/recipes/PI-2026-014%20%C2%B7%20INV-014?company_id=7')
     ).toBe(true));
   });
 });
 
-describe('Recipe revision', () => {
-  it('renames from the edit form and follows the server-returned name', async () => {
+describe('Per-product formulation', () => {
+  it('shows one card per invoice product with its formulation state', async () => {
+    renderRecipes({ recipes: [RECIPE_ROW] });
+    await openRecipeDetail();
+
+    expect(screen.getByText('1 of 3 products formulated')).toBeTruthy();
+
+    const soda = card('Caustic Soda 50%');
+    expect(within(soda).getByText('Ready')).toBeTruthy();
+    expect(within(soda).getByText(/Invoiced/).textContent).toContain('200.00 KG');
+    expect(within(soda).getByText(/Remaining/).textContent).toContain('150.00 KG');
+    // Duplicate invoice lines are merged, not silently mixed.
+    expect(within(soda).getByText(/2 lines merged/)).toBeTruthy();
+
+    const ash = card('Soda Ash');
+    expect(within(ash).getByText('Empty formulation')).toBeTruthy();
+    expect(within(card('Sodium Silicate')).getByText('Empty formulation')).toBeTruthy();
+  });
+
+  it('adds an ingredient to a specific product', async () => {
     const { fetchMock } = renderRecipes({ recipes: [RECIPE_ROW] });
     await openRecipeDetail();
-    await openEditRecipe();
+
+    const ash = card('Soda Ash');
+    fireEvent.change(within(ash).getByLabelText('Chemical for Soda Ash'), {
+      target: { value: 'NaOH' },
+    });
+    fireEvent.change(within(ash).getByLabelText('Percentage for Soda Ash'), {
+      target: { value: '60' },
+    });
+    fireEvent.click(within(ash).getByRole('button', { name: 'Add ingredient to Soda Ash' }));
+
+    await waitFor(() => {
+      const post = fetchMock.mock.calls.find(
+        ([url, options]) => String(url).includes('/api/recipes/by-id/3/products/')
+          && options?.method === 'POST');
+      expect(post).toBeTruthy();
+      expect(decodeURIComponent(String(post[0])))
+        .toContain('/api/recipes/by-id/3/products/Soda Ash/items');
+      expect(JSON.parse(post[1].body)).toEqual({ chemical: 'NaOH', percentage: 60 });
+    });
+
+    // The card re-reads the recipe so it can never show a stale formulation.
+    expect(await within(card('Soda Ash')).findByText('60%')).toBeTruthy();
+  });
+
+  it('updates and removes an ingredient by its row id', async () => {
+    const { fetchMock } = renderRecipes({ recipes: [RECIPE_ROW] });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    fireEvent.click(within(soda).getByRole('button', {
+      name: 'Edit NaOH percentage in Caustic Soda 50%',
+    }));
+    fireEvent.change(within(soda).getByLabelText('Percentage for NaOH in Caustic Soda 50%'), {
+      target: { value: '45' },
+    });
+    fireEvent.click(within(soda).getByRole('button', {
+      name: 'Save NaOH percentage in Caustic Soda 50%',
+    }));
+
+    await waitFor(() => {
+      const put = fetchMock.mock.calls.find(
+        ([url, options]) => String(url).endsWith('/api/recipes/by-id/3/items/101')
+          && options?.method === 'PUT');
+      expect(put).toBeTruthy();
+      expect(JSON.parse(put[1].body)).toEqual({ percentage: 45 });
+    });
+    expect(await within(card('Caustic Soda 50%')).findByText('45%')).toBeTruthy();
+
+    fireEvent.click(within(card('Caustic Soda 50%')).getByRole('button', {
+      name: 'Remove NaOH from Caustic Soda 50%',
+    }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove' }));
+
+    await waitFor(() => {
+      const del = fetchMock.mock.calls.find(
+        ([url, options]) => String(url).endsWith('/api/recipes/by-id/3/items/101')
+          && options?.method === 'DELETE');
+      expect(del).toBeTruthy();
+    });
+    expect(await within(card('Caustic Soda 50%')).findByText('Empty formulation')).toBeTruthy();
+  });
+});
+
+describe('Recipe revision', () => {
+  it('renames by row id and follows the server-returned name', async () => {
+    const { fetchMock } = renderRecipes({ recipes: [RECIPE_ROW] });
+    await openRecipeDetail();
+    fireEvent.click(screen.getByRole('button', { name: /^Edit$/ }));
 
     const nameInput = screen.getByLabelText(/^Recipe Name/);
-    expect(nameInput.value).toBe('PI-2026-014 - Caustic Soda 50%');
-    fireEvent.change(nameInput, { target: { value: '  PI-2026-014 - Renamed  ' } });
+    expect(nameInput.value).toBe('PI-2026-014 · INV-014');
+    // The invoice and its products are the recipe's identity, not header fields.
+    expect(screen.queryByLabelText(/^Product/)).toBeNull();
+    expect(screen.queryByLabelText(/^Total Quantity/)).toBeNull();
+
+    fireEvent.change(nameInput, { target: { value: '  INV-014 production  ' } });
     fireEvent.click(screen.getByRole('button', { name: /^Save$/ }));
 
     await waitFor(() => {
       const put = fetchMock.mock.calls.find(
-        ([url, options]) => String(url).includes('/api/recipes') && options?.method === 'PUT');
+        ([url, options]) => String(url).includes('/api/recipes/by-id/3')
+          && options?.method === 'PUT');
       expect(put).toBeTruthy();
-      expect(decodeURIComponent(String(put[0])))
-        .toContain('/api/recipes/PI-2026-014 - Caustic Soda 50%?company_id=7');
-      expect(JSON.parse(put[1].body)).toMatchObject({
-        company_id: 7,
-        new_name: 'PI-2026-014 - Renamed',
-      });
+      expect(JSON.parse(put[1].body)).toEqual({ name: 'INV-014 production' });
     });
 
-    // The detail view follows the returned name, so the next item call cannot
-    // hit the old one. It re-reads by row id, which a rename cannot move.
-    await screen.findByRole('heading', { name: 'PI-2026-014 - Renamed' });
+    await screen.findByRole('heading', { name: 'INV-014 production' });
     await waitFor(() => expect(called(fetchMock, '/api/recipes/by-id/3')).toBe(true));
 
-    // And the list row is no longer under the old name.
     fireEvent.click(screen.getByRole('button', { name: /Back to recipes/ }));
-    expect(await screen.findByText('PI-2026-014 - Renamed')).toBeTruthy();
-    expect(screen.queryByText('PI-2026-014 - Caustic Soda 50%')).toBeNull();
-  });
-
-  it('locks the product once production has run', async () => {
-    renderRecipes({ recipes: [RECIPE_ROW], runCount: 2 });
-    await openRecipeDetail();
-    await openEditRecipe();
-
-    const product = screen.getByLabelText(/^Product/);
-    expect(product.disabled).toBe(true);
-    expect(product.value).toBe('Caustic Soda 50%');
-    expect(screen.getByText(/Production has run — the product is fixed/)).toBeTruthy();
+    expect(await screen.findByText('INV-014 production')).toBeTruthy();
+    expect(screen.queryByText('PI-2026-014 · INV-014')).toBeNull();
   });
 
   it('keeps the form open and shows a rename conflict inline', async () => {
     renderRecipes({
       recipes: [RECIPE_ROW],
-      putError: "Recipe 'PI-2026-014 - Other' already exists for this company",
+      putError: "Recipe 'INV-015 production' already exists for this company",
     });
     await openRecipeDetail();
-    await openEditRecipe();
+    fireEvent.click(screen.getByRole('button', { name: /^Edit$/ }));
 
     fireEvent.change(screen.getByLabelText(/^Recipe Name/), {
-      target: { value: 'PI-2026-014 - Other' },
+      target: { value: 'INV-015 production' },
     });
     fireEvent.click(screen.getByRole('button', { name: /^Save$/ }));
 
     expect(await screen.findByText(/already exists for this company/)).toBeTruthy();
     expect(screen.getByRole('heading', { name: 'Edit Recipe' })).toBeTruthy();
-    expect(screen.getByLabelText(/^Recipe Name/).value).toBe('PI-2026-014 - Other');
+    expect(screen.getByLabelText(/^Recipe Name/).value).toBe('INV-015 production');
   });
+});
 
-  it('opens production under the renamed recipe', async () => {
-    renderRecipes({
-      recipes: [RECIPE_ROW],
-      recipeItems: [{ chemical_name: 'Caustic Soda', percentage: 40 }],
-    });
+describe('Production from the detail', () => {
+  it('opens production against the fixed invoice and re-reads the recipe', async () => {
+    const { fetchMock } = renderRecipes({ recipes: [RECIPE_ROW] });
     await openRecipeDetail();
-    await openEditRecipe();
-
-    fireEvent.change(screen.getByLabelText(/^Recipe Name/), {
-      target: { value: 'PI-2026-014 - Renamed' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: /^Save$/ }));
-    await screen.findByRole('heading', { name: 'PI-2026-014 - Renamed' });
+    const detailReads = () => fetchMock.mock.calls.filter(
+      ([url, options]) => String(url).includes('/api/recipes/by-id/3')
+        && (options?.method || 'GET') === 'GET',
+    ).length;
+    const before = detailReads();
 
     fireEvent.click(screen.getByRole('button', { name: /Go for Production/ }));
-    expect(await screen.findByText('PI-2026-014 - Renamed · 1 ingredient')).toBeTruthy();
-  });
-
-  it('re-reads the recipe after a production run so the product locks', async () => {
-    renderRecipes({
-      recipes: [RECIPE_ROW],
-      recipeItems: [{ chemical_name: 'Caustic Soda', percentage: 40 }],
-    });
-    await openRecipeDetail();
-    fireEvent.click(screen.getByRole('button', { name: /Go for Production/ }));
-
-    // The company is preset from the recipe; the PI is the operator's choice.
-    fireEvent.change(await screen.findByLabelText('PI / Sale'), { target: { value: '5' } });
+    expect(await screen.findByRole('heading', { name: 'Go for Production' })).toBeTruthy();
     await waitFor(() => expect(
-      screen.getByLabelText('Invoice number').querySelector('option[value="9"]'),
-    ).toBeTruthy());
-    fireEvent.click(screen.getByRole('button', { name: /Start Production/ }));
+      screen.getByLabelText('Quantity for Caustic Soda 50%').value,
+    ).toBe('150'));
 
-    // The run is real now. Without re-reading, Edit still offers a product
-    // change the server refuses with 409 because run_count never moved.
+    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
+
     await waitFor(() => expect(
       screen.queryByRole('heading', { name: 'Go for Production' }),
     ).toBeNull());
-    await openEditRecipe();
-    await waitFor(() => expect(screen.getByLabelText(/^Product/).disabled).toBe(true));
-    expect(screen.getByText(/Production has run — the product is fixed/)).toBeTruthy();
+    await waitFor(() => expect(detailReads()).toBeGreaterThan(before));
+    // Every product on the invoice was covered by the run.
+    expect((await within(card('Soda Ash')).findByText(/Remaining/)).textContent)
+      .toContain('0.00 KG');
+  });
+});
+
+describe('Recipe list', () => {
+  it('shows the invoice, the product count and what is still unformulated', async () => {
+    renderRecipes({ recipes: [RECIPE_ROW] });
+
+    expect(await screen.findByText('INV-014')).toBeTruthy();
+    expect(screen.getByText('1 of 3 formulated')).toBeTruthy();
+    expect(screen.getByText('Products awaiting formulation')).toBeTruthy();
+    // 3 products, 1 formulated.
+    expect(screen.getByText('2')).toBeTruthy();
+    expect(screen.queryByText(/Recipes with Water/)).toBeNull();
   });
 });

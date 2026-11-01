@@ -1,4 +1,4 @@
-﻿import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import {
   BookOpen,
@@ -10,13 +10,11 @@ import {
   Edit3,
   Check,
   AlertTriangle,
-  Droplets,
-  Hash,
-  Weight,
   Factory
 } from 'lucide-react';
 import clsx from 'clsx';
 import Button from '../components/ui/Button';
+import Badge from '../components/ui/Badge';
 import Modal from '../components/modals/Modal';
 import KpiCard from '../components/cards/KpiCard';
 import { formatNumber } from '../utils/format';
@@ -25,6 +23,241 @@ import { useAuth } from '../context/AuthContext';
 import { useConfirm } from '../context/ConfirmContext';
 import { toast } from 'sonner';
 import ProductionRunModal from '../components/modals/ProductionRunModal';
+
+const inputCls =
+  'w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent';
+
+/**
+ * One product's formulation. The invoice defines the product and its
+ * quantities; this card only owns the chemicals and their percentages, so a
+ * product added to the invoice later appears as an empty card on reload.
+ */
+function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, onDelete }) {
+  const [chemical, setChemical] = useState('');
+  const [pct, setPct] = useState('');
+  const [editItemId, setEditItemId] = useState(null);
+  const [editPct, setEditPct] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  const available = chemicals.filter(
+    (c) => !product.items.some((item) => item.chemical_name === c.name)
+  );
+
+  const submitAdd = async () => {
+    if (!chemical || pct === '') {
+      toast.error('Select chemical and enter percentage');
+      return;
+    }
+    setSaving(true);
+    try {
+      const ok = await onAdd(product, chemical, parseFloat(pct));
+      if (ok) {
+        setChemical('');
+        setPct('');
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const submitEdit = async (item) => {
+    setSaving(true);
+    try {
+      const ok = await onUpdate(product, item, parseFloat(editPct));
+      if (ok) {
+        setEditItemId(null);
+        setEditPct('');
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section
+      aria-label={`${product.product_name} formulation`}
+      className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs overflow-hidden"
+    >
+      <div className="p-4 border-b border-slate-100 dark:border-slate-800">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-blue-50 dark:bg-blue-950/40 text-blue-600 dark:text-blue-400">
+              <FlaskConical className="h-4 w-4" />
+            </div>
+            <div>
+              <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
+                {product.product_name}
+              </h3>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                {product.items.length} ingredient{product.items.length === 1 ? '' : 's'}
+                {' '}&middot;{' '}
+                {product.percentage.toFixed(1)}% raw materials
+              </p>
+            </div>
+          </div>
+          <Badge variant={product.formulated ? 'success' : 'warning'}>
+            {product.formulated ? 'Ready' : 'Empty formulation'}
+          </Badge>
+        </div>
+
+        <div className="mt-3 grid grid-cols-3 gap-2 text-[11px] text-slate-600 dark:text-slate-400">
+          <p>Invoiced {formatNumber(product.invoiced_qty)} {product.unit}</p>
+          <p>Produced {formatNumber(product.produced_qty)} {product.unit}</p>
+          <p className="font-semibold text-slate-800 dark:text-slate-200">
+            Remaining {formatNumber(product.remaining_qty)} {product.unit}
+          </p>
+        </div>
+
+        {product.line_count > 1 && (
+          <p className="mt-1.5 text-[11px] text-slate-400 dark:text-slate-500">
+            {product.line_count} lines merged · {formatNumber(product.invoiced_qty)} {product.unit} on the invoice
+          </p>
+        )}
+        {product.unconverted && product.unconverted.length > 0 && (
+          <p className="mt-1.5 flex items-start gap-1 text-[11px] text-rose-600 dark:text-rose-400">
+            <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+            <span>
+              Some invoice lines need a unit conversion (
+              {product.unconverted.map((u) => `${u.from_unit} → ${u.to_unit}`).join(', ')}
+              ) — add it in Unit Conversions before producing.
+            </span>
+          </p>
+        )}
+      </div>
+
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b border-slate-100 dark:border-slate-800">
+            <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">#</th>
+            <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Chemical</th>
+            <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Percentage</th>
+            <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Current Stock</th>
+            <th className="px-4 py-2.5 text-right text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Actions</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-50 dark:divide-slate-800/50">
+          {product.items.map((item, idx) => (
+            <tr key={item.id} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40">
+              <td className="px-4 py-2.5 text-slate-400">{idx + 1}</td>
+              <td className="px-4 py-2.5 font-medium text-slate-900 dark:text-white">
+                {item.chemical_name}
+              </td>
+              <td className="px-4 py-2.5">
+                {editItemId === item.id ? (
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      max="100"
+                      aria-label={`Percentage for ${item.chemical_name} in ${product.product_name}`}
+                      value={editPct}
+                      onChange={(e) => setEditPct(e.target.value)}
+                      className="w-20 px-2 py-1 text-sm rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                      autoFocus
+                    />
+                    <button
+                      aria-label={`Save ${item.chemical_name} percentage in ${product.product_name}`}
+                      onClick={() => submitEdit(item)}
+                      disabled={saving}
+                      className="p-1 text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-950/40 rounded cursor-pointer"
+                    >
+                      <Check className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    aria-label={`Edit ${item.chemical_name} percentage in ${product.product_name}`}
+                    onClick={() => { setEditItemId(item.id); setEditPct(String(item.percentage)); }}
+                    className="px-2 py-1 text-sm rounded-md bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-mono transition-colors cursor-pointer"
+                  >
+                    {item.percentage}%
+                  </button>
+                )}
+              </td>
+              <td className="px-4 py-2.5">
+                <span className={clsx('font-mono', item.current_stock > 0 ? 'text-slate-700 dark:text-slate-300' : 'text-rose-500')}>
+                  {formatNumber(item.current_stock)} {item.unit}
+                </span>
+              </td>
+              <td className="px-4 py-2.5 text-right">
+                {isAdmin && (
+                  <button
+                    aria-label={`Remove ${item.chemical_name} from ${product.product_name}`}
+                    onClick={() => onDelete(product, item)}
+                    className="p-1.5 rounded-md text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors cursor-pointer"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </td>
+            </tr>
+          ))}
+          {product.items.length === 0 && (
+            <tr>
+              <td colSpan="5" className="px-4 py-6 text-center text-slate-400 dark:text-slate-500">
+                No ingredients yet. Add this product&apos;s chemicals below.
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+
+      <div className="p-4 border-t border-slate-100 dark:border-slate-800 flex items-end gap-3 flex-wrap">
+        <div className="flex-1 min-w-[180px]">
+          <label
+            htmlFor={`chem-${product.product_name}`}
+            className="block text-xs text-slate-500 dark:text-slate-400 mb-1"
+          >
+            Chemical
+          </label>
+          <select
+            id={`chem-${product.product_name}`}
+            aria-label={`Chemical for ${product.product_name}`}
+            value={chemical}
+            onChange={(e) => setChemical(e.target.value)}
+            className={inputCls}
+          >
+            <option value="">Select chemical...</option>
+            {available.map((c) => (
+              <option key={c.name} value={c.name}>{c.name}</option>
+            ))}
+          </select>
+        </div>
+        <div className="w-32">
+          <label
+            htmlFor={`pct-${product.product_name}`}
+            className="block text-xs text-slate-500 dark:text-slate-400 mb-1"
+          >
+            Percentage %
+          </label>
+          <input
+            id={`pct-${product.product_name}`}
+            aria-label={`Percentage for ${product.product_name}`}
+            type="number"
+            step="0.01"
+            min="0"
+            max="100"
+            value={pct}
+            onChange={(e) => setPct(e.target.value)}
+            placeholder="0"
+            className={inputCls}
+          />
+        </div>
+        <Button
+          variant="primary"
+          size="sm"
+          icon={Plus}
+          onClick={submitAdd}
+          loading={saving}
+          aria-label={`Add ingredient to ${product.product_name}`}
+        >
+          Add
+        </Button>
+      </div>
+    </section>
+  );
+}
 
 export default function Recipes() {
   const { apiFetch, user } = useAuth();
@@ -35,16 +268,14 @@ export default function Recipes() {
   const [loading, setLoading] = useState(true);
 
   const [selectedRecipe, setSelectedRecipe] = useState(null);
-  const [recipeItems, setRecipeItems] = useState([]);
+  const [detailProducts, setDetailProducts] = useState([]);
 
-const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showCreateModal, setShowCreateModal] = useState(false);
   const [showDetail, setShowDetail] = useState(false);
   const [showEditMeta, setShowEditMeta] = useState(false);
   const [showProductionRun, setShowProductionRun] = useState(false);
 
   const [newName, setNewName] = useState('');
-  const [newYield, setNewYield] = useState('');
-  const [newWater, setNewWater] = useState('');
   const [companies, setCompanies] = useState([]);
   const [allLcs, setAllLcs] = useState([]);
   const [companyId, setCompanyId] = useState('');
@@ -54,22 +285,13 @@ const [showCreateModal, setShowCreateModal] = useState(false);
   const [invoices, setInvoices] = useState([]);
   const [invoiceId, setInvoiceId] = useState('');
   const [invoiceItems, setInvoiceItems] = useState([]);
-  const [productName, setProductName] = useState('');
   const [loadingRefs, setLoadingRefs] = useState(false);
   const [loadingPis, setLoadingPis] = useState(false);
   const [loadingInvoiceItems, setLoadingInvoiceItems] = useState(false);
 
   const [editName, setEditName] = useState('');
-  const [editProduct, setEditProduct] = useState('');
-  const [editYield, setEditYield] = useState('');
-  const [editWater, setEditWater] = useState('');
   const [editError, setEditError] = useState(null);
   const [savingMeta, setSavingMeta] = useState(false);
-
-  const [addChemical, setAddChemical] = useState('');
-  const [addPct, setAddPct] = useState('');
-  const [editItemId, setEditItemId] = useState(null);
-  const [editItemPct, setEditItemPct] = useState('');
 
   // Fetch only — loading is already true on mount; event-handler refreshers
   // flip the spinner on themselves before calling this.
@@ -123,34 +345,33 @@ const [showCreateModal, setShowCreateModal] = useState(false);
   );
 
   // Distinct products on the selected invoice, with the quantity each line
-  // carries (the recipe's batch basis prefill, never a production cap).
+  // carries. Read-only: the invoice, not the operator, defines the products.
   const invoiceProducts = useMemo(() => {
     const byName = new Map();
     for (const item of invoiceItems) {
       const name = (item.product_name || '').trim();
       if (!name) continue;
-      const entry = byName.get(name) || { name, unit: item.unit || 'KG', quantity: 0 };
+      const key = name.toLowerCase();
+      const entry = byName.get(key) || { name, unit: item.unit || 'KG', quantity: 0 };
       entry.quantity += Number(item.quantity) || 0;
-      byName.set(name, entry);
+      byName.set(key, entry);
     }
     return [...byName.values()];
   }, [invoiceItems]);
 
-  const recipeProducts = useMemo(() => new Set(
-    recipes
-      .filter(r => String(r.company_id) === String(companyId) && r.product_name)
-      .map(r => r.product_name.trim().toLowerCase())
-  ), [recipes, companyId]);
-
-  const productsWithRecipe = invoiceProducts.filter(
-    p => recipeProducts.has(p.name.toLowerCase())
-  ).length;
+  const invoiceRecipe = useMemo(
+    () => recipes.find(r => String(r.invoice_id) === String(invoiceId)) || null,
+    [recipes, invoiceId]
+  );
 
   const selectedPi = lcPis.find(p => String(p.id) === String(saleId));
   const piLabel = selectedPi?.pi_number || (saleId ? `PI #${saleId}` : '');
-  const namePlaceholder = piLabel && productName
-    ? `e.g. ${piLabel} — ${productName}`
-    : 'e.g. PI-2026-014 — Caustic Soda 50%';
+  const selectedInvoice = invoices.find(
+    (inv) => String(inv.invoice_id ?? inv.id) === String(invoiceId)
+  );
+  const namePlaceholder = piLabel && selectedInvoice
+    ? `e.g. ${piLabel} · ${selectedInvoice.invoice_number}`
+    : 'e.g. PI-2026-014 · INV-014';
 
   const handleCompanyChange = (value) => {
     setCompanyId(value);
@@ -160,10 +381,6 @@ const [showCreateModal, setShowCreateModal] = useState(false);
     setInvoices([]);
     setInvoiceId('');
     setInvoiceItems([]);
-    setProductName('');
-    // The product is gone, so its invoice quantity must not linger as a
-    // prefill for whatever gets picked next.
-    setNewYield('');
   };
 
   const handleLcChange = async (value) => {
@@ -173,8 +390,6 @@ const [showCreateModal, setShowCreateModal] = useState(false);
     setInvoices([]);
     setInvoiceId('');
     setInvoiceItems([]);
-    setProductName('');
-    setNewYield('');
     if (!value) return;
     setLoadingPis(true);
     try {
@@ -196,8 +411,6 @@ const [showCreateModal, setShowCreateModal] = useState(false);
     setInvoices([]);
     setInvoiceId('');
     setInvoiceItems([]);
-    setProductName('');
-    setNewYield('');
     if (!value) return;
     try {
       // booked/shipped/paid invoices are past production.
@@ -214,8 +427,6 @@ const [showCreateModal, setShowCreateModal] = useState(false);
   const handleInvoiceChange = async (value) => {
     setInvoiceId(value);
     setInvoiceItems([]);
-    setProductName('');
-    setNewYield('');
     if (!value) return;
     setLoadingInvoiceItems(true);
     try {
@@ -227,12 +438,6 @@ const [showCreateModal, setShowCreateModal] = useState(false);
     } finally {
       setLoadingInvoiceItems(false);
     }
-  };
-
-  const handleProductChange = (value) => {
-    setProductName(value);
-    const match = invoiceProducts.find(p => p.name === value);
-    setNewYield(match ? String(match.quantity) : '');
   };
 
   // The list hands out the row id, so detail reads key off it: a (company,
@@ -248,7 +453,7 @@ const [showCreateModal, setShowCreateModal] = useState(false);
       const data = await res.json();
       if (data.recipe) {
         setSelectedRecipe(data.recipe);
-        setRecipeItems(data.items || []);
+        setDetailProducts(Array.isArray(data.products) ? data.products : []);
         setShowDetail(true);
       }
     } catch (err) {
@@ -269,52 +474,55 @@ const [showCreateModal, setShowCreateModal] = useState(false);
     if (!lcId) return toast.error('LC is required');
     if (!saleId) return toast.error('PI / Sale is required');
     if (!invoiceId) return toast.error('Invoice is required');
-    if (!productName) return toast.error('Product name is required');
+    if (invoiceRecipe) {
+      return toast.error(`${invoiceRecipe.invoice_number || 'This invoice'} already has a recipe`);
+    }
     try {
+      const name = newName.trim();
       const res = await apiFetch('/api/recipes', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          name: newName.trim(),
-          yield_qty: parseFloat(newYield) || 1,
-          water_percentage: parseFloat(newWater) || 0,
+          name,
           company_id: Number(companyId),
-          product_name: productName
+          invoice_id: Number(invoiceId),
         })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || `Failed to create recipe (${res.status})`);
-      // Keep the LC/PI/invoice selection: a PI with several products needs one
-      // recipe per product, so the next one should be one click away.
+      toast.success(`Recipe "${name}" created`);
       setNewName('');
-      setNewYield('');
-      setNewWater('');
-      setProductName('');
-      toast.success(`Recipe "${newName.trim()}" created`);
+      setShowCreateModal(false);
       setLoading(true);
-      fetchData();
+      await fetchData();
+      // The new recipe is empty until its products are formulated, so open it
+      // instead of dropping the operator back on the list.
+      const created = data.recipe || {};
+      if (created.id != null) {
+        await fetchRecipeDetail(created);
+      }
     } catch (err) {
       toast.error(err.message || 'Failed to create recipe');
     }
   };
 
-  const handleDelete = async (name, companyId) => {
+  const handleDelete = async (recipe) => {
     const ok = await confirm({
-      title: `Delete recipe "${name}"?`,
-      message: 'The recipe and all its ingredients will be removed.',
+      title: `Delete recipe "${recipe.name}"?`,
+      message: 'The recipe and all its formulations will be removed.',
       confirmLabel: 'Delete',
       danger: true,
     });
     if (!ok) return;
     try {
       const res = await apiFetch(
-        '/api/recipes/' + encodeURIComponent(name) + '?company_id=' + encodeURIComponent(companyId),
+        '/api/recipes/by-id/' + encodeURIComponent(recipe.id),
         { method: 'DELETE' }
       );
       const data = await res.json();
       if (data.success) {
-        if (showDetail && selectedRecipe?.name === name) setShowDetail(false);
-        toast.success(`Recipe "${name}" deleted`);
+        if (showDetail && selectedRecipe?.id === recipe.id) setShowDetail(false);
+        toast.success(`Recipe "${recipe.name}" deleted`);
         setLoading(true);
         fetchData();
       }
@@ -326,65 +534,45 @@ const [showCreateModal, setShowCreateModal] = useState(false);
   const openEditMeta = () => {
     if (!selectedRecipe) return;
     setEditName(selectedRecipe.name);
-    setEditProduct(selectedRecipe.product_name || '');
-    setEditYield(String(selectedRecipe.total_quantity ?? ''));
-    setEditWater(String(selectedRecipe.water_percentage ?? 0));
     setEditError(null);
     setShowEditMeta(true);
   };
 
   const handleUpdateMeta = async () => {
     if (!selectedRecipe) return;
-    const oldName = selectedRecipe.name;
     const trimmedName = editName.trim();
     if (!trimmedName) {
       setEditError('Recipe name is required');
       return;
     }
-    const body = {
-      company_id: selectedRecipe.company_id,
-      total_quantity: parseFloat(editYield) || selectedRecipe.total_quantity,
-      water_percentage: parseFloat(editWater) || selectedRecipe.water_percentage,
-    };
-    if (trimmedName !== oldName) body.new_name = trimmedName;
-    const product = editProduct.trim();
-    if (product && product.toLowerCase() !== (selectedRecipe.product_name || '').toLowerCase()) {
-      body.product_name = product;
-    }
     setSavingMeta(true);
     setEditError(null);
     try {
       const res = await apiFetch(
-        '/api/recipes/' + encodeURIComponent(oldName) +
-          '?company_id=' + encodeURIComponent(selectedRecipe.company_id),
+        '/api/recipes/by-id/' + encodeURIComponent(selectedRecipe.id),
         {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
+          body: JSON.stringify({ name: trimmedName }),
         }
       );
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        // A name clash (409) or a frozen product stays here: the form is the
-        // only place the user can correct it.
+        // A name clash (409) stays here: the form is the only place the user
+        // can correct it.
         setEditError(data?.error || `Could not update recipe (${res.status})`);
         return;
       }
-      // The name is the URL key and the key everything else in this page keys
-      // off, so adopt the server's answer everywhere instead of the input.
       const finalName = data.name || trimmedName;
-      const patch = {
-        name: finalName,
-        total_quantity: body.total_quantity,
-        water_percentage: body.water_percentage,
-        product_name: body.product_name ?? selectedRecipe.product_name,
-      };
-      setRecipes(prev => prev.map(r => (r.id === selectedRecipe.id ? { ...r, ...patch } : r)));
-      setSelectedRecipe(prev => (prev ? { ...prev, ...patch } : prev));
+      const renamed = finalName !== selectedRecipe.name;
+      setRecipes(prev => prev.map(r => (
+        r.id === selectedRecipe.id ? { ...r, name: finalName } : r
+      )));
+      setSelectedRecipe(prev => (prev ? { ...prev, name: finalName } : prev));
       setShowEditMeta(false);
-      toast.success(finalName !== oldName
-        ? `Recipe renamed to "${finalName}"`
-        : 'Recipe updated');
+      toast.success(renamed ? `Recipe renamed to "${finalName}"` : 'Recipe updated');
+      // The invoice and its products follow the row id, so a rename cannot
+      // detach the detail from what it is showing.
       fetchRecipeDetail({ ...selectedRecipe, name: finalName });
       setLoading(true);
       fetchData();
@@ -395,76 +583,76 @@ const [showCreateModal, setShowCreateModal] = useState(false);
     }
   };
 
-  const handleAddItem = async () => {
-    if (!addChemical || !addPct) return toast.error('Select chemical and enter percentage');
+  // Formulation writes key off the product, not the recipe name: the invoice
+  // defines which slot an ingredient belongs to.
+  const handleAddItem = async (product, chemical, percentage) => {
+    if (!selectedRecipe) return false;
     try {
-      const res = await apiFetch('/api/recipes/' + encodeURIComponent(selectedRecipe.name) + '/items', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chemical: addChemical, percentage: parseFloat(addPct), company_id: selectedRecipe.company_id })
-      });
-      const data = await res.json();
-      if (data.success) {
-        setAddChemical('');
-        setAddPct('');
-        toast.success('Ingredient added');
-        fetchRecipeDetail(selectedRecipe);
-      } else {
-        toast.error('Failed to add ingredient');
-      }
+      const res = await apiFetch(
+        '/api/recipes/by-id/' + encodeURIComponent(selectedRecipe.id) +
+          '/products/' + encodeURIComponent(product.product_name) + '/items',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chemical, percentage }),
+        }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || 'Failed to add ingredient');
+      toast.success('Ingredient added');
+      await fetchRecipeDetail(selectedRecipe);
+      return true;
     } catch (err) {
       toast.error(err.message || 'Failed to add ingredient');
+      return false;
     }
   };
 
-  const handleUpdateItem = async (chem) => {
+  const handleUpdateItem = async (product, item, percentage) => {
+    if (!selectedRecipe) return false;
     try {
       const res = await apiFetch(
-        '/api/recipes/' + encodeURIComponent(selectedRecipe.name) + '/items/' + encodeURIComponent(chem),
+        '/api/recipes/by-id/' + encodeURIComponent(selectedRecipe.id) +
+          '/items/' + encodeURIComponent(item.id),
         {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ percentage: parseFloat(editItemPct), company_id: selectedRecipe.company_id })
+          body: JSON.stringify({ percentage }),
         }
       );
-      const data = await res.json();
-      if (data.success) {
-        setEditItemId(null);
-        setEditItemPct('');
-        toast.success('Ingredient updated');
-        fetchRecipeDetail(selectedRecipe);
-      }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || 'Could not update ingredient');
+      toast.success('Ingredient updated');
+      await fetchRecipeDetail(selectedRecipe);
+      return true;
     } catch (err) {
       toast.error(err.message || 'Could not update ingredient');
+      return false;
     }
   };
 
-  const handleDeleteItem = async (chem) => {
+  const handleDeleteItem = async (product, item) => {
+    if (!selectedRecipe) return;
     const ok = await confirm({
-      title: `Remove "${chem}" from recipe?`,
+      title: `Remove "${item.chemical_name}" from ${product.product_name}?`,
       confirmLabel: 'Remove',
       danger: true,
     });
     if (!ok) return;
     try {
       const res = await apiFetch(
-        '/api/recipes/' + encodeURIComponent(selectedRecipe.name) + '/items/' + encodeURIComponent(chem) +
-          '?company_id=' + encodeURIComponent(selectedRecipe.company_id),
+        '/api/recipes/by-id/' + encodeURIComponent(selectedRecipe.id) +
+          '/items/' + encodeURIComponent(item.id),
         { method: 'DELETE' }
       );
-      const data = await res.json();
-      if (data.success) {
-        toast.success('Ingredient removed');
-        fetchRecipeDetail(selectedRecipe);
-      }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || 'Could not remove ingredient');
+      toast.success('Ingredient removed');
+      await fetchRecipeDetail(selectedRecipe);
     } catch (err) {
       toast.error(err.message || 'Could not remove ingredient');
     }
   };
-
-  const availableChemicals = chemicals.filter(
-    c => !recipeItems.some(item => item.chemical_name === c.name)
-  );
 
   if (loading) {
     return (
@@ -478,18 +666,16 @@ const [showCreateModal, setShowCreateModal] = useState(false);
   }
 
   if (showDetail && selectedRecipe) {
-    const sumPct = recipeItems.reduce((s, i) => s + (i.percentage || 0), 0);
-    const waterPct = selectedRecipe.water_percentage || (100 - sumPct);
-    // Readiness and the commercial report key off recipes.product_name, so a
-    // rebind after production would re-attribute history that already ran.
-    const productLocked = (selectedRecipe.run_count || 0) > 0;
+    const productCount = detailProducts.length;
+    const formulatedCount = detailProducts.filter(p => p.formulated).length;
+    const hasFormulated = formulatedCount > 0;
 
     return (
       <div className="space-y-6 max-w-7xl mx-auto">
         <div className="flex items-center gap-4">
           <button
             aria-label="Back to recipes"
-            onClick={() => { setShowDetail(false); setSelectedRecipe(null); setLoading(true); fetchData(); }}
+            onClick={() => { setShowDetail(false); setSelectedRecipe(null); setDetailProducts([]); setLoading(true); fetchData(); }}
             className="p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
           >
             <ArrowLeft className="h-5 w-5 text-slate-600 dark:text-slate-400" />
@@ -497,19 +683,19 @@ const [showCreateModal, setShowCreateModal] = useState(false);
           <div className="flex-1">
             <h1 className="text-2xl font-bold text-slate-900 dark:text-white">{selectedRecipe.name}</h1>
             <p className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">
-              Total Quantity: <span className="font-semibold text-blue-600 dark:text-blue-400">{formatNumber(selectedRecipe.total_quantity)}</span>
+              {selectedRecipe.invoice_number || '—'}
+              {selectedRecipe.pi_number ? ` · ${selectedRecipe.pi_number}` : ''}
+              {selectedRecipe.client_name ? ` · ${selectedRecipe.client_name}` : ''}
               {' '}&middot;{' '}
-              Water: <span className="font-semibold">{selectedRecipe.water_percentage}%</span>
-              {' '}&middot;{' '}
-              {recipeItems.length} ingredient{recipeItems.length !== 1 ? 's' : ''}
+              <span>{formulatedCount} of {productCount} products formulated</span>
             </p>
           </div>
-<div className="flex gap-2">
+          <div className="flex gap-2">
             <Button variant="secondary" size="sm" icon={Edit3} onClick={openEditMeta}>Edit</Button>
             {isAdmin && (
-              <Button variant="danger" size="sm" icon={Trash2} onClick={() => handleDelete(selectedRecipe.name, selectedRecipe.company_id)}>Delete</Button>
+              <Button variant="danger" size="sm" icon={Trash2} onClick={() => handleDelete(selectedRecipe)}>Delete</Button>
             )}
-            {isAdmin && recipeItems.length > 0 && (
+            {isAdmin && hasFormulated && (
               <Button variant="primary" size="sm" icon={Factory} onClick={() => setShowProductionRun(true)}>
                 Go for Production
               </Button>
@@ -517,148 +703,35 @@ const [showCreateModal, setShowCreateModal] = useState(false);
           </div>
         </div>
 
-        <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs p-5">
-          <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-3">Formulation Summary</h3>
-          <div className="flex flex-wrap gap-6 items-center">
-            <div className="flex items-center gap-2">
-              <Weight className="h-4 w-4 text-slate-400" />
-              <span className="text-sm text-slate-600 dark:text-slate-400">Raw Materials:</span>
-              <span className={clsx('text-lg font-bold', sumPct === 100 ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400')}>
-                {sumPct.toFixed(1)}%
-              </span>
-            </div>
-            <div className="flex items-center gap-2">
-              <Droplets className="h-4 w-4 text-blue-400" />
-              <span className="text-sm text-slate-600 dark:text-slate-400">Water:</span>
-              <span className="text-lg font-bold text-blue-600 dark:text-blue-400">{waterPct.toFixed(1)}%</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <Hash className="h-4 w-4 text-slate-400" />
-              <span className="text-sm text-slate-600 dark:text-slate-400">Grand Total:</span>
-              <span className={clsx('text-lg font-bold', (sumPct + waterPct) === 100 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400')}>
-                {(sumPct + waterPct).toFixed(1)}%
-              </span>
-              {(sumPct + waterPct) !== 100 && (
-                <AlertTriangle className="h-4 w-4 text-amber-500" />
-              )}
-            </div>
+        {!hasFormulated && productCount > 0 && (
+          <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 dark:border-amber-800 dark:bg-amber-950/40">
+            <p className="text-sm font-medium text-amber-700 dark:text-amber-300">
+              Formulate at least one product before producing this invoice.
+            </p>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+              Booking stays blocked until every product is formulated and covered by a production run.
+            </p>
           </div>
-        </div>
+        )}
 
-        <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs overflow-hidden">
-          <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Ingredients</h3>
+        {productCount === 0 && (
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 text-center text-sm text-slate-500 dark:text-slate-400">
+            This invoice has no lines, so there is nothing to formulate.
           </div>
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-slate-100 dark:border-slate-800">
-                <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">#</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Chemical</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Percentage</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Batch Qty</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Current Stock</th>
-                <th className="px-4 py-3 text-right text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-50 dark:divide-slate-800/50">
-              {recipeItems.map((item, idx) => (
-                <tr key={item.chemical_name} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40">
-                  <td className="px-4 py-3 text-slate-400">{idx + 1}</td>
-                  <td className="px-4 py-3">
-                    <div className="flex items-center gap-2">
-                      <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-slate-100 dark:bg-slate-800">
-                        <FlaskConical className="h-3.5 w-3.5 text-slate-500 dark:text-slate-400" />
-                      </div>
-                      <span className="font-medium text-slate-900 dark:text-white">{item.chemical_name}</span>
-                    </div>
-                  </td>
-                  <td className="px-4 py-3">
-                    {editItemId === item.chemical_name ? (
-                      <div className="flex items-center gap-1.5">
-                        <input
-                          type="number"
-                          step="0.01"
-                          value={editItemPct}
-                          onChange={e => setEditItemPct(e.target.value)}
-                          className="w-20 px-2 py-1 text-sm rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                          autoFocus
-                        />
-                        <button onClick={() => handleUpdateItem(item.chemical_name)} className="p-1 text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-950/40 rounded cursor-pointer">
-                          <Check className="h-3.5 w-3.5" />
-                        </button>
-                      </div>
-                    ) : (
-                      <button
-                        onClick={() => { setEditItemId(item.chemical_name); setEditItemPct(String(item.percentage)); }}
-                        className="px-2 py-1 text-sm rounded-md bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-mono transition-colors cursor-pointer"
-                      >
-                        {item.percentage}%
-                      </button>
-                    )}
-                  </td>
-                  <td className="px-4 py-3 text-slate-700 dark:text-slate-300 font-mono">{formatNumber(item.batch_qty)}</td>
-                  <td className="px-4 py-3">
-                    <span className={clsx('font-mono', item.current_stock > 0 ? 'text-slate-700 dark:text-slate-300' : 'text-rose-500')}>
-                      {formatNumber(item.current_stock)} {item.unit}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 text-right">
-                    {isAdmin && (
-                      <button
-                        onClick={() => handleDeleteItem(item.chemical_name)}
-                        className="p-1.5 rounded-md text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors cursor-pointer"
-                        title="Remove ingredient"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
-                    )}
-                  </td>
-                </tr>
-              ))}
-              {recipeItems.length === 0 && (
-                <tr>
-                  <td colSpan="6" className="px-4 py-8 text-center text-slate-400 dark:text-slate-500">
-                    No ingredients yet. Add chemicals below.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
+        )}
 
-        <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs p-5">
-          <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-3">Add Ingredient</h3>
-          <div className="flex items-end gap-3 flex-wrap">
-            <div className="flex-1 min-w-[200px]">
-              <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Chemical</label>
-              <select
-                value={addChemical}
-                onChange={e => setAddChemical(e.target.value)}
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              >
-                <option value="">Select chemical...</option>
-                {availableChemicals.map(c => (
-                  <option key={c.name} value={c.name}>{c.name}</option>
-                ))}
-              </select>
-            </div>
-            <div className="w-32">
-              <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Percentage %</label>
-              <input
-                type="number"
-                step="0.01"
-                min="0"
-                max="100"
-                value={addPct}
-                onChange={e => setAddPct(e.target.value)}
-                placeholder="0"
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              />
-            </div>
-            <Button variant="primary" size="sm" icon={Plus} onClick={handleAddItem}>
-              Add
-            </Button>
-          </div>
+        <div className="space-y-4">
+          {detailProducts.map((product) => (
+            <ProductFormulationCard
+              key={product.id ?? product.product_name}
+              product={product}
+              chemicals={chemicals}
+              isAdmin={isAdmin}
+              onAdd={handleAddItem}
+              onUpdate={handleUpdateItem}
+              onDelete={handleDeleteItem}
+            />
+          ))}
         </div>
 
         <Modal
@@ -674,8 +747,8 @@ const [showCreateModal, setShowCreateModal] = useState(false);
         >
           <div className="space-y-4">
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Renaming keeps the ingredients and the run history — they follow the
-              recipe, not its label.
+              Renaming keeps the invoice, the formulations and the run history — they
+              follow the recipe, not its label.
             </p>
             <div>
               <label htmlFor="edit-recipe-name" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Recipe Name *</label>
@@ -684,46 +757,17 @@ const [showCreateModal, setShowCreateModal] = useState(false);
                 type="text"
                 value={editName}
                 onChange={e => setEditName(e.target.value)}
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                className={inputCls}
               />
             </div>
-            <div>
-              <label htmlFor="edit-recipe-product" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Product</label>
-              <input
-                id="edit-recipe-product"
-                type="text"
-                value={editProduct}
-                onChange={e => setEditProduct(e.target.value)}
-                disabled={productLocked}
-                aria-describedby="edit-recipe-product-help"
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-60"
-              />
-              <p id="edit-recipe-product-help" className="mt-1 text-xs text-slate-400 dark:text-slate-500">
-                {productLocked
-                  ? 'Production has run — the product is fixed.'
-                  : 'Must be a product on one of this company’s PIs or invoices.'}
+            <div className="rounded-lg border border-slate-200 dark:border-slate-700 px-3 py-2">
+              <p className="text-xs text-slate-500 dark:text-slate-400">Invoice</p>
+              <p className="text-sm font-semibold text-slate-900 dark:text-white">
+                {selectedRecipe.invoice_number || '—'}
               </p>
-            </div>
-            <div>
-              <label htmlFor="edit-recipe-total" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Total Quantity</label>
-              <input
-                id="edit-recipe-total"
-                type="number"
-                value={editYield}
-                onChange={e => setEditYield(e.target.value)}
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              />
-            </div>
-            <div>
-              <label htmlFor="edit-recipe-water" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Water Percentage</label>
-              <input
-                id="edit-recipe-water"
-                type="number"
-                step="0.01"
-                value={editWater}
-                onChange={e => setEditWater(e.target.value)}
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              />
+              <p className="mt-1 text-[11px] text-slate-400 dark:text-slate-500">
+                The invoice and its products are the recipe&apos;s identity and cannot be changed.
+              </p>
             </div>
             {editError && (
               <p role="alert" className="text-xs font-medium text-rose-600 dark:text-rose-400">
@@ -734,17 +778,14 @@ const [showCreateModal, setShowCreateModal] = useState(false);
         </Modal>
 
         <ProductionRunModal
-          key={selectedRecipe.name}
+          key={selectedRecipe.id ?? selectedRecipe.name}
           isOpen={showProductionRun}
           onClose={() => setShowProductionRun(false)}
           recipe={selectedRecipe}
-          recipeItems={recipeItems}
           onSaved={() => {
             setShowProductionRun(false);
-            // The run is now on the record: re-read the recipe so run_count,
-            // the items and the product lock reflect it. The list alone does
-            // not carry run_count, so it would leave Edit offering a product
-            // change the server refuses with 409.
+            // The run changes produced/remaining, which the cards show, so the
+            // detail is re-read instead of trusting the pre-run rows.
             if (selectedRecipe) {
               fetchRecipeDetail(selectedRecipe);
             }
@@ -753,6 +794,11 @@ const [showCreateModal, setShowCreateModal] = useState(false);
       </div>
     );
   }
+
+  const awaitingFormulation = recipes.reduce(
+    (sum, r) => sum + Math.max((r.product_count || 0) - (r.formulated_count || 0), 0),
+    0
+  );
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
@@ -769,9 +815,14 @@ const [showCreateModal, setShowCreateModal] = useState(false);
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <KpiCard label="Total Recipes" value={recipes.length} icon={BookOpen} />
-        <KpiCard label="Total Chemicals" value={chemicals.length} icon={FlaskConical} />
-        <KpiCard label="Recipes with Water" value={recipes.filter(r => r.water_percentage > 0).length} icon={Droplets} />
+        <KpiCard title="Total Recipes" value={recipes.length} icon={BookOpen} color="blue" />
+        <KpiCard title="Total Chemicals" value={chemicals.length} icon={FlaskConical} color="purple" />
+        <KpiCard
+          title="Products awaiting formulation"
+          value={awaitingFormulation}
+          icon={AlertTriangle}
+          color={awaitingFormulation > 0 ? 'amber' : 'emerald'}
+        />
       </div>
 
       <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs overflow-hidden">
@@ -780,15 +831,16 @@ const [showCreateModal, setShowCreateModal] = useState(false);
             <tr className="border-b border-slate-100 dark:border-slate-800">
               <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">#</th>
               <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Recipe Name</th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Total Quantity</th>
-              <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Water %</th>
+              <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Invoice</th>
+              <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Products</th>
+              <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Formulated</th>
               <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Created</th>
               <th className="px-4 py-3 text-right text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Actions</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-50 dark:divide-slate-800/50">
             {recipes.map((recipe, idx) => (
-              <tr key={recipe.name} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40 transition-colors">
+              <tr key={recipe.id ?? recipe.name} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40 transition-colors">
                 <td className="px-4 py-3 text-slate-400">{idx + 1}</td>
                 <td className="px-4 py-3">
                   <div className="flex items-center gap-2">
@@ -798,10 +850,20 @@ const [showCreateModal, setShowCreateModal] = useState(false);
                     <span className="font-medium text-slate-900 dark:text-white">{recipe.name}</span>
                   </div>
                 </td>
-                <td className="px-4 py-3 text-slate-700 dark:text-slate-300 font-mono">{formatNumber(recipe.total_quantity)}</td>
+                <td className="px-4 py-3 text-slate-700 dark:text-slate-300 font-mono">
+                  {recipe.invoice_number || '—'}
+                </td>
+                <td className="px-4 py-3 text-slate-700 dark:text-slate-300">
+                  {recipe.product_count ?? 0}
+                </td>
                 <td className="px-4 py-3">
-                  <span className={clsx('font-mono', recipe.water_percentage > 0 ? 'text-blue-600 dark:text-blue-400' : 'text-slate-400')}>
-                    {recipe.water_percentage}%
+                  <span className={clsx(
+                    'text-xs font-medium',
+                    (recipe.formulated_count || 0) === (recipe.product_count || 0)
+                      ? 'text-emerald-600 dark:text-emerald-400'
+                      : 'text-amber-600 dark:text-amber-400'
+                  )}>
+                    {recipe.formulated_count || 0} of {recipe.product_count || 0} formulated
                   </span>
                 </td>
                 <td className="px-4 py-3 text-slate-500 dark:text-slate-400 text-xs">{recipe.created || '—'}</td>
@@ -812,7 +874,8 @@ const [showCreateModal, setShowCreateModal] = useState(false);
                     </Button>
                     {isAdmin && (
                       <button
-                        onClick={() => handleDelete(recipe.name, recipe.company_id)}
+                        aria-label={`Delete recipe ${recipe.name}`}
+                        onClick={() => handleDelete(recipe)}
                         className="p-1.5 rounded-md text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors cursor-pointer"
                         title="Delete recipe"
                       >
@@ -825,7 +888,7 @@ const [showCreateModal, setShowCreateModal] = useState(false);
             ))}
             {recipes.length === 0 && (
               <tr>
-                <td colSpan="6" className="px-4 py-8 text-center text-slate-400 dark:text-slate-500">
+                <td colSpan="7" className="px-4 py-8 text-center text-slate-400 dark:text-slate-500">
                   No recipes found. Create your first recipe to get started.
                 </td>
               </tr>
@@ -841,14 +904,22 @@ const [showCreateModal, setShowCreateModal] = useState(false);
         footer={
           <>
             <Button variant="secondary" size="sm" onClick={() => setShowCreateModal(false)}>Cancel</Button>
-            <Button variant="primary" size="sm" icon={Plus} onClick={handleCreate}>Create</Button>
+            <Button
+              variant="primary"
+              size="sm"
+              icon={Plus}
+              onClick={handleCreate}
+              disabled={Boolean(invoiceRecipe)}
+            >
+              Create
+            </Button>
           </>
         }
       >
         <div className="space-y-4">
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            A recipe is the production formula for one product on an invoice.
-            Only LCs with open PIs, and invoices still in production, are listed.
+            One recipe covers every product on one invoice. Only LCs with open
+            PIs, and invoices still in production, are listed.
           </p>
           <div className="grid grid-cols-1 gap-3">
             <div>
@@ -857,7 +928,7 @@ const [showCreateModal, setShowCreateModal] = useState(false);
                 id="recipe-company"
                 value={companyId}
                 onChange={e => handleCompanyChange(e.target.value)}
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                className={inputCls}
               >
                 <option value="">Select company…</option>
                 {loadingRefs ? <option disabled>Loading…</option> : companies.map(c => (
@@ -873,7 +944,7 @@ const [showCreateModal, setShowCreateModal] = useState(false);
                 onChange={e => handleLcChange(e.target.value)}
                 disabled={!companyId}
                 aria-describedby="recipe-lc-help"
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-60"
+                className={clsx(inputCls, 'disabled:opacity-60')}
               >
                 <option value="">{companyId ? 'Select LC…' : 'Select a company first'}</option>
                 {companyId && companyLcs.map(l => {
@@ -902,7 +973,7 @@ const [showCreateModal, setShowCreateModal] = useState(false);
                 value={saleId}
                 onChange={e => handleSaleChange(e.target.value)}
                 disabled={!lcId || loadingPis}
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-60"
+                className={clsx(inputCls, 'disabled:opacity-60')}
               >
                 <option value="">{!lcId ? 'Select an LC first' : loadingPis ? 'Loading PIs…' : 'Select PI/Sale…'}</option>
                 {lcId && lcPis.map(s => {
@@ -924,7 +995,7 @@ const [showCreateModal, setShowCreateModal] = useState(false);
                 value={invoiceId}
                 onChange={e => handleInvoiceChange(e.target.value)}
                 disabled={!saleId}
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-60"
+                className={clsx(inputCls, 'disabled:opacity-60')}
               >
                 <option value="">{saleId ? 'Select invoice…' : 'Select a PI first'}</option>
                 {invoices.map(inv => {
@@ -937,30 +1008,40 @@ const [showCreateModal, setShowCreateModal] = useState(false);
                 })}
               </select>
             </div>
-            <div>
-              <label htmlFor="recipe-product" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Product *</label>
-              <select
-                id="recipe-product"
-                value={productName}
-                onChange={e => handleProductChange(e.target.value)}
-                disabled={!invoiceId || loadingInvoiceItems}
-                aria-describedby="recipe-product-help"
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-60"
-              >
-                <option value="">{loadingInvoiceItems ? 'Loading items…' : invoiceId ? 'Select product…' : 'Select an invoice first'}</option>
-                {invoiceProducts.map(p => (
-                  <option key={p.name} value={p.name}>
-                    {p.name} · {formatNumber(p.quantity)} {p.unit}
-                    {recipeProducts.has(p.name.toLowerCase()) ? ' · recipe exists' : ''}
-                  </option>
-                ))}
-              </select>
-              <p id="recipe-product-help" aria-live="polite" className="mt-1 text-xs text-slate-400 dark:text-slate-500">
-                {invoiceProducts.length > 0
-                  ? `${productsWithRecipe} of ${invoiceProducts.length} products on this invoice have a recipe`
-                  : 'Products come from the selected invoice.'}
-              </p>
-            </div>
+            {invoiceId && (
+              <div className="rounded-lg border border-slate-200 dark:border-slate-700 px-3 py-2">
+                <p className="text-xs font-medium text-slate-600 dark:text-slate-300">
+                  Invoice products
+                </p>
+                {loadingInvoiceItems ? (
+                  <p className="mt-1 text-xs text-slate-400 dark:text-slate-500">Loading items…</p>
+                ) : invoiceProducts.length === 0 ? (
+                  <p className="mt-1 text-xs text-slate-400 dark:text-slate-500">
+                    This invoice has no lines.
+                  </p>
+                ) : (
+                  <ul className="mt-1.5 space-y-1">
+                    {invoiceProducts.map(p => (
+                      <li key={p.name} className="flex items-center justify-between gap-2 text-xs">
+                        <span className="text-slate-700 dark:text-slate-300">{p.name}</span>
+                        <span className="font-mono text-slate-500 dark:text-slate-400">
+                          {formatNumber(p.quantity)} {p.unit}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <p className="mt-1.5 text-[11px] text-slate-400 dark:text-slate-500">
+                  {invoiceProducts.length} products on this invoice
+                </p>
+                {invoiceRecipe && (
+                  <p className="mt-1.5 text-[11px] font-medium text-amber-600 dark:text-amber-400">
+                    {invoiceRecipe.invoice_number || 'This invoice'} already has a recipe
+                    ({invoiceRecipe.name}). Open it to formulate its products — one recipe per invoice.
+                  </p>
+                )}
+              </div>
+            )}
           </div>
           <div>
             <label htmlFor="recipe-name" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Recipe Name *</label>
@@ -971,45 +1052,16 @@ const [showCreateModal, setShowCreateModal] = useState(false);
               onChange={e => setNewName(e.target.value)}
               placeholder={namePlaceholder}
               aria-describedby="recipe-name-help"
-              className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              className={inputCls}
             />
             <p id="recipe-name-help" className="mt-1 text-xs text-slate-400 dark:text-slate-500">
-              {piLabel && productName
-                ? <>Selected: {piLabel} · {productName}</>
-                : 'Name it yourself — the PI and product appear here once chosen.'}
+              {piLabel && selectedInvoice
+                ? <>Selected: {piLabel} · {selectedInvoice.invoice_number}</>
+                : 'Name it yourself — the PI and invoice appear here once chosen.'}
             </p>
           </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label htmlFor="recipe-total" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Total Quantity</label>
-              <input
-                id="recipe-total"
-                type="number"
-                value={newYield}
-                onChange={e => setNewYield(e.target.value)}
-                placeholder="15630"
-                aria-describedby="recipe-total-help"
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              />
-              <p id="recipe-total-help" className="mt-1 text-xs text-slate-400 dark:text-slate-500">
-                Batch basis — production quantity is entered when producing.
-              </p>
-            </div>
-            <div>
-              <label htmlFor="recipe-water" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Water % (optional)</label>
-              <input
-                id="recipe-water"
-                type="number"
-                step="0.01"
-                value={newWater}
-                onChange={e => setNewWater(e.target.value)}
-                placeholder="0"
-                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              />
-            </div>
-          </div>
           <p className="text-xs text-slate-400 dark:text-slate-500">
-            Add ingredients after creating the recipe.
+            Formulate each invoice product after creating the recipe.
           </p>
         </div>
       </Modal>

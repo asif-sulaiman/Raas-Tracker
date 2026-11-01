@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
   Download,
@@ -34,9 +34,17 @@ export default function Reports() {
   const [recipes, setRecipes] = useState([]);
   const [loading, setLoading] = useState(true);
 
-  const [selectedRecipes, setSelectedRecipes] = useState([]);
-  const [productionQty, setProductionQty] = useState('');
-  const [autoCalc, setAutoCalc] = useState(true);
+  // A recipe is one invoice's production plan: it is selected by row id and
+  // its product quantities come from that invoice, never from a global tonnage.
+  const [selectedRecipeIds, setSelectedRecipeIds] = useState([]);
+  // id -> { status: 'loading' | 'ready' | 'error', products, error }
+  const [sources, setSources] = useState({});
+  const sourcesRef = useRef({});
+  // `${recipeId}::${lower product name}` -> the operator's quantity string.
+  const [quantities, setQuantities] = useState({});
+  // What was actually sent for the current report, so export cannot drift from
+  // the numbers the table was built from.
+  const [lastSelection, setLastSelection] = useState([]);
 
   const [report, setReport] = useState(null);
   const [generating, setGenerating] = useState(false);
@@ -231,39 +239,122 @@ export default function Reports() {
     }
   }, [isAdmin, activeTab, searchParams, fetchCommercialReport, fetchCommercialSummary]);
 
-  // Auto-calc quantity derives from the selection. It is recomputed in the
-  // event handlers that change the inputs — recipes load exactly once in the
-  // mount fetch while the loading skeleton (and no selection UI) is showing,
-  // so selection/checkbox changes are the only post-load triggers, matching
-  // the old [selectedRecipes, autoCalc, recipes] effect 1:1.
-  const computeAutoQty = (selected) =>
-    String(recipes
-      .filter(r => selected.includes(r.name))
-      .reduce((sum, r) => sum + (r.total_quantity || 0), 0));
+  // A recipe can only produce what its invoice still owes: the prefilled
+  // quantity is the remainder, and a fully produced product has no row.
+  const remainingOf = (product) => {
+    const remaining = Number(product.remaining_qty);
+    if (Number.isFinite(remaining)) return Math.max(remaining, 0);
+    return Math.max(
+      (Number(product.invoiced_qty) || 0) - (Number(product.produced_qty) || 0),
+      0,
+    );
+  };
+  const qtyKey = (recipeId, product) =>
+    `${recipeId}::${String(product.product_name || '').toLowerCase()}`;
 
-  const toggleRecipe = (name) => {
-    const next = selectedRecipes.includes(name)
-      ? selectedRecipes.filter(n => n !== name)
-      : [...selectedRecipes, name];
-    setSelectedRecipes(next);
-    if (autoCalc && next.length > 0) setProductionQty(computeAutoQty(next));
+  const loadSource = useCallback(async (recipeId, force = false) => {
+    const recipe = recipes.find(r => r.id === recipeId);
+    if (!recipe) return;
+    if (recipe.invoice_id == null) {
+      sourcesRef.current[recipeId] = 'error';
+      setSources(prev => ({
+        ...prev,
+        [recipeId]: {
+          status: 'error',
+          error: 'This recipe is not linked to an invoice.',
+          products: [],
+        },
+      }));
+      return;
+    }
+    const seen = sourcesRef.current[recipeId];
+    if (!force && seen && seen !== 'error') return;
+    sourcesRef.current[recipeId] = 'loading';
+    setSources(prev => ({ ...prev, [recipeId]: { status: 'loading', products: [] } }));
+    try {
+      const res = await apiFetch(`/api/invoices/${recipe.invoice_id}/production-source`);
+      const data = await res.json();
+      const products = (data.products || []).filter(p => p.on_invoice !== false);
+      sourcesRef.current[recipeId] = 'ready';
+      setSources(prev => ({
+        ...prev,
+        [recipeId]: { status: 'ready', products },
+      }));
+      setQuantities(prev => {
+        const next = { ...prev };
+        products.forEach(product => {
+          const key = qtyKey(recipeId, product);
+          if (next[key] === undefined) next[key] = String(remainingOf(product));
+        });
+        return next;
+      });
+    } catch (err) {
+      // A failed read is not an empty invoice: keep the two visibly distinct.
+      sourcesRef.current[recipeId] = 'error';
+      setSources(prev => ({
+        ...prev,
+        [recipeId]: {
+          status: 'error',
+          error: err.message || 'Could not load invoice products',
+          products: [],
+        },
+      }));
+    }
+  }, [apiFetch, recipes]);
+
+  useEffect(() => {
+    if (activeTab !== 'production') return;
+    selectedRecipeIds.forEach(id => { loadSource(id); });
+  }, [activeTab, selectedRecipeIds, loadSource]);
+
+  const toggleRecipe = (id) => {
+    if (selectedRecipeIds.includes(id)) {
+      setSelectedRecipeIds(prev => prev.filter(x => x !== id));
+      setQuantities(prev => {
+        const next = {};
+        Object.entries(prev).forEach(([key, value]) => {
+          if (!key.startsWith(`${id}::`)) next[key] = value;
+        });
+        return next;
+      });
+      return;
+    }
+    setSelectedRecipeIds(prev => [...prev, id]);
   };
 
+  // Only formulated products with a positive quantity can be reported on; an
+  // unformulated product would 400 the whole request, so it is left out.
+  const buildSelection = () => selectedRecipeIds
+    .map(recipeId => {
+      const products = (sources[recipeId]?.products || [])
+        .filter(product => product.formulated)
+        .map(product => ({
+          product_name: product.product_name,
+          quantity: Number(quantities[qtyKey(recipeId, product)]),
+        }))
+        .filter(output => Number.isFinite(output.quantity) && output.quantity > 0);
+      return { recipe_id: recipeId, outputs: products };
+    })
+    .filter(selection => selection.outputs.length > 0);
+
+  const canGenerate = selectedRecipeIds.length > 0 && buildSelection().length > 0;
+
   const handleGenerate = async () => {
-    if (selectedRecipes.length === 0) return toast.error('Select at least one recipe');
+    const selection = buildSelection();
+    if (selection.length === 0) {
+      return toast.error('Enter a quantity for at least one formulated product');
+    }
     setGenerating(true);
     try {
       const res = await apiFetch('/api/reports/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          recipes: selectedRecipes,
-          qty: parseFloat(productionQty) || 0
-        })
+        body: JSON.stringify({ recipes: selection })
       });
       const data = await res.json();
       if (data.report) {
         setReport(data);
+        setLastSelection(selection);
         toast.success('Report generated');
       }
     } catch (err) {
@@ -274,12 +365,14 @@ export default function Reports() {
   };
 
   const handleExport = async () => {
-    if (!report) return;
+    if (!report || lastSelection.length === 0) return;
     try {
       const res = await apiFetch('/api/reports/export', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ recipes: report.recipes, qty: report.qty })
+        // Same selection the table came from — report.recipes are server
+        // recipe rows, which the export route rejects.
+        body: JSON.stringify({ recipes: lastSelection })
       });
       const data = await res.json();
       if (data.filename) toast.success('Exported to: ' + data.filename);
@@ -652,48 +745,119 @@ export default function Reports() {
       {activeTab === 'production' && (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2 space-y-4">
-            {/* Recipe Selection */}
+            {/* Invoice recipe selection */}
             <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 shadow-xs">
-              <h3 className="text-base font-semibold text-slate-900 dark:text-white mb-4">Select Recipes</h3>
+              <h3 className="text-base font-semibold text-slate-900 dark:text-white mb-4">Select Invoice Recipes</h3>
               {recipes.length === 0 ? (
                 <p className="text-sm text-slate-400 dark:text-slate-500 py-4 text-center">
-                  No recipes found. Create recipes first.
+                  No recipes found. Create a recipe from an invoice first.
                 </p>
               ) : (
                 <div className="space-y-2">
                   {recipes.map(recipe => {
-                    const isSelected = selectedRecipes.includes(recipe.name);
+                    const isSelected = selectedRecipeIds.includes(recipe.id);
+                    const source = sources[recipe.id];
+                    const products = source?.products || [];
+                    const remaining = products.filter(p => remainingOf(p) > 0);
+                    const leftover = products.filter(p => remainingOf(p) === 0);
                     return (
-                      <button
-                        key={recipe.name}
-                        onClick={() => toggleRecipe(recipe.name)}
-                        className={clsx(
-                          'w-full flex items-center gap-3 p-3.5 rounded-xl border-2 text-left transition-all cursor-pointer',
-                          isSelected
-                            ? 'border-blue-500 bg-blue-50/50 dark:bg-blue-950/20 dark:border-blue-600'
-                            : 'border-slate-200 dark:border-slate-700 hover:border-slate-300 dark:hover:border-slate-600'
-                        )}
-                      >
-                        <div className={clsx(
-                          'flex h-5 w-5 shrink-0 items-center justify-center rounded-md border-2',
-                          isSelected
-                            ? 'border-blue-500 bg-blue-500'
-                            : 'border-slate-300 dark:border-slate-600'
-                        )}>
-                          {isSelected && <CheckCircle2 className="h-3 w-3 text-white" />}
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-2">
-                            <BookOpen className={clsx('h-4 w-4', isSelected ? 'text-blue-600 dark:text-blue-400' : 'text-slate-400')} />
-                            <span className={clsx('text-sm font-semibold', isSelected ? 'text-blue-700 dark:text-blue-300' : 'text-slate-800 dark:text-white')}>
-                              {recipe.name}
-                            </span>
+                      <div key={recipe.id}>
+                        <button
+                          onClick={() => toggleRecipe(recipe.id)}
+                          className={clsx(
+                            'w-full flex items-center gap-3 p-3.5 rounded-xl border-2 text-left transition-all cursor-pointer',
+                            isSelected
+                              ? 'border-blue-500 bg-blue-50/50 dark:bg-blue-950/20 dark:border-blue-600'
+                              : 'border-slate-200 dark:border-slate-700 hover:border-slate-300 dark:hover:border-slate-600'
+                          )}
+                        >
+                          <div className={clsx(
+                            'flex h-5 w-5 shrink-0 items-center justify-center rounded-md border-2',
+                            isSelected
+                              ? 'border-blue-500 bg-blue-500'
+                              : 'border-slate-300 dark:border-slate-600'
+                          )}>
+                            {isSelected && <CheckCircle2 className="h-3 w-3 text-white" />}
                           </div>
-                          <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 ml-6">
-                            Qty: {formatNumber(recipe.total_quantity)} {recipe.water_percentage > 0 ? ` | Water: ${recipe.water_percentage}%` : ''}
-                          </p>
-                        </div>
-                      </button>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2">
+                              <BookOpen className={clsx('h-4 w-4', isSelected ? 'text-blue-600 dark:text-blue-400' : 'text-slate-400')} />
+                              <span className={clsx('text-sm font-semibold', isSelected ? 'text-blue-700 dark:text-blue-300' : 'text-slate-800 dark:text-white')}>
+                                {recipe.name}
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 ml-6">
+                              {recipe.invoice_number || 'No invoice'} · {recipe.product_count ?? 0} products · {recipe.formulated_count ?? 0} formulated
+                            </p>
+                          </div>
+                        </button>
+
+                        {isSelected && (
+                          <div className="mt-2 ml-8 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50/50 dark:bg-slate-800/30 p-3">
+                            {source?.status === 'loading' && (
+                              <p className="text-xs text-slate-500 dark:text-slate-400">Loading invoice products…</p>
+                            )}
+                            {source?.status === 'error' && (
+                              <div className="space-y-1.5">
+                                <p className="text-xs font-medium text-rose-600 dark:text-rose-400">Could not load invoice products</p>
+                                <p className="text-[11px] text-slate-500 dark:text-slate-400">{source.error}</p>
+                                <button
+                                  onClick={() => loadSource(recipe.id, true)}
+                                  className="text-[11px] font-medium text-blue-600 dark:text-blue-400 hover:underline cursor-pointer"
+                                >
+                                  Retry invoice products
+                                </button>
+                              </div>
+                            )}
+                            {source?.status === 'ready' && (
+                              <div className="space-y-2">
+                                {remaining.length === 0 && (
+                                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                                    Every product on {recipe.invoice_number || 'this invoice'} has been fully produced.
+                                  </p>
+                                )}
+                                {remaining.map(product => {
+                                  const key = qtyKey(recipe.id, product);
+                                  const qty = quantities[key] ?? '';
+                                  return (
+                                    <div key={product.product_name} className="grid grid-cols-[1fr_auto] items-center gap-2">
+                                      <div className="min-w-0">
+                                        <label htmlFor={key} className="block text-xs font-medium text-slate-700 dark:text-slate-300">
+                                          {product.product_name}
+                                        </label>
+                                        <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                                          Remaining {formatNumber(remainingOf(product))} {product.unit}
+                                        </span>
+                                        {!product.formulated && (
+                                          <span className="ml-2 text-[11px] text-amber-600 dark:text-amber-400">
+                                            no formulation yet — add chemicals in the recipe
+                                          </span>
+                                        )}
+                                      </div>
+                                      <input
+                                        id={key}
+                                        aria-label={`Quantity for ${product.product_name}`}
+                                        type="number"
+                                        min="0"
+                                        step="any"
+                                        value={qty}
+                                        disabled={!product.formulated}
+                                        onChange={e => setQuantities(prev => ({ ...prev, [key]: e.target.value }))}
+                                        className="w-28 px-2 py-1.5 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
+                                      />
+                                    </div>
+                                  );
+                                })}
+                                {leftover.length > 0 && (
+                                  <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                                    Fully produced: {leftover.map(p => p.product_name).join(', ')}
+                                  </p>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
                     );
                   })}
                 </div>
@@ -754,8 +918,13 @@ export default function Reports() {
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex flex-wrap gap-1">
+                            {item.products && item.products.map((p, i) => (
+                              <span key={`p-${i}`} className="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300">
+                                {p.product_name}: {formatNumber(p.required_qty)} {item.unit} ({p.percentage}%)
+                              </span>
+                            ))}
                             {item.recipes && item.recipes.map((r, i) => (
-                              <span key={i} className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">
+                              <span key={`r-${i}`} className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">
                                 {r.recipe_name}: {formatNumber(r.qty_from_this_recipe)}
                               </span>
                             ))}
@@ -771,37 +940,15 @@ export default function Reports() {
 
           {/* Sidebar */}
           <div className="space-y-4">
-            {/* Production Quantity */}
+            {/* Selection summary */}
             <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 shadow-xs">
-              <h3 className="text-base font-semibold text-slate-900 dark:text-white mb-3">Production Quantity</h3>
-              <div className="space-y-3">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={autoCalc}
-                    onChange={e => {
-                      const checked = e.target.checked;
-                      setAutoCalc(checked);
-                      if (checked && selectedRecipes.length > 0) {
-                        setProductionQty(computeAutoQty(selectedRecipes));
-                      }
-                    }}
-                    className="h-4 w-4 rounded border-slate-300 dark:border-slate-600 text-blue-600 focus:ring-blue-500"
-                  />
-                  <span className="text-sm text-slate-700 dark:text-slate-300">Auto-calculate from recipes</span>
-                </label>
-                <input
-                  type="number"
-                  value={productionQty}
-                  onChange={e => { setAutoCalc(false); setProductionQty(e.target.value); }}
-                  placeholder="0"
-                  disabled={autoCalc}
-                  className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
-                />
-                <p className="text-[11px] text-slate-400 dark:text-slate-500">
-                  {selectedRecipes.length} recipe{selectedRecipes.length !== 1 ? 's' : ''} selected
-                </p>
-              </div>
+              <h3 className="text-base font-semibold text-slate-900 dark:text-white mb-3">Selection</h3>
+              <p className="text-[11px] text-slate-400 dark:text-slate-500">
+                Quantities come from each invoice's remainder and stay editable.
+              </p>
+              <p className="mt-2 text-sm text-slate-700 dark:text-slate-300">
+                {selectedRecipeIds.length} invoice recipe{selectedRecipeIds.length !== 1 ? 's' : ''} selected
+              </p>
             </div>
 
             {/* Summary */}
@@ -854,7 +1001,7 @@ export default function Reports() {
                 icon={BarChart3}
                 loading={generating}
                 onClick={handleGenerate}
-                disabled={selectedRecipes.length === 0}
+                disabled={!canGenerate}
               >
                 Generate Report
               </Button>

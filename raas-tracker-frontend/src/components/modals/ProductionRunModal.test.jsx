@@ -25,36 +25,41 @@ function jsonResponse(data, ok = true, status = 200) {
   return { ok, status, json: async () => data, headers: { get: () => null } };
 }
 
-const COMPANIES = [{ id: 7, name: 'Acme' }];
-const RECIPES = [
-  { id: 1, name: 'Cleaner X', total_quantity: 1500, company_id: 7 },
-  { id: 3, name: 'Cleaner Y', total_quantity: 800, company_id: 7 },
-  { id: 2, name: 'Other Recipe', total_quantity: 900, company_id: 8 },
-];
-const SALES = [
-  { id: 5, pi_number: 'PI-9', client_name: 'Acme LLC', company_id: 7 },
-  { id: 6, pi_number: 'PI-10', client_name: 'Beta', company_id: 8 },
-];
-const PRODUCTS = [{ product_name: 'Cleaner', quantity: 5000, unit: 'KG', item_no: '1001001' }];
-const INVOICES = [{ invoice_id: 31, invoice_number: 'INV-31', status: 'issued' }];
-const BUDGET = {
-  lines: [{ sale_item_id: 501, product_name: 'Cleaner', unit: 'KG', remaining: 5000 }],
-  has_line_less_invoices: false,
+const RECIPE = {
+  id: 1, name: 'INV-9 · Cleaner', company_id: 7, invoice_id: 9,
+  invoice_number: 'INV-9', pi_number: 'PI-9', client_name: 'Acme LLC',
+  company_name: 'Acme',
 };
 
-function installFetch({ companies = COMPANIES, companiesFailTimes = 0, companiesError = 'Companies service unavailable', produceStatus = 201, produceBody = { runs: [] }, invoices = INVOICES, sales = SALES, invoiceStatus = 201, invoiceBody = null, invoiceLines = BUDGET } = {}) {
+const PRODUCTS = [
+  {
+    id: 11, on_invoice: true, product_name: 'Cleaner', unit: 'KG',
+    invoiced_qty: 5000, produced_qty: 1000, remaining_qty: 4000,
+    formulated: true, items: [{ id: 1, chemical_name: 'NaOH', percentage: 40 }],
+  },
+  {
+    id: 12, on_invoice: true, product_name: 'Polisher', unit: 'KG',
+    invoiced_qty: 3000, produced_qty: 3000, remaining_qty: 0,
+    formulated: true, items: [{ id: 2, chemical_name: 'Wax', percentage: 20 }],
+  },
+  {
+    id: 13, on_invoice: true, product_name: 'Degreaser', unit: 'KG',
+    invoiced_qty: 900, produced_qty: 0, remaining_qty: 900,
+    formulated: false, items: [],
+  },
+];
+
+function installFetch({
+  products = PRODUCTS,
+  sourceFails = 0,
+  sourceError = 'Invoice service unavailable',
+  produceStatus = 201,
+  produceBody = { runs: [] },
+} = {}) {
   const posts = [];
-  const invoicePosts = [];
-  const invoiceDeletes = [];
-  const calls = [];
-  let companyFailsLeft = companiesFailTimes;
-  posts.invoicePosts = invoicePosts;
-  posts.invoiceDeletes = invoiceDeletes;
-  posts.calls = calls;
+  let failsLeft = sourceFails;
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
     const u = String(url);
-    const method = options?.method || 'GET';
-    calls.push({ url: u, method });
     if (u.includes('/api/auth/me')) {
       return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
     }
@@ -62,39 +67,21 @@ function installFetch({ companies = COMPANIES, companiesFailTimes = 0, companies
       posts.push({ url: u, body: options?.body ? JSON.parse(options.body) : null });
       return jsonResponse(produceBody, produceStatus < 400, produceStatus);
     }
-    if (u.includes('/api/companies')) {
-      if (companyFailsLeft > 0) {
-        companyFailsLeft -= 1;
-        return jsonResponse({ error: companiesError }, false, 500);
+    if (u.includes('/production-source')) {
+      if (failsLeft > 0) {
+        failsLeft -= 1;
+        return jsonResponse({ error: sourceError }, false, 500);
       }
-      return jsonResponse(companies);
+      return jsonResponse({
+        invoice_id: 9, invoice_number: 'INV-9', recipe: RECIPE, products,
+      });
     }
-    if (u.includes('/api/recipes')) return jsonResponse(RECIPES);
-    if (u.includes('/api/production-source')) return jsonResponse({ sale_id: 5, products: PRODUCTS });
-    if (u.includes('/invoice-lines')) return jsonResponse(invoiceLines);
-    if (u.includes('/invoices') && method === 'POST') {
-      const body = options?.body ? JSON.parse(options.body) : null;
-      invoicePosts.push({ url: u, body });
-      const created = invoiceBody || {
-        invoice_id: 42, invoice_number: body?.invoice_number, status: 'planned', amount: 2000,
-      };
-      return jsonResponse(created, invoiceStatus < 400, invoiceStatus);
-    }
-    if (u.includes('/invoices') && method === 'DELETE') {
-      invoiceDeletes.push({ url: u, method });
-      return jsonResponse({ success: true });
-    }
-    if (u.includes('/invoices')) return jsonResponse(invoices);
-    if (u.includes('/api/sales')) return jsonResponse(sales);
     return jsonResponse({});
   }));
   return posts;
 }
 
-const RECIPE = { name: 'Cleaner X', total_quantity: 1500, company_id: 7 };
-const RECIPE_ITEMS = [{ chemical_name: 'NaOH' }, { chemical_name: 'Water' }];
-
-function renderModal({ recipe = RECIPE, recipeItems = RECIPE_ITEMS, onSaved = vi.fn(), onClose = vi.fn() } = {}) {
+function renderModal({ recipe = RECIPE, onSaved = vi.fn(), onClose = vi.fn() } = {}) {
   render(
     <MemoryRouter>
       <AuthProvider>
@@ -102,7 +89,6 @@ function renderModal({ recipe = RECIPE, recipeItems = RECIPE_ITEMS, onSaved = vi
           isOpen
           onClose={onClose}
           recipe={recipe}
-          recipeItems={recipeItems}
           onSaved={onSaved}
         />
       </AuthProvider>
@@ -111,334 +97,162 @@ function renderModal({ recipe = RECIPE, recipeItems = RECIPE_ITEMS, onSaved = vi
   return { onSaved, onClose };
 }
 
-async function pickCompanyAndPi() {
-  fireEvent.change(await screen.findByLabelText('Company'), { target: { value: '7' } });
-  fireEvent.change(screen.getByLabelText('PI / Sale'), { target: { value: '5' } });
-  await waitFor(() => expect(screen.getByLabelText('Quantity').value).toBe('5000'));
+async function waitForSource() {
+  return screen.findByLabelText('Quantity for Cleaner');
 }
 
-describe('ProductionRunModal', () => {
-  it('renders the required fields with the current recipe pre-listed', async () => {
-    installFetch();
+describe('ProductionRunModal invoice scope', () => {
+  it('fixes the recipe and its invoice instead of asking for a PI or invoice', async () => {
+    const posts = installFetch();
     renderModal();
 
-    const company = await screen.findByLabelText('Company');
-    expect(company.value).toBe('7');
-    screen.getByLabelText('PI / Sale');
-    screen.getByLabelText('Invoice number');
+    // The run can only ever land on the recipe's own invoice, so there is
+    // nothing to pick — and nothing to cross-link.
+    expect(await screen.findByText('INV-9')).toBeTruthy();
+    expect(screen.queryByLabelText('PI / Sale')).toBeNull();
+    expect(screen.queryByLabelText('Invoice number')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Add recipe' })).toBeNull();
+
     screen.getByLabelText('Material number');
     screen.getByLabelText('Packing');
     screen.getByLabelText('Batch number');
     screen.getByLabelText('Production date');
-    screen.getByLabelText('Recipe');
-    expect(screen.getByLabelText('Quantity').value).toBe('1500');
-    screen.getByRole('button', { name: 'Add recipe' });
-    screen.getByRole('button', { name: 'Start Production' });
-  });
-
-  it('requires a company and a PI before starting', async () => {
-    const posts = installFetch();
-    renderModal({ recipe: { name: 'Cleaner X', total_quantity: 1500, company_id: null } });
-
-    fireEvent.click(await screen.findByRole('button', { name: 'Start Production' }));
-    expect(await screen.findByText('Company is required')).toBeTruthy();
-
-    fireEvent.change(await screen.findByLabelText('Company'), { target: { value: '7' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
-    expect(await screen.findByText('PI / Sale is required')).toBeTruthy();
-
     expect(posts).toHaveLength(0);
   });
 
-  it('auto-fills quantity and material number from the PI, then posts the run', async () => {
+  it('prefills each product with its remaining invoice quantity', async () => {
+    installFetch();
+    renderModal();
+
+    const cleaner = await waitForSource();
+    expect(cleaner.value).toBe('4000');
+    // Fully produced products have nothing left to prefill.
+    expect(screen.queryByLabelText('Quantity for Polisher')).toBeNull();
+    expect(screen.getByText(/Fully produced/i).textContent).toContain('Polisher');
+    // An unformulated product is not silently produced.
+    const degreaser = screen.getByLabelText('Quantity for Degreaser');
+    expect(degreaser.disabled).toBe(true);
+    expect(screen.getByText(/no formulation yet/i)).toBeTruthy();
+  });
+
+  it('posts per-product outputs to the recipe id, never legacy fields', async () => {
     const posts = installFetch();
-    const { onSaved } = renderModal();
+    const { onSaved, onClose } = renderModal();
 
-    await pickCompanyAndPi();
-    expect(screen.getByLabelText('Material number').value).toBe('1001001');
-
-    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: '31' } });
+    await waitForSource();
+    fireEvent.change(screen.getByLabelText('Material number'), { target: { value: '1001001' } });
     fireEvent.change(screen.getByLabelText('Packing'), { target: { value: '30 Kg Drum' } });
     fireEvent.change(screen.getByLabelText('Batch number'), { target: { value: 'B-77' } });
-    fireEvent.change(screen.getByLabelText('Quantity'), { target: { value: '4000' } });
     fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
 
     await waitFor(() => expect(posts).toHaveLength(1));
-    expect(posts[0].url).toContain('/api/recipes/Cleaner%20X/produce');
+    expect(posts[0].url).toContain('/api/recipes/by-id/1/produce');
     expect(posts[0].body).toMatchObject({
       company_id: 7,
-      production_qty: 4000,
       material_number: '1001001',
       packing: '30 Kg Drum',
       batch_number: 'B-77',
-      invoice_number: 'INV-31',
-      invoice_ids: [31],
-      sale_ids: [5],
-      recipes: [{ recipe_name: 'Cleaner X', qty: 4000 }],
+      outputs: [{ product_name: 'Cleaner', quantity: 4000 }],
     });
     expect(posts[0].body.production_date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    // The server derives sale and invoice from the recipe; the client cannot.
+    expect(posts[0].body).not.toHaveProperty('production_qty');
+    expect(posts[0].body).not.toHaveProperty('sale_ids');
+    expect(posts[0].body).not.toHaveProperty('invoice_ids');
+    expect(posts[0].body).not.toHaveProperty('recipes');
     await waitFor(() => expect(onSaved).toHaveBeenCalled());
-    expect(toast.success).toHaveBeenCalled();
-    // Picking an existing invoice never creates a row.
-    expect(posts.invoicePosts).toHaveLength(0);
+    expect(onClose).toHaveBeenCalled();
+    expect(toast.success).toHaveBeenCalledWith('Production run recorded');
   });
 
-  it('creates the invoice row before producing when a new number is typed', async () => {
+  it('submits an edited quantity and warns above the invoice remainder', async () => {
     const posts = installFetch();
     renderModal();
 
-    await pickCompanyAndPi();
-    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
-    fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-NEW-7' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
+    const cleaner = await waitForSource();
+    fireEvent.change(cleaner, { target: { value: '4500' } });
 
+    expect(screen.getByText(/exceeds the invoice remainder/i).textContent)
+      .toContain('4,000.00 KG');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
     await waitFor(() => expect(posts).toHaveLength(1));
-    expect(posts.invoicePosts).toHaveLength(1);
-    expect(posts.invoicePosts[0].url).toContain('/api/sales/5/invoices');
-    // Money is server-derived from the lines, and the lines are stated here:
-    // the API refuses an invoice without them, so there is no blind create.
-    expect(posts.invoicePosts[0].body).toEqual({
-      invoice_number: 'INV-NEW-7',
-      invoice_date: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/),
-      lines: [{ sale_item_id: 501, quantity: 5000 }],
-    });
-    expect(posts.invoicePosts[0].body).not.toHaveProperty('amount');
-    // The invoice POST ran before the produce POST.
-    const invIdx = posts.calls.findIndex((c) => c.url.endsWith('/api/sales/5/invoices') && c.method === 'POST');
-    const prodIdx = posts.calls.findIndex((c) => c.url.includes('/produce'));
-    expect(invIdx).toBeGreaterThanOrEqual(0);
-    expect(prodIdx).toBeGreaterThan(invIdx);
-    expect(posts[0].body.invoice_number).toBe('INV-NEW-7');
-    expect(posts[0].body.invoice_ids).toEqual([42]);
-    // The server-derived amount is reported back to the operator.
-    expect(toast.success).toHaveBeenCalledWith(
-      'Production run recorded · invoiced $2,000.00'
-    );
+    // Over-production is warned, not capped by the client.
+    expect(posts[0].body.outputs).toEqual([{ product_name: 'Cleaner', quantity: 4500 }]);
   });
 
-  it('never asks for an invoice amount and explains the derived total', async () => {
-    installFetch({
-      sales: [{ id: 5, pi_number: 'PI-9', client_name: 'Acme LLC', company_id: 7, total_value: 5000 }],
-      invoices: [
-        { invoice_id: 31, invoice_number: 'INV-31', status: 'booked', amount: 1200, paid_amount: 200 },
-        { invoice_id: 32, invoice_number: 'INV-32', status: 'planned', amount: 800, paid_amount: 0 },
-      ],
-    });
-    renderModal();
-
-    await pickCompanyAndPi();
-    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
-    await screen.findByLabelText('New invoice number');
-    // No amount is asked for, whatever the sale total and prior invoices are.
-    expect(screen.queryByLabelText('Amount')).toBeNull();
-    expect(screen.queryByLabelText('Payment amount')).toBeNull();
-    expect(
-      screen.getByText(/every line of this pi that is not yet invoiced/i)
-    ).toBeTruthy();
-  });
-
-  it('refuses to create an invoice when the PI has nothing left to invoice', async () => {
-    // The run can still link an existing invoice, but "new" has no lines to
-    // carry — the API would 400, and a blind create used to mint a zero-amount
-    // row. Say so before producing so the run is not left half-done.
-    const posts = installFetch({
-      invoiceLines: {
-        lines: [{ sale_item_id: 501, product_name: 'Cleaner', unit: 'KG', remaining: 0 }],
-        has_line_less_invoices: false,
-      },
-    });
-    renderModal();
-
-    await pickCompanyAndPi();
-    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
-    fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-EMPTY' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
-
-    expect(await screen.findByText(/nothing left to invoice on this pi/i)).toBeTruthy();
-    expect(posts.invoicePosts).toHaveLength(0);
-    expect(posts).toHaveLength(0);
-    expect(toast.success).not.toHaveBeenCalled();
-  });
-
-  it('refuses to create an invoice when the PI has a header-only invoice', async () => {
-    // `remaining` cannot see a line-less invoice, so these lines would bill
-    // goods that are already on the books.
-    const posts = installFetch({
-      invoiceLines: { ...BUDGET, has_line_less_invoices: true },
-    });
-    renderModal();
-
-    await pickCompanyAndPi();
-    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
-    fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-DUP' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
-
-    expect(await screen.findByText(/older invoice with no lines/i)).toBeTruthy();
-    expect(posts.invoicePosts).toHaveLength(0);
-    expect(posts).toHaveLength(0);
-  });
-
-  it('omits the amount from the create body for a sale with no invoices', async () => {
-    const posts = installFetch({ invoices: [] });
-    renderModal();
-
-    await pickCompanyAndPi();
-    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
-    fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-FIRST' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
-
-    await waitFor(() => expect(posts).toHaveLength(1));
-    expect(posts.invoicePosts).toHaveLength(1);
-    expect(posts.invoicePosts[0].body).toEqual({
-      invoice_number: 'INV-FIRST',
-      invoice_date: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/),
-      lines: [{ sale_item_id: 501, quantity: 5000 }],
-    });
-    expect(posts[0].body.invoice_ids).toEqual([42]);
-  });
-
-  it('still needs a number for a new invoice, but never an amount', async () => {
+  it('omits zero quantities from the outputs', async () => {
     const posts = installFetch();
     renderModal();
 
-    await pickCompanyAndPi();
-    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
-    await screen.findByLabelText('New invoice number');
+    const cleaner = await waitForSource();
+    fireEvent.change(cleaner, { target: { value: '0' } });
     fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
 
-    expect(await screen.findByText('New invoice number is required')).toBeTruthy();
-    expect(posts.invoicePosts).toHaveLength(0);
+    expect(await screen.findByText('Enter a quantity for at least one product')).toBeTruthy();
     expect(posts).toHaveLength(0);
   });
 
-  it('shows the invoice-create error inline and does not produce', async () => {
-    const posts = installFetch({
-      invoiceStatus: 400,
-      invoiceBody: { error: 'No uninvoiced PI lines remain on this sale' },
-    });
-    const { onSaved } = renderModal();
-
-    await pickCompanyAndPi();
-    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
-    fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-DONE' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
-
-    expect(await screen.findByText('No uninvoiced PI lines remain on this sale')).toBeTruthy();
-    expect(posts.invoicePosts).toHaveLength(1);
-    expect(posts).toHaveLength(0);
-    expect(onSaved).not.toHaveBeenCalled();
-    expect(toast.success).not.toHaveBeenCalled();
-  });
-
-  it('sends every recipe row and uses the first row for production_qty', async () => {
-    const posts = installFetch();
+  it('never claims the invoice is fully produced when its source failed', async () => {
+    installFetch({ sourceFails: 10 });
     renderModal();
 
-    await pickCompanyAndPi();
-    fireEvent.click(screen.getByRole('button', { name: 'Add recipe' }));
-    fireEvent.change(screen.getByLabelText('Recipe 2'), { target: { value: 'Cleaner Y' } });
-    fireEvent.change(screen.getByLabelText('Recipe qty 2'), { target: { value: '250' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
-
-    await waitFor(() => expect(posts).toHaveLength(1));
-    expect(posts[0].body.production_qty).toBe(5000);
-    expect(posts[0].body.recipes).toEqual([
-      { recipe_name: 'Cleaner X', qty: 5000 },
-      { recipe_name: 'Cleaner Y', qty: 250 },
-    ]);
-  });
-
-  it('shows the server 400 message inline and does not close', async () => {
-    installFetch({ produceStatus: 400, produceBody: { error: 'Recipe has no ingredients' } });
-    const { onSaved } = renderModal();
-
-    await pickCompanyAndPi();
-    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
-
-    expect(await screen.findByText('Recipe has no ingredients')).toBeTruthy();
-    expect(onSaved).not.toHaveBeenCalled();
-    expect(toast.success).not.toHaveBeenCalled();
-  });
-
-  it('voids the just-created invoice when produce fails, so a retry starts clean', async () => {
-    const posts = installFetch({
-      produceStatus: 400,
-      produceBody: { error: 'Recipe has no ingredients' },
-    });
-    const { onSaved } = renderModal();
-
-    await pickCompanyAndPi();
-    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: 'new' } });
-    fireEvent.change(await screen.findByLabelText('New invoice number'), { target: { value: 'INV-NEW-7' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
-
-    expect(await screen.findByText('Recipe has no ingredients')).toBeTruthy();
-    expect(onSaved).not.toHaveBeenCalled();
-    expect(posts.invoicePosts).toHaveLength(1);
-    // The invoice row exists only to link the run — without the run it would
-    // be orphaned, and a retry with the same number would hit a duplicate.
-    await waitFor(() => expect(posts.invoiceDeletes).toHaveLength(1));
-    expect(posts.invoiceDeletes[0].url).toContain('/api/sales/5/invoices/42');
-    expect(posts.invoiceDeletes[0].method).toBe('DELETE');
-  });
-
-  it('does not void anything when the invoice already existed (no create)', async () => {
-    const posts = installFetch({ produceStatus: 400, produceBody: { error: 'Recipe has no ingredients' } });
-    renderModal();
-
-    await pickCompanyAndPi();
-    fireEvent.change(screen.getByLabelText('Invoice number'), { target: { value: '31' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
-
-    expect(await screen.findByText('Recipe has no ingredients')).toBeTruthy();
-    expect(posts.invoicePosts).toHaveLength(0);
-    expect(posts.invoiceDeletes).toHaveLength(0);
-  });
-
-  it('shows an empty state when no companies exist', async () => {
-    installFetch({ companies: [] });
-    renderModal({ recipe: { name: 'Cleaner X', total_quantity: 1500, company_id: null } });
-
-    expect(await screen.findByText('No companies registered yet.')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
-    expect(await screen.findByText('Company is required')).toBeTruthy();
-  });
-
-  it('never claims the company master is empty when the reference fetch fails', async () => {
-    installFetch({ companiesFailTimes: 10 });
-    renderModal({ recipe: { name: 'Cleaner X', total_quantity: 1500, company_id: 7 } });
-
-    // A failed fetch is not evidence that no companies exist — say so.
-    expect(await screen.findByText('Could not load companies')).toBeTruthy();
-    expect(screen.getByText('Companies service unavailable')).toBeTruthy();
-    expect(screen.queryByText('No companies registered yet.')).toBeNull();
-    expect(screen.queryByText('No PIs found for this company yet.')).toBeNull();
-    expect(screen.queryByText('No recipes registered for this company yet.')).toBeNull();
+    expect(await screen.findByText('Could not load invoice products')).toBeTruthy();
+    expect(screen.getByText('Invoice service unavailable')).toBeTruthy();
+    expect(screen.queryByText(/fully produced/i)).toBeNull();
+    expect(screen.queryByText(/no formulated product/i)).toBeNull();
+    expect(screen.getByRole('button', { name: 'Start Production' }).disabled).toBe(true);
     screen.getByRole('button', { name: 'Retry' });
   });
 
-  it('recovers the reference lists when the failure is retried', async () => {
-    // The first companies call fails; the retry hits a healthy API.
-    installFetch({ companiesFailTimes: 1 });
+  it('recovers the product list when the failure is retried', async () => {
+    installFetch({ sourceFails: 1 });
     renderModal();
 
-    expect(await screen.findByText('Could not load companies')).toBeTruthy();
+    expect(await screen.findByText('Could not load invoice products')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
-    const company = await screen.findByLabelText('Company');
-    expect(company.value).toBe('7');
-    expect(screen.queryByText('Could not load companies')).toBeNull();
+
+    expect((await waitForSource()).value).toBe('4000');
+    expect(screen.queryByText('Could not load invoice products')).toBeNull();
   });
 
-  it('reads the paginated sales envelope instead of expecting a bare array', async () => {
-    // GET /api/sales answers {sales, total}. Treating it as an array left the
-    // PI list empty ("No PIs found") for a company that has plenty.
-    installFetch({ sales: { sales: SALES, total: SALES.length } });
+  it('says every product is fully produced and refuses an empty run', async () => {
+    const posts = installFetch({ products: [PRODUCTS[1]] });
     renderModal();
-    fireEvent.change(await screen.findByLabelText('Company'), { target: { value: '7' } });
 
-    const option = await screen.findByRole('option', { name: /PI-9/ });
-    expect(option).toBeTruthy();
-    expect(screen.queryByText('No PIs found for this company yet.')).toBeNull();
-    expect(screen.queryByRole('option', { name: /PI-10/ })).toBeNull();
+    expect(await screen.findByText(/fully produced/i)).toBeTruthy();
+    const start = screen.getByRole('button', { name: 'Start Production' });
+    expect(start.disabled).toBe(true);
+    fireEvent.click(start);
+    expect(posts).toHaveLength(0);
+  });
+
+  it('refuses a run when no remaining product has a formulation', async () => {
+    const posts = installFetch({ products: [PRODUCTS[2]] });
+    renderModal();
+
+    expect(await screen.findByText(/no formulated product/i)).toBeTruthy();
+    const start = screen.getByRole('button', { name: 'Start Production' });
+    expect(start.disabled).toBe(true);
+    fireEvent.click(start);
+    expect(posts).toHaveLength(0);
+  });
+
+  it('shows the server error inline and does not close', async () => {
+    installFetch({
+      produceStatus: 400,
+      produceBody: { error: 'no unit conversion from KG to L for chemical NaOH' },
+    });
+    const { onSaved, onClose } = renderModal();
+
+    await waitForSource();
+    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
+
+    expect(await screen.findByText(
+      'no unit conversion from KG to L for chemical NaOH',
+    )).toBeTruthy();
+    expect(onSaved).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
   });
 });
