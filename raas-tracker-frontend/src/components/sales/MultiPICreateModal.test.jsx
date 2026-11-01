@@ -84,7 +84,7 @@ describe('MultiPICreateModal batch wiring', () => {
     renderModal({ onSaved, postsOpts: { posts } });
 
     const company = await screen.findByLabelText('Company');
-    fireEvent.change(company, { target: { value: '7' } });
+    fireEvent.change(company, { target: { value: 'Acme' } });
 
     await fillDoc(1, 'PI-B0-TEST');
     fireEvent.click(screen.getByRole('button', { name: 'Add PI document' }));
@@ -105,7 +105,7 @@ describe('MultiPICreateModal batch wiring', () => {
     renderModal({ postsOpts: { posts } });
 
     const company = await screen.findByLabelText('Company');
-    fireEvent.change(company, { target: { value: '7' } });
+    fireEvent.change(company, { target: { value: 'Acme' } });
 
     await fillDoc(1, 'PI-B0-TEST');
     fireEvent.click(screen.getByRole('button', { name: 'Add PI document' }));
@@ -133,7 +133,7 @@ describe('MultiPICreateModal batch wiring', () => {
     });
 
     const company = await screen.findByLabelText('Company');
-    fireEvent.change(company, { target: { value: '7' } });
+    fireEvent.change(company, { target: { value: 'Acme' } });
 
     await fillDoc(1, 'PI-B0-TEST');
     fireEvent.click(screen.getByRole('button', { name: 'Add PI document' }));
@@ -152,7 +152,7 @@ describe('MultiPICreateModal batch wiring', () => {
     renderModal({ onSaved, postsOpts: { posts } });
 
     const company = await screen.findByLabelText('Company');
-    fireEvent.change(company, { target: { value: '7' } });
+    fireEvent.change(company, { target: { value: 'Acme' } });
 
     await fillDoc(1, 'PI-UNIT-TEST');
     fireEvent.change(screen.getByLabelText('Unit document 1 row 1'), {

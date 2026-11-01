@@ -76,8 +76,8 @@ function renderReviewWithCustomFetch(onSave, initialData = INITIAL) {
 describe('ReviewModal capture fields', () => {
   it('preselects the matching company from the register', async () => {
     renderReview(vi.fn());
-    const select = await screen.findByLabelText('Company');
-    await waitFor(() => expect(select.value).toBe('7'));
+    const input = await screen.findByLabelText('Company');
+    await waitFor(() => expect(input).toHaveValue('Acme'));
   });
 
   it('offers the product catalog as a dropdown for each row', async () => {
@@ -93,8 +93,8 @@ describe('ReviewModal capture fields', () => {
   it('saves company_id and per-row units', async () => {
     const saved = vi.fn(async () => {});
     renderReview(saved);
-    const select = await screen.findByLabelText('Company');
-    await waitFor(() => expect(select.value).toBe('7'));
+    const input = await screen.findByLabelText('Company');
+    await waitFor(() => expect(input).toHaveValue('Acme'));
     const units = screen.getAllByLabelText('Unit');
     expect(units[0].value).toBe('KG');
     fireEvent.change(units[0], { target: { value: 'DRUM' } });
@@ -119,8 +119,8 @@ describe('ReviewModal server error surfacing', () => {
       ]);
     });
     renderReview(failing);
-    const select = await screen.findByLabelText('Company');
-    await waitFor(() => expect(select.value).toBe('7'));
+    const input = await screen.findByLabelText('Company');
+    await waitFor(() => expect(input).toHaveValue('Acme'));
     fireEvent.click(screen.getByRole('button', { name: 'Save to PI Issued' }));
 
     expect(await screen.findByText('Validation failed')).toBeTruthy();
@@ -138,40 +138,40 @@ describe('Company auto-match tiered fuzzy', () => {
 
   it('tier 1: exact case-insensitive match auto-selects', async () => {
     renderReview(vi.fn(), { ...INITIAL, client_name: 'acme corp' }, [{ id: 1, name: 'ACME Corp' }]);
-    const select = await screen.findByLabelText('Company');
-    await waitFor(() => expect(select.value).toBe('1'));
+    const input = await screen.findByLabelText('Company');
+    await waitFor(() => expect(input).toHaveValue('ACME Corp'));
   });
 
   it('tier 2: prefix match (PI name is prefix of DB name) auto-selects', async () => {
     renderReview(vi.fn(), { ...INITIAL, client_name: 'COLOR CITY' }, [{ id: 2, name: 'COLOR CITY LTD.' }]);
-    const select = await screen.findByLabelText('Company');
-    await waitFor(() => expect(select.value).toBe('2'));
+    const input = await screen.findByLabelText('Company');
+    await waitFor(() => expect(input).toHaveValue('COLOR CITY LTD.'));
   });
 
   it('tier 2: prefix match (DB name is prefix of PI name) auto-selects', async () => {
     renderReview(vi.fn(), { ...INITIAL, client_name: 'ABC Corp Ltd' }, [{ id: 3, name: 'ABC' }]);
-    const select = await screen.findByLabelText('Company');
-    await waitFor(() => expect(select.value).toBe('3'));
+    const input = await screen.findByLabelText('Company');
+    await waitFor(() => expect(input).toHaveValue('ABC'));
   });
 
   it('tier 3: word-boundary contains — single match auto-selects', async () => {
     renderReview(vi.fn(), { ...INITIAL, client_name: 'HUEWASH LTW' }, [{ id: 4, name: 'HUEWASH LTW Soaping' }]);
-    const select = await screen.findByLabelText('Company');
-    await waitFor(() => expect(select.value).toBe('4'));
+    const input = await screen.findByLabelText('Company');
+    await waitFor(() => expect(input).toHaveValue('HUEWASH LTW Soaping'));
   });
 
   it('tier 3: multiple word-boundary matches → NO auto-select, toast warning', async () => {
     renderReview(vi.fn(), { ...INITIAL, client_name: 'CITY' }, [{ id: 5, name: 'CITY LTD' }, { id: 6, name: 'CITY BANK' }]);
-    const select = await screen.findByLabelText('Company');
-    await waitFor(() => expect(select.value).toBe('')); // no auto-select
+    const input = await screen.findByLabelText('Company');
+    await waitFor(() => expect(input).toHaveValue('')); // no auto-select
     expect(toast.warning).toHaveBeenCalledWith(expect.stringContaining('Multiple matches'));
   });
 
   it('tier 4: loose substring never auto-selects', async () => {
     // "TY BA" is a substring of "CITY BANK" but not a prefix or word-boundary match
     renderReview(vi.fn(), { ...INITIAL, client_name: 'TY BA' }, [{ id: 7, name: 'CITY BANK' }]);
-    const select = await screen.findByLabelText('Company');
-    await waitFor(() => expect(select.value).toBe(''));
+    const input = await screen.findByLabelText('Company');
+    await waitFor(() => expect(input).toHaveValue(''));
   });
 
   it('no companies → Save disabled, message shown', async () => {
@@ -223,8 +223,22 @@ describe('Company auto-match tiered fuzzy', () => {
     expect(screen.getByRole('button', { name: 'Save to PI Issued' }).disabled).toBe(true);
 
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
-    const select = await screen.findByLabelText('Company');
-    await waitFor(() => expect(select.value).toBe('7'));
+    const input = await screen.findByLabelText('Company');
+    await waitFor(() => expect(input).toHaveValue('Acme'));
     expect(screen.queryByText('Could not load companies')).toBeNull();
+  });
+
+  it('rejects a company name that is not in the register', async () => {
+    const saved = vi.fn(async () => {});
+    renderReview(saved);
+    const input = await screen.findByLabelText('Company');
+    await waitFor(() => expect(input).toHaveValue('Acme'));
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: 'Ghost Co' } });
+    fireEvent.blur(input);
+    expect(screen.getByRole('status').textContent).toContain('No matching record');
+    fireEvent.click(screen.getByRole('button', { name: 'Save to PI Issued' }));
+    expect(await screen.findByText(/Select a company/i)).toBeTruthy();
+    expect(saved).not.toHaveBeenCalled();
   });
 });

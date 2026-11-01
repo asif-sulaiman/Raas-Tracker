@@ -4,6 +4,7 @@ import Modal from '../modals/Modal';
 import Button from '../ui/Button';
 import ProductInput from '../ui/ProductInput';
 import SuggestionInput from '../ui/SuggestionInput';
+import EntityCombobox from '../ui/EntityCombobox';
 import { formatNumber, sumLineTotals, lineTotal } from '../../utils/format';
 import { COMMON_UNITS } from '../../utils/units';
 import { useAuth } from '../../context/AuthContext';
@@ -240,21 +241,18 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
                 </Button>
               </div>
             ) : companies.length > 0 ? (
-              <select
+              <EntityCombobox
                 aria-label="Company"
+                options={companies.map((c) => ({ value: c.id, label: c.name }))}
                 value={companyId}
-                onChange={(e) => {
-                  setCompanyId(e.target.value);
-                  const picked = companies.find((c) => String(c.id) === e.target.value);
+                onChange={(next) => {
+                  setCompanyId(next);
+                  const picked = companies.find((c) => String(c.id) === next);
                   setClientName(picked ? picked.name : '');
                 }}
+                placeholder="Search companies…"
                 className={inputCls}
-              >
-                <option value="">Select company…</option>
-                {companies.map((c) => (
-                  <option key={c.id} value={c.id}>{c.name}</option>
-                ))}
-              </select>
+              />
             ) : (
               <p className="text-xs text-slate-500 dark:text-slate-400 italic">No companies registered</p>
             )}
