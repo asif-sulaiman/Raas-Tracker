@@ -1,7 +1,7 @@
 import { render, screen, fireEvent } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
 import ProductInput from './ProductInput';
-import { PRODUCT_CATALOG, PRODUCT_NAMES } from '../../data/products';
+import { PRODUCT_NAMES } from '../../data/products';
 
 describe('ProductInput', () => {
   it('offers the full 2026 catalog as a datalist and keeps free text editable', () => {
@@ -30,12 +30,12 @@ describe('ProductInput', () => {
     expect(values).toContain('Ecoclean RM');
   });
 
-  it('catalog holds 70 unique products with a category and HS code', () => {
-    expect(PRODUCT_CATALOG).toHaveLength(70);
+  it('catalog holds 70 unique product names', () => {
+    expect(PRODUCT_NAMES).toHaveLength(70);
     expect(new Set(PRODUCT_NAMES).size).toBe(70);
-    for (const product of PRODUCT_CATALOG) {
-      expect(product.category).toBeTruthy();
-      expect(product.hs_code).toMatch(/^\d{4}(?:\.\d{2,4}){1,3}$/);
+    for (const name of PRODUCT_NAMES) {
+      expect(name).toBe(name.trim());
+      expect(name.length).toBeGreaterThan(0);
     }
   });
 

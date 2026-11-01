@@ -886,9 +886,9 @@ parsed PIs and products not yet on the list must still be able to save.
 
 | # | Phase | Scope | Commit |
 |---|---|---|---|
-| 1 | **Catalog + combobox** | `src/data/products.js` (`PRODUCT_CATALOG` with `name`/`category`/`hs_code`, `PRODUCT_NAMES`); `src/components/ui/ProductInput.jsx` — a native `<input list>` + `<datalist>` with a `useId()` list id per instance, drop-in for a text input | this commit |
+| 1 | **Catalog + combobox** | `src/data/products.js` (`PRODUCT_NAMES`, the 70 names only — no category or HS code); `src/components/ui/ProductInput.jsx` — a native `<input list>` + `<datalist>` with a `useId()` list id per instance, drop-in for a text input | this commit |
 | 2 | **Call sites** | `MultiPICreateModal` (per-document row, keeps its `Product name document N row R` label), `SaleDetailModal` edit rows (`Product name row N`), `ReviewModal` parsed-PI rows. No other editable product field exists: invoice, recipe and report product names are derived from invoice lines, and `CommercialFilters` carries unused `product_name` URL state with no rendered input | this commit |
-| 3 | **Tests + docs** | `ProductInput.test.jsx` (70 unique options, valid HS-code shape, free text `onChange`, distinct ids for two instances), one dropdown-presence assertion each in `SaleDetailModal.test.jsx` and `ReviewModal.test.jsx`; SPEC/PRD notes | this commit |
+| 3 | **Tests + docs** | `ProductInput.test.jsx` (70 unique option values, free text `onChange`, distinct ids for two instances), one dropdown-presence assertion each in `SaleDetailModal.test.jsx` and `ReviewModal.test.jsx`; SPEC/PRD notes | this commit |
 
 **Locked decisions.** The catalog is code-owned, not a DB table: no admin CRUD
 was requested, and shipping a table would mean a migration, seed and API for a
