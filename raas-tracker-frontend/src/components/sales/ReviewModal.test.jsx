@@ -80,6 +80,16 @@ describe('ReviewModal capture fields', () => {
     await waitFor(() => expect(select.value).toBe('7'));
   });
 
+  it('offers the product catalog as a dropdown for each row', async () => {
+    renderReview(vi.fn());
+    const input = await screen.findByPlaceholderText('Product name');
+    const listId = input.getAttribute('list');
+    expect(listId).toBeTruthy();
+    const options = document.querySelectorAll(`#${CSS.escape(listId)} option`);
+    expect(options).toHaveLength(70);
+    expect([...options].map((o) => o.value)).toContain('Cottonese BT 11');
+  });
+
   it('saves company_id and per-row units', async () => {
     const saved = vi.fn(async () => {});
     renderReview(saved);

@@ -338,6 +338,14 @@ describe('SaleDetailModal item sign guard', () => {
     return { quantity: spinbuttons[0], unitPrice: spinbuttons[1] };
   }
 
+  it('offers the product catalog as a dropdown while editing items', async () => {
+    await openEditor(vi.fn());
+    const input = screen.getByLabelText('Product name row 1');
+    const listId = input.getAttribute('list');
+    expect(listId).toBeTruthy();
+    expect(document.querySelectorAll(`#${CSS.escape(listId)} option`)).toHaveLength(70);
+  });
+
   it('blocks a zero quantity client-side instead of posting it', async () => {
     const onSaved = vi.fn();
     const { quantity } = await openEditor(onSaved);

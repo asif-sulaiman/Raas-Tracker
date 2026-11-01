@@ -70,6 +70,7 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 2. **Parse PI** → uploads PDF/`.docx` → system parses in-memory → returns extracted data (PI number, date, client, item list) → user reviews → **Create** → entry created at `pi_issued`
 3. **Add multiple PIs** → one form holds N PI documents (each with its own PI number, date and item rows), created atomically: if any PI fails, nothing is saved
 4. **Link PIs → LC** → select one or more unlinked PIs and attach them to a new or existing LC. A PI created but never covered by an LC is transient — delete it
+5. **Product names are a catalog-backed combobox, not a free-for-all.** Every editable product-name field (manual/multi-PI entry, the parsed-PI review, and the sale editor) offers the 70 SKUs of the 2026 product list as suggestions, while still accepting a typed name that is not in the catalog — a parsed PI or a newly introduced product must never be blocked by the list
 
 ### Flow 3: Sales Pipeline Advance (LC-driven)
 1. `pi_issued` → **Link PIs to LC** (the LC record carries the number, dates, bank ref) → the LC and all its PIs move to `lc_received`
