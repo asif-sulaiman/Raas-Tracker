@@ -130,6 +130,17 @@ describe('Chemicals add flow', () => {
     expect(posts[0]).toMatchObject({ name: 'Acid', delta: 5, reason: 'Supplier delivery' });
   });
 
+  it('saves a typed reason and a typed unit', async () => {
+    const posts = [];
+    renderChemicals({ posts });
+    fireEvent.click(await screen.findByRole('button', { name: 'Adjust' }));
+    fireEvent.change(screen.getByLabelText('New quantity'), { target: { value: '15' } });
+    fireEvent.change(screen.getByLabelText('Reason'), { target: { value: 'Spill cleanup' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Adjustment' }));
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0]).toMatchObject({ reason: 'Spill cleanup' });
+  });
+
   it('lets admins set the alarm from the Info modal', async () => {
     const puts = [];
     renderChemicals({ puts });

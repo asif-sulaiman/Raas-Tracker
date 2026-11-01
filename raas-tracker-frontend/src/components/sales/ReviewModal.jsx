@@ -3,6 +3,7 @@ import { Plus, Trash2, AlertTriangle, Loader2 } from 'lucide-react';
 import Modal from '../modals/Modal';
 import Button from '../ui/Button';
 import ProductInput from '../ui/ProductInput';
+import SuggestionInput from '../ui/SuggestionInput';
 import { formatNumber, sumLineTotals, lineTotal } from '../../utils/format';
 import { COMMON_UNITS } from '../../utils/units';
 import { useAuth } from '../../context/AuthContext';
@@ -311,16 +312,13 @@ export default function ReviewModal({ isOpen, initialData, onClose, onSave }) {
                         />
                       </td>
                       <td className="px-2.5 py-1.5">
-                        <select
+                        <SuggestionInput
                           aria-label="Unit"
+                          options={COMMON_UNITS}
                           value={item.unit || 'KG'}
                           onChange={(e) => updateItem(item.key, 'unit', e.target.value)}
                           className={inputCls}
-                        >
-                          {COMMON_UNITS.map((u) => (
-                            <option key={u} value={u}>{u}</option>
-                          ))}
-                        </select>
+                        />
                       </td>
                       <td className="px-2.5 py-1.5">
                         <input

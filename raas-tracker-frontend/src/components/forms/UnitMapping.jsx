@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, ArrowRight, CheckCircle2, Loader2 } from 'lucide-react';
 import Button from '../ui/Button';
+import SuggestionInput from '../ui/SuggestionInput';
 import { useAuth } from '../../context/AuthContext';
 import { formatNumber } from '../../utils/format';
 import { COMMON_UNITS } from '../../utils/units';
@@ -159,16 +160,12 @@ export default function UnitMapping({ rows = [], onMappingsSaved }) {
               <div className="mt-2.5 flex flex-wrap items-end gap-3">
                 <label className="text-xs text-slate-600 dark:text-slate-400">
                   Target unit
-                  <select
+                  <SuggestionInput
+                    options={[...new Set([...(knownUnits.length ? knownUnits : COMMON_UNITS), ...g.dbUnits])]}
                     value={f.target}
                     onChange={(e) => setForm(g.unit, { target: e.target.value })}
                     className="ml-2 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1.5 text-sm text-slate-900 dark:text-white"
-                  >
-                    <option value="">Select…</option>
-                    {[...new Set([...(knownUnits.length ? knownUnits : COMMON_UNITS), ...g.dbUnits])].map((u) => (
-                      <option key={u} value={u}>{u}</option>
-                    ))}
-                  </select>
+                  />
                 </label>
                 <label className="text-xs text-slate-600 dark:text-slate-400">
                   1 {g.unit} = 

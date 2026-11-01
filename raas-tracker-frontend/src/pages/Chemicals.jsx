@@ -15,12 +15,23 @@ import Button from '../components/ui/Button';
 import Modal from '../components/modals/Modal';
 import KpiCard from '../components/cards/KpiCard';
 import StockHistory from '../components/stock/StockHistory';
+import SuggestionInput from '../components/ui/SuggestionInput';
 import { COMMON_UNITS } from '../utils/units';
 import { formatNumber } from '../utils/format';
 import { useAuth } from '../context/AuthContext';
 import { toast } from 'sonner';
 
 import { stockStatus } from '../utils/stock';
+
+const REASON_SUGGESTIONS = [
+  'Physical count correction',
+  'Transfer from another warehouse',
+  'Disposal / expiry',
+  'Supplier delivery',
+];
+
+const fieldCls =
+  'w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500';
 
 export default function Chemicals() {
   const { apiFetch, user } = useAuth();
@@ -392,11 +403,7 @@ export default function Chemicals() {
             </div>
             <div>
               <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Unit</label>
-              <select aria-label="Unit" value={addUnit} onChange={(e) => setAddUnit(e.target.value)} className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500">
-                {COMMON_UNITS.map((u) => (
-                  <option key={u} value={u}>{u}</option>
-                ))}
-              </select>
+              <SuggestionInput aria-label="Unit" options={COMMON_UNITS} value={addUnit} onChange={(e) => setAddUnit(e.target.value)} className={fieldCls} />
             </div>
           </div>
           <div>
@@ -436,12 +443,7 @@ export default function Chemicals() {
             </div>
             <div>
               <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Reason</label>
-              <select aria-label="Reason" value={adjustReason} onChange={(e) => setAdjustReason(e.target.value)} className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500">
-                <option>Physical count correction</option>
-                <option>Transfer from another warehouse</option>
-                <option>Disposal / expiry</option>
-                <option>Supplier delivery</option>
-              </select>
+              <SuggestionInput aria-label="Reason" options={REASON_SUGGESTIONS} value={adjustReason} onChange={(e) => setAdjustReason(e.target.value)} maxLength={120} className={fieldCls} />
             </div>
           </div>
         )}
