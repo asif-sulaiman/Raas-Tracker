@@ -462,6 +462,16 @@ CREATE TABLE app_settings (
 
 ## 4. API Endpoints
 
+**Path parameters arrive percent-decoded.** Vercel's Python runtime leaves
+`PATH_INFO` encoded, so a host that behaves that way declares
+`DECODE_PATH_INFO=1` (set in `vercel.json`) and `flask_app.py` installs
+`DecodePathInfo` (`raas_tracker/wsgi_compat.py`) ahead of routing. A
+PEP 3333-compliant server already decodes the path, so the shim stays off there
+— decoding twice would corrupt a name that literally contains an escape
+(`Batch%20A` → `Batch A`). Recipe and chemical names may therefore contain
+spaces and non-ASCII characters; clients send them `encodeURIComponent`-escaped
+(`/api/recipes/Production%20KNIT%20432`).
+
 ### Auth
 | Method | Path | Auth | Description |
 |---|---|---|---|
@@ -1252,6 +1262,7 @@ than removed.
 | `RAAS_RATE_LIMITS` | No | `on` | `off` disables Flask-Limiter (tests) |
 | `REDIS_URL` | **Prod (multi-process)** | unset → in-memory | Shared rate-limit storage (Flask-Limiter). **Required on serverless/multi-process** so limits are global, not per-process; optional for single-process dev |
 | `TRUSTED_PROXY` | **Behind a proxy** | unset → header ignored | `1` trusts one `X-Forwarded-For` hop (`ProxyFix x_for`), making `remote_addr` the client IP. Unset means `remote_addr` is the socket address. `remote_addr` gates the API-key IP allowlist, login lockout-by-IP and the IP-keyed rate limits, so set this **only** when a proxy is the sole entry point |
+| `DECODE_PATH_INFO` | **Vercel** | unset → shim off | `1` installs `DecodePathInfo` because the host hands the app a still-percent-encoded `PATH_INFO` (Vercel's Python runtime does; set in `vercel.json`). Leave unset on a PEP 3333-compliant server — the path is already decoded and a second pass would corrupt names containing a literal escape |
 | `MAX_CONTENT_LENGTH_MB` | No | `50` | Upload body cap in MB (float allowed, e.g. `4.5` on Vercel) |
 | `RAAS_DATA_DIR` | No | repo root | Writable data dir (uploads, reports) |
 | `CRON_SECRET` | **Cron** | unset → cron answers 500 | Bearer token for `POST /api/cron/maturity-check` |
