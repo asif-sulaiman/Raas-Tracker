@@ -105,6 +105,8 @@ REACT_BUILD_DIR = os.path.join(os.path.dirname(__file__), "react_frontend")
 # over-trust is a correctness problem rather than an authz bypass.
 from werkzeug.middleware.proxy_fix import ProxyFix
 
+from raas_tracker.wsgi_compat import DecodePathInfo
+
 _BASE_WSGI_APP = app.wsgi_app
 
 
@@ -118,14 +120,37 @@ def _trusted_proxy() -> bool:
     return os.getenv("TRUSTED_PROXY") == "1"
 
 
+def _decodes_encoded_path() -> bool:
+    """Does this host hand the app a still-percent-encoded ``PATH_INFO``?
+
+    Vercel's Python runtime does. It is a property of the deployment, not of a
+    request, so the deployment declares it (``vercel.json``) the way
+    TRUSTED_PROXY is declared. Default off: a PEP 3333 server has already
+    decoded the path, and decoding again would corrupt a name that literally
+    contains a percent-escape — a recipe called ``Batch%20A`` would arrive as
+    ``Batch A``.
+    """
+    return os.getenv("DECODE_PATH_INFO") == "1"
+
+
 def _apply_proxy_fix() -> None:
-    """(Re)install ProxyFix using the current TRUSTED_PROXY setting.
+    """(Re)install the WSGI adapters: path decoding, then ProxyFix.
+
+    Vercel leaves ``PATH_INFO`` percent-encoded, so a route parameter arrives
+    as ``Production%20KNIT%20432`` and every name lookup misses — that was the
+    live "Recipe not found" on Edit. ``DECODE_PATH_INFO=1`` turns the shim on
+    for that host only; anywhere the server already decoded the path it stays
+    out of the way. ProxyFix remains outermost so the middleware-chain checks
+    keep finding it.
 
     A function rather than a bare call so the trust decision can be tested in
-    both states; the env var is otherwise read once, at import.
+    both states; the env vars are otherwise read once, at import.
     """
+    inner = _BASE_WSGI_APP
+    if _decodes_encoded_path():
+        inner = DecodePathInfo(inner)
     app.wsgi_app = ProxyFix(
-        _BASE_WSGI_APP,
+        inner,
         x_for=1 if _trusted_proxy() else 0,
         x_proto=1, x_host=1, x_prefix=1,
     )
