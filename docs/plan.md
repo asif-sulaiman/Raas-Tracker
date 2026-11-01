@@ -783,6 +783,27 @@ now means the row is gone: the list refreshes. Mutations still address the
 recipe by name (the detail carries the server's name), and runs link by
 `recipe_id`, so renames stay surgical.
 
+**Percent-encoded path parameters (2026-11-01).** Live Edit still answered
+"Recipe not found" for the recipe the list and the detail were showing. The
+cause was the host, not the data: Vercel's Python runtime hands the app a
+`PATH_INFO` that is still percent-encoded, so
+`PUT /api/recipes/Production%20KNIT%20432` captured the encoded name and every
+lookup missed.
+Proved read-only: `/api/auth/status` is 200 while `/api/auth/%73tatus` is 401,
+and the Flask test client reproduces it with
+`environ_overrides={"PATH_INFO": ...}`. The same defect caused the 2026-10-29
+View miss — the by-id route fixed that read by sidestepping the name, not by
+fixing the path. `DecodePathInfo` (`raas_tracker/wsgi_compat.py`) is installed
+in the WSGI chain inside `_apply_proxy_fix` — inside ProxyFix, so it runs after
+the proxy headers are applied and before routing — only when the
+deployment declares `DECODE_PATH_INFO=1` (`vercel.json`), because a compliant
+server has already decoded the path and a second pass would rewrite a name that
+literally contains an escape (`Batch%20A` → `Batch A`); tests pin both host
+behaviours. One shim
+repairs every name-addressed route (detail fallback, update, delete, items with
+a `<chem>` segment, produce, runs), and the gate now sees the path PEP 3333
+promises.
+
 ---
 
 ## 🧾 Phase INV-UNIFY: PI-faithful invoice editor (completed 2026-10-22)
