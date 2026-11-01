@@ -295,15 +295,16 @@ describe('EntityCombobox', () => {
     expect(screen.getByLabelText('Company')).toHaveValue('Beta');
   });
 
-  it('clears the typed query when the parent resets the value', () => {
+  it('follows a parent value change while focused', () => {
     const { rerender } = render(
       <EntityCombobox aria-label="Company" options={OPTIONS} value="1" onChange={() => {}} />,
     );
     const input = screen.getByLabelText('Company');
     fireEvent.focus(input);
-    fireEvent.change(input, { target: { value: 'Be' } });
-    rerender(<EntityCombobox aria-label="Company" options={OPTIONS} value="" onChange={() => {}} />);
-    expect(input).toHaveValue('');
+    fireEvent.change(input, { target: { value: 'Acme' } });
+    rerender(<EntityCombobox aria-label="Company" options={OPTIONS} value="2" onChange={() => {}} />);
+    expect(input).toHaveValue('Beta');
+    expect(screen.queryByRole('listbox')).toBeNull();
   });
 });
 ```
@@ -745,15 +746,16 @@ git commit -m "feat(ui): free-text units and adjustment reasons"
 
 ---
 
-### Task 4: Company pickers
+### Task 4: Company pickers — MultiPI and Review
 
 **Files:**
 - Modify: `raas-tracker-frontend/src/components/sales/MultiPICreateModal.jsx`
 - Modify: `raas-tracker-frontend/src/components/sales/ReviewModal.jsx`
-- Modify: `raas-tracker-frontend/src/pages/Recipes.jsx`
 - Test: `raas-tracker-frontend/src/components/sales/MultiPICreateModal.test.jsx`
 - Test: `raas-tracker-frontend/src/components/sales/ReviewModal.test.jsx`
-- Test: `raas-tracker-frontend/src/pages/Recipes.test.jsx`
+
+The recipe create modal's company field moves to Task 5 together with its LC →
+PI → invoice cascade, so this commit leaves every suite green.
 
 **Interfaces:**
 - Consumes: `EntityCombobox` from Task 2.
@@ -779,7 +781,7 @@ git commit -m "feat(ui): free-text units and adjustment reasons"
 
 Rename the local `select` to `input` in those blocks (e.g. `const input = await screen.findByLabelText('Company');`).
 
-`Recipes.test.jsx` — change every `{ target: { value: '7' } }` on `/^Company/` to `{ target: { value: 'Acme' } }` (lines 295, 318, 332, 349, 423).
+`Recipes.test.jsx` — its company/LC/PI/invoice interactions are migrated in Task 5, which converts that modal as one unit.
 
 Add one new test to `ReviewModal.test.jsx`:
 
@@ -799,10 +801,10 @@ Add one new test to `ReviewModal.test.jsx`:
   });
 ```
 
-Run: `npx vitest run src/components/sales/MultiPICreateModal.test.jsx src/components/sales/ReviewModal.test.jsx src/pages/Recipes.test.jsx`
+Run: `npx vitest run src/components/sales/MultiPICreateModal.test.jsx src/components/sales/ReviewModal.test.jsx`
 Expected: FAIL — the fields are still `<select>`s, so typing a name yields no id and the save payload/company id is missing.
 
-- [ ] **Step 2: Replace the three company selects**
+- [ ] **Step 2: Replace the two company selects**
 
 `MultiPICreateModal.jsx` (import `EntityCombobox`):
 
@@ -838,33 +840,18 @@ Expected: FAIL — the fields are still `<select>`s, so typing a name yields no 
 />
 ```
 
-`Recipes.jsx` (the `<label htmlFor="recipe-company">` stays; the input receives the id):
-
-```jsx
-<EntityCombobox
-  id="recipe-company"
-  options={companies.map((c) => ({ value: c.id, label: c.name }))}
-  value={companyId}
-  onChange={handleCompanyChange}
-  placeholder="Search companies…"
-  className={inputCls}
-/>
-```
-
 - [ ] **Step 3: Run the suites**
 
-Run: `npx vitest run src/components/sales/MultiPICreateModal.test.jsx src/components/sales/ReviewModal.test.jsx src/pages/Recipes.test.jsx`
-Expected: PASS. Note `Recipes.test.jsx` also selects LC/PI/invoice by id — those tests fail here and are fixed in Task 5; if they block the run, run the two sales suites now and re-run Recipes after Task 5. Do not "fix" the cascade by making the company picker accept ids.
+Run: `npx vitest run src/components/sales/MultiPICreateModal.test.jsx src/components/sales/ReviewModal.test.jsx`
+Expected: PASS. `Recipes.jsx` keeps its company `<select>` until Task 5 converts the whole cascade in one commit, so `Recipes.test.jsx` stays green and untouched here.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add raas-tracker-frontend/src/components/sales/MultiPICreateModal.jsx \
         raas-tracker-frontend/src/components/sales/ReviewModal.jsx \
-        raas-tracker-frontend/src/pages/Recipes.jsx \
         raas-tracker-frontend/src/components/sales/MultiPICreateModal.test.jsx \
-        raas-tracker-frontend/src/components/sales/ReviewModal.test.jsx \
-        raas-tracker-frontend/src/pages/Recipes.test.jsx
+        raas-tracker-frontend/src/components/sales/ReviewModal.test.jsx
 git commit -m "feat(sales): searchable company pickers"
 ```
 
@@ -882,7 +869,7 @@ git commit -m "feat(sales): searchable company pickers"
 
 **Interfaces:**
 - Consumes: `EntityCombobox` from Task 2.
-- Produces: `lcId`, `saleId`, `invoiceId`, `targetId`, `lcId` (LinkPIs) stay string ids; the cascade handlers are untouched.
+- Produces: `companyId`, `lcId`, `saleId`, `invoiceId`, `targetId`, `lcId` (LinkPIs) stay string ids; the cascade handlers are untouched.
 
 - [ ] **Step 1: Migrate the tests first**
 
@@ -1002,7 +989,7 @@ Then rewrite the option-inspection tests so the list is open before querying it,
 Run: `npx vitest run src/components/sales/LinkPIsModal.test.jsx src/components/sales/SaleDetailModal.test.jsx src/pages/Recipes.test.jsx`
 Expected: FAIL — the controls are still selects.
 
-- [ ] **Step 2: Replace the five controls**
+- [ ] **Step 2: Replace the six controls**
 
 `LinkPIsModal.jsx`:
 
@@ -1035,7 +1022,20 @@ Expected: FAIL — the controls are still selects.
 />
 ```
 
-`Recipes.jsx` — LC:
+`Recipes.jsx` — company first (the cascade converts as one unit so `Recipes.test.jsx` never goes red between commits; the `<label htmlFor="recipe-company">` stays and the input receives the id):
+
+```jsx
+<EntityCombobox
+  id="recipe-company"
+  options={companies.map((c) => ({ value: c.id, label: c.name }))}
+  value={companyId}
+  onChange={handleCompanyChange}
+  placeholder="Search companies…"
+  className={inputCls}
+/>
+```
+
+LC:
 
 ```jsx
 <EntityCombobox
