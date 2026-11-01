@@ -232,11 +232,25 @@ def test_missing_conversion_is_reported_and_production_refuses(db):
 # late products
 # --------------------------------------------------------------------------- #
 def test_late_product_is_a_ghost_slot_without_any_write(db):
+    """A line written outside the invoice service still shows in the plan.
+
+    ``create_invoice_item`` syncs the slot in its own transaction, so the
+    ghost path is the backstop for a row that arrived by another route (a
+    legacy row, or a writer that bypasses the service). Reading the detail
+    must not write: the slot stays virtual — ``id: None`` — until it is
+    formulated.
+    """
     co, sale, inv = _scenario(db)
     recipe = _recipe(db, co, inv)
     before = db.execute("SELECT COUNT(*) FROM recipe_products").fetchone()[0]
 
-    _add_late_line(db, sale, inv, "Late Additive", 12)
+    item_id = salesmod.add_sale_item(db, sale, "Late Additive", 12, 5, "KG")
+    db.execute(
+        "INSERT INTO invoice_items (invoice_id, sale_item_id, product_name,"
+        " unit, quantity, unit_price, line_total)"
+        " VALUES (%s, %s, 'Late Additive', 'KG', 12, 5, 60)",
+        (inv, item_id))
+    db.commit()
 
     detail = recipesmod.get_recipe_detail(db, recipe["id"])
     ghost = _product(detail, "Late Additive")
@@ -251,6 +265,25 @@ def test_late_product_is_a_ghost_slot_without_any_write(db):
     source = recipesmod.get_invoice_production_source(db, inv)
     assert [p["product_name"] for p in source["products"]] == sorted(
         [PRODUCT_A, PRODUCT_B, "Late Additive"])
+
+
+def test_late_invoice_line_syncs_its_slot_in_the_same_transaction(db):
+    """The service path materialises the slot with the line, not on a GET."""
+    co, sale, inv = _scenario(db)
+    recipe = _recipe(db, co, inv)
+
+    _add_late_line(db, sale, inv, "Late Additive", 12)
+
+    slot = db.execute(
+        "SELECT id FROM recipe_products WHERE recipe_id = %s"
+        " AND lower(product_name) = lower(%s)",
+        (recipe["id"], "Late Additive")).fetchone()
+    assert slot is not None
+    product = _product(recipesmod.get_recipe_detail(db, recipe["id"]),
+                       "Late Additive")
+    assert product["id"] == slot[0]
+    assert product["formulated"] is False
+    assert product["invoiced_qty"] == 12
 
 
 def test_formulating_a_ghost_creates_its_slot(db):
@@ -358,6 +391,36 @@ def test_rename_touches_only_the_header(db):
                              "INV-RCP-OTHER"), name="Taken Name")
     with pytest.raises(RecipeNameConflict):
         recipesmod.update_recipe(db, recipe["id"], "Taken Name")
+
+
+def test_case_only_rename_keeps_the_formulation(db):
+    """The old items query matched ``r.name = %s`` exactly; a case-only rename
+    passed the lower() lookup and then returned zero ingredients."""
+    co, sale, inv = _scenario(db)
+    recipe = _recipe(db, co, inv, name="Batch A")
+    stockmod.add_chemical(db, CHEM, 500, "KG")
+    recipesmod.add_recipe_item(db, recipe["id"], PRODUCT_A, CHEM, 40)
+
+    assert recipesmod.update_recipe(db, recipe["id"], "BATCH A")
+    detail = recipesmod.get_recipe_detail(db, recipe["id"])
+    assert detail["recipe"]["name"] == "BATCH A"
+    items = _product(detail, PRODUCT_A)["items"]
+    assert [(i["chemical_name"], float(i["percentage"])) for i in items] == [
+        (CHEM, 40.0)]
+
+
+def test_rename_audit_records_both_names(db):
+    co, sale, inv = _scenario(db)
+    recipe = _recipe(db, co, inv, name="Audit Batch")
+
+    recipesmod.update_recipe(db, recipe["id"], "Audited Batch")
+    row = db.execute(
+        "SELECT old_value, new_value FROM audit_logs"
+        " WHERE entity_type = 'recipe' AND entity_id = %s"
+        "   AND action = 'RECIPE_UPDATE' ORDER BY id DESC LIMIT 1",
+        (recipe["id"],)).fetchone()
+    assert row[0] == "Audit Batch"
+    assert "Audited Batch" in row[1]
 
 
 def test_delete_with_runs_is_409(db):
@@ -576,6 +639,28 @@ def test_api_create_and_detail(admin_client, db):
     assert {p["product_name"] for p in body["products"]} == {
         PRODUCT_A, PRODUCT_B}
     assert all(p["id"] is not None for p in body["products"])
+
+
+def test_api_rename_by_id_and_conflict(admin_client, db):
+    co, sale, inv = _scenario(db)
+    rid = _api_recipe(admin_client, co, inv, name="API Old")
+
+    r = admin_client.put(f"/api/recipes/by-id/{rid}", json={"name": "API New"})
+    assert r.status_code == 200, r.get_json()
+    assert r.get_json() == {"success": True, "name": "API New"}
+
+    _api_recipe(admin_client, co,
+                _invoice(db, _sale(db, co, "PI-API-TAKEN"), "INV-API-TAKEN"),
+                name="Taken")
+    r = admin_client.put(f"/api/recipes/by-id/{rid}", json={"name": "taken"})
+    assert r.status_code == 409
+    assert "already exists" in r.get_json()["error"]
+
+    r = admin_client.put(f"/api/recipes/by-id/{rid}",
+                         json={"name": "X", "product_name": PRODUCT_A})
+    assert r.status_code == 400
+    assert admin_client.put(
+        "/api/recipes/by-id/999999", json={"name": "X"}).status_code == 404
 
 
 def test_api_create_rejects_legacy_product_and_quantity_fields(admin_client, db):

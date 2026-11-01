@@ -83,6 +83,11 @@ OPERATOR_ROUTES = [
     ("POST", "/api/recipes/<path:name>/items"),
     ("PUT", "/api/recipes/<path:name>"),
     ("PUT", "/api/recipes/<path:name>/items/<chem>"),
+    # The primary id-keyed routes. The name paths above stay as one-release
+    # aliases, so both spellings must declare the same class.
+    ("PUT", "/api/recipes/by-id/<int:recipe_id>"),
+    ("POST", "/api/recipes/by-id/<int:recipe_id>/products/<path:product>/items"),
+    ("PUT", "/api/recipes/by-id/<int:recipe_id>/items/<int:item_id>"),
     ("POST", "/api/upload"),
     ("POST", "/api/unit-conversions"),
     ("POST", "/api/reports/generate"),
@@ -401,6 +406,7 @@ VOLUME_BOUNDED_ROUTES = OPERATOR_ROUTES + [
     # *unthrottled* while carrying an unbounded list — the higher-amplification
     # half of the surface, which the first draft of P1-B had left at 300/min.
     ("POST", "/api/recipes/<path:name>/produce"),
+    ("POST", "/api/recipes/by-id/<int:recipe_id>/produce"),
     ("PUT", "/api/sales/<int:sale_id>"),
     # Upload/LC/report writes already limited in practice, converted to the
     # stamping form so the policy test can actually see them.
@@ -665,35 +671,29 @@ def test_row_fanning_list_field_is_capped(model_name, field, build):
         model(**over)
 
 
-@pytest.mark.parametrize("field", ["sale_ids", "invoice_ids", "recipes"])
-def test_production_run_id_lists_are_capped(field):
-    """HIGH-1: these were the largest fan-out on /produce and shipped uncapped.
+def test_production_run_outputs_are_capped():
+    """HIGH-1: outputs drive per-product work inside the run transaction.
 
-    Each id drives a sequential per-element round trip inside a transaction
-    holding a pool slot (`recipes.py` `_owned_sale_ids`, and the per-invoice
-    SELECT/INSERT/FOR UPDATE).
+    The old id lists (sale_ids / invoice_ids / recipes) are gone — the run's
+    invoice is derived from the recipe — so `outputs` is the only fan-out left
+    on /produce.
     """
-    from flask_app import ProductionRunCreateIn
-    cap = _cap_of(ProductionRunCreateIn, field)
-    assert cap is not None, f"ProductionRunCreateIn.{field} is still unbounded"
+    from flask_app import ProductionRunIn
+    cap = _cap_of(ProductionRunIn, "outputs")
+    assert cap is not None, "ProductionRunIn.outputs is still unbounded"
 
-    # `recipes` holds ProductionRecipeIn rows (no required fields); the other
-    # two hold plain ints.
-    fill = (lambda: {}) if field == "recipes" else (lambda: 1)
+    def build(n):
+        return [{"product_name": f"P{i}", "quantity": 1.0} for i in range(n)]
 
-    at_cap = {"production_qty": 1.0, field: [fill() for _ in range(cap)]}
-    ProductionRunCreateIn(**at_cap)  # at the cap: fine
-
-    over = dict(at_cap)
-    over[field] = [fill() for _ in range(cap + 1)]
+    ProductionRunIn(outputs=build(cap))  # at the cap: fine
     with pytest.raises(Exception):
-        ProductionRunCreateIn(**over)
+        ProductionRunIn(outputs=build(cap + 1))
 
 
-def test_production_run_recipes_cap_has_a_regression_test():
+def test_production_run_outputs_cap_has_a_regression_test():
     """MED-4: this cap shipped with no test; assert it explicitly, by name."""
-    from flask_app import ProductionRunCreateIn
-    assert _cap_of(ProductionRunCreateIn, "recipes") == 50
+    from flask_app import ProductionRunIn
+    assert _cap_of(ProductionRunIn, "outputs") == 200
 
 
 @pytest.mark.parametrize("path", ["/api/reports/generate", "/api/reports/export"])
@@ -712,8 +712,14 @@ def test_report_rejects_more_than_the_declared_recipe_cap(user_client, path):
 @pytest.mark.parametrize("path", ["/api/reports/generate", "/api/reports/export"])
 def test_report_rejects_a_non_list_recipes_body(user_client, path):
     """LOW-4: `len()` on a str counts characters and the shape loop then
-    indexes a `str`, which is a 500. The cap is the natural place to reject it.
+    indexes a `str`, which is a 500. The typed body rejects it at the edge.
+
+    The wording is the model's (Pydantic's "valid list", or the route's own
+    "must be a list" if it ever returns to hand validation), so assert the
+    field and the meaning rather than the library's phrasing.
     """
     res = user_client.post(path, json={"recipes": "not-a-list", "qty": 1})
     assert res.status_code == 400, f"{path} accepted a string recipes body"
-    assert res.get_json()["details"][0]["message"] == "must be a list"
+    detail = res.get_json()["details"][0]
+    assert detail["field"] == "recipes"
+    assert "list" in detail["message"].lower()

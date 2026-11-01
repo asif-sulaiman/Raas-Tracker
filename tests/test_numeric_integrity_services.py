@@ -42,7 +42,6 @@ from raas_tracker.companies import create_company
 from raas_tracker.recipes import (
     add_recipe,
     add_recipe_item,
-    update_recipe,
     update_recipe_item,
 )
 from raas_tracker.sales import (
@@ -140,11 +139,20 @@ def _audit_count(db, action):
 
 
 def _company_with_product(db, name="NF Co", product="Soap"):
-    """A company plus a registered sale line, which `add_recipe` demands."""
+    """A company plus an invoice whose line `add_recipe` can formulate."""
     cid = create_company(db, name=name)
-    add_sale(db, {"pi_number": f"PI-{name}", "client_name": name, "company_id": cid},
-             [{"product_name": product, "quantity": 5, "unit_price": 10, "unit": "KG"}])
-    return cid
+    sid = add_sale(db, {"pi_number": f"PI-{name}", "client_name": name,
+                        "company_id": cid},
+                   [{"product_name": product, "quantity": 5,
+                     "unit_price": 10, "unit": "KG"}])
+    item_id = db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id LIMIT 1",
+        (sid,)).fetchone()[0]
+    invoice_id = create_invoice(
+        db, sid, f"INV-{name}",
+        lines=[{"sale_item_id": item_id, "quantity": 5}],
+        invoice_date="2026-01-15")["invoice_id"]
+    return cid, invoice_id
 
 
 # ==================== 1. record_sale_payment — the forgery cascade ============
@@ -621,39 +629,25 @@ def test_import_from_json_rejects_non_finite_file_values(db, tmp_path, monkeypat
 
 @NON_FINITE
 def test_recipe_writers_reject_non_finite(db, bad):
-    """``water_percentage < 0 or > 100`` is False for ``nan``, and
-    ``percentage < 0`` is False for ``nan`` and ``inf`` — so a poisoned formula
-    snapshot lands in ``recipes.total_quantity`` / ``recipe_items.percentage``
-    and every later production run multiplies by it. ``cli.py`` reaches all of
-    these with ``float(sys.argv[...])``."""
-    cid = _company_with_product(db)
+    """``percentage < 0`` is False for ``nan`` and ``inf`` — so a poisoned
+    formulation lands in ``recipe_items.percentage`` and every later production
+    run multiplies by it. ``cli.py`` reaches these with
+    ``float(sys.argv[...])``."""
+    cid, invoice_id = _company_with_product(db)
     add_chemical(db, "Water", 500, "KG")
+    recipe = add_recipe(db, "GoodRecipe", cid, invoice_id)
 
     with pytest.raises(ValueError):
-        add_recipe(db, "PoisonRecipe", bad, 0, company_id=cid, product_name="Soap")
-    with pytest.raises(ValueError):
-        add_recipe(db, "PoisonRecipe", 1, bad, company_id=cid, product_name="Soap")
-    assert db.execute("SELECT count(*) FROM recipes").fetchone()[0] == 0
-
-    assert add_recipe(db, "GoodRecipe", 1, 0, company_id=cid, product_name="Soap") is True
-    with pytest.raises(ValueError):
-        add_recipe_item(db, cid, "GoodRecipe", "Water", bad)
+        add_recipe_item(db, recipe["id"], "Soap", "Water", bad)
     assert db.execute("SELECT count(*) FROM recipe_items").fetchone()[0] == 0
 
     # ...and the same for the update path, on a line that really exists.
-    assert add_recipe_item(db, cid, "GoodRecipe", "Water", 40.0) is True
+    assert add_recipe_item(db, recipe["id"], "Soap", "Water", 40.0) is True
+    item_id = db.execute("SELECT id FROM recipe_items").fetchone()[0]
     with pytest.raises(ValueError):
-        update_recipe_item(db, cid, "GoodRecipe", "Water", bad)
-    assert db.execute("SELECT percentage, required_qty_per_unit FROM recipe_items").fetchone() == (40.0, 0.4)
+        update_recipe_item(db, recipe["id"], item_id, bad)
+    assert db.execute("SELECT percentage FROM recipe_items").fetchone()[0] == 40.0
 
-    with pytest.raises(ValueError):
-        update_recipe(db, cid, "GoodRecipe", total_quantity=bad)
-    with pytest.raises(ValueError):
-        update_recipe(db, cid, "GoodRecipe", water_percentage=bad)
-
-    assert db.execute("SELECT total_quantity, water_percentage FROM recipes "
-                      "WHERE name = 'GoodRecipe'").fetchone() == (1, 0)
-    assert _audit_count(db, "RECIPE_UPDATE") == 0
     assert _audit_count(db, "RECIPE_ITEM_UPDATE") == 0
 
 
@@ -693,17 +687,14 @@ def test_add_unit_conversion_still_accepts_finite_factors(db):
 
 
 def test_recipe_writers_still_accept_zero_and_finite(db):
-    cid = _company_with_product(db, name="Happy Co")
+    cid, invoice_id = _company_with_product(db, name="Happy Co")
     add_chemical(db, "Water", 500, "KG")
 
-    assert add_recipe(db, "R", 0, 0, company_id=cid, product_name="Soap") is True
-    assert add_recipe_item(db, cid, "R", "Water", 0.0) is True
-    assert update_recipe_item(db, cid, "R", "Water", 50.0) is True
-    assert update_recipe(db, cid, "R", total_quantity=0, water_percentage=0) is True
-    assert db.execute("SELECT percentage, required_qty_per_unit "
-                      "FROM recipe_items").fetchone() == (50.0, 0.5)
-    assert db.execute("SELECT total_quantity FROM recipes "
-                      "WHERE name = 'R'").fetchone()[0] == 0
+    recipe = add_recipe(db, "R", cid, invoice_id)
+    assert add_recipe_item(db, recipe["id"], "Soap", "Water", 0.0) is True
+    item_id = db.execute("SELECT id FROM recipe_items").fetchone()[0]
+    assert update_recipe_item(db, recipe["id"], item_id, 50.0) is True
+    assert db.execute("SELECT percentage FROM recipe_items").fetchone()[0] == 50.0
 
 
 def test_no_non_finite_value_survives_any_guarded_write(db):

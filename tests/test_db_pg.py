@@ -79,7 +79,18 @@ def test_column_defaults_format(clean_pg):
         upload_date = conn.execute(
             "SELECT upload_date FROM uploads WHERE filename = 'f.pdf'").fetchone()[0]
         assert DATETIME_RE.match(upload_date), upload_date
-        conn.execute("INSERT INTO recipes (name) VALUES ('R')")
+        company_id = conn.execute(
+            "INSERT INTO companies (name) VALUES ('T-Co') RETURNING id"
+        ).fetchone()[0]
+        sale_id = conn.execute(
+            "INSERT INTO sales (stage, pi_number, client_name, company_id)"
+            " VALUES ('pi_issued', 'PI-T', 'x', %s) RETURNING id",
+            (company_id,)).fetchone()[0]
+        invoice_id = conn.execute(
+            "INSERT INTO invoices (sale_id, invoice_number)"
+            " VALUES (%s, 'INV-T') RETURNING id", (sale_id,)).fetchone()[0]
+        conn.execute("INSERT INTO recipes (name, invoice_id) VALUES ('R', %s)",
+                     (invoice_id,))
         created = conn.execute(
             "SELECT created_date FROM recipes WHERE name = 'R'").fetchone()[0]
         assert DATE_RE.match(created), created

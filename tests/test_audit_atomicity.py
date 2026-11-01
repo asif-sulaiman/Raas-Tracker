@@ -86,11 +86,23 @@ def _sale_with_items(db, pi_number="PI-ATOM", product="Acetone"):
     return cid, sale_id, item_id
 
 
-def _recipe(db, cid, name="AtomicRecipe", product="Acetone"):
+def _invoice(db, company_id, invoice_number):
+    from raas_tracker.sales import create_invoice
+    sale_id, item_id = db.execute(
+        "SELECT s.id, si.id FROM sales s "
+        "JOIN sale_items si ON si.sale_id = s.id "
+        "WHERE s.company_id = %s ORDER BY s.id, si.id LIMIT 1",
+        (company_id,)).fetchone()
+    return create_invoice(
+        db, sale_id, invoice_number,
+        lines=[{"sale_item_id": item_id, "quantity": 100}],
+        invoice_date="2026-01-15")["invoice_id"]
+
+
+def _recipe(db, cid, name="AtomicRecipe"):
     from raas_tracker.recipes import add_recipe
-    assert add_recipe(db, name, total_quantity=10, water_percentage=10,
-                      company_id=cid, product_name=product)
-    return db.execute("SELECT id FROM recipes WHERE name = %s", (name,)).fetchone()[0]
+    invoice_id = _invoice(db, cid, f"INV-{name}")
+    return add_recipe(db, name, cid, invoice_id)["id"]
 
 
 def _upload_results(names):
@@ -183,7 +195,7 @@ def test_delete_recipe_survives_a_failed_audit(db, other, monkeypatch):
     import raas_tracker.recipes as mod
     _boom(mod, monkeypatch)
     with pytest.raises(RuntimeError):
-        delete_recipe(db, cid, "AtomicRecipe")
+        delete_recipe(db, rid)
     assert other.execute("SELECT COUNT(*) FROM recipes WHERE id = %s",
                          (rid,)).fetchone()[0] == 1, \
         "RECIPE_DELETE was committed before its audit row could be written"
@@ -194,17 +206,18 @@ def test_delete_recipe_item_survives_a_failed_audit(db, other, monkeypatch):
     from raas_tracker.recipes import add_recipe_item, delete_recipe_item
     from raas_tracker.stock import add_chemical
     cid, _sale, _item = _sale_with_items(db, "PI-DELRI")
-    _recipe(db, cid)
+    rid = _recipe(db, cid)
     add_chemical(db, "Salt", 5, "KG")
-    assert add_recipe_item(db, cid, "AtomicRecipe", "Salt", 10.0)
+    assert add_recipe_item(db, rid, "Acetone", "Salt", 10.0)
     item_id = db.execute(
-        "SELECT ri.id FROM recipe_items ri JOIN recipes r ON r.id = ri.recipe_id "
-        "WHERE r.name = 'AtomicRecipe'").fetchone()[0]
+        "SELECT id FROM recipe_items WHERE recipe_product_id IN "
+        "(SELECT id FROM recipe_products WHERE recipe_id = %s)",
+        (rid,)).fetchone()[0]
 
     import raas_tracker.recipes as mod
     _boom(mod, monkeypatch)
     with pytest.raises(RuntimeError):
-        delete_recipe_item(db, cid, "AtomicRecipe", "Salt")
+        delete_recipe_item(db, rid, item_id)
     assert other.execute("SELECT COUNT(*) FROM recipe_items WHERE id = %s",
                          (item_id,)).fetchone()[0] == 1, \
         "RECIPE_ITEM_DELETE was committed before its audit row could be written"
@@ -294,11 +307,11 @@ def test_add_chemical_survives_a_failed_audit(db, other, monkeypatch):
 
 def test_add_recipe_survives_a_failed_audit(db, other, monkeypatch):
     cid, _sale, _item = _sale_with_items(db, "PI-ADDREC")
+    invoice_id = _invoice(db, cid, "INV-GHOSTREC")
     import raas_tracker.recipes as mod
     _boom(mod, monkeypatch)
     with pytest.raises(RuntimeError):
-        mod.add_recipe(db, "GhostRecipe", 10, 10, company_id=cid,
-                       product_name="Acetone")
+        mod.add_recipe(db, "GhostRecipe", cid, invoice_id)
     assert other.execute("SELECT COUNT(*) FROM recipes WHERE name = %s",
                          ("GhostRecipe",)).fetchone()[0] == 0
     assert _rows(other, "RECIPE_CREATE") == []
@@ -478,12 +491,12 @@ def test_happy_path_recipe_and_sale_mutations(db, other):
     from raas_tracker.recipes import add_recipe, delete_recipe
     from raas_tracker.sales import add_sale_item, delete_sale_item
     cid, sale_id, _item = _sale_with_items(db, "PI-HAPPY")
-    assert add_recipe(db, "HappyRecipe", 10, 10, company_id=cid,
-                      product_name="Acetone")
+    invoice_id = _invoice(db, cid, "INV-HAPPYREC")
+    assert add_recipe(db, "HappyRecipe", cid, invoice_id)
     rid = other.execute("SELECT id FROM recipes WHERE name = 'HappyRecipe'"
                         ).fetchone()[0]
     assert _rows(other, "RECIPE_CREATE", rid) == [("recipe", rid)]
-    assert delete_recipe(db, cid, "HappyRecipe") is True
+    assert delete_recipe(db, rid) is True
     assert other.execute("SELECT COUNT(*) FROM recipes WHERE id = %s",
                          (rid,)).fetchone()[0] == 0
     assert _rows(other, "RECIPE_DELETE", rid) == [("recipe", rid)]

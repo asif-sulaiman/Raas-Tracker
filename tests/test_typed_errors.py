@@ -40,6 +40,7 @@ requirements that do not exist yet.
 
 import ast
 import pathlib
+from urllib.parse import quote
 
 import pytest
 
@@ -129,17 +130,21 @@ def _sale_item_id(db, sale_id):
     ).fetchone()[0]
 
 
-def _recipe(admin_client, company_id, product, recipe_name, chem_name, pct=10):
+def _recipe(admin_client, company_id, invoice_id, product, recipe_name,
+            chem_name, pct=10):
     r = admin_client.post("/api/chemicals",
                           json={"name": chem_name, "qty": 100, "unit": "KG"})
     assert r.status_code == 200, r.get_json()
     r = admin_client.post("/api/recipes", json={
-        "name": recipe_name, "yield": 100, "company_id": company_id,
-        "product_name": product})
+        "name": recipe_name, "company_id": company_id,
+        "invoice_id": invoice_id})
     assert r.status_code == 201, r.get_json()
-    r = admin_client.post(f"/api/recipes/{recipe_name}/items", json={
-        "chemical": chem_name, "percentage": pct, "company_id": company_id})
+    rid = r.get_json()["recipe"]["id"]
+    r = admin_client.post(
+        f"/api/recipes/by-id/{rid}/products/{quote(product)}/items", json={
+            "chemical": chem_name, "percentage": pct})
     assert r.status_code == 200, r.get_json()
+    return rid
 
 
 def _invoice_status(db, invoice_id):
@@ -387,52 +392,36 @@ def test_produce_route_409_for_terminal_invoice(admin_client, db, produce_for):
     assert r.status_code == 201, r.get_json()
 
     r = admin_client.post("/api/recipes/GateRecipe-TypedProd/produce", json={
-        "production_qty": 10, "company_id": cid,
-        "sale_ids": [sid], "invoice_ids": [inv]})
+        "company_id": cid,
+        "outputs": [{"product_name": "TypedProd", "quantity": 10}]})
     assert r.status_code == 409, r.get_json()
     assert r.get_json()["error"] == "invoice already shipped"
     assert _invoice_status(db, inv) == "shipped"
 
 
-def test_produce_route_404_for_missing_linked_sale(admin_client, db):
-    """recipes.py:530 — a sale id outside this company is a 404."""
+def test_produce_route_404_for_another_companys_recipe(admin_client, db):
+    """A recipe id outside this company reads as missing (no disclosure)."""
     cid_a = _company(admin_client, db, "TypedOwnA")
-    _sale(admin_client, cid_a, "PI-TOA-1", "TypedProdA")
-    _recipe(admin_client, cid_a, "TypedProdA", "TypedRecipeA", "TypedChemA")
+    sid_a = _sale(admin_client, cid_a, "PI-TOA-1", "TypedProdA")
+    inv_a = _invoice(admin_client, db, sid_a, "INV-TOA-1")
+    rid = _recipe(admin_client, cid_a, inv_a, "TypedProdA",
+                  "TypedRecipeA", "TypedChemA")
     cid_b = _company(admin_client, db, "TypedOwnB")
-    sid_b = _sale(admin_client, cid_b, "PI-TOB-1", "TypedProdB")
 
-    r = admin_client.post("/api/recipes/TypedRecipeA/produce", json={
-        "production_qty": 10, "company_id": cid_a,
-        "sale_ids": [sid_b]})
+    r = admin_client.post(f"/api/recipes/by-id/{rid}/produce", json={
+        "company_id": cid_b,
+        "outputs": [{"product_name": "TypedProdA", "quantity": 10}]})
     assert r.status_code == 404, r.get_json()
-    assert r.get_json()["error"] == (
-        f"linked sale {sid_b} not found for this company")
-
-
-def test_produce_route_404_for_missing_linked_invoice(admin_client, db):
-    """recipes.py:547 — own sale, but the invoice belongs to another company."""
-    cid_a = _company(admin_client, db, "TypedInvA")
-    sid_a = _sale(admin_client, cid_a, "PI-TIA-1", "TypedProdAI")
-    _recipe(admin_client, cid_a, "TypedProdAI", "TypedRecipeAI", "TypedChemAI")
-    cid_b = _company(admin_client, db, "TypedInvB")
-    sid_b = _sale(admin_client, cid_b, "PI-TIB-1", "TypedProdBI")
-    inv_b = _invoice(admin_client, db, sid_b, "INV-TIB-1")
-
-    r = admin_client.post("/api/recipes/TypedRecipeAI/produce", json={
-        "production_qty": 10, "company_id": cid_a,
-        "sale_ids": [sid_a], "invoice_ids": [inv_b]})
-    assert r.status_code == 404, r.get_json()
-    assert r.get_json()["error"] == (
-        f"linked invoice {inv_b} not found for this company")
+    assert r.get_json()["error"] == "Recipe not found"
 
 
 def test_book_route_409_when_not_produced(admin_client, db):
     """sales.py:2191 — booking a shipment before production is a 409."""
     cid = _company(admin_client, db, "TypedBookCo")
     sid = _sale(admin_client, cid, "PI-TB-1", "TypedBookProd")
-    _recipe(admin_client, cid, "TypedBookProd", "TypedBookRecipe", "TypedBookChem")
     inv = _invoice(admin_client, db, sid, "INV-TB-1")
+    _recipe(admin_client, cid, inv, "TypedBookProd",
+            "TypedBookRecipe", "TypedBookChem")
 
     r = admin_client.post(f"/api/sales/{sid}/invoices/{inv}/book",
                           json={"approx_ship_date": "2026-11-01"})

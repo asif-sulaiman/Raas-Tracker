@@ -10,11 +10,23 @@ import pytest
 psycopg = pytest.importorskip("psycopg")
 
 from raas_tracker import lcs as lcsmod  # noqa: E402
+from raas_tracker import recipes as recipesmod  # noqa: E402
 from raas_tracker import sales as salesmod  # noqa: E402
+from raas_tracker import stock as stockmod  # noqa: E402
 
 
 def _tag() -> str:
     return uuid.uuid4().hex[:8]
+
+
+def _formulated_recipe(conn, company_id, invoice_id, product):
+    """Invoice-scoped recipe with one formulated product, ready to produce."""
+    recipe = recipesmod.add_recipe(
+        conn, f"R-{_tag()}", company_id, invoice_id)
+    chemical = f"Chem-{_tag()}"
+    stockmod.add_chemical(conn, chemical, 500, "KG")
+    recipesmod.add_recipe_item(conn, recipe["id"], product, chemical, 10)
+    return recipe
 
 
 def _company(conn, name=None):
@@ -294,13 +306,6 @@ def test_move_lc_stage_propagates(db):
     s1 = _sale(db, co, product="P1")
     s2 = _sale(db, co, product="P2")
     lcsmod.attach_pis(db, lc["id"], [s1, s2])
-    for prod in ("P1", "P2"):
-        db.execute(
-            "INSERT INTO recipes (name, company_id, product_name)"
-            " VALUES (%s, %s, %s)",
-            (f"R-MV-{prod}-{_tag()}", co, prod),
-        )
-    db.commit()
     _invoice(db, s1, f"INV-MV-{_tag()}")
     assert lcsmod.move_lc_stage(db, lc["id"], "shipment_ongoing", notes="go") is True
     assert lcsmod.get_lc(db, lc["id"])["stage"] == "shipment_ongoing"
@@ -343,32 +348,12 @@ def test_move_lc_stage_sequential_double_move(db):
     lc = lcsmod.create_lc(db, co, f"LC-2MV-{_tag()}")
     s1 = _sale(db, co, product="PSeq")
     lcsmod.attach_pis(db, lc["id"], [s1])
-    db.execute(
-        "INSERT INTO recipes (name, company_id, product_name)"
-        " VALUES (%s, %s, %s)",
-        (f"R-SEQ-{_tag()}", co, "PSeq"),
-    )
-    db.commit()
-    _invoice(db, s1, f"INV-SEQ-{_tag()}")
     # P1-14: reaching payment_due is a SECOND barrier. It needs a shipped
     # invoice; shipping is what starts the payment clock.
-    recipe_id = db.execute(
-        "SELECT id FROM recipes WHERE company_id = %s AND product_name = %s",
-        (co, "PSeq")).fetchone()[0]
-    inv_id = db.execute(
-        "SELECT id FROM invoices WHERE sale_id = %s ORDER BY id DESC LIMIT 1",
-        (s1,)).fetchone()[0]
-    sale_item_id = db.execute(
-        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id LIMIT 1",
-        (s1,)).fetchone()[0]
-    run_id = db.execute(
-        "INSERT INTO production_runs (recipe_id, sale_item_id, qty_produced) "
-        "VALUES (%s, %s, 42.5) RETURNING id",
-        (recipe_id, sale_item_id)).fetchone()[0]
-    db.execute(
-        "INSERT INTO production_run_links (run_id, sale_id, invoice_id) "
-        "VALUES (%s, %s, %s)", (run_id, s1, inv_id))
-    db.commit()
+    inv_id = _invoice(db, s1, f"INV-SEQ-{_tag()}")["invoice_id"]
+    recipe = _formulated_recipe(db, co, inv_id, "PSeq")
+    recipesmod.create_production_run(
+        db, co, recipe["id"], [{"product_name": "PSeq", "quantity": 42.5}])
     assert salesmod.book_invoice(db, inv_id, "2026-11-01") is True
     # Payment Due needs an actual ship date.
     db.execute("UPDATE invoices SET status = 'shipped', actual_ship_date = %s"
@@ -472,15 +457,11 @@ def _lc_ready_setup(db, co, product, with_recipe=True, with_invoice=True):
     lc = lcsmod.create_lc(db, co, f"LC-GT-{_tag()}")
     sid = _sale(db, co, product=product)
     lcsmod.attach_pis(db, lc["id"], [sid])
-    if with_recipe:
-        db.execute(
-            "INSERT INTO recipes (name, company_id, product_name)"
-            " VALUES (%s, %s, %s)",
-            (f"R-{_tag()}", co, product),
-        )
-        db.commit()
+    assert with_invoice or not with_recipe, "a recipe needs its invoice"
     if with_invoice:
-        _invoice(db, sid, f"INV-{_tag()}")
+        inv = _invoice(db, sid, f"INV-{_tag()}")["invoice_id"]
+        if with_recipe:
+            _formulated_recipe(db, co, inv, product)
     return lc["id"], sid
 
 

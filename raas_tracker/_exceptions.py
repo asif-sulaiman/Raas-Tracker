@@ -113,6 +113,16 @@ class InvoiceNotShipped(LifecycleConflict):
     """
 
 
+class InvoiceHasRuns(LifecycleConflict):
+    """409 — voiding an invoice that production has already run for.
+
+    ``recipes.invoice_id`` cascades from the invoice, but
+    ``production_runs.recipe_id`` is RESTRICT. Deleting the invoice would
+    therefore surface as a database error halfway through the void. The
+    refusal is explicit instead, before any write.
+    """
+
+
 class SaleNotReadyPastShipment(LifecycleConflict):
     """409 — a sale cannot enter Payment Due without one booked invoice.
 

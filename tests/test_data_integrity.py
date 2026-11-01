@@ -90,6 +90,17 @@ def test_update_stock_negative_400(client, admin_client):
     assert chem["qty"] == 50.0
 
 
+def _invoice(conn, sale_id, invoice_number):
+    from raas_tracker.sales import create_invoice
+    item_id = conn.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s ORDER BY id LIMIT 1",
+        (sale_id,)).fetchone()[0]
+    return create_invoice(
+        conn, sale_id, invoice_number,
+        lines=[{"sale_item_id": item_id, "quantity": 10}],
+        invoice_date="2026-01-15")["invoice_id"]
+
+
 def test_recipe_company_isolation(db):
     """Two companies with same recipe name; each company's calls only see their own recipe."""
     conn = db
@@ -98,27 +109,29 @@ def test_recipe_company_isolation(db):
     c1_id = create_company(conn, name="Company A", code="CA", country="US", address="Addr A", contact_person="Contact A")
     c2_id = create_company(conn, name="Company B", code="CB", country="US", address="Addr B", contact_person="Contact B")
     
-    # Create a product for each company (required for recipe creation)
-    add_sale(conn, {
+    # Each company invoices one product
+    sale_c1 = add_sale(conn, {
         "pi_number": "PI-CA-1", "pi_date": "2024-01-01",
         "client_name": "Company A", "company_id": c1_id
     }, [{"product_name": "Product A", "quantity": 10, "unit_price": 100, "unit": "KG"}])
-    add_sale(conn, {
+    sale_c2 = add_sale(conn, {
         "pi_number": "PI-CB-1", "pi_date": "2024-01-01",
         "client_name": "Company B", "company_id": c2_id
     }, [{"product_name": "Product B", "quantity": 10, "unit_price": 100, "unit": "KG"}])
+    inv_c1 = _invoice(conn, sale_c1, "INV-CA-1")
+    inv_c2 = _invoice(conn, sale_c2, "INV-CB-1")
     
     # Add chemicals
     add_chemical(conn, "ChemA", 100, "KG")
     add_chemical(conn, "ChemB", 200, "KG")
     
-    # Create same recipe name for both companies
-    add_recipe(conn, "Shared Recipe", 1000, 0, c1_id, "Product A")
-    add_recipe(conn, "Shared Recipe", 2000, 10, c2_id, "Product B")
+    # Create same recipe name for both companies, each on its own invoice
+    recipe_c1_row = add_recipe(conn, "Shared Recipe", c1_id, inv_c1)
+    recipe_c2_row = add_recipe(conn, "Shared Recipe", c2_id, inv_c2)
     
     # Add different items to each recipe
-    add_recipe_item(conn, c1_id, "Shared Recipe", "ChemA", 50.0)
-    add_recipe_item(conn, c2_id, "Shared Recipe", "ChemB", 30.0)
+    add_recipe_item(conn, recipe_c1_row["id"], "Product A", "ChemA", 50.0)
+    add_recipe_item(conn, recipe_c2_row["id"], "Product B", "ChemB", 30.0)
     
     # Query recipes - each company should only see their own
     recipe_c1 = get_recipe_by_name(conn, c1_id, "Shared Recipe")
@@ -128,10 +141,8 @@ def test_recipe_company_isolation(db):
     assert recipe_c2 is not None
     assert recipe_c1["company_id"] == c1_id
     assert recipe_c2["company_id"] == c2_id
-    assert recipe_c1["total_quantity"] == 1000
-    assert recipe_c2["total_quantity"] == 2000
-    assert recipe_c1["water_percentage"] == 0
-    assert recipe_c2["water_percentage"] == 10
+    assert recipe_c1["invoice_id"] == inv_c1
+    assert recipe_c2["invoice_id"] == inv_c2
     
     # List items - each should only see their own items
     items_c1 = list_recipe_items(conn, c1_id, "Shared Recipe")
@@ -153,18 +164,19 @@ def test_recipe_url_encoding(client, admin_client, db, pg_dsn):
     
     # Create company and product
     c_id = create_company(conn, name="Company C", code="CC", country="US", address="Addr C", contact_person="Contact C")
-    add_sale(conn, {
+    sale_id = add_sale(conn, {
         "pi_number": "PI-CC-1", "pi_date": "2024-01-01",
         "client_name": "Company C", "company_id": c_id
     }, [{"product_name": "Product C", "quantity": 10, "unit_price": 100, "unit": "KG"}])
+    invoice_id = _invoice(conn, sale_id, "INV-CC-1")
     
     # Add chemical
     add_chemical(conn, "ChemC", 100, "KG")
     
     # Create recipe with special characters in name
     recipe_name = "Special Recipe / Test & Co."
-    add_recipe(conn, recipe_name, 1000, 0, c_id, "Product C")
-    add_recipe_item(conn, c_id, recipe_name, "ChemC", 25.0)
+    recipe = add_recipe(conn, recipe_name, c_id, invoice_id)
+    add_recipe_item(conn, recipe["id"], "Product C", "ChemC", 25.0)
     
     # URL-encode the recipe name for the API call
     import urllib.parse
@@ -229,14 +241,16 @@ def test_production_run_get_serializers_map_columns(admin_client, db, pg_dsn):
     conn = db
     c_id = create_company(conn, name="Run Co", code="RUNCO", country="US",
                           address="Addr", contact_person="P")
-    add_sale(conn, {"pi_number": "PI-RUN-1", "client_name": "Run Co",
-                    "company_id": c_id},
-             [{"product_name": "Product R", "quantity": 10, "unit_price": 10,
-               "unit": "KG"}])
+    sale_id = add_sale(conn, {"pi_number": "PI-RUN-1", "client_name": "Run Co",
+                              "company_id": c_id},
+                       [{"product_name": "Product R", "quantity": 10,
+                         "unit_price": 10, "unit": "KG"}])
+    invoice_id = _invoice(conn, sale_id, "INV-RUN-1")
     add_chemical(conn, "ChemRun", 100, "KG")
-    add_recipe(conn, "Run Recipe", 100, 0, c_id, "Product R")
-    add_recipe_item(conn, c_id, "Run Recipe", "ChemRun", 10.0)
-    create_production_run(conn, c_id, "Run Recipe", 42.5,
+    recipe_row = add_recipe(conn, "Run Recipe", c_id, invoice_id)
+    add_recipe_item(conn, recipe_row["id"], "Product R", "ChemRun", 10.0)
+    create_production_run(conn, c_id, recipe_row["id"],
+                          [{"product_name": "Product R", "quantity": 42.5}],
                           order_number="ORD-1", batch_number="BATCH-1",
                           production_date="2026-05-04", notes="hello")
     conn.commit()

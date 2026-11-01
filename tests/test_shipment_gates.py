@@ -10,9 +10,9 @@ production from recipe/run content.
 """
 import uuid
 
-from chem_stock import add_recipe, add_sale
+from chem_stock import add_sale
 from raas_tracker.sales import book_invoice, create_invoice
-from raas_tracker.recipes import create_production_run
+from raas_tracker.recipes import add_recipe
 
 
 def _tag() -> str:
@@ -51,6 +51,16 @@ def _invoice(db, sale_id, number):
                  "ORDER BY id", (sale_id,)).fetchall()]
     return create_invoice(db, sale_id, number, lines=lines,
                           invoice_date="2026-01-15")
+
+
+def _recipe(db, sale_id, name):
+    """Create the one recipe for the sale's most recent invoice."""
+    invoice_id = db.execute(
+        "SELECT id FROM invoices WHERE sale_id = %s ORDER BY id DESC LIMIT 1",
+        (sale_id,)).fetchone()[0]
+    company_id = db.execute(
+        "SELECT company_id FROM sales WHERE id = %s", (sale_id,)).fetchone()[0]
+    return add_recipe(db, name, company_id, invoice_id)
 
 
 def _mk_lc(admin_client, company_id, lc_number, **kw):
@@ -141,7 +151,7 @@ def test_payment_due_blocked_with_recipe_but_no_shipped_invoice(admin_client, db
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
     _invoice(db, sid, f"INV-G4-{tag}")
-    assert add_recipe(db, f"R-G4-{tag}", 100, 0, co, product) is not False
+    _recipe(db, sid, f"R-G4-{tag}")
     r = admin_client.post(f"/api/lcs/{lc['id']}/move",
                           json={"new_stage": "shipment_ongoing"})
     assert r.status_code == 200, r.get_json()
@@ -164,7 +174,7 @@ def test_payment_due_ignores_a_sale_linked_run_that_never_shipped(admin_client, 
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
     _invoice(db, sid, f"INV-G5-{tag}")
-    assert add_recipe(db, f"R-G5-{tag}", 100, 0, co, product) is not False
+    _recipe(db, sid, f"R-G5-{tag}")
     # Production run attached to the sale but NOT to its invoice.
     recipe_id = db.execute(
         "SELECT id FROM recipes WHERE company_id = %s AND lower(name) = lower(%s)",
@@ -186,7 +196,7 @@ def test_payment_due_ignores_a_sale_linked_run_that_never_shipped(admin_client, 
     assert r.status_code == 409, r.get_json()
 
 
-def test_payment_due_passes_with_a_shipped_invoice(admin_client, db):
+def test_payment_due_passes_with_a_shipped_invoice(admin_client, db, produce_for):
     tag = _tag()
     co = _company(db, f"G6 {tag}")
     lc = _mk_lc(admin_client, co, f"LC-G6-{tag}")
@@ -200,18 +210,8 @@ def test_payment_due_passes_with_a_shipped_invoice(admin_client, db):
     inv_id = db.execute(
         "SELECT id FROM invoices WHERE sale_id = %s AND invoice_number = %s",
         (sid, f"INV-G6-{tag}")).fetchone()[0]
-    assert add_recipe(db, f"R-G6-{tag}", 100, 0, co, product) is not False
-    recipe_id = db.execute(
-        "SELECT id FROM recipes WHERE company_id = %s AND lower(name) = lower(%s)",
-        (co, f"R-G6-{tag}")).fetchone()[0]
-    sale_item_id = _sale_item_id(db, sid)
-    run_id = db.execute(
-        "INSERT INTO production_runs (recipe_id, sale_item_id, order_number, batch_number, production_date, qty_produced, created_by) VALUES (%s, %s, NULL, NULL, NULL, 42.5, NULL) RETURNING id",
-        (recipe_id, sale_item_id)).fetchone()[0]
-    db.execute(
-        "INSERT INTO production_run_links (run_id, sale_id, invoice_id) VALUES (%s, %s, %s)",
-        (run_id, sid, inv_id))
-    db.commit()
+    # Booking now proves production: formulate and run every product.
+    produce_for(co, sid, inv_id, tag, product)
     assert book_invoice(db, inv_id, "2026-11-01") is True
     # Shipment is the gate (status-only here: this test is about the LC gate).
     db.execute(
@@ -237,7 +237,7 @@ def test_direct_jump_from_lc_received_to_payment_due_requires_a_shipped_invoice(
         f"/api/lcs/{lc['id']}/pis",
         json={"sale_ids": [sid]}).status_code == 200
     _invoice(db, sid, f"INV-G7-{tag}")
-    assert add_recipe(db, f"R-G7-{tag}", 100, 0, co, product) is not False
+    _recipe(db, sid, f"R-G7-{tag}")
 
     # A direct overshoot to payment_due still has to clear the shipped gate.
     r = admin_client.post(f"/api/lcs/{lc['id']}/move",
