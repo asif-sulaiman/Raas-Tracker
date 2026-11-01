@@ -291,13 +291,37 @@ async function openCreateModal() {
 const called = (fetchMock, needle) => fetchMock.mock.calls
   .some(([url]) => String(url).includes(needle));
 
+async function pickCompany(name = 'Acme') {
+  const company = screen.getByLabelText(/^Company/);
+  // The combobox ignores typed text until the register has arrived.
+  await waitFor(() => expect(company).toHaveAttribute('placeholder', 'Search companies…'));
+  fireEvent.focus(company);
+  await screen.findByRole('option', { name });
+  fireEvent.change(company, { target: { value: name } });
+}
+
 async function pickInvoice() {
-  fireEvent.change(screen.getByLabelText(/^Company/), { target: { value: '7' } });
-  fireEvent.change(screen.getByLabelText(/^LC/), { target: { value: '1' } });
+  await pickCompany();
+
+  const lc = await screen.findByLabelText(/^LC/);
+  fireEvent.focus(lc);
+  fireEvent.change(lc, { target: { value: 'LC-2026-001' } });
+  fireEvent.keyDown(lc, { key: 'Enter' });
+
+  const pi = await screen.findByLabelText(/^PI/);
+  await waitFor(() => expect(pi.disabled).toBe(false));
+  fireEvent.focus(pi);
   await screen.findByRole('option', { name: /PI-2026-014/ });
-  fireEvent.change(screen.getByLabelText(/^PI/), { target: { value: '5' } });
+  fireEvent.change(pi, { target: { value: 'PI-2026-014' } });
+  fireEvent.keyDown(pi, { key: 'Enter' });
+
+  const invoice = await screen.findByLabelText(/^Invoice/);
+  await waitFor(() => expect(invoice.disabled).toBe(false));
+  fireEvent.focus(invoice);
   await screen.findByRole('option', { name: /INV-014/ });
-  fireEvent.change(screen.getByLabelText(/^Invoice/), { target: { value: '9' } });
+  fireEvent.change(invoice, { target: { value: 'INV-014' } });
+  fireEvent.keyDown(invoice, { key: 'Enter' });
+
   await screen.findByText('3 products on this invoice');
 }
 
@@ -315,43 +339,58 @@ describe('Create New Recipe sourcing', () => {
   it('labels running LCs by their producible PIs and disables empty ones', async () => {
     renderRecipes();
     await openCreateModal();
-    fireEvent.change(screen.getByLabelText(/^Company/), { target: { value: '7' } });
+    await pickCompany();
+
+    const lc = screen.getByLabelText(/^LC/);
+    fireEvent.focus(lc);
 
     const withWork = await screen.findByRole('option', { name: /LC-2026-001/ });
     expect(withWork.textContent).toContain('1 PI in production');
     expect(withWork.textContent).not.toContain('lc_received');
 
     const noWork = screen.getByRole('option', { name: /LC-2026-002/ });
-    expect(noWork.disabled).toBe(true);
+    expect(noWork).toHaveAttribute('aria-disabled', 'true');
     expect(noWork.textContent).toContain('no invoices in production');
   });
 
   it('keeps a PI with nothing left to produce visible but disabled', async () => {
     const { fetchMock } = renderRecipes();
     await openCreateModal();
-    fireEvent.change(screen.getByLabelText(/^Company/), { target: { value: '7' } });
-    fireEvent.change(screen.getByLabelText(/^LC/), { target: { value: '1' } });
+    await pickCompany();
 
+    const lc = screen.getByLabelText(/^LC/);
+    fireEvent.focus(lc);
+    fireEvent.click(await screen.findByRole('option', { name: /LC-2026-001/ }));
     await waitFor(() => expect(called(fetchMock, '/api/lcs/1?open_only=true')).toBe(true));
 
+    const pi = screen.getByLabelText(/^PI/);
+    await waitFor(() => expect(pi.disabled).toBe(false));
+    fireEvent.focus(pi);
     const openPi = await screen.findByRole('option', { name: /PI-2026-014/ });
-    expect(openPi.disabled).toBe(false);
+    expect(openPi).not.toHaveAttribute('aria-disabled', 'true');
     expect(openPi.textContent).toContain('1 invoice in production');
 
     const donePi = screen.getByRole('option', { name: /PI-2026-015/ });
-    expect(donePi.disabled).toBe(true);
+    expect(donePi).toHaveAttribute('aria-disabled', 'true');
     expect(donePi.textContent).toContain('no invoices in production');
   });
 
   it('offers only invoices still in production', async () => {
     const { fetchMock } = renderRecipes();
     await openCreateModal();
-    fireEvent.change(screen.getByLabelText(/^Company/), { target: { value: '7' } });
-    fireEvent.change(screen.getByLabelText(/^LC/), { target: { value: '1' } });
-    await screen.findByRole('option', { name: /PI-2026-014/ });
-    fireEvent.change(screen.getByLabelText(/^PI/), { target: { value: '5' } });
+    await pickCompany();
+
+    const lc = screen.getByLabelText(/^LC/);
+    fireEvent.focus(lc);
+    fireEvent.click(await screen.findByRole('option', { name: /LC-2026-001/ }));
+
+    const pi = await screen.findByLabelText(/^PI/);
+    await waitFor(() => expect(pi.disabled).toBe(false));
+    fireEvent.focus(pi);
+    fireEvent.click(await screen.findByRole('option', { name: /PI-2026-014/ }));
 
     await waitFor(() => expect(called(fetchMock, '/api/sales/5/invoices?producible=true')).toBe(true));
+    fireEvent.focus(screen.getByLabelText(/^Invoice/));
     const option = await screen.findByRole('option', { name: /INV-014/ });
     expect(option.textContent).toContain('Planned');
     expect(option.textContent).not.toContain('planned');
@@ -420,7 +459,7 @@ describe('Create New Recipe sourcing', () => {
   it('offers a link to Sales when the company has no running LC', async () => {
     renderRecipes({ lcs: [] });
     await openCreateModal();
-    fireEvent.change(screen.getByLabelText(/^Company/), { target: { value: '7' } });
+    await pickCompany();
 
     const link = await screen.findByRole('link', { name: /Sales/ });
     expect(link.getAttribute('href')).toBe('/sales');

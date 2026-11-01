@@ -3,6 +3,7 @@ import { Search, Loader2, AlertTriangle, Link2 } from 'lucide-react';
 import Modal from '../modals/Modal';
 import Button from '../ui/Button';
 import Badge from '../ui/Badge';
+import EntityCombobox from '../ui/EntityCombobox';
 import { formatNumber, formatDate } from '../../utils/format';
 import { useAuth } from '../../context/AuthContext';
 import { toast } from 'sonner';
@@ -320,20 +321,17 @@ export default function LinkPIsModal({
 
           {mode === 'existing' ? (
             existingLcs.length > 0 ? (
-              <select
+              <EntityCombobox
                 aria-label="Existing LC"
+                options={existingLcs.map((l) => ({
+                  value: l.id,
+                  label: `${l.lc_number} — ${l.company_name || l.client_name || ''} (${l.pi_count ?? 0} PIs)`,
+                }))}
                 value={lcId}
-                onChange={(e) => setLcId(e.target.value)}
+                onChange={setLcId}
+                placeholder="Search LCs…"
                 className={inputCls}
-              >
-                <option value="">Select LC…</option>
-                {existingLcs.map((l) => (
-                  <option key={l.id} value={l.id}>
-                    {l.lc_number} — {l.company_name || l.client_name || ''} ({l.pi_count ?? 0}{' '}
-                    PIs)
-                  </option>
-                ))}
-              </select>
+              />
             ) : (
               <p className="text-xs text-slate-500 dark:text-slate-400 italic">
                 No LCs yet — create a new one below.
