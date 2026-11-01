@@ -177,7 +177,7 @@ Vertical slices, each independently testable.
 |---|---|---|---|
 | M7.1 ✓ | **Upload Size Guard** — Env-configurable `MAX_CONTENT_LENGTH` (default 50MB via `MAX_CONTENT_LENGTH_MB`, Vercel 4.5MB override) + 413 JSON that reports the real cap | `flask_app.py`, `.env.example`, `docs/SPEC.md` | `MAX_CONTENT_LENGTH_MB` env respected (floats OK); 413 JSON message matches configured cap |
 | M7.2 | **Frontend Error Boundary Logging** — Send React errors to `/api/notifications` (type `frontend_error`) | `ErrorBoundary.jsx`, `NotificationContext.jsx`, `flask_app.py` | Uncaught React errors appear in admin notifications |
-| M7.3 | **Recipe Item `required_qty_per_unit` Persistence** — Store computed `percentage * total_quantity / 100` on create/update | `recipes.py`, `flask_app.py` (recipe item PUT), `recipes.jsx` | Field persisted, editable, used in reports |
+| M7.3 ✓ | **~~Recipe Item `required_qty_per_unit` Persistence~~** — Obsolete 2026-11-01: v8 dropped the column with the product/quantity model. Items store `percentage` only and the per-unit requirement is derived at read time (`percentage / 100` scaled by the run quantity), so there is nothing to persist | — | Superseded by Phase INVOICE-SCOPED-RECIPES |
 | M7.4 | **Sales Duplicate PI Warning → Configurable** — Add `ALLOW_DUPLICATE_PI` env (default true) to suppress warning | `flask_app.py:_duplicate_pi_warning`, `.env.example` | Env controls warning behavior |
 | M7.5 ✓ | **Frontend Oxlint Cleanup** — Fix 39 baseline warnings (unused imports, exhaustive-deps, refs in render) | `raas-tracker-frontend/src/**/*.jsx`, `.oxlintrc.json` | `oxlint` → 0 warnings |
 | M7.6 | **Vercel `public/` Assets Verify** — Ensure `favicon.svg`, `icons.svg` served with correct MIME | `vercel.json` (buildCommand), `public/` | `/favicon.svg` → `image/svg+xml` |
@@ -760,6 +760,10 @@ free of `total_quantity`; water is metadata. Out of scope and flagged:
 ones; `Reports.jsx` posts bare recipe names; `DELETE` of a produced recipe still
 500s on FK RESTRICT; legacy `lc_number`-only PIs are not in the cascade.
 
+> Superseded 2026-11-01 by **Phase INVOICE-SCOPED-RECIPES** below: one recipe now
+> belongs to one invoice, so the product/quantity/water revision and the name-keyed
+> report payloads described above no longer exist.
+
 **Walkthrough (isolated Postgres, built SPA).** Two defects surfaced and were
 fixed. `ProductionRunModal` read `GET /api/sales` as an array although it
 answers `{sales, total}`, so the PI dropdown was always empty and no run could
@@ -803,6 +807,72 @@ behaviours. One shim
 repairs every name-addressed route (detail fallback, update, delete, items with
 a `<chem>` segment, produce, runs), and the gate now sees the path PEP 3333
 promises.
+
+---
+
+## 🧾 Phase INVOICE-SCOPED-RECIPES: one recipe per invoice (completed 2026-11-01)
+
+A recipe is now the **production plan for one invoice**, not a formula for one
+product: every product on the invoice is formulated and produced under that one
+recipe, quantities come from the invoice, and the old product/quantity/water
+header fields are gone. Existing recipes were demo data and were deleted rather
+than migrated (the v8 migration refuses to guess a product → invoice mapping).
+
+| # | Phase | Scope | Commit |
+|---|---|---|---|
+| 0 | **Demo reset** | `scripts/reset_demo_recipes.py` + `raas_tracker/demo_reset.py`: dry run by default, apply needs `--yes` **and** an existing `--backup-file` dump written under an advisory lock; prints the per-chemical stock delta and restores it only with `--restore-stock`; resets affected invoices to `planned` and sale badges to `production_running`; never touches stages, payments, shipments or amounts | `1dd9ca4` |
+| 1 | **Schema v8** | `recipes.invoice_id` NOT NULL + unique; `recipe_products` (slot per product, unique `(recipe_id, lower(product_name))`); `recipe_items.recipe_product_id` + percentage; `production_run_outputs`; drops the old product/quantity/water columns after asserting no recipe/run rows remain; `_SCHEMA_VERSION = 8` | `ae6b2c9` |
+| 2 | **Service + API** | `add_recipe(name, company_id, invoice_id)` derives and syncs slots from invoice lines; detail returns `{recipe, products, items}` with invoiced/produced/remaining and formulation state; per-product item routes by item id; rename-only `PUT /api/recipes/by-id/<id>`; `POST /api/recipes/by-id/<id>/produce` takes `{outputs}` and derives sale/invoice links from the recipe; `/api/invoices/<id>/production-source` | `3dea6ac` |
+| 3 | **Readiness, reports, units, stock** | Booking requires the invoice's recipe, a formulation per product and a linked run **output** per product; ship re-checks; report attribution per output and per invoice (provisional rows by sale); report request is `{recipes:[{recipe_id, outputs}]}` with one aggregated deduction per chemical and converted stock units; void guard when runs exist | `d04b6f5` |
+| 4 | **Frontend** | Create modal keeps Company → LC → PI → Invoice and drops product/quantity/water; detail is one `ProductFormulationCard` per invoice product; rename-only edit; production modal fixed to the invoice with remainders prefilled; report picker by recipe id with per-product quantities and a per-product breakdown; list/KPI invoice wording | `0497c94` |
+| 5 | **Docs + gate** | PRD Flow 4/6/7 + data model; SPEC schema/routes/readiness/report/version history; this section; full gate | this commit |
+
+**Locked decisions.** `recipes.invoice_id` is `UNIQUE` because the invoice *is*
+the recipe — two plans for one invoice would make readiness ambiguous. A product
+on the invoice with no formulation blocks booking (an empty slot is not a plan);
+a product added after the recipe was created gets that slot automatically and is
+named in the block message. Production quantities are prefilled from the invoice
+remainder but stay editable and are **not capped**, because over-production is a
+real scenario; the UI warns instead. A run's links are derived from
+`recipes.invoice_id`, so a request cannot fulfil an invoice it does not own.
+Invoice lines removed after formulation mark the slot off-invoice instead of
+deleting history. Reports aggregate one requirement per chemical across all
+product outputs, and a missing unit conversion is a **400 naming both units**,
+never a guessed KG.
+
+**Risks and resolutions.** (1) *Lost demo formulations* — the reset script prints
+the delta and requires a dump first; stock restore is opt-in and previewed. (2)
+*Old clients posting product/quantity/water* — the Pydantic models are
+`extra="forbid"`, so the request fails loudly with a 400 instead of silently
+creating an invoice-less recipe. (3) *Late invoice lines silently unproduced* —
+slots are synced on every detail read and readiness names the missing product.
+(4) *Double deduction when two products share a chemical* — requirements are
+aggregated per chemical id before conversion and one deduction is written. (5)
+*Report totals that drift from the table* — export re-posts the exact selection
+that generated the table, never `report.recipes` (server rows the route rejects).
+
+**Cutover (live v7 → v8).** Stop writes, keep a dump, reset the demo data, then
+deploy:
+
+```bash
+python scripts/reset_demo_recipes.py                     # dry run, review delta
+pg_dump "$DATABASE_URL" -Fc -f demo_backup.dump          # keep this file
+python scripts/reset_demo_recipes.py --yes \
+    --backup-file demo_backup.dump --restore-stock
+```
+
+Then start the v8 app: the migration asserts no recipes/runs remain, adds the new
+tables and drops the old columns in one transaction under
+`pg_advisory_xact_lock`. Apply is **not** reversible without the dump.
+
+**Verification.** Backend (Phase 5 gate, 2026-11-01): **1444 passed, 8 skipped**
+(1225s on the embedded Postgres), `ruff check` at its 18 known baseline nits
+(unused imports/redefinitions in `flask_app.py` and `sales.py`, none added by
+this phase), `pyright` 0 errors / 15 baseline warnings. Frontend at Phase 4 and
+re-run for Phase 5: 375 tests across 41 files, oxlint 0 warnings / 0 errors,
+`vite build` green, `dist/` copied to `react_frontend/`. Isolated-Postgres and
+browser walkthroughs (the plan's verification steps 1–5) remain to be re-run
+against the deployed v8 before the demo data is rebuilt.
 
 ---
 
