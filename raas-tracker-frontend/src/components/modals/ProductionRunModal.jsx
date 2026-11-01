@@ -1,10 +1,10 @@
 import { useState, useEffect } from 'react';
-import { Plus, Trash2 } from 'lucide-react';
+import { AlertTriangle } from 'lucide-react';
 import Modal from './Modal';
 import Button from '../ui/Button';
 import { useAuth } from '../../context/AuthContext';
 import { toast } from 'sonner';
-import { formatNumber, todayLocalISO } from '../../utils/format';
+import { formatNumber } from '../../utils/format';
 
 const inputCls =
   'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
@@ -13,330 +13,160 @@ function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
-export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItems = [], onSaved }) {
+const keyOf = (product) => String(product.product_name || '').toLowerCase();
+
+const remainingOf = (product) => {
+  const remaining = Number(product.remaining_qty);
+  if (Number.isFinite(remaining)) return Math.max(remaining, 0);
+  return Math.max(
+    (Number(product.invoiced_qty) || 0) - (Number(product.produced_qty) || 0),
+    0,
+  );
+};
+
+/**
+ * One run against the recipe's own invoice.
+ *
+ * The sale and invoice are fixed by the recipe, so this form cannot point a
+ * run at another invoice. Every product on the invoice gets a row prefilled
+ * with its remaining quantity; a row left at 0 is not sent, and a product
+ * with no formulation is never silently produced.
+ */
+export default function ProductionRunModal({ isOpen, onClose, recipe, onSaved }) {
   const { apiFetch } = useAuth();
 
-  const [companies, setCompanies] = useState([]);
-  const [recipes, setRecipes] = useState([]);
-  const [allSales, setAllSales] = useState([]);
-  const [loadingRefs, setLoadingRefs] = useState(false);
-
-  const [companyId, setCompanyId] = useState('');
-  const [saleId, setSaleId] = useState('');
   const [products, setProducts] = useState([]);
-  const [invoices, setInvoices] = useState([]);
-  const [loadingSource, setLoadingSource] = useState(false);
+  const [quantities, setQuantities] = useState({});
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState(null);
+  const [attempt, setAttempt] = useState(0);
 
-  const [invoiceChoice, setInvoiceChoice] = useState('');
-  const [newInvoiceNumber, setNewInvoiceNumber] = useState('');
   const [materialNumber, setMaterialNumber] = useState('');
   const [packing, setPacking] = useState('');
   const [batchNumber, setBatchNumber] = useState('');
   const [productionDate, setProductionDate] = useState(today());
-  const [sourceError, setSourceError] = useState(null);
-
-  const [recipeRows, setRecipeRows] = useState([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
-  // The dropdown sources (companies / recipes / PIs) load as one unit. A failure
-  // leaves every list empty, which is indistinguishable from a genuinely empty
-  // master — so the failure gets its own state and never renders as "no data".
-  const [refsError, setRefsError] = useState(null);
-  const [refsAttempt, setRefsAttempt] = useState(0);
+
+  const invoiceId = recipe?.invoice_id ?? null;
 
   useEffect(() => {
-    if (!isOpen) return;
-    const presetCompany = recipe?.company_id != null ? String(recipe.company_id) : '';
-    const initialQty = recipe?.total_quantity != null ? String(recipe.total_quantity) : '';
+    if (!isOpen) return undefined;
     // Always mounted (isOpen toggles visibility) — reset the form and reload
-    // the dropdown sources on every open.
+    // the invoice's products on every open.
     // oxlint-disable-next-line react/set-state-in-effect
-    setCompanies([]);
-    setRecipes([]);
-    setAllSales([]);
-    setCompanyId(presetCompany);
-    setSaleId('');
     setProducts([]);
-    setInvoices([]);
-    setLoadingSource(false);
-    setInvoiceChoice('');
-    setNewInvoiceNumber('');
+    // oxlint-disable-next-line react/set-state-in-effect
+    setQuantities({});
+    // oxlint-disable-next-line react/set-state-in-effect
     setMaterialNumber('');
+    // oxlint-disable-next-line react/set-state-in-effect
     setPacking('');
+    // oxlint-disable-next-line react/set-state-in-effect
     setBatchNumber('');
+    // oxlint-disable-next-line react/set-state-in-effect
     setProductionDate(today());
-    setRecipeRows([{ key: 'row-0', recipe_name: recipe?.name || '', qty: initialQty }]);
+    // oxlint-disable-next-line react/set-state-in-effect
     setError(null);
-    setRefsError(null);
+    // oxlint-disable-next-line react/set-state-in-effect
+    setLoadError(null);
+    // oxlint-disable-next-line react/set-state-in-effect
     setSaving(false);
-    setLoadingRefs(true);
+    if (invoiceId == null) {
+      // Without its invoice the run cannot be linked at all; say so instead of
+      // showing an empty product list that reads like "nothing to produce".
+      setLoadError('This recipe is not linked to an invoice.');
+      setLoading(false);
+      return undefined;
+    }
+    let cancelled = false;
+    setLoading(true);
     (async () => {
       try {
-        const [coRes, recRes, saleRes] = await Promise.all([
-          apiFetch('/api/companies'),
-          apiFetch('/api/recipes'),
-          apiFetch('/api/sales'),
-        ]);
-        const [cos, recs, sales] = await Promise.all([coRes.json(), recRes.json(), saleRes.json()]);
-        setCompanies(Array.isArray(cos) ? cos : []);
-        setRecipes(Array.isArray(recs) ? recs : []);
-        // GET /api/sales is paginated ({sales, total}); an older array shape is
-        // still accepted so the modal cannot silently lose every PI again.
-        setAllSales(
-          Array.isArray(sales)
-            ? sales
-            : Array.isArray(sales?.sales)
-              ? sales.sales
-              : [],
+        const res = await apiFetch(
+          `/api/invoices/${encodeURIComponent(invoiceId)}/production-source`,
         );
+        const data = await res.json();
+        if (cancelled) return;
+        const rows = Array.isArray(data?.products) ? data.products : [];
+        setProducts(rows);
+        setQuantities(Object.fromEntries(rows.map((p) => [
+          keyOf(p), String(remainingOf(p)),
+        ])));
       } catch (err) {
-        // Empty lists are indistinguishable from an empty master, so record the
-        // failure — the empty-state messages below stay reserved for a real
-        // successful-but-empty response.
-        setCompanies([]);
-        setRecipes([]);
-        setAllSales([]);
-        setRefsError(err?.message || 'Could not load companies, recipes, and PIs');
+        if (cancelled) return;
+        // An empty list is not evidence that everything is produced.
+        setProducts([]);
+        setLoadError(err?.message || 'Could not load invoice products');
       } finally {
-        setLoadingRefs(false);
+        if (!cancelled) setLoading(false);
       }
     })();
-    // apiFetch is not referentially stable (its useCallback chain bottoms out in
-    // react-router's navigate) — adding it would refetch on every parent render.
+    return () => { cancelled = true; };
+    // apiFetch is not referentially stable; re-keying on recipe identity is
+    // what opens a fresh run.
     // oxlint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOpen, recipe, refsAttempt]);
+  }, [isOpen, invoiceId, recipe?.id, attempt]);
 
-  const retryRefs = () => setRefsAttempt((n) => n + 1);
+  const rows = products
+    .filter((p) => p.on_invoice !== false && remainingOf(p) > 0);
+  const producedOut = products
+    .filter((p) => p.on_invoice !== false && remainingOf(p) === 0)
+    .map((p) => p.product_name);
+  const submittableRows = rows.filter((p) => p.formulated);
+  const hasFormulatedRow = submittableRows.length > 0;
 
-  const defaultQty = () => (recipe?.total_quantity != null ? String(recipe.total_quantity) : '');
-
-  const setRowField = (index, field, value) => {
-    setRecipeRows((prev) => prev.map((row, i) => (i === index ? { ...row, [field]: value } : row)));
-  };
-
-  const resetSaleFields = () => {
-    setSaleId('');
-    setProducts([]);
-    setInvoices([]);
-    setLoadingSource(false);
-    setSourceError(null);
-    setInvoiceChoice('');
-    setNewInvoiceNumber('');
-    setRowField(0, 'qty', defaultQty());
-  };
-
-  const handleCompanyChange = (value) => {
-    setCompanyId(value);
-    resetSaleFields();
-  };
-
-  const handleSaleChange = async (value) => {
-    setSaleId(value);
-    setProducts([]);
-    setInvoices([]);
-    setInvoiceChoice('');
-    setNewInvoiceNumber('');
-    setSourceError(null);
-    if (!value) {
-      setRowField(0, 'qty', defaultQty());
-      setLoadingSource(false);
-      return;
-    }
-    setLoadingSource(true);
-    try {
-      const [srcRes, invRes] = await Promise.all([
-        apiFetch(`/api/production-source?sale_id=${encodeURIComponent(value)}`),
-        apiFetch(`/api/sales/${encodeURIComponent(value)}/invoices`),
-      ]);
-      const [src, invs] = await Promise.all([srcRes.json(), invRes.json()]);
-      const rows = Array.isArray(src?.products) ? src.products : [];
-      setProducts(rows);
-      setInvoices(Array.isArray(invs) ? invs : []);
-      if (rows.length > 0) {
-        const total = rows.reduce((sum, p) => sum + (Number(p.quantity) || 0), 0);
-        setRowField(0, 'qty', String(total));
-        const itemNo = rows.find((p) => p.item_no)?.item_no;
-        if (itemNo) setMaterialNumber(String(itemNo));
-      }
-    } catch (err) {
-      setSourceError(err.message || 'Could not load PI details');
-      setError(err.message || 'Could not load PI details');
-    } finally {
-      setLoadingSource(false);
-    }
-  };
-
-  // Money is never typed here: the server derives the new invoice's amount from
-  // the lines this form posts, which are the PI's remaining quantities.
-  const addRecipeRow = () => {
-    setRecipeRows((prev) => [
-      ...prev,
-      { key: `row-${Date.now()}-${prev.length}`, recipe_name: '', qty: '' },
-    ]);
-  };
-
-  const removeRecipeRow = (index) => {
-    setRecipeRows((prev) => prev.filter((_, i) => i !== index));
+  const setQuantity = (product, value) => {
+    setQuantities((prev) => ({ ...prev, [keyOf(product)]: value }));
   };
 
   const handleStart = async () => {
     setError(null);
-    if (!companyId) {
-      setError('Company is required');
+    if (invoiceId == null) {
+      setError('This recipe is not linked to an invoice.');
       return;
     }
-    if (!saleId) {
-      setError('PI / Sale is required');
+    const outputs = submittableRows
+      .map((p) => ({
+        product_name: p.product_name,
+        quantity: Number(quantities[keyOf(p)]),
+      }))
+      .filter((o) => Number.isFinite(o.quantity) && o.quantity > 0);
+    if (outputs.length === 0) {
+      setError('Enter a quantity for at least one product');
       return;
     }
-    const rows = recipeRows.map((row) => ({
-      recipe_name: row.recipe_name,
-      qty: parseFloat(row.qty),
-    }));
-    if (rows.some((row) => !row.recipe_name)) {
-      setError('Choose a recipe for every row');
-      return;
-    }
-    if (!rows.some((row) => row.qty > 0)) {
-      setError('Add at least one recipe with a quantity greater than 0');
-      return;
-    }
-    if (rows.some((row) => !(row.qty > 0))) {
-      setError('Each recipe needs a quantity greater than 0');
-      return;
-    }
-
-    const isNewInvoice = invoiceChoice === 'new';
-    const trimmedNewNumber = newInvoiceNumber.trim();
-    if (isNewInvoice && !trimmedNewNumber) {
-      setError('New invoice number is required');
-      return;
-    }
-
     setSaving(true);
-    // A typed invoice number is free text until it exists as a row: create it
-    // first so produce can link the run via invoice_ids. The create states its
-    // own lines — the API refuses an invoice without them — taken from this
-    // PI's remaining quantities, so the amount stays server-derived. A failed
-    // create (400 over total, 409 duplicate) blocks the run — the error shows
-    // inline.
-    let createdInvoiceId = null;
-    let invoiceNumber;
-    let invoicedAmount = null;
-    if (isNewInvoice) {
-      try {
-        const budgetRes = await apiFetch(
-          `/api/sales/${encodeURIComponent(saleId)}/invoice-lines`,
-        );
-        const budget = await budgetRes.json();
-        if (budget?.has_line_less_invoices) {
-          // `remaining` cannot see a header-only invoice, so invoicing it would
-          // bill goods that are already on the books.
-          setError(
-            'This PI has an older invoice with no lines — add lines to it from the sale first.',
-          );
-          setSaving(false);
-          return;
-        }
-        const lines = (Array.isArray(budget?.lines) ? budget.lines : [])
-          .filter((line) => Number(line?.remaining) > 0)
-          .map((line) => ({
-            sale_item_id: line.sale_item_id,
-            quantity: Number(line.remaining),
-          }));
-        if (lines.length === 0) {
-          setError('Nothing left to invoice on this PI — pick an existing invoice or none.');
-          setSaving(false);
-          return;
-        }
-        const invRes = await apiFetch(`/api/sales/${encodeURIComponent(saleId)}/invoices`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            invoice_number: trimmedNewNumber,
-            invoice_date: todayLocalISO(),
-            lines,
-          }),
-        });
-        const created = await invRes.json();
-        createdInvoiceId = created?.invoice_id ?? created?.id ?? null;
-        invoiceNumber = created?.invoice_number || trimmedNewNumber;
-        if (typeof created?.amount === 'number') invoicedAmount = created.amount;
-      } catch (err) {
-        setError(err.message || 'Could not create invoice');
-        setSaving(false);
-        return;
-      }
-    } else {
-      const chosen = invoices.find((inv) => String(inv.invoice_id) === invoiceChoice);
-      invoiceNumber = chosen?.invoice_number || '';
-    }
-
-    const body = {
-      company_id: Number(companyId),
-      production_qty: rows[0].qty,
-      batch_number: batchNumber.trim() || null,
-      production_date: productionDate || null,
-      material_number: materialNumber.trim() || null,
-      packing: packing.trim() || null,
-      invoice_number: invoiceNumber || null,
-      sale_ids: [Number(saleId)],
-      recipes: rows,
-    };
-    if (createdInvoiceId !== null) {
-      body.invoice_ids = [createdInvoiceId];
-    } else if (invoiceChoice && invoiceChoice !== 'new') {
-      body.invoice_ids = [Number(invoiceChoice)];
-    }
-
     try {
-      await apiFetch(`/api/recipes/${encodeURIComponent(rows[0].recipe_name)}/produce`, {
+      await apiFetch(`/api/recipes/by-id/${encodeURIComponent(recipe.id)}/produce`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          company_id: Number(recipe.company_id),
+          outputs,
+          batch_number: batchNumber.trim() || null,
+          production_date: productionDate || null,
+          material_number: materialNumber.trim() || null,
+          packing: packing.trim() || null,
+        }),
       });
-      // Report the server-derived amount so the operator sees what the new
-      // invoice actually invoiced — it is never typed on this form.
-      toast.success(
-        invoicedAmount === null
-          ? 'Production run recorded'
-          : `Production run recorded · invoiced $${formatNumber(invoicedAmount)}`
-      );
+      toast.success('Production run recorded');
       onSaved?.();
       onClose?.();
     } catch (err) {
-      // The typed invoice was created only to link this run. Without the run
-      // it would be orphaned and a retry with the same number would collide,
-      // so void it best-effort — the produce error stays the one shown.
-      if (createdInvoiceId !== null) {
-        try {
-          await apiFetch(
-            `/api/sales/${encodeURIComponent(saleId)}/invoices/${encodeURIComponent(createdInvoiceId)}`,
-            { method: 'DELETE' },
-          );
-        } catch {
-          // Cleanup is secondary — never mask the produce error.
-        }
-      }
       setError(err.message || 'Could not start the production run');
       setSaving(false);
     }
   };
 
-  const companySales = allSales.filter((sale) => String(sale.company_id) === companyId);
-  const companyRecipes = recipes.filter((rec) => String(rec.company_id) === companyId);
-  const totalProductQty = products.reduce((sum, p) => sum + (Number(p.quantity) || 0), 0);
+  const disabled = saving || loading || Boolean(loadError) || !hasFormulatedRow;
 
   return (
     <Modal
       isOpen={isOpen}
       onClose={onClose}
       title="Go for Production"
-      subtitle={
-        recipe
-          ? `${recipe.name} · ${recipeItems.length} ingredient${recipeItems.length === 1 ? '' : 's'}`
-          : undefined
-      }
+      subtitle={recipe ? recipe.name : undefined}
       maxWidth="max-w-2xl"
       footer={
         <>
@@ -348,7 +178,7 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
             size="sm"
             onClick={handleStart}
             loading={saving}
-            disabled={saving || loadingRefs}
+            disabled={disabled}
           >
             Start Production
           </Button>
@@ -356,104 +186,27 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
       }
     >
       <div className="space-y-3">
-        <div>
-          <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Company *</label>
-          {loadingRefs ? (
-            <p className="text-xs text-slate-400 dark:text-slate-500">Loading…</p>
-          ) : refsError ? (
-            <div className="flex flex-wrap items-center gap-2">
-              <p className="text-xs font-medium text-rose-600 dark:text-rose-400">
-                Could not load companies
-              </p>
-              <p className="text-xs text-slate-500 dark:text-slate-400">{refsError}</p>
-              <Button variant="secondary" size="sm" onClick={retryRefs}>
-                Retry
-              </Button>
-            </div>
-          ) : companies.length === 0 ? (
-            <p className="text-xs text-slate-500 dark:text-slate-400 italic">
-              No companies registered yet.
+        <div className="grid grid-cols-2 gap-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50/60 dark:bg-slate-800/40 px-3 py-2">
+          <div>
+            <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+              Invoice
             </p>
-          ) : (
-            <select
-              aria-label="Company"
-              value={companyId}
-              onChange={(e) => handleCompanyChange(e.target.value)}
-              className={inputCls}
-            >
-              <option value="">Select company…</option>
-              {companies.map((c) => (
-                <option key={c.id} value={c.id}>{c.name}</option>
-              ))}
-            </select>
-          )}
-        </div>
-
-        <div>
-          <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">PI / Sale *</label>
-          {!companyId ? (
-            <select aria-label="PI / Sale" value="" disabled className={inputCls}>
-              <option value="">Select a company first</option>
-            </select>
-          ) : loadingRefs ? (
-            <p className="text-xs text-slate-400 dark:text-slate-500">Loading…</p>
-          ) : refsError ? (
-            <p className="text-xs font-medium text-rose-600 dark:text-rose-400">
-              Could not load PIs for this company
+            <p className="text-sm font-semibold text-slate-900 dark:text-white">
+              {recipe?.invoice_number || '—'}
             </p>
-          ) : companySales.length === 0 ? (
-            <p className="text-xs text-slate-500 dark:text-slate-400 italic">
-              No PIs found for this company yet.
+          </div>
+          <div>
+            <p className="text-[11px] font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+              PI / Client
             </p>
-          ) : (
-            <select
-              aria-label="PI / Sale"
-              value={saleId}
-              onChange={(e) => handleSaleChange(e.target.value)}
-              className={inputCls}
-            >
-              <option value="">Select PI…</option>
-              {companySales.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.pi_number || `PI #${s.id}`}{s.client_name ? ` — ${s.client_name}` : ''}
-                </option>
-              ))}
-            </select>
-          )}
-          {saleId && (
-            <p className="mt-1 text-xs text-slate-400 dark:text-slate-500">
-              {loadingSource
-                ? 'Loading PI details…'
-                : sourceError
-                  ? <span className="font-medium text-rose-600 dark:text-rose-400">{sourceError}</span>
-                  : products.length === 0
-                    ? 'No items found on this PI.'
-                    : `${products.length} item${products.length === 1 ? '' : 's'} · total quantity ${formatNumber(totalProductQty)}`}
+            <p className="text-sm font-semibold text-slate-900 dark:text-white">
+              {recipe?.pi_number || '—'}
+              {recipe?.client_name ? ` · ${recipe.client_name}` : ''}
             </p>
-          )}
+          </div>
         </div>
 
         <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Invoice number</label>
-            <select
-              aria-label="Invoice number"
-              value={invoiceChoice}
-              onChange={(e) => setInvoiceChoice(e.target.value)}
-              disabled={!saleId || loadingSource}
-              className={inputCls}
-            >
-              <option value="">
-                {!saleId ? 'Select a PI first' : loadingSource ? 'Loading…' : 'No invoice'}
-              </option>
-              {invoices.map((inv) => (
-                <option key={inv.invoice_id} value={inv.invoice_id}>
-                  {inv.invoice_number}
-                </option>
-              ))}
-              {saleId && !loadingSource && <option value="new">New invoice number…</option>}
-            </select>
-          </div>
           <div>
             <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Material number</label>
             <input
@@ -465,26 +218,6 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
               className={inputCls}
             />
           </div>
-          {invoiceChoice === 'new' && (
-            <div className="col-span-2">
-              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">New invoice number</label>
-              <input
-                aria-label="New invoice number"
-                type="text"
-                value={newInvoiceNumber}
-                onChange={(e) => setNewInvoiceNumber(e.target.value)}
-                placeholder="INV-2026-001"
-                className={inputCls}
-              />
-              <p className="mt-1 text-[11px] text-slate-400 dark:text-slate-500">
-                The invoice covers every line of this PI that is not yet invoiced. To invoice
-                less, create the invoice from the sale instead and link it here.
-              </p>
-            </div>
-          )}
-        </div>
-
-        <div className="grid grid-cols-3 gap-3">
           <div>
             <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Packing</label>
             <input
@@ -520,67 +253,105 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, recipeItem
         </div>
 
         <div>
-          <div className="flex items-center justify-between mb-2">
-            <h4 className="text-sm font-semibold text-slate-700 dark:text-slate-300">Recipes *</h4>
-            <Button variant="secondary" size="sm" icon={Plus} onClick={addRecipeRow}>
-              Add recipe
-            </Button>
-          </div>
-          <div className="rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden">
-            <div className="grid grid-cols-[1fr_9rem_2.25rem] gap-2 bg-slate-50 dark:bg-slate-800/60 px-3 py-2 text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
-              <span>Recipe</span>
-              <span>Quantity</span>
-              <span className="sr-only">Actions</span>
+          <h4 className="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-2">
+            Products on this invoice
+          </h4>
+          {loading ? (
+            <p className="text-xs text-slate-400 dark:text-slate-500">Loading invoice products…</p>
+          ) : loadError ? (
+            <div className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 dark:border-amber-800 dark:bg-amber-950/40">
+              <p className="text-xs font-medium text-amber-700 dark:text-amber-300">
+                Could not load invoice products
+              </p>
+              <p className="text-xs text-slate-500 dark:text-slate-400">{loadError}</p>
+              <Button variant="secondary" size="sm" onClick={() => setAttempt((n) => n + 1)}>
+                Retry
+              </Button>
             </div>
-            {recipeRows.map((row, index) => (
-              <div
-                key={row.key}
-                className="grid grid-cols-[1fr_9rem_2.25rem] gap-2 items-center px-3 py-2 border-t border-slate-100 dark:border-slate-800"
-              >
-                <select
-                  aria-label={index === 0 ? 'Recipe' : `Recipe ${index + 1}`}
-                  value={row.recipe_name}
-                  onChange={(e) => setRowField(index, 'recipe_name', e.target.value)}
-                  className={inputCls}
-                >
-                  <option value="">Select recipe…</option>
-                  {/* A stale name is never offered as a synthetic option: the
-                      parent re-keys this modal on the recipe name and reloads
-                      the list, so a missing row means pick the recipe again. */}
-                  {companyRecipes.map((rec) => (
-                    <option key={rec.name} value={rec.name}>{rec.name}</option>
-                  ))}
-                </select>
-                <input
-                  aria-label={index === 0 ? 'Quantity' : `Recipe qty ${index + 1}`}
-                  type="number"
-                  min="0"
-                  step="any"
-                  value={row.qty}
-                  onChange={(e) => setRowField(index, 'qty', e.target.value)}
-                  placeholder="0"
-                  className={inputCls}
-                />
-                <div className="flex justify-center">
-                  {index > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => removeRecipeRow(index)}
-                      aria-label={`Remove recipe ${index + 1}`}
-                      title="Remove row"
-                      className="p-1.5 rounded-md text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40 cursor-pointer"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-          {companyId && !loadingRefs && !refsError && companyRecipes.length === 0 && (
-            <p className="mt-1.5 text-xs text-slate-400 dark:text-slate-500 italic">
-              No recipes registered for this company yet.
+          ) : rows.length === 0 ? (
+            <p className="rounded-lg border border-slate-200 dark:border-slate-700 px-3 py-3 text-xs text-slate-500 dark:text-slate-400">
+              Every product on {recipe?.invoice_number || 'this invoice'} has been fully produced.
             </p>
+          ) : (
+            <>
+              {!hasFormulatedRow && (
+                <p className="mb-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-700 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
+                  No formulated product is left to produce — add a formulation in the recipe first.
+                </p>
+              )}
+              <div className="rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="bg-slate-50 dark:bg-slate-800/60 text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                      <th className="px-3 py-2 text-left">Product</th>
+                      <th className="px-3 py-2 text-right">Invoiced</th>
+                      <th className="px-3 py-2 text-right">Produced</th>
+                      <th className="px-3 py-2 text-right">Remaining</th>
+                      <th className="px-3 py-2 text-right">Quantity</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((product) => {
+                      const remaining = remainingOf(product);
+                      const qty = Number(quantities[keyOf(product)]);
+                      const exceeds = Number.isFinite(qty) && qty > remaining;
+                      return (
+                        <tr
+                          key={keyOf(product)}
+                          className="border-t border-slate-100 dark:border-slate-800 align-top"
+                        >
+                          <td className="px-3 py-2">
+                            <p className="font-medium text-slate-900 dark:text-white">
+                              {product.product_name}
+                            </p>
+                            {!product.formulated && (
+                              <p className="text-[11px] text-rose-600 dark:text-rose-400">
+                                no formulation yet — add chemicals in the recipe
+                              </p>
+                            )}
+                          </td>
+                          <td className="px-3 py-2 text-right font-mono text-slate-600 dark:text-slate-300">
+                            {formatNumber(product.invoiced_qty)} {product.unit}
+                          </td>
+                          <td className="px-3 py-2 text-right font-mono text-slate-600 dark:text-slate-300">
+                            {formatNumber(product.produced_qty)} {product.unit}
+                          </td>
+                          <td className="px-3 py-2 text-right font-mono text-slate-600 dark:text-slate-300">
+                            {formatNumber(remaining)} {product.unit}
+                          </td>
+                          <td className="px-3 py-2">
+                            <input
+                              aria-label={`Quantity for ${product.product_name}`}
+                              type="number"
+                              min="0"
+                              step="any"
+                              value={quantities[keyOf(product)] ?? ''}
+                              onChange={(e) => setQuantity(product, e.target.value)}
+                              disabled={!product.formulated}
+                              className={inputCls}
+                            />
+                            {exceeds && (
+                              <p className="mt-1 flex items-start gap-1 text-[11px] text-amber-600 dark:text-amber-400">
+                                <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+                                <span>
+                                  Exceeds the invoice remainder ({formatNumber(remaining)} {product.unit}).
+                                  Production is not capped — confirm this is intentional.
+                                </span>
+                              </p>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              {producedOut.length > 0 && (
+                <p className="mt-1.5 text-[11px] text-slate-400 dark:text-slate-500">
+                  Fully produced: {producedOut.join(', ')}
+                </p>
+              )}
+            </>
           )}
         </div>
 

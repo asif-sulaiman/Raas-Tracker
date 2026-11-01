@@ -32,7 +32,18 @@ function jsonResponse(data, ok = true, status = 200, headers = {}) {
   };
 }
 
-function installFetch({ role = 'admin', companiesFailTimes = 0, companiesError = 'Companies service unavailable', recipes = [], report = [], periods = [], filteredTotal = null } = {}) {
+function installFetch({
+  role = 'admin',
+  companiesFailTimes = 0,
+  companiesError = 'Companies service unavailable',
+  recipes = [],
+  report = [],
+  periods = [],
+  filteredTotal = null,
+  productionSources = {},
+  sourceError = 'Invoice service unavailable',
+  generated = null,
+} = {}) {
   let companyFailsLeft = companiesFailTimes;
   const fetchMock = vi.fn(async (url, options) => {
     const u = String(url);
@@ -44,6 +55,20 @@ function installFetch({ role = 'admin', companiesFailTimes = 0, companiesError =
         return jsonResponse({ error: companiesError }, false, 500);
       }
       return jsonResponse(COMPANIES);
+    }
+    const source = u.match(/\/api\/invoices\/(\d+)\/production-source$/);
+    if (source) {
+      const entry = productionSources[source[1]];
+      if (!entry || entry === 'error') {
+        return jsonResponse({ error: sourceError }, false, 500);
+      }
+      return jsonResponse(entry);
+    }
+    if (u.includes('/api/reports/generate') && method === 'POST') {
+      return jsonResponse(generated || {});
+    }
+    if (u.includes('/api/reports/export') && method === 'POST') {
+      return jsonResponse({ success: true, filename: 'report_INV-014_3700.csv' });
     }
     if (u.includes('/api/recipes')) return jsonResponse(recipes);
     // The report's edit path opens the existing sale editor.
@@ -267,5 +292,165 @@ describe('Commercial report provisional rows and editing', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 
     await waitFor(() => expect(reportReads()).toBeGreaterThan(before));
+  });
+});
+
+const RECIPE_ROWS = [
+  {
+    id: 3, name: 'INV-014 · Cleaner', invoice_id: 9, invoice_number: 'INV-014',
+    pi_number: 'PI-2026-014', client_name: 'Globex', product_count: 3,
+    formulated_count: 2, created: '2026-10-29',
+  },
+  {
+    id: 4, name: 'INV-015 · Degreaser', invoice_id: 10, invoice_number: 'INV-015',
+    pi_number: 'PI-2026-015', client_name: 'Initech', product_count: 1,
+    formulated_count: 0, created: '2026-10-29',
+  },
+];
+
+const PRODUCTION_SOURCES = {
+  9: {
+    invoice_id: 9, invoice_number: 'INV-014',
+    products: [
+      {
+        product_name: 'Cleaner', unit: 'KG', invoiced_qty: 5000,
+        produced_qty: 1000, remaining_qty: 4000, formulated: true,
+      },
+      {
+        product_name: 'Polisher', unit: 'KG', invoiced_qty: 3000,
+        produced_qty: 1800, remaining_qty: 1200, formulated: true,
+      },
+      {
+        product_name: 'Sealer', unit: 'KG', invoiced_qty: 500,
+        produced_qty: 500, remaining_qty: 0, formulated: true,
+      },
+    ],
+  },
+  10: {
+    invoice_id: 10, invoice_number: 'INV-015',
+    products: [
+      {
+        product_name: 'Degreaser', unit: 'KG', invoiced_qty: 900,
+        produced_qty: 0, remaining_qty: 900, formulated: false,
+      },
+    ],
+  },
+};
+
+const GENERATED = {
+  report: [{
+    chemical_name: 'NaOH', current_stock: 500, required_total: 1240, unit: 'KG',
+    shortage: -740, status: 'SHORTAGE',
+    products: [{
+      product_name: 'Cleaner', quantity: 2500, percentage: 40, required_qty: 1000,
+    }],
+    recipes: [{ recipe_name: 'INV-014 · Cleaner', qty_from_this_recipe: 2500 }],
+  }],
+  recipes: [RECIPE_ROWS[0]],
+  qty: 3700,
+};
+
+async function pickRecipe(name) {
+  fireEvent.click(await screen.findByRole('button', { name: new RegExp(name) }));
+}
+
+const lastPost = (fetchMock, needle) => fetchMock.mock.calls
+  .filter(([u, options]) => String(u).includes(needle) && options?.method === 'POST')
+  .at(-1);
+
+describe('Production report selections', () => {
+  it('picks the invoice recipe by id, prefills the remainder and posts per-product outputs', async () => {
+    const { fetchMock } = renderReports({
+      recipes: RECIPE_ROWS,
+      productionSources: PRODUCTION_SOURCES,
+      generated: GENERATED,
+    });
+    await pickRecipe('INV-014');
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(
+      ([u]) => String(u) === '/api/invoices/9/production-source',
+    )).toBe(true));
+
+    const cleaner = await screen.findByLabelText('Quantity for Cleaner');
+    expect(cleaner.value).toBe('4000');
+    expect(screen.getByLabelText('Quantity for Polisher').value).toBe('1200');
+    // A fully produced product has nothing left to report on.
+    expect(screen.queryByLabelText('Quantity for Sealer')).toBeNull();
+    expect(screen.getByText(/Fully produced: Sealer/)).toBeTruthy();
+    expect(screen.getByText(/3 products · 2 formulated/)).toBeTruthy();
+    // The invoice decides the products; there is no global tonnage or water.
+    expect(screen.queryByText(/Auto-calculate from recipes/)).toBeNull();
+    expect(screen.queryByText(/Water:/)).toBeNull();
+
+    fireEvent.change(cleaner, { target: { value: '2500' } });
+    fireEvent.click(screen.getByRole('button', { name: /Generate Report/ }));
+
+    await waitFor(() => {
+      const post = lastPost(fetchMock, '/api/reports/generate');
+      expect(post).toBeTruthy();
+      expect(JSON.parse(post[1].body)).toEqual({
+        recipes: [{
+          recipe_id: 3,
+          outputs: [
+            { product_name: 'Cleaner', quantity: 2500 },
+            { product_name: 'Polisher', quantity: 1200 },
+          ],
+        }],
+      });
+    });
+
+    // The report names the product each chemical need came from.
+    expect(await screen.findByText('Cleaner: 1,000.00 KG (40%)')).toBeTruthy();
+  });
+
+  it('reports a failed production-source load instead of claiming everything is produced', async () => {
+    renderReports({
+      recipes: RECIPE_ROWS,
+      productionSources: {},
+      generated: GENERATED,
+    });
+    await pickRecipe('INV-014');
+
+    expect(await screen.findByText('Could not load invoice products')).toBeTruthy();
+    expect(screen.getByText('Invoice service unavailable')).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Generate Report/ }).disabled).toBe(true);
+    expect(screen.queryByText(/Fully produced/)).toBeNull();
+  });
+
+  it('cannot generate from a product that has no formulation', async () => {
+    renderReports({
+      recipes: RECIPE_ROWS,
+      productionSources: PRODUCTION_SOURCES,
+      generated: GENERATED,
+    });
+    await pickRecipe('INV-015');
+
+    const degreaser = await screen.findByLabelText('Quantity for Degreaser');
+    expect(degreaser.disabled).toBe(true);
+    expect(screen.getByText(/no formulation yet/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: /Generate Report/ }).disabled).toBe(true);
+  });
+
+  it('exports the same per-product selections it generated from', async () => {
+    const { fetchMock } = renderReports({
+      recipes: RECIPE_ROWS,
+      productionSources: PRODUCTION_SOURCES,
+      generated: GENERATED,
+    });
+    await pickRecipe('INV-014');
+    await screen.findByLabelText('Quantity for Cleaner');
+    fireEvent.click(screen.getByRole('button', { name: /Generate Report/ }));
+    await screen.findByText('Cleaner: 1,000.00 KG (40%)');
+
+    const generateBody = JSON.parse(lastPost(fetchMock, '/api/reports/generate')[1].body);
+    fireEvent.click(screen.getByRole('button', { name: /Export as CSV/ }));
+
+    await waitFor(() => {
+      const post = lastPost(fetchMock, '/api/reports/export');
+      expect(post).toBeTruthy();
+      // report.recipes is the server's recipe rows, not a request payload;
+      // re-posting it would be rejected by extra="forbid".
+      expect(JSON.parse(post[1].body)).toEqual(generateBody);
+    });
   });
 });
