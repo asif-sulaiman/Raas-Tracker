@@ -558,6 +558,28 @@ describe('Per-product formulation', () => {
     expect(await within(card('Soda Ash')).findByText('60%')).toBeTruthy();
   });
 
+  it('refuses a chemical that is not registered', async () => {
+    const { fetchMock } = renderRecipes({ recipes: [RECIPE_ROW] });
+    await openRecipeDetail();
+
+    const ash = card('Soda Ash');
+    const chemical = within(ash).getByLabelText('Chemical for Soda Ash');
+    fireEvent.focus(chemical);
+    fireEvent.change(chemical, { target: { value: 'Unobtainium' } });
+    fireEvent.blur(chemical);
+
+    expect(within(ash).getByRole('status').textContent).toContain('No matching record');
+    fireEvent.change(within(ash).getByLabelText('Percentage for Soda Ash'), { target: { value: '10' } });
+    fireEvent.click(within(ash).getByRole('button', { name: 'Add ingredient to Soda Ash' }));
+    await waitFor(() => {
+      const posted = fetchMock.mock.calls.some(
+        ([url, options]) => String(url).includes('/api/recipes/by-id/') &&
+          String(url).includes('/products/') && options?.method === 'POST',
+      );
+      expect(posted).toBe(false);
+    });
+  });
+
   it('updates and removes an ingredient by its row id', async () => {
     const { fetchMock } = renderRecipes({ recipes: [RECIPE_ROW] });
     await openRecipeDetail();
