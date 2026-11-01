@@ -212,18 +212,15 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
           >
             Chemical
           </label>
-          <select
+          <EntityCombobox
             id={`chem-${product.product_name}`}
             aria-label={`Chemical for ${product.product_name}`}
+            options={available.map((c) => ({ value: c.name, label: c.name }))}
             value={chemical}
-            onChange={(e) => setChemical(e.target.value)}
+            onChange={setChemical}
+            placeholder="Search chemicals…"
             className={inputCls}
-          >
-            <option value="">Select chemical...</option>
-            {available.map((c) => (
-              <option key={c.name} value={c.name}>{c.name}</option>
-            ))}
-          </select>
+          />
         </div>
         <div className="w-32">
           <label
