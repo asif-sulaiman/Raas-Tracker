@@ -1435,6 +1435,54 @@ sign rule and matters most before Phase 5 swaps the UI onto these writers.
 
 ---
 
+## ⚖️ Phase RECIPE-QUANTITIES: needed / remaining on the card + the 100% production gate (completed 2026-11-02)
+
+The formulation card showed a percentage and the current stock but never how
+much chemical the invoice still needed or what would be left, and water was
+purely decorative: an unbalanced formula could still be produced. Now the
+detail payload projects the quantities, the card shows them, and production
+requires a balanced formula.
+
+- Detail and production-source items add `required_qty` (percentage × the
+  product's **unproduced remainder**, converted into the chemical's stock unit)
+  and `stock_remaining` (current stock minus the whole invoice's need, summed
+  once per chemical so shared chemicals show one remainder). Missing
+  conversions or unconverted invoice lines yield null, never a guess.
+- Products add `water_qty` (effective water × remainder, in product units);
+  water is still never deducted.
+- The card adds **Chemical needed** and **Stock remaining** columns, the water
+  quantity, a `Quantities are for the X still to produce` line, and a
+  `Ready` / `Not balanced` / `Empty formulation` badge. Negative remainders
+  render in rose; unavailable quantities render `—`.
+- Production refuses a product whose `ingredients + water` is not 100% within
+  ±0.01 (`_BALANCE_TOLERANCE`, absorbing float4 noise), per product, before any
+  write. The production modal disables only the unbalanced row and can still
+  submit the rest of the invoice. A deduction shortage now names the chemical:
+  `insufficient stock: NaOH needs 20 KG, 10 KG available`.
+- Reports stay lax (`require_balanced=False`) and the Reports page only flags
+  `formula totals 95.0% — production will be blocked until it's 100%`.
+  Readiness keeps its formulation-only SQL; an unbalanced-but-formulated
+  product still reads `missing_production`, and the produce 400 is the single
+  authoritative explanation.
+
+**Commits:**
+
+```
+0346101 feat(reports): flag unbalanced formulas without blocking the report
+b795026 feat(recipes): block unbalanced products in the production modal
+8a582cf feat(recipes): needed and remaining columns on the formulation card
+757f99d feat(recipes): gate production on a balanced formulation and name shortages
+079243d feat(recipes): report chemical needed and stock remaining per product
+```
+
+**Verification.** Backend: `tests/test_recipe_invoice_model.py` 66 passed;
+recipe/production-adjacent suites 258 passed; `ruff` clean on the touched
+files; `pyright` 0 errors. Frontend: Recipes 35, ProductionRunModal 14,
+Reports 16, all green; `oxlint` 0 warnings. Full gate and `vite build` recorded
+below.
+
+---
+
 ## 📜 Public contract changes
 
 Every entry here is an **intentional** change to a response a client can
@@ -1443,6 +1491,7 @@ this is where to look.
 
 | Date | Change | Routes affected | Rationale |
 |---|---|---|---|
+| 2026-11-02 | **Production refuses an unbalanced formulation, and a shortage names the chemical.** `POST /api/recipes/by-id/<id>/produce` (and its name alias) now answers **400** when an output product's `ingredients + water` is not 100% within ±0.01 (`'<product>' formulation totals 95% - ingredients + water must equal 100% before production`), before any write. A deduction that would go below zero answers 400 `insufficient stock: <chemical> needs X <unit>, Y <unit> available` instead of the bare `insufficient stock`. Detail/production-source payloads additionally carry `water_qty`, `required_qty`, `stock_remaining` (additive). Reports, the CSV and booking readiness are unchanged. | `POST /api/recipes/by-id/<id>/produce`, `POST /api/recipes/<name>/produce` (new 400 condition; additive keys on `GET /api/recipes/by-id/<id>` and `GET /api/invoices/<id>/production-source`) | The operator asked for production to deduct exactly what the recipe needs; a formula that does not total 100% cannot say what that is, and a bare "insufficient stock" did not say which chemical was short |
 | 2026-10-15 | **Superseded 2026-10-25 — the tolerance was removed; no quantity answers 409 any more.** Originally: **A 5% over-invoice tolerance breach answers `409`, not `400`.** `ToleranceExceeded` (`raas_tracker/_exceptions.py`) is a conflict with what the sale has already been invoiced for — retrying the identical body will never succeed — so it is RFC 9110 §15.5.10. `POST /api/invoices/<id>/items` already returned 409; `POST /api/sales/<id>/invoices` and `POST /api/sales/<id>/invoices/batch` **hardcoded 400** for the same refusal, so the status depended on which door the request came in by. Both now go through `status_for(e)`. **Not a bug** — `tests/test_typed_errors.py::test_tolerance_breach_is_409_on_every_invoice_write_route` pins all three at once | `POST /api/sales/<id>/invoices`, `POST /api/sales/<id>/invoices/batch` (400 → 409) | One condition must yield one status; the phase's whole purpose. `POST /api/invoices/<id>/items` is unchanged |
 | 2026-10-17 | **A wrong or absent request `Content-Type` answers `415`, not `500`.** `request.get_json()` raises Werkzeug's `UnsupportedMediaType`, which had no handler, so Flask's lookup fell through to the catch-all `Exception` handler. A client that posted a JSON body as `text/plain` (or with no type at all) was told *"internal server error"* — a retry instruction for a fault that is permanently its own. `@app.errorhandler(415)` now answers `{"error": "unsupported media type (expected application/json)"}` | every JSON route (`request.get_json() or {}`) whose `Content-Type` is not JSON (500 → 415) | 415 is RFC 9110 §15.5.16 for exactly this, and it is the only honest answer: the body will never parse until the header changes. **Not authenticated-only** — an earlier draft of this row claimed it was. The three `_PUBLIC_API` routes `/api/auth/login`, `/api/auth/forgot-password` and `/api/auth/reset-password` take `_gate_api`'s `None` path and parse the body before any credential exists, so each went from an unauthenticated **500** to a 415: the change improves the unauthenticated surface rather than leaving it untouched. Pinned by `tests/test_edge_hardening.py::test_a_public_route_answers_415_unauthenticated` |
 | 2026-10-25 | **Invoice quantities are uncapped; the 5% tolerance and its `ceiling` field are gone.** `OVER_INVOICE_TOLERANCE`, `check_invoice_tolerance`, `ToleranceExceeded` and the `GET /api/sales/<id>/invoice-lines` `ceiling` field were removed. A quantity may equal, exceed, or fall below the PI line; writes accept anything finite and > 0. No invoice-write route returns 409 for a quantity. | `POST /api/invoices/<id>/items`, `POST /api/sales/<id>/invoices`, `POST /api/sales/<id>/invoices/batch` (no quantity 409; responses otherwise unchanged), `GET /api/sales/<id>/invoice-lines` (`ceiling` removed) | The operator manages over-invoicing manually (operator decision, 2026-10-25). A hard cap that refused a fully invoiced line was a UI blocker, not a commercial control; the writer still derives price and money server-side |
