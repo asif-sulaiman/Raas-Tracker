@@ -131,6 +131,7 @@ function installFetch({
   detailMissing = false,
   putError = null,
   firstItem = { chemical_name: 'NaOH', percentage: 40 },
+  water = {},
 } = {}) {
   const state = {
     recipes: [...recipes],
@@ -142,6 +143,10 @@ function installFetch({
       'Soda Ash': [],
       'Sodium Silicate': [],
     },
+    water: {
+      'Caustic Soda 50%': null, 'Soda Ash': null, 'Sodium Silicate': null,
+      ...water,
+    },
     runs: false,
     nextId: 200,
   };
@@ -151,14 +156,26 @@ function installFetch({
       const items = state.items[base.product_name] || [];
       const invoiced = base.invoiced_qty;
       const produced = state.runs ? invoiced : base.produced_qty;
+      const ingredientPct = items.reduce(
+        (sum, i) => sum + Number(i.percentage || 0), 0);
+      const storedWater = state.water[base.product_name];
+      const waterEffective = storedWater != null
+        ? storedWater
+        : (items.length ? 100 - ingredientPct : null);
       return {
         ...base,
-        id: 900 + BASE_PRODUCTS.findIndex((p) => p.product_name === base.product_name),
+        id: 900 + BASE_PRODUCTS.findIndex(
+          (p) => p.product_name === base.product_name),
         on_invoice: true,
         produced_qty: produced,
         remaining_qty: Math.max(invoiced - produced, 0),
         formulated: items.length > 0,
-        percentage: items.reduce((sum, i) => sum + Number(i.percentage || 0), 0),
+        percentage: ingredientPct,
+        water_percentage: storedWater ?? null,
+        water_effective: waterEffective,
+        grand_total: waterEffective == null
+          ? null
+          : ingredientPct + waterEffective,
         items,
       };
     }),
@@ -201,6 +218,14 @@ function installFetch({
         id: state.nextId, chemical_id: 2, chemical_name: body.chemical,
         current_stock: 100, unit: 'KG', percentage: body.percentage,
       }];
+      return jsonResponse({ success: true });
+    }
+    const productWater = u.match(
+      /\/api\/recipes\/by-id\/\d+\/products\/(.+)\/water$/);
+    if (productWater && method === 'PUT') {
+      const product = decodeURIComponent(productWater[1]);
+      const body = JSON.parse(options.body);
+      state.water[product] = body.percentage;
       return jsonResponse({ success: true });
     }
     const byId = u.match(/\/api\/recipes\/by-id\/(\d+)$/);
@@ -616,6 +641,111 @@ describe('Per-product formulation', () => {
       expect(del).toBeTruthy();
     });
     expect(await within(card('Caustic Soda 50%')).findByText('Empty formulation')).toBeTruthy();
+  });
+
+  it('shows the remainder as water and flags a total that is not 100%', async () => {
+    renderRecipes({ recipes: [RECIPE_ROW] });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    // 40% NaOH -> 60% water -> 100%.
+    expect(within(soda).getByLabelText(
+      'Water percentage for Caustic Soda 50%')).toHaveValue(null);
+    expect(within(soda).getByText('Grand total 100.0%')).toBeTruthy();
+    expect(within(soda).queryByText(/do not add up to 100/)).toBeNull();
+
+    // Empty product: no remainder to show, so no invented grand total.
+    expect(within(card('Soda Ash')).getByText('Grand total —')).toBeTruthy();
+  });
+
+  it('saves and clears water per product without blocking', async () => {
+    const { fetchMock } = renderRecipes({ recipes: [RECIPE_ROW] });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    const water = within(soda).getByLabelText(
+      'Water percentage for Caustic Soda 50%');
+    fireEvent.change(water, { target: { value: '25' } });
+    // Preview is immediate; the warning is informational only.
+    expect(within(soda).getByText('Grand total 65.0%')).toBeTruthy();
+    expect(within(soda).getByText(/do not add up to 100/)).toBeTruthy();
+
+    fireEvent.click(within(soda).getByRole('button', {
+      name: 'Save water for Caustic Soda 50%',
+    }));
+
+    await waitFor(() => {
+      const put = fetchMock.mock.calls.find(
+        ([url, options]) => options?.method === 'PUT'
+          && decodeURIComponent(String(url))
+            .endsWith('/api/recipes/by-id/3/products/Caustic Soda 50%/water'));
+      expect(put).toBeTruthy();
+      expect(JSON.parse(put[1].body)).toEqual({ percentage: 25 });
+    });
+    expect(await within(card('Caustic Soda 50%')).findByText('Grand total 65.0%'))
+      .toBeTruthy();
+
+    // Blank means "auto": the server stores NULL and the remainder returns.
+    fireEvent.change(
+      within(card('Caustic Soda 50%')).getByLabelText(
+        'Water percentage for Caustic Soda 50%'),
+      { target: { value: '' } });
+    fireEvent.click(within(card('Caustic Soda 50%')).getByRole('button', {
+      name: 'Save water for Caustic Soda 50%',
+    }));
+
+    await waitFor(() => {
+      const puts = fetchMock.mock.calls.filter(
+        ([url, options]) => options?.method === 'PUT'
+          && decodeURIComponent(String(url)).endsWith('/water'));
+      expect(JSON.parse(puts[puts.length - 1][1].body))
+        .toEqual({ percentage: null });
+    });
+    expect(await within(card('Caustic Soda 50%')).findByText('Grand total 100.0%'))
+      .toBeTruthy();
+  });
+
+  it('shows a stored float4 water rounded to the input step', async () => {
+    // recipe_products.water_percentage is REAL, so 33.33 reads back noisy.
+    renderRecipes({
+      recipes: [RECIPE_ROW],
+      water: { 'Caustic Soda 50%': 33.332998275756836 },
+    });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    expect(within(soda).getByLabelText(
+      'Water percentage for Caustic Soda 50%')).toHaveValue(33.33);
+    expect(within(soda).getByText('Grand total 73.3%')).toBeTruthy();
+  });
+
+  it('keeps an explicit stored 0 instead of treating it as blank', async () => {
+    renderRecipes({ recipes: [RECIPE_ROW], water: { 'Caustic Soda 50%': 0 } });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    expect(within(soda).getByLabelText(
+      'Water percentage for Caustic Soda 50%')).toHaveValue(0);
+    // 40% NaOH + 0% water is a warning, never a blocked save.
+    expect(within(soda).getByText('Grand total 40.0%')).toBeTruthy();
+    expect(within(soda).getByText(/do not add up to 100/)).toBeTruthy();
+  });
+
+  it('refuses water outside 0-100 without calling the server', async () => {
+    const { fetchMock } = renderRecipes({ recipes: [RECIPE_ROW] });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    fireEvent.change(within(soda).getByLabelText(
+      'Water percentage for Caustic Soda 50%'), { target: { value: '150' } });
+    fireEvent.click(within(soda).getByRole('button', {
+      name: 'Save water for Caustic Soda 50%',
+    }));
+
+    await waitFor(() => expect(toast.error)
+      .toHaveBeenCalledWith('Water must be between 0 and 100'));
+    expect(fetchMock.mock.calls.some(
+      ([, options]) => options?.method === 'PUT')).toBe(false);
   });
 });
 

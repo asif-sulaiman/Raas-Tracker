@@ -28,17 +28,52 @@ import ProductionRunModal from '../components/modals/ProductionRunModal';
 const inputCls =
   'w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent';
 
+// recipe_products.water_percentage is a float4, so a stored 33.33 reads back as
+// 33.332998… — round to the input's own step for display. An explicit 0 stays
+// "0", never blank.
+const waterDraftFromServer = (value) => (
+  value == null ? '' : String(Math.round(Number(value) * 100) / 100)
+);
+
 /**
  * One product's formulation. The invoice defines the product and its
  * quantities; this card only owns the chemicals and their percentages, so a
  * product added to the invoice later appears as an empty card on reload.
  */
-function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, onDelete }) {
+function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, onDelete, onSetWater }) {
   const [chemical, setChemical] = useState('');
   const [pct, setPct] = useState('');
   const [editItemId, setEditItemId] = useState(null);
   const [editPct, setEditPct] = useState('');
   const [saving, setSaving] = useState(false);
+  const [savingWater, setSavingWater] = useState(false);
+
+  // The water input is a draft the operator types; the server wins whenever it
+  // reports a different value (save, add/remove item, dialog re-open). Syncing
+  // during render — not in an effect — means the stored value is on screen at
+  // the first paint instead of one commit later, so it can never clobber an
+  // edit typed in between.
+  const serverWater = product.water_percentage;
+  const waterKey = `${product.product_name}\u0000${serverWater}`;
+  const [waterDraft, setWaterDraft] = useState(
+    () => waterDraftFromServer(serverWater));
+  const [syncedWaterKey, setSyncedWaterKey] = useState(waterKey);
+  if (syncedWaterKey !== waterKey) {
+    setSyncedWaterKey(waterKey);
+    setWaterDraft(waterDraftFromServer(serverWater));
+  }
+
+  const ingredientPct = product.percentage;
+  const trimmedWater = waterDraft.trim();
+  const draftWater = trimmedWater === '' ? null : Number(trimmedWater);
+  // A draft that is neither blank nor a finite number keeps the remainder
+  // preview (the save below refuses it); it must never render "NaN%".
+  const usableDraft = draftWater != null && Number.isFinite(draftWater);
+  const waterPct = usableDraft
+    ? draftWater
+    : (product.items.length ? 100 - ingredientPct : null);
+  const grandTotal = waterPct == null ? null : ingredientPct + waterPct;
+  const offBalance = grandTotal != null && Math.abs(grandTotal - 100) > 1e-6;
 
   const available = chemicals.filter(
     (c) => !product.items.some((item) => item.chemical_name === c.name)
@@ -71,6 +106,21 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
       }
     } finally {
       setSaving(false);
+    }
+  };
+
+  const submitWater = async () => {
+    const trimmed = waterDraft.trim();
+    const value = trimmed === '' ? null : Number(trimmed);
+    if (value !== null && (!Number.isFinite(value) || value < 0 || value > 100)) {
+      toast.error('Water must be between 0 and 100');
+      return;
+    }
+    setSavingWater(true);
+    try {
+      await onSetWater(product, value);
+    } finally {
+      setSavingWater(false);
     }
   };
 
@@ -203,6 +253,50 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
           )}
         </tbody>
       </table>
+
+      <div className="flex flex-wrap items-center gap-3 border-t border-slate-100 dark:border-slate-800 px-4 py-3">
+        <label
+          htmlFor={`water-${product.product_name}`}
+          className="text-xs font-medium text-slate-500 dark:text-slate-400"
+        >
+          Water %
+        </label>
+        <input
+          id={`water-${product.product_name}`}
+          aria-label={`Water percentage for ${product.product_name}`}
+          type="number"
+          step="0.01"
+          min="0"
+          max="100"
+          value={waterDraft}
+          onChange={(e) => setWaterDraft(e.target.value)}
+          placeholder="auto"
+          className="w-24 px-2 py-1 text-sm rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+        />
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={submitWater}
+          loading={savingWater}
+          aria-label={`Save water for ${product.product_name}`}
+        >
+          Save
+        </Button>
+        <span className="text-[11px] text-slate-400 dark:text-slate-500">
+          {trimmedWater === '' ? 'blank = the unformulated remainder' : 'stored percentage'}
+        </span>
+        <span className="ml-auto text-sm font-semibold text-slate-700 dark:text-slate-200">
+          {grandTotal == null
+            ? 'Grand total —'
+            : `Grand total ${grandTotal.toFixed(1)}%`}
+        </span>
+        {offBalance && (
+          <span className="flex items-center gap-1 text-xs font-medium text-amber-600 dark:text-amber-400">
+            <AlertTriangle className="h-3.5 w-3.5" />
+            ingredients + water do not add up to 100%
+          </span>
+        )}
+      </div>
 
       <div className="p-4 border-t border-slate-100 dark:border-slate-800 flex items-end gap-3 flex-wrap">
         <div className="flex-1 min-w-[180px]">
@@ -629,6 +723,35 @@ export default function Recipes() {
     }
   };
 
+  // Water is display-only: the server stores an override, or NULL for the
+  // unformulated remainder. Nothing is deducted and no cap reads it, so a
+  // total that is not 100 stays a warning.
+  const handleSetWater = async (product, percentage) => {
+    if (!selectedRecipe) return false;
+    try {
+      const res = await apiFetch(
+        '/api/recipes/by-id/' + encodeURIComponent(selectedRecipe.id) +
+          '/products/' + encodeURIComponent(product.product_name) + '/water',
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ percentage }),
+        }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data?.error || 'Could not save water percentage');
+      }
+      toast.success(
+        percentage == null ? 'Water reset to the remainder' : 'Water saved');
+      await fetchRecipeDetail(selectedRecipe);
+      return true;
+    } catch (err) {
+      toast.error(err.message || 'Could not save water percentage');
+      return false;
+    }
+  };
+
   const handleDeleteItem = async (product, item) => {
     if (!selectedRecipe) return;
     const ok = await confirm({
@@ -728,6 +851,7 @@ export default function Recipes() {
               onAdd={handleAddItem}
               onUpdate={handleUpdateItem}
               onDelete={handleDeleteItem}
+              onSetWater={handleSetWater}
             />
           ))}
         </div>
