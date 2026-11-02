@@ -453,4 +453,56 @@ describe('Production report selections', () => {
       expect(JSON.parse(post[1].body)).toEqual(generateBody);
     });
   });
+
+  it('flags an unbalanced formula without blocking the report', async () => {
+    const { fetchMock } = renderReports({
+      recipes: RECIPE_ROWS,
+      productionSources: {
+        9: {
+          ...PRODUCTION_SOURCES[9],
+          products: PRODUCTION_SOURCES[9].products.map((p) => (
+            p.product_name === 'Cleaner' ? { ...p, grand_total: 95 } : p
+          )),
+        },
+      },
+      generated: GENERATED,
+    });
+    await pickRecipe('INV-014');
+    await screen.findByLabelText('Quantity for Cleaner');
+
+    expect(screen.getByText(/formula totals 95\.0%/)).toBeTruthy();
+    expect(screen.getByText(/production will be blocked until/)).toBeTruthy();
+
+    // A report is a planning tool: Generate still runs with the product.
+    const generate = screen.getByRole('button', { name: /Generate Report/ });
+    expect(generate.disabled).toBe(false);
+    fireEvent.click(generate);
+    await waitFor(() => {
+      const post = lastPost(fetchMock, '/api/reports/generate');
+      expect(post).toBeTruthy();
+      expect(JSON.parse(post[1].body).recipes[0].outputs).toEqual([
+        { product_name: 'Cleaner', quantity: 4000 },
+        { product_name: 'Polisher', quantity: 1200 },
+      ]);
+    });
+  });
+
+  it('stays quiet for a balanced formula', async () => {
+    renderReports({
+      recipes: RECIPE_ROWS,
+      productionSources: {
+        9: {
+          ...PRODUCTION_SOURCES[9],
+          products: PRODUCTION_SOURCES[9].products.map((p) => (
+            p.product_name === 'Cleaner' ? { ...p, grand_total: 100 } : p
+          )),
+        },
+      },
+      generated: GENERATED,
+    });
+    await pickRecipe('INV-014');
+    await screen.findByLabelText('Quantity for Cleaner');
+
+    expect(screen.queryByText(/formula totals/)).toBeNull();
+  });
 });

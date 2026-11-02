@@ -18,6 +18,7 @@ import clsx from 'clsx';
 import Button from '../components/ui/Button';
 import Badge from '../components/ui/Badge';
 import { formatNumber } from '../utils/format';
+import { isBalanced } from '../utils/formulation';
 import { useAuth } from '../context/AuthContext';
 import { toast } from 'sonner';
 import CommercialFilters from '../components/reports/CommercialFilters';
@@ -833,6 +834,13 @@ export default function Reports() {
                                             no formulation yet — add chemicals in the recipe
                                           </span>
                                         )}
+                                        {product.formulated && product.grand_total != null
+                                          && !isBalanced(product.grand_total) && (
+                                            <span className="ml-2 text-[11px] text-amber-600 dark:text-amber-400">
+                                              formula totals {Number(product.grand_total).toFixed(1)}%
+                                              {' '}— production will be blocked until it&apos;s 100%
+                                            </span>
+                                          )}
                                       </div>
                                       <input
                                         id={key}
