@@ -313,6 +313,8 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
             value={chemical}
             onChange={setChemical}
             placeholder="Search chemicals…"
+            emptyMessage="No matching chemical — check the spelling or pick from the list"
+            hint="No chemical by that name — pick one from the list"
             className={inputCls}
           />
         </div>

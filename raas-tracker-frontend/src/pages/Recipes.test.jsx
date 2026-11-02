@@ -583,6 +583,46 @@ describe('Per-product formulation', () => {
     expect(await within(card('Soda Ash')).findByText('60%')).toBeTruthy();
   });
 
+  it('lists the stock chemicals when the chemical field is focused', async () => {
+    renderRecipes({ recipes: [RECIPE_ROW] });
+    await openRecipeDetail();
+
+    const ash = card('Soda Ash');
+    fireEvent.focus(within(ash).getByLabelText('Chemical for Soda Ash'));
+
+    expect((await screen.findAllByRole('option')).map((o) => o.textContent))
+      .toEqual(['NaOH', 'Caustic Flakes', 'Soda Ash']);
+    // The card is overflow-hidden; the list must live outside it.
+    expect(ash.contains(screen.getByRole('listbox'))).toBe(false);
+
+    // Typing still narrows the stock list.
+    fireEvent.change(within(ash).getByLabelText('Chemical for Soda Ash'), {
+      target: { value: 'caust' },
+    });
+    expect(screen.getAllByRole('option').map((o) => o.textContent)).toEqual([
+      'Caustic Flakes',
+    ]);
+  });
+
+  it('explains a typed name that matches no stock chemical', async () => {
+    renderRecipes({ recipes: [RECIPE_ROW] });
+    await openRecipeDetail();
+
+    const ash = card('Soda Ash');
+    const chemical = within(ash).getByLabelText('Chemical for Soda Ash');
+    fireEvent.focus(chemical);
+    fireEvent.change(chemical, { target: { value: 'Acclofol' } });
+
+    // The empty row is portaled with the listbox, so it is not inside the card.
+    expect(screen.getByText(/No matching chemical/)).toBeTruthy();
+    expect(within(ash).queryByText(/No matching chemical/)).toBeNull();
+
+    // Leaving the field keeps the unmatched text and explains it in place.
+    fireEvent.blur(chemical);
+    expect(within(ash).getByRole('status').textContent)
+      .toContain('No chemical by that name');
+  });
+
   it('refuses a chemical that is not registered', async () => {
     const { fetchMock } = renderRecipes({ recipes: [RECIPE_ROW] });
     await openRecipeDetail();
@@ -593,7 +633,7 @@ describe('Per-product formulation', () => {
     fireEvent.change(chemical, { target: { value: 'Unobtainium' } });
     fireEvent.blur(chemical);
 
-    expect(within(ash).getByRole('status').textContent).toContain('No matching record');
+    expect(within(ash).getByRole('status').textContent).toContain('No chemical by that name');
     fireEvent.change(within(ash).getByLabelText('Percentage for Soda Ash'), { target: { value: '10' } });
     fireEvent.click(within(ash).getByRole('button', { name: 'Add ingredient to Soda Ash' }));
     await waitFor(() => {
