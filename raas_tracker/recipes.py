@@ -7,7 +7,9 @@ product per run, and readiness asks whether every invoiced product has a
 formulation *and* an output on a run linked to that invoice.
 
 Water/solvent is whatever is not formulated: a slot's percentages may sum to
-anything from 0 to 100, and only the listed chemicals are deducted. There is
+anything from 0 to 100, and only the listed chemicals are deducted. An
+optional per-slot `water_percentage` overrides that remainder for display; it
+is never added to a deduction or used as a production quantity. There is
 no batch basis on the recipe any more; the quantity is entered at production
 time and prefilled from the invoice.
 """
@@ -225,10 +227,12 @@ def list_recipe_products(conn: psycopg.Connection,
     invoice_products = _invoice_product_lines(conn, recipe["invoice_id"])
     slots = {}
     for row in conn.execute(
-            "SELECT id, product_name, unit FROM recipe_products "
-            "WHERE recipe_id = %s ORDER BY id", (recipe_id,)).fetchall():
+            "SELECT id, product_name, unit, water_percentage "
+            "FROM recipe_products WHERE recipe_id = %s ORDER BY id",
+            (recipe_id,)).fetchall():
         slots[(row[1] or "").strip().lower()] = {
-            "id": row[0], "product_name": row[1], "unit": row[2]}
+            "id": row[0], "product_name": row[1], "unit": row[2],
+            "water_percentage": row[3]}
     items = _slot_items(conn, recipe_id)
     produced = _produced_by_product(conn, recipe_id)
 
@@ -253,6 +257,17 @@ def _product_row(group, slot, items, produced, on_invoice=True) -> Dict[str, Any
     slot_items = items.get(slot["id"], []) if slot else []
     invoiced = float(group.get("invoiced_qty") or 0)
     built = float(produced.get(group["key"], 0))
+    ingredient_pct = sum(i["percentage"] for i in slot_items)
+    stored_water = slot.get("water_percentage") if slot else None
+    if stored_water is not None:
+        water_effective = float(stored_water)
+    elif slot_items:
+        water_effective = round(100.0 - ingredient_pct, 6)
+    else:
+        water_effective = None
+    grand_total = (
+        None if water_effective is None
+        else round(ingredient_pct + water_effective, 6))
     return {
         "id": slot["id"] if slot else None,
         "on_invoice": on_invoice,
@@ -265,7 +280,10 @@ def _product_row(group, slot, items, produced, on_invoice=True) -> Dict[str, Any
         "produced_qty": built,
         "remaining_qty": max(invoiced - built, 0.0),
         "formulated": bool(slot_items),
-        "percentage": sum(i["percentage"] for i in slot_items),
+        "percentage": ingredient_pct,
+        "water_percentage": stored_water,
+        "water_effective": water_effective,
+        "grand_total": grand_total,
         "items": slot_items,
     }
 
@@ -487,6 +505,36 @@ def add_recipe_item(conn: psycopg.Connection, recipe_id: int, product_name: str,
     log_audit_action(
         conn, "RECIPE_ITEM_ADD", "recipe_item", item_id,
         new_value=f"{recipe['name']}:{product_name}:{chem[1]}:{percentage}",
+        atomic=False)
+    conn.commit()
+    return True
+
+
+def set_product_water(conn: psycopg.Connection, recipe_id: int,
+                      product_name: str,
+                      percentage: Optional[float]) -> bool:
+    """Set (or clear, with ``None``) one product's water percentage.
+
+    Display only: the detail read reports ``100 - ingredients`` when this is
+    NULL and the stored value otherwise. Nothing is deducted and no cap uses
+    it, so a total that is not 100 is a warning, never a refusal.
+    """
+    if percentage is not None:
+        finite_values(percentage)
+        if percentage < 0 or percentage > 100:
+            raise ValueError("water percentage must be between 0 and 100")
+    recipe = _require_recipe(conn, recipe_id)
+    slot_id = _slot_for_product(conn, recipe, product_name)
+    old = conn.execute(
+        "SELECT water_percentage FROM recipe_products WHERE id = %s",
+        (slot_id,)).fetchone()[0]
+    conn.execute(
+        "UPDATE recipe_products SET water_percentage = %s WHERE id = %s",
+        (percentage, slot_id))
+    log_audit_action(
+        conn, "RECIPE_WATER_SET", "recipe_product", slot_id,
+        old_value="auto" if old is None else str(old),
+        new_value="auto" if percentage is None else str(percentage),
         atomic=False)
     conn.commit()
     return True

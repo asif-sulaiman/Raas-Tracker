@@ -804,3 +804,70 @@ def test_api_reports_accept_outputs(admin_client, db):
     report = r.get_json()["report"]
     assert len(report) == 1
     assert report[0]["required_total"] == pytest.approx(2.5)
+
+
+# --------------------------------------------------------------------------- #
+# water (display only)
+# --------------------------------------------------------------------------- #
+def test_water_defaults_to_the_remainder_and_overrides_once_set(db):
+    co, sale, inv = _scenario(db)
+    recipe = _recipe(db, co, inv)
+    stockmod.add_chemical(db, CHEM, 500, "KG")
+    recipesmod.add_recipe_item(db, recipe["id"], PRODUCT_A, CHEM, 40)
+
+    product = _product(recipesmod.get_recipe_detail(db, recipe["id"]), PRODUCT_A)
+    assert product["percentage"] == 40
+    assert product["water_percentage"] is None
+    assert product["water_effective"] == 60
+    assert product["grand_total"] == 100
+
+    assert recipesmod.set_product_water(
+        db, recipe["id"], PRODUCT_A, 25) is True
+    product = _product(recipesmod.get_recipe_detail(db, recipe["id"]), PRODUCT_A)
+    assert product["water_percentage"] == 25
+    assert product["water_effective"] == 25
+    assert product["grand_total"] == 65
+
+    # Clearing (None) puts the remainder back.
+    assert recipesmod.set_product_water(
+        db, recipe["id"], PRODUCT_A, None) is True
+    product = _product(recipesmod.get_recipe_detail(db, recipe["id"]), PRODUCT_A)
+    assert product["water_percentage"] is None
+    assert product["water_effective"] == 60
+
+
+def test_water_is_per_product_and_never_needs_an_ingredient(db):
+    co, sale, inv = _scenario(db)
+    recipe = _recipe(db, co, inv)
+    stockmod.add_chemical(db, CHEM, 500, "KG")
+    recipesmod.add_recipe_item(db, recipe["id"], PRODUCT_A, CHEM, 40)
+
+    # An empty product has no auto remainder, but an explicit value still shows.
+    empty = _product(recipesmod.get_recipe_detail(db, recipe["id"]), PRODUCT_B)
+    assert empty["water_effective"] is None
+    assert empty["grand_total"] is None
+
+    recipesmod.set_product_water(db, recipe["id"], PRODUCT_B, 15)
+    detail = recipesmod.get_recipe_detail(db, recipe["id"])
+    assert _product(detail, PRODUCT_B)["grand_total"] == 15
+    assert _product(detail, PRODUCT_A)["water_effective"] == 60
+
+
+def test_water_is_validated_and_audited(db):
+    co, sale, inv = _scenario(db)
+    recipe = _recipe(db, co, inv)
+
+    with pytest.raises(ValueError):
+        recipesmod.set_product_water(db, recipe["id"], PRODUCT_A, -1)
+    with pytest.raises(ValueError):
+        recipesmod.set_product_water(db, recipe["id"], PRODUCT_A, 100.5)
+    with pytest.raises(ValueError):
+        recipesmod.set_product_water(db, recipe["id"], "Not On Invoice", 10)
+
+    recipesmod.set_product_water(db, recipe["id"], PRODUCT_A, 12.5)
+    row = db.execute(
+        "SELECT old_value, new_value FROM audit_logs"
+        " WHERE entity_type = 'recipe_product'"
+        "   AND action = 'RECIPE_WATER_SET' ORDER BY id DESC LIMIT 1").fetchone()
+    assert row[0] == "auto"
+    assert row[1] == "12.5"
