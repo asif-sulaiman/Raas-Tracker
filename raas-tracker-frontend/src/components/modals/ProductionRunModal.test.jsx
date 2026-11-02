@@ -35,12 +35,14 @@ const PRODUCTS = [
   {
     id: 11, on_invoice: true, product_name: 'Cleaner', unit: 'KG',
     invoiced_qty: 5000, produced_qty: 1000, remaining_qty: 4000,
-    formulated: true, items: [{ id: 1, chemical_name: 'NaOH', percentage: 40 }],
+    formulated: true, grand_total: 100,
+    items: [{ id: 1, chemical_name: 'NaOH', percentage: 40 }],
   },
   {
     id: 12, on_invoice: true, product_name: 'Polisher', unit: 'KG',
     invoiced_qty: 3000, produced_qty: 3000, remaining_qty: 0,
-    formulated: true, items: [{ id: 2, chemical_name: 'Wax', percentage: 20 }],
+    formulated: true, grand_total: 100,
+    items: [{ id: 2, chemical_name: 'Wax', percentage: 20 }],
   },
   {
     id: 13, on_invoice: true, product_name: 'Degreaser', unit: 'KG',
@@ -255,4 +257,67 @@ describe('ProductionRunModal invoice scope', () => {
     expect(onClose).not.toHaveBeenCalled();
     expect(toast.success).not.toHaveBeenCalled();
   });
+
+  it('blocks an unbalanced product', async () => {
+    const posts = installFetch({
+      products: [{ ...PRODUCTS[0], grand_total: 95 }],
+    });
+    renderModal();
+
+    const cleaner = await waitForSource();
+    expect(cleaner.disabled).toBe(true);
+    expect(screen.getByText(/formulation totals 95.0%/)).toBeTruthy();
+    expect(screen.getByText(/must equal 100% before production/)).toBeTruthy();
+    expect(screen.getByText(/No product has a formulation totaling 100%/))
+      .toBeTruthy();
+
+    const start = screen.getByRole('button', { name: 'Start Production' });
+    expect(start.disabled).toBe(true);
+    fireEvent.click(start);
+    expect(posts).toHaveLength(0);
+  });
+
+  it('sends only balanced products', async () => {
+    const posts = installFetch({
+      products: [
+        { ...PRODUCTS[0], grand_total: 100 },
+        {
+          ...PRODUCTS[0], id: 14, product_name: 'Degreaser', grand_total: 95,
+          invoiced_qty: 900, produced_qty: 0, remaining_qty: 900,
+        },
+      ],
+    });
+    renderModal();
+
+    await waitForSource();
+    expect(screen.getByLabelText('Quantity for Degreaser').disabled).toBe(true);
+    expect(screen.getByRole('button', { name: 'Start Production' }).disabled)
+      .toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
+
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0].body.outputs).toEqual([
+      { product_name: 'Cleaner', quantity: 4000 },
+    ]);
+  });
+
+  it.each([99.99, 100.01])(
+    'treats a formulation totaling %s as balanced',
+    async (total) => {
+      const posts = installFetch({
+        products: [{ ...PRODUCTS[0], grand_total: total }],
+      });
+      renderModal();
+
+      const cleaner = await waitForSource();
+      expect(cleaner.disabled).toBe(false);
+      expect(screen.queryByText(/must equal 100%/)).toBeNull();
+      fireEvent.click(screen.getByRole('button', { name: 'Start Production' }));
+
+      await waitFor(() => expect(posts).toHaveLength(1));
+      expect(posts[0].body.outputs).toEqual([
+        { product_name: 'Cleaner', quantity: 4000 },
+      ]);
+    },
+  );
 });

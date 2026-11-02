@@ -5,6 +5,7 @@ import Button from '../ui/Button';
 import { useAuth } from '../../context/AuthContext';
 import { toast } from 'sonner';
 import { formatNumber } from '../../utils/format';
+import { isBalanced } from '../../utils/formulation';
 
 const inputCls =
   'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
@@ -14,6 +15,11 @@ function today() {
 }
 
 const keyOf = (product) => String(product.product_name || '').toLowerCase();
+
+// The server refuses a run whose formation does not total 100%; the modal
+// says why per row and never sends that product, so one unfinished card does
+// not stop the rest of the invoice from being produced.
+const balancedOf = (product) => isBalanced(product.grand_total);
 
 const remainingOf = (product) => {
   const remaining = Number(product.remaining_qty);
@@ -30,7 +36,9 @@ const remainingOf = (product) => {
  * The sale and invoice are fixed by the recipe, so this form cannot point a
  * run at another invoice. Every product on the invoice gets a row prefilled
  * with its remaining quantity; a row left at 0 is not sent, and a product
- * with no formulation is never silently produced.
+ * with no formulation is never silently produced. A product whose ingredients
+ * and water do not total 100% is shown disabled and left out of the run, so
+ * one unfinished card cannot block the rest of the invoice.
  */
 export default function ProductionRunModal({ isOpen, onClose, recipe, onSaved }) {
   const { apiFetch } = useAuth();
@@ -113,8 +121,10 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, onSaved })
   const producedOut = products
     .filter((p) => p.on_invoice !== false && remainingOf(p) === 0)
     .map((p) => p.product_name);
-  const submittableRows = rows.filter((p) => p.formulated);
-  const hasFormulatedRow = submittableRows.length > 0;
+  const formulatedRows = rows.filter((p) => p.formulated);
+  const submittableRows = formulatedRows.filter(balancedOf);
+  const hasFormulatedRow = formulatedRows.length > 0;
+  const hasProducibleRow = submittableRows.length > 0;
 
   const setQuantity = (product, value) => {
     setQuantities((prev) => ({ ...prev, [keyOf(product)]: value }));
@@ -159,7 +169,7 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, onSaved })
     }
   };
 
-  const disabled = saving || loading || Boolean(loadError) || !hasFormulatedRow;
+  const disabled = saving || loading || Boolean(loadError) || !hasProducibleRow;
 
   return (
     <Modal
@@ -274,11 +284,15 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, onSaved })
             </p>
           ) : (
             <>
-              {!hasFormulatedRow && (
+              {!hasFormulatedRow ? (
                 <p className="mb-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-700 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
                   No formulated product is left to produce — add a formulation in the recipe first.
                 </p>
-              )}
+              ) : !hasProducibleRow ? (
+                <p className="mb-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-700 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
+                  No product has a formulation totaling 100% — fix the recipe first.
+                </p>
+              ) : null}
               <div className="rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden">
                 <table className="w-full text-sm">
                   <thead>
@@ -295,6 +309,8 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, onSaved })
                       const remaining = remainingOf(product);
                       const qty = Number(quantities[keyOf(product)]);
                       const exceeds = Number.isFinite(qty) && qty > remaining;
+                      const balanced = balancedOf(product);
+                      const total = Number(product.grand_total);
                       return (
                         <tr
                           key={keyOf(product)}
@@ -307,6 +323,13 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, onSaved })
                             {!product.formulated && (
                               <p className="text-[11px] text-rose-600 dark:text-rose-400">
                                 no formulation yet — add chemicals in the recipe
+                              </p>
+                            )}
+                            {product.formulated && !balanced && (
+                              <p className="text-[11px] text-amber-600 dark:text-amber-400">
+                                formulation totals {Number.isFinite(total)
+                                  ? `${total.toFixed(1)}%`
+                                  : 'unknown'} — must equal 100% before production
                               </p>
                             )}
                           </td>
@@ -327,7 +350,7 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, onSaved })
                               step="any"
                               value={quantities[keyOf(product)] ?? ''}
                               onChange={(e) => setQuantity(product, e.target.value)}
-                              disabled={!product.formulated}
+                              disabled={!product.formulated || !balanced}
                               className={inputCls}
                             />
                             {exceeds && (
