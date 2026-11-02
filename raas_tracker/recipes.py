@@ -27,6 +27,7 @@ from .db import get_connection, logger
 from .stock import (
     convert_quantity,
     get_all_chemicals,
+    get_unit_conversion,
     sync_reorder_notifications,
     update_stock,
 )
@@ -249,6 +250,7 @@ def list_recipe_products(conn: psycopg.Connection,
             {"key": key, "product_name": slot["product_name"],
              "unit": slot["unit"], "lines": [], "invoiced_qty": 0.0,
              "unconverted": []}, slot, items, produced, on_invoice=False))
+    _attach_material_quantities(conn, products)
     products.sort(key=lambda p: (p["product_name"] or "").lower())
     return products
 
@@ -286,6 +288,63 @@ def _product_row(group, slot, items, produced, on_invoice=True) -> Dict[str, Any
         "grand_total": grand_total,
         "items": slot_items,
     }
+
+
+def _attach_material_quantities(conn: psycopg.Connection,
+                                products: List[Dict[str, Any]]) -> None:
+    """Add what each row still needs and what the invoice leaves in stock.
+
+    ``required_qty`` is a row's share of a chemical for the quantity still to
+    produce, converted into the chemical's stock unit. ``stock_remaining``
+    subtracts the whole invoice's need from current stock *once* per chemical,
+    so every row that shares a chemical shows the same projection.
+
+    ``water_qty`` is the effective water share in product units; it is display
+    only and never deducted. A missing unit conversion (or an invoice line
+    without one) leaves the quantities ``None`` rather than guessing, because
+    an understated remainder would overstate the stock projection.
+    """
+    factors: Dict[tuple, Optional[float]] = {}
+    needs: Dict[int, float] = {}
+    unsafe: Dict[int, bool] = {}
+
+    def factor(from_unit: str, to_unit: str) -> Optional[float]:
+        key = ((from_unit or "").upper().strip(),
+               (to_unit or "").upper().strip())
+        if key not in factors:
+            factors[key] = get_unit_conversion(conn, key[0], key[1])
+        return factors[key]
+
+    for product in products:
+        remaining = max(float(product.get("remaining_qty") or 0.0), 0.0)
+        water = product.get("water_effective")
+        product["water_qty"] = (
+            None if water is None
+            else round(float(water) / 100.0 * remaining, 6))
+        blind = bool(product.get("unconverted"))
+        for item in product["items"]:
+            qty = None
+            if not blind:
+                rate = factor(product["unit"], item["unit"])
+                if rate is None:
+                    unsafe[item["chemical_id"]] = True
+                else:
+                    qty = (item["percentage"] / 100.0) * remaining * rate
+                    needs[item["chemical_id"]] = (
+                        needs.get(item["chemical_id"], 0.0) + qty)
+            else:
+                unsafe[item["chemical_id"]] = True
+            item["required_qty"] = None if qty is None else round(qty, 6)
+
+    for product in products:
+        for item in product["items"]:
+            chemical_id = item["chemical_id"]
+            if unsafe.get(chemical_id):
+                item["stock_remaining"] = None
+            else:
+                item["stock_remaining"] = round(
+                    float(item["current_stock"] or 0.0)
+                    - needs.get(chemical_id, 0.0), 6)
 
 
 def get_recipe_detail(conn: psycopg.Connection,

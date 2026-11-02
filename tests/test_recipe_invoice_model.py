@@ -910,3 +910,147 @@ def test_water_is_validated_and_audited(db):
         "   AND action = 'RECIPE_WATER_SET' ORDER BY id DESC LIMIT 1").fetchone()
     assert row[0] == "auto"
     assert row[1] == "12.5"
+
+
+# --------------------------------------------------------------------------- #
+# quantities on the detail payload (needed now, stock left invoice-wide)
+# --------------------------------------------------------------------------- #
+def test_detail_reports_needed_and_stock_remaining_per_chemical(db):
+    co, sale, inv, recipe = _formulated_two_product_recipe(db)
+
+    detail = recipesmod.get_recipe_detail(db, recipe["id"])
+    a = _product(detail, PRODUCT_A)
+    b = _product(detail, PRODUCT_B)
+
+    # A is 20% of its 100 KG, B is 10% of its 50 KG.
+    assert a["items"][0]["required_qty"] == pytest.approx(20)
+    assert b["items"][0]["required_qty"] == pytest.approx(5)
+    # One invoice-wide need of 25, so both rows see the same remainder.
+    assert a["items"][0]["stock_remaining"] == pytest.approx(475)
+    assert b["items"][0]["stock_remaining"] == pytest.approx(475)
+    # Water is a quantity in product units, never a deduction.
+    assert a["water_qty"] == pytest.approx(80)
+    assert b["water_qty"] == pytest.approx(45)
+    assert a["items"][0]["required_per_unit"] == pytest.approx(0.2)
+
+
+def test_detail_quantities_follow_what_is_still_to_produce(db):
+    co, sale, inv, recipe = _formulated_two_product_recipe(db)
+
+    recipesmod.create_production_run(db, co, recipe["id"], [
+        {"product_name": PRODUCT_A, "quantity": 40},
+    ])
+
+    detail = recipesmod.get_recipe_detail(db, recipe["id"])
+    a = _product(detail, PRODUCT_A)
+    b = _product(detail, PRODUCT_B)
+
+    assert a["remaining_qty"] == pytest.approx(60)
+    assert a["items"][0]["required_qty"] == pytest.approx(12)
+    assert b["items"][0]["required_qty"] == pytest.approx(5)
+    # 492 in stock (500 - 8 deducted) minus the next 17 needed.
+    assert a["items"][0]["stock_remaining"] == pytest.approx(475)
+    assert b["items"][0]["stock_remaining"] == pytest.approx(475)
+    assert a["water_qty"] == pytest.approx(48)
+
+
+def test_detail_needed_converts_into_the_chemical_unit(db):
+    co, sale, inv = _scenario(db)
+    recipe = _recipe(db, co, inv)
+    stockmod.add_chemical(db, "Solvent", 100, "L")
+    recipesmod.add_recipe_item(db, recipe["id"], PRODUCT_A, "Solvent", 10)
+    assert stockmod.add_unit_conversion(db, "KG", "L", 1.5)
+
+    product = _product(
+        recipesmod.get_recipe_detail(db, recipe["id"]), PRODUCT_A)
+
+    assert product["items"][0]["required_qty"] == pytest.approx(15)
+    assert product["items"][0]["stock_remaining"] == pytest.approx(85)
+    # Water stays in product units (100 KG - 10 KG).
+    assert product["water_qty"] == pytest.approx(90)
+
+
+def test_detail_needed_is_null_when_a_conversion_is_missing(db):
+    co, sale, inv = _scenario(db)
+    recipe = _recipe(db, co, inv)
+    stockmod.add_chemical(db, "Solvent", 100, "PCS")
+    recipesmod.add_recipe_item(db, recipe["id"], PRODUCT_A, "Solvent", 10)
+
+    product = _product(
+        recipesmod.get_recipe_detail(db, recipe["id"]), PRODUCT_A)
+
+    assert product["items"][0]["required_qty"] is None
+    assert product["items"][0]["stock_remaining"] is None
+
+
+def test_detail_needed_is_null_when_an_invoice_line_is_unconverted(db):
+    items = [
+        {"product_name": PRODUCT_A, "quantity": 100, "unit_price": 2,
+         "unit": "KG"},
+        {"product_name": PRODUCT_A, "quantity": 50, "unit_price": 2,
+         "unit": "GAL"},
+    ]
+    co, sale, inv = _scenario(db, items)
+    recipe = _recipe(db, co, inv)
+    stockmod.add_chemical(db, CHEM, 500, "KG")
+    recipesmod.add_recipe_item(db, recipe["id"], PRODUCT_A, CHEM, 10)
+
+    product = _product(
+        recipesmod.get_recipe_detail(db, recipe["id"]), PRODUCT_A)
+
+    # The remaining quantity is understated, so no projection is safe.
+    assert product["unconverted"] == [{"from_unit": "GAL", "to_unit": "KG"}]
+    assert product["items"][0]["required_qty"] is None
+    assert product["items"][0]["stock_remaining"] is None
+
+
+def test_detail_water_quantity_and_deduction_for_the_users_example(db):
+    """100 KG product: 95% raw material + 5% water, stock 100."""
+    co, sale, inv = _scenario(db)
+    recipe = _recipe(db, co, inv)
+    stockmod.add_chemical(db, CHEM, 100, "KG")
+    recipesmod.add_recipe_item(db, recipe["id"], PRODUCT_A, CHEM, 95)
+    recipesmod.set_product_water(db, recipe["id"], PRODUCT_A, 5)
+
+    product = _product(
+        recipesmod.get_recipe_detail(db, recipe["id"]), PRODUCT_A)
+    assert product["items"][0]["required_qty"] == pytest.approx(95)
+    assert product["items"][0]["stock_remaining"] == pytest.approx(5)
+    assert product["water_qty"] == pytest.approx(5)
+
+    recipesmod.create_production_run(db, co, recipe["id"], [
+        {"product_name": PRODUCT_A, "quantity": 100},
+    ])
+    assert _stock(db) == pytest.approx(5)
+    deducted = db.execute(
+        "SELECT required_qty FROM production_run_items").fetchone()[0]
+    assert deducted == pytest.approx(95)
+
+
+def test_detail_quantities_are_zero_after_full_production(db):
+    co, sale, inv, recipe = _formulated_two_product_recipe(db)
+
+    recipesmod.create_production_run(db, co, recipe["id"], [
+        {"product_name": PRODUCT_A, "quantity": 100},
+        {"product_name": PRODUCT_B, "quantity": 50},
+    ])
+
+    detail = recipesmod.get_recipe_detail(db, recipe["id"])
+    for name in (PRODUCT_A, PRODUCT_B):
+        product = _product(detail, name)
+        assert product["remaining_qty"] == 0
+        assert product["items"][0]["required_qty"] == 0
+        assert product["water_qty"] == 0
+        assert product["items"][0]["stock_remaining"] == pytest.approx(475)
+
+
+def test_api_detail_carries_needed_and_stock_remaining(admin_client, db):
+    co, sale, inv, recipe = _formulated_two_product_recipe(db)
+
+    body = admin_client.get(
+        f"/api/recipes/by-id/{recipe['id']}").get_json()
+    a = next(p for p in body["products"] if p["product_name"] == PRODUCT_A)
+
+    assert a["water_qty"] == pytest.approx(80)
+    assert a["items"][0]["required_qty"] == pytest.approx(20)
+    assert a["items"][0]["stock_remaining"] == pytest.approx(475)
