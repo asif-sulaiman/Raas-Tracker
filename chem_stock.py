@@ -123,6 +123,7 @@ from raas_tracker.recipes import (
     get_recipe_by_invoice,
     get_recipe_by_name,
     get_recipe_detail,
+    set_product_water,
     list_chemicals_cli,
     list_recipe_items,
     list_recipe_items_by_id,

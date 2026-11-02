@@ -715,6 +715,45 @@ def test_api_formulate_by_product_path(admin_client, db):
     assert r.status_code == 200
 
 
+def test_api_set_and_clear_water(admin_client, db):
+    co, sale, inv = _scenario(db)
+    rid = _api_recipe(admin_client, co, inv)
+    stockmod.add_chemical(db, CHEM, 500, "KG")
+    items_path = f"/api/recipes/by-id/{rid}/products/{quote(PRODUCT_A)}/items"
+    assert admin_client.post(
+        items_path, json={"chemical": CHEM, "percentage": 40}).status_code == 200
+
+    water_path = f"/api/recipes/by-id/{rid}/products/{quote(PRODUCT_A)}/water"
+    assert admin_client.put(water_path, json={"percentage": 25}).status_code == 200
+
+    detail = admin_client.get(f"/api/recipes/by-id/{rid}").get_json()
+    product = next(p for p in detail["products"]
+                   if p["product_name"] == PRODUCT_A)
+    assert product["water_percentage"] == 25
+    assert product["water_effective"] == 25
+    assert product["grand_total"] == 65
+
+    assert admin_client.put(water_path, json={"percentage": None}).status_code == 200
+    detail = admin_client.get(f"/api/recipes/by-id/{rid}").get_json()
+    product = next(p for p in detail["products"]
+                   if p["product_name"] == PRODUCT_A)
+    assert product["water_percentage"] is None
+    assert product["water_effective"] == 60
+    assert product["grand_total"] == 100
+
+    assert admin_client.put(water_path, json={"percentage": 100.5}).status_code == 400
+    assert admin_client.put(
+        f"/api/recipes/by-id/999999/products/{quote(PRODUCT_A)}/water",
+        json={"percentage": 10}).status_code == 404
+
+
+def test_api_set_water_requires_authentication(client):
+    r = client.put(
+        f"/api/recipes/by-id/1/products/{quote(PRODUCT_A)}/water",
+        json={"percentage": 10})
+    assert r.status_code == 401
+
+
 def test_api_produce_and_validation(admin_client, db):
     co, sale, inv, recipe = _formulated_two_product_recipe(db)
     rid = recipe["id"]

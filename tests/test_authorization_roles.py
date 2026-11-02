@@ -87,6 +87,7 @@ OPERATOR_ROUTES = [
     # aliases, so both spellings must declare the same class.
     ("PUT", "/api/recipes/by-id/<int:recipe_id>"),
     ("POST", "/api/recipes/by-id/<int:recipe_id>/products/<path:product>/items"),
+    ("PUT", "/api/recipes/by-id/<int:recipe_id>/products/<path:product>/water"),
     ("PUT", "/api/recipes/by-id/<int:recipe_id>/items/<int:item_id>"),
     ("POST", "/api/upload"),
     ("POST", "/api/unit-conversions"),
