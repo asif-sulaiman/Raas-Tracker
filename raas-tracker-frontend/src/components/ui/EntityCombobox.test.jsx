@@ -1,5 +1,5 @@
 import { render, screen, fireEvent } from '@testing-library/react';
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { useState } from 'react';
 import EntityCombobox from './EntityCombobox';
 
@@ -23,6 +23,10 @@ function Controlled({ onChange, initial = '' }) {
     />
   );
 }
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe('EntityCombobox', () => {
   it('filters options by substring and lists all on focus', () => {
@@ -145,5 +149,30 @@ describe('EntityCombobox', () => {
     rerender(<EntityCombobox aria-label="Company" options={OPTIONS} value="2" onChange={() => {}} />);
     expect(input).toHaveValue('Beta');
     expect(screen.queryByRole('listbox')).toBeNull();
+  });
+
+  it('escapes an overflow-hidden ancestor so the list is never clipped', () => {
+    render(
+      <div data-testid="clipped" style={{ overflow: 'hidden', height: 24 }}>
+        <Controlled />
+      </div>,
+    );
+    fireEvent.focus(screen.getByLabelText('Company'));
+    const listbox = screen.getByRole('listbox');
+    expect(screen.getByTestId('clipped').contains(listbox)).toBe(false);
+    expect(document.body.contains(listbox)).toBe(true);
+    expect(listbox).toHaveStyle({ position: 'fixed' });
+  });
+
+  it('opens upwards when there is no room below the field', () => {
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({
+      top: 700, bottom: 740, left: 10, right: 210, width: 200, height: 40,
+      x: 10, y: 700, toJSON: () => ({}),
+    });
+    render(<Controlled />);
+    fireEvent.focus(screen.getByLabelText('Company'));
+    const listbox = screen.getByRole('listbox');
+    expect(listbox.style.top).toBe('');
+    expect(listbox.style.bottom).not.toBe('');
   });
 });
