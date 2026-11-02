@@ -1054,3 +1054,133 @@ def test_api_detail_carries_needed_and_stock_remaining(admin_client, db):
     assert a["water_qty"] == pytest.approx(80)
     assert a["items"][0]["required_qty"] == pytest.approx(20)
     assert a["items"][0]["stock_remaining"] == pytest.approx(475)
+
+
+# --------------------------------------------------------------------------- #
+# the 100% production gate
+# --------------------------------------------------------------------------- #
+def _balanced_case(db, pct=40, water=None, stock_qty=500):
+    """One formulated product on its invoice, with an optional stored water."""
+    co, sale, inv = _scenario(db)
+    recipe = _recipe(db, co, inv)
+    stockmod.add_chemical(db, CHEM, stock_qty, "KG")
+    recipesmod.add_recipe_item(db, recipe["id"], PRODUCT_A, CHEM, pct)
+    if water is not None:
+        recipesmod.set_product_water(db, recipe["id"], PRODUCT_A, water)
+    return co, sale, inv, recipe
+
+
+def _runs_and_stock(db):
+    return (db.execute("SELECT COUNT(*) FROM production_runs").fetchone()[0],
+            _stock(db))
+
+
+def test_production_requires_exactly_100_percent(db):
+    co, sale, inv, recipe = _balanced_case(db, pct=40, water=25)
+
+    with pytest.raises(ValueError, match="must equal 100"):
+        recipesmod.create_production_run(db, co, recipe["id"], [
+            {"product_name": PRODUCT_A, "quantity": 100},
+        ])
+
+    assert _runs_and_stock(db) == (0, 500)
+
+
+def test_production_rejects_a_missing_remainder(db):
+    co, sale, inv, recipe = _balanced_case(db, pct=90, water=5)
+
+    with pytest.raises(ValueError, match="95"):
+        recipesmod.create_production_run(db, co, recipe["id"], [
+            {"product_name": PRODUCT_A, "quantity": 100},
+        ])
+
+    assert _runs_and_stock(db) == (0, 500)
+
+
+def test_production_rejects_above_100(db):
+    co, sale, inv, recipe = _balanced_case(db, pct=98, water=5)
+
+    with pytest.raises(ValueError, match="103"):
+        recipesmod.create_production_run(db, co, recipe["id"], [
+            {"product_name": PRODUCT_A, "quantity": 100},
+        ])
+
+    assert _runs_and_stock(db) == (0, 500)
+
+
+def test_production_accepts_an_explicit_100(db):
+    co, sale, inv, recipe = _balanced_case(db, pct=40, water=60)
+
+    recipesmod.create_production_run(db, co, recipe["id"], [
+        {"product_name": PRODUCT_A, "quantity": 100},
+    ])
+
+    assert _runs_and_stock(db) == (1, 460)
+
+
+def test_production_accepts_blank_water_auto_remainder(db):
+    co, sale, inv, recipe = _balanced_case(db, pct=40)
+
+    recipesmod.create_production_run(db, co, recipe["id"], [
+        {"product_name": PRODUCT_A, "quantity": 100},
+    ])
+
+    assert _runs_and_stock(db) == (1, 460)
+
+
+@pytest.mark.parametrize("water", [59.99, 60.01])
+def test_production_accepts_a_hundredth_either_side(db, water):
+    co, sale, inv, recipe = _balanced_case(db, pct=40, water=water)
+
+    recipesmod.create_production_run(db, co, recipe["id"], [
+        {"product_name": PRODUCT_A, "quantity": 100},
+    ])
+
+    assert _runs_and_stock(db) == (1, 460)
+
+
+def test_production_rejects_beyond_a_hundredth(db):
+    co, sale, inv, recipe = _balanced_case(db, pct=40, water=59.98)
+
+    with pytest.raises(ValueError, match="99.98"):
+        recipesmod.create_production_run(db, co, recipe["id"], [
+            {"product_name": PRODUCT_A, "quantity": 100},
+        ])
+
+    assert _runs_and_stock(db) == (0, 500)
+
+
+def test_shortage_names_the_chemical_and_amounts(db):
+    co, sale, inv, recipe = _balanced_case(db, pct=20, stock_qty=10)
+
+    with pytest.raises(
+            ValueError,
+            match="Caustic Soda needs 20 KG, 10 KG available"):
+        recipesmod.create_production_run(db, co, recipe["id"], [
+            {"product_name": PRODUCT_A, "quantity": 100},
+        ])
+
+    assert _runs_and_stock(db) == (0, 10)
+
+
+def test_report_still_previews_an_unbalanced_formulation(db):
+    co, sale, inv, recipe = _balanced_case(db, pct=40, water=25)
+
+    report = recipesmod.generate_report(db, co, recipe["id"], [
+        {"product_name": PRODUCT_A, "quantity": 100},
+    ])
+
+    assert report[0]["required_total"] == pytest.approx(40)
+    assert report[0]["current_stock"] == 500
+
+
+def test_api_produce_rejects_unbalanced_formulation(admin_client, db):
+    co, sale, inv, recipe = _balanced_case(db, pct=40, water=25)
+
+    r = admin_client.post(
+        f"/api/recipes/by-id/{recipe['id']}/produce",
+        json={"outputs": [{"product_name": PRODUCT_A, "quantity": 100}]})
+
+    assert r.status_code == 400
+    assert "100" in r.get_json()["error"]
+    assert _runs_and_stock(db) == (0, 500)

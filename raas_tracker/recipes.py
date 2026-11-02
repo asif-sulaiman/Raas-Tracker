@@ -9,9 +9,10 @@ formulation *and* an output on a run linked to that invoice.
 Water/solvent is whatever is not formulated: a slot's percentages may sum to
 anything from 0 to 100, and only the listed chemicals are deducted. An
 optional per-slot `water_percentage` overrides that remainder for display; it
-is never added to a deduction or used as a production quantity. There is
-no batch basis on the recipe any more; the quantity is entered at production
-time and prefilled from the invoice.
+is never added to a deduction or used as a production quantity, but
+`ingredients + water` must total 100% (within 0.01) before a production run.
+There is no batch basis on the recipe any more; the quantity is entered at
+production time and prefilled from the invoice.
 """
 
 import math
@@ -43,6 +44,12 @@ from ._exceptions import (
     ResourceMissing,
 )
 from .uploads import csv_safe
+
+
+# Percentages are REAL (float4), so a legitimate two-decimal split can sit a
+# few 1e-7 away from 100. One hundredth of a percentage point absorbs that
+# without letting a real formulation error through.
+_BALANCE_TOLERANCE = 0.01
 
 
 # --------------------------------------------------------------------------- #
@@ -574,9 +581,11 @@ def set_product_water(conn: psycopg.Connection, recipe_id: int,
                       percentage: Optional[float]) -> bool:
     """Set (or clear, with ``None``) one product's water percentage.
 
-    Display only: the detail read reports ``100 - ingredients`` when this is
-    NULL and the stored value otherwise. Nothing is deducted and no cap uses
-    it, so a total that is not 100 is a warning, never a refusal.
+    Display and gate only: the detail read reports ``100 - ingredients`` when
+    this is NULL and the stored value otherwise. Nothing is deducted, but
+    ``ingredients + water`` must total 100% (within 0.01) before production,
+    so a stored value that misses that total blocks the product's run while
+    still allowing the formulation to be saved and previewed.
     """
     if percentage is not None:
         finite_values(percentage)
@@ -723,7 +732,9 @@ def _normalized_outputs(outputs) -> List[Dict[str, Any]]:
 
 
 def _aggregate_requirements(conn: psycopg.Connection, recipe: Dict[str, Any],
-                            outputs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                            outputs: List[Dict[str, Any]],
+                            require_balanced: bool = False
+                            ) -> List[Dict[str, Any]]:
     """Convert per-product needs into one row per chemical, in stock units.
 
     A product's formulation percentages apply to that product's quantity. Each
@@ -731,6 +742,10 @@ def _aggregate_requirements(conn: psycopg.Connection, recipe: Dict[str, Any],
     the products are summed, so giving two products the same chemical produces
     exactly one deduction. A missing conversion is a 400 naming both units:
     guessing KG would silently over- or under-deduct.
+
+    ``require_balanced`` is production-only: ingredients + water must total
+    100% within ``_BALANCE_TOLERANCE``. Reports keep the default ``False`` so
+    an unbalanced formulation is still previewed as a planning tool.
     """
     products = {p["product_name"].lower(): p
                 for p in list_recipe_products(conn, recipe["id"])}
@@ -751,6 +766,15 @@ def _aggregate_requirements(conn: psycopg.Connection, recipe: Dict[str, Any],
             raise ValueError(
                 f"invoice lines for '{product['product_name']}' need a unit "
                 f"conversion ({pairs}) - add it in Unit Conversions")
+        if require_balanced:
+            total = product["grand_total"]
+            # +1e-9 because 100 - 99.99 is 0.010000000000005 in binary float.
+            if total is None or \
+                    abs(total - 100.0) > _BALANCE_TOLERANCE + 1e-9:
+                shown = "no total" if total is None else f"{total:g}%"
+                raise ValueError(
+                    f"'{product['product_name']}' formulation totals {shown} "
+                    "- ingredients + water must equal 100% before production")
         for item in product["items"]:
             required = (item["percentage"] / 100.0) * output["quantity"]
             converted = convert_quantity(
@@ -890,7 +914,8 @@ def create_production_run(
     if current in ("shipped", "paid"):
         raise InvoiceAlreadyAdvanced(f"invoice already {current}")
 
-    requirements = _aggregate_requirements(conn, recipe, normalized)
+    requirements = _aggregate_requirements(
+        conn, recipe, normalized, require_balanced=True)
 
     try:
         prod_date = production_date or date.today().isoformat()
@@ -937,11 +962,19 @@ def create_production_run(
             (_now_str(), sale_id))
 
         for row in requirements:
-            success = update_stock(
-                conn, row["chemical_name"], -row["required_qty"],
-                unit=row["unit"],
-                reason=f"Production {batch_number or run_id} for {recipe['name']}",
-                atomic=False)
+            try:
+                success = update_stock(
+                    conn, row["chemical_name"], -row["required_qty"],
+                    unit=row["unit"],
+                    reason=f"Production {batch_number or run_id} for {recipe['name']}",
+                    atomic=False)
+            except ValueError as exc:
+                if "insufficient stock" not in str(exc):
+                    raise
+                raise ValueError(
+                    f"insufficient stock: {row['chemical_name']} needs "
+                    f"{row['required_qty']:g} {row['unit']}, "
+                    f"{row['current_stock']:g} {row['unit']} available") from exc
             if not success:
                 raise ValueError(
                     f"chemical '{row['chemical_name']}' disappeared during production")
