@@ -1,5 +1,6 @@
 // raas-tracker-frontend/src/components/ui/EntityCombobox.jsx
-import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 
 const normalize = (text) => String(text ?? '').toLowerCase().trim();
 
@@ -31,6 +32,7 @@ export default function EntityCombobox({
   const [open, setOpen] = useState(false);
   const [invalid, setInvalid] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
+  const [anchor, setAnchor] = useState(null);
 
   const selected = options.find((option) => String(option.value) === String(value));
   const filtered = useMemo(() => {
@@ -53,6 +55,52 @@ export default function EntityCombobox({
     setOpen(false);
     setInvalid(false);
   }, [value]);
+
+  // The list renders in a portal so a clipping ancestor (`overflow-hidden`)
+  // cannot cut it off; measure the input to place it, flipping up when the
+  // space below is too small.
+  useLayoutEffect(() => {
+    if (!open) {
+      // Closing forgets the last geometry so a reopen never flashes a stale popup.
+      // oxlint-disable-next-line react/set-state-in-effect
+      setAnchor(null);
+      return undefined;
+    }
+    const place = () => {
+      const el = inputRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const gap = 4;
+      const below = window.innerHeight - rect.bottom;
+      const above = rect.top;
+      const up = below < 200 && above > below;
+      const next = {
+        left: rect.left,
+        width: rect.width,
+        top: up ? undefined : rect.bottom + gap,
+        bottom: up ? window.innerHeight - rect.top + gap : undefined,
+        maxHeight: Math.max(120, Math.min(240, (up ? above : below) - gap)),
+      };
+      // Scrolling inside the popup fires the capture listener too; skip the
+      // render when nothing actually moved.
+      setAnchor((prev) => {
+        const unchanged = prev
+          && prev.left === next.left
+          && prev.width === next.width
+          && prev.top === next.top
+          && prev.bottom === next.bottom
+          && prev.maxHeight === next.maxHeight;
+        return unchanged ? prev : next;
+      });
+    };
+    place();
+    window.addEventListener('scroll', place, true);
+    window.addEventListener('resize', place);
+    return () => {
+      window.removeEventListener('scroll', place, true);
+      window.removeEventListener('resize', place);
+    };
+  }, [open]);
 
   const display = open
     ? query
@@ -214,11 +262,20 @@ export default function EntityCombobox({
         onKeyDown={handleKeyDown}
         className={className}
       />
-      {open && (
+      {open && anchor && createPortal(
         <ul
           id={listId}
           role="listbox"
-          className="absolute z-30 mt-1 max-h-60 w-full overflow-auto rounded-lg border border-slate-200 bg-white py-1 text-sm shadow-lg dark:border-slate-700 dark:bg-slate-800"
+          style={{
+            position: 'fixed',
+            left: anchor.left,
+            width: anchor.width,
+            top: anchor.top,
+            bottom: anchor.bottom,
+            maxHeight: anchor.maxHeight,
+            zIndex: 1000,
+          }}
+          className="overflow-auto rounded-lg border border-slate-200 bg-white py-1 text-sm shadow-lg dark:border-slate-700 dark:bg-slate-800"
         >
           {filtered.length === 0 ? (
             <li className="px-3 py-2 text-xs text-slate-400 dark:text-slate-500">{emptyMessage}</li>
@@ -244,7 +301,8 @@ export default function EntityCombobox({
               </li>
             ))
           )}
-        </ul>
+        </ul>,
+        document.body,
       )}
       {invalid && (
         <p id={hintId} role="status" className="mt-1 text-xs font-medium text-rose-600 dark:text-rose-400">
