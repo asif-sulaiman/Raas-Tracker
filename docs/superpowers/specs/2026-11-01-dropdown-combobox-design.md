@@ -113,6 +113,11 @@ shows the query. If `value` changes from the parent while the input is focused
 not act as a filter) and selects the label text, so the first keystroke replaces
 it and searches afresh instead of appending to the old name.
 
+**Clipping.** The list is not a child of the field's card. It renders through a
+portal at `document.body` with `position: fixed`, measured from the input on open
+and on scroll/resize, and opens upwards when the space below is too small. Cards
+that clip their contents (`overflow-hidden`) must never be able to hide it.
+
 **Filtering.** Case-insensitive substring match on `label`; an empty query lists
 all options. Disabled options are listed (greyed) and never skipped by the
 filter, so the reason they are disabled stays visible.
@@ -150,9 +155,9 @@ production and PIs whose invoices are all past production.
 **Accessibility.** `role="combobox"`, `aria-expanded`, `aria-controls`,
 `aria-autocomplete="list"`, `aria-activedescendant`; the panel is
 `role="listbox"`; each row is `role="option"` with `aria-selected` and
-`aria-disabled`. The panel is a scrollable (max ~240 px) absolutely positioned
-box inside the field's relative wrapper, above modal content; the hint is
-`aria-live="polite"`.
+`aria-disabled`. The panel is a scrollable (max ~240 px) fixed-position box
+portalled to `document.body` and measured from the input, above modal content;
+the hint is `aria-live="polite"`.
 
 **Styling.** Same input classes as today's selects (passed in via
 `className`), same dark-mode tokens; the panel reuses the app's border,

@@ -85,12 +85,13 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
    - The LC list is server-filtered to LCs with at least one **open child PI** (`GET /api/lcs?open_only=true`). A paid/closed LC never appears, and neither does a stale `lc_received` LC whose PIs are all completed; completion is derived from the children, not the LC's own stage.
    - The PI list drops completed PIs. A PI with no invoice in `planned`/`produced` stays visible but disabled.
    - The invoice list is `planned`/`produced` only: `booked`, `shipped` and `paid` are past production.
-   - **One recipe belongs to one invoice, not one product.** The invoice's products and quantities are shown read-only and are pulled automatically; there is no product select, total quantity or water field. A product list that changes later changes the recipe's slots, not its identity.
+   - **One recipe belongs to one invoice, not one product.** The invoice's products and quantities are shown read-only and are pulled automatically; there is no product select, total quantity or water field. A product list that changes later changes the recipe's slots, not its identity. Water is set per formulation card once the recipe is open, never in this form.
    - An invoice that already has a recipe is named inline and **Create is disabled** — the server also refuses a second one with a 409.
    - The name is **typed by the user**, never auto-filled.
 2. **View** → recipe detail: **one formulation card per product on the invoice**
    - Each card shows the invoiced quantity (duplicate lines merged, with "N lines merged"), produced and remaining quantities, and a `Ready` / `Empty formulation` badge.
    - Add a chemical and its percentage to that product; the product's percentages may sum to at most 100%. Ingredients are edited and removed per row.
+   - Each card has a **Water %** control. Blank means the unformulated remainder (`100 − ingredients`); a saved value replaces it. The card shows `Grand total N%` and, when ingredients + water are not 100%, an amber note — informational only: nothing is blocked, deducted or capped by it.
    - The header counts `N of M products formulated`. A product added to the invoice after the recipe was created appears as an **empty card** and blocks booking until it is formulated and covered by a production run.
    - An unconverted invoice-line unit is flagged on the card; producing it needs a Unit Conversion rather than a guessed KG.
 3. **Revise** → recipe detail → **Edit**: rename only. The invoice and its products are the recipe's identity. Rename is always allowed; production runs and stock history link by `recipe_id`, so the past keeps its old name in audit and stock reasons. Names are unique per company **ignoring case** — a clash is a 409 shown inline.
@@ -147,7 +148,7 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 |---|---|---|
 | `chemicals` | id, name (unique, case-insensitive idx), current_qty, balance_last_month, unit, last_updated, reorder_level | Chemical master data |
 | `recipes` | id, company_id (FK), invoice_id (FK, **unique**, NOT NULL), name, created_date | Recipe header. **One recipe per invoice**; `UNIQUE (company_id, name)` (all lookups are `lower()`) so a rename checks uniqueness ignoring case. The invoice is the recipe's identity, so there is no product, tonnage or water field |
-| `recipe_products` | id, recipe_id (FK), product_name, unit | One formulation slot per product on the invoice; unique on `(recipe_id, lower(product_name))`. Slots are synced from invoice lines — a new line adds an empty slot, duplicates merge, a removed line marks the slot off-invoice |
+| `recipe_products` | id, recipe_id (FK), product_name, unit, water_percentage | One formulation slot per product on the invoice; unique on `(recipe_id, lower(product_name))`. Slots are synced from invoice lines — a new line adds an empty slot, duplicates merge, a removed line marks the slot off-invoice. `water_percentage` is `REAL NULL`: NULL means the auto remainder (`100 − ingredients`), and a stored value is the product's water, display only |
 | `recipe_items` | id, recipe_product_id (FK), chemical_id (FK), percentage | One chemical's percentage in one product's formulation; unique on `(recipe_product_id, chemical_id)`, and a product's percentages may not exceed 100% |
 | `uploads` | id, filename, upload_date, file_type, status, total_chemicals, matched, mismatches..., match_percentage | Upload metadata |
 | `upload_rows` | id, upload_id (FK), chemical_name, batch_number, expiry_date, upload_unit, balance_last_month, balance_this_month, matched_in_db, unit_match | Upload detail rows |
