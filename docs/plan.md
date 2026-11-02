@@ -876,6 +876,39 @@ against the deployed v8 before the demo data is rebuilt.
 
 ---
 
+## 💧 Phase RECIPE-WATER: water % in the view + un-clipped pickers (completed 2026-11-02)
+
+Water disappeared from the recipe flow with the invoice-scoped rewrite, and the
+formulation card's stock-chemical picker rendered its options inside an
+`overflow-hidden` card, so the suggestions were invisible. Water is back as a
+per-product, **display-only** value in the recipe **view**; the picker's
+listbox now renders outside the card.
+
+- Schema v9: `recipe_products.water_percentage` (nullable; NULL = `100 − ingredients`).
+- Detail payload adds `water_percentage`, `water_effective`, `grand_total`; `PUT /api/recipes/by-id/<id>/products/<product>/water` sets or clears it (operator, audited `RECIPE_WATER_SET`).
+- The recipe view shows an inline Water % control per product card and an informational grand-total warning; the create form still has none.
+- `EntityCombobox` portals its listbox to `document.body` (fixed, flips up), so `overflow-hidden` cards no longer hide suggestions.
+
+**Commits** (`git log --oneline main..HEAD`; the docs commit for this phase follows them):
+
+```
+f398ada fix(recipes): surface the stock chemical picker with clear empty copy
+f86b977 fix(ui): render combobox options outside clipped cards
+7f065fe feat(recipes): inline water percentage and grand total in the view
+bb36db3 feat(api): set or clear a product's water percentage
+1dec1ec feat(recipes): report and set per-product water percentage
+d913577 feat(schema): per-product water percentage (v9)
+```
+
+**Verification.** Backend gate: **1451 passed, 8 skipped** (1405s on the embedded
+Postgres), `ruff check` at its 18 known baseline findings (unused imports,
+redefinitions, unused locals and an ambiguous name in `flask_app.py` /
+`sales.py`; none on a line this phase added), `pyright` 0 errors / 15 baseline
+warnings. Frontend gate: **411 passed across 44 files**, `oxlint` 0 warnings /
+0 errors, `vite build` green, `dist/` copied to `react_frontend/`.
+
+---
+
 ## 🧾 Phase PRODUCT-CATALOG: product-name suggestions (completed 2026-11-01)
 
 Operators typed product names freehand in three places, so the same SKU could
