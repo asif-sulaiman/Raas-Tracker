@@ -170,6 +170,7 @@ from chem_stock import (
     get_recipe_detail, add_recipe_item, list_recipes,
     get_invoice_production_source,
     list_recipe_items_by_id, update_recipe, update_recipe_item, delete_recipe_item,
+    set_product_water,
     delete_recipe, generate_multi_recipe_report, export_report_to_csv,
     compare_stock_upload, save_upload, get_upload_history, get_upload_results,
     get_unit_conversion, convert_quantity, get_all_unit_conversions, add_unit_conversion,
@@ -1435,6 +1436,12 @@ class RecipePercentageIn(_FiniteModel):
     percentage: float = Field(ge=0, le=100)
 
 
+class RecipeWaterIn(_FiniteModel):
+    model_config = ConfigDict(
+        str_strip_whitespace=True, allow_inf_nan=False, extra="forbid")
+    percentage: float | None = Field(default=None, ge=0, le=100)
+
+
 def _recipe_detail(conn, recipe_id):
     """Detail payload: products (new shape) plus the flattened legacy `items`."""
     detail = get_recipe_detail(conn, recipe_id)
@@ -1698,6 +1705,25 @@ def api_delete_recipe_item_by_id(recipe_id, item_id):
     conn.close()
     if not success:
         return jsonify({"error": "Recipe item not found"}), 404
+    return jsonify({"success": True})
+
+
+@app.route("/api/recipes/by-id/<int:recipe_id>/products/<path:product>/water",
+           methods=["PUT"])
+@operator_or_admin_required
+@limited()
+def api_set_recipe_water(recipe_id, product):
+    try:
+        payload = RecipeWaterIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        set_product_water(conn, recipe_id, product, payload.percentage)
+    except ValueError as e:
+        _rollback_close(conn)
+        return jsonify({"error": str(e)}), status_for(e)
+    conn.close()
     return jsonify({"success": True})
 
 
