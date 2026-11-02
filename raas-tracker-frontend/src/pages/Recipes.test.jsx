@@ -132,6 +132,10 @@ function installFetch({
   putError = null,
   firstItem = { chemical_name: 'NaOH', percentage: 40 },
   water = {},
+  items = {},
+  chemicals = CHEMICALS,
+  products = BASE_PRODUCTS,
+  omitQuantities = false,
 } = {}) {
   const state = {
     recipes: [...recipes],
@@ -142,6 +146,7 @@ function installFetch({
         : [],
       'Soda Ash': [],
       'Sodium Silicate': [],
+      ...items,
     },
     water: {
       'Caustic Soda 50%': null, 'Soda Ash': null, 'Sodium Silicate': null,
@@ -150,37 +155,76 @@ function installFetch({
     runs: false,
     nextId: 200,
   };
-  const detailFor = (rec) => ({
-    recipe: { ...rec, run_count: state.runs ? 1 : (rec.run_count || 0) },
-    products: BASE_PRODUCTS.map((base) => {
-      const items = state.items[base.product_name] || [];
+  const stockOf = (name) => {
+    const chemical = chemicals.find((c) => c.name === name);
+    return chemical ? chemical.current_qty : null;
+  };
+  const detailFor = (rec) => {
+    const rows = products.map((base) => {
+      const rowItems = state.items[base.product_name] || [];
       const invoiced = base.invoiced_qty;
       const produced = state.runs ? invoiced : base.produced_qty;
-      const ingredientPct = items.reduce(
+      const ingredientPct = rowItems.reduce(
         (sum, i) => sum + Number(i.percentage || 0), 0);
       const storedWater = state.water[base.product_name];
       const waterEffective = storedWater != null
         ? storedWater
-        : (items.length ? 100 - ingredientPct : null);
+        : (rowItems.length ? 100 - ingredientPct : null);
       return {
-        ...base,
-        id: 900 + BASE_PRODUCTS.findIndex(
-          (p) => p.product_name === base.product_name),
-        on_invoice: true,
-        produced_qty: produced,
-        remaining_qty: Math.max(invoiced - produced, 0),
-        formulated: items.length > 0,
-        percentage: ingredientPct,
-        water_percentage: storedWater ?? null,
-        water_effective: waterEffective,
-        grand_total: waterEffective == null
-          ? null
-          : ingredientPct + waterEffective,
-        items,
+        base,
+        rowItems,
+        invoiced,
+        produced,
+        remaining: Math.max(invoiced - produced, 0),
+        ingredientPct,
+        storedWater,
+        waterEffective,
+        // The detail read projects the remainder, then subtracts the whole
+        // invoice's need once per chemical.
+        items: rowItems.map((item) => ({
+          ...item,
+          current_stock: stockOf(item.chemical_name) ?? item.current_stock,
+          required_qty: omitQuantities
+            ? undefined
+            : (Number(item.percentage) / 100) * Math.max(invoiced - produced, 0),
+        })),
       };
-    }),
-    items: Object.values(state.items).flat(),
-  });
+    });
+    const needs = {};
+    for (const row of rows) {
+      for (const item of row.items) {
+        needs[item.chemical_name] = (needs[item.chemical_name] || 0)
+          + Number(item.percentage) / 100 * row.remaining;
+      }
+    }
+    return {
+      recipe: { ...rec, run_count: state.runs ? 1 : (rec.run_count || 0) },
+      products: rows.map((row, index) => ({
+        ...row.base,
+        id: 900 + index,
+        on_invoice: true,
+        produced_qty: row.produced,
+        remaining_qty: row.remaining,
+        formulated: row.rowItems.length > 0,
+        percentage: row.ingredientPct,
+        water_percentage: row.storedWater ?? null,
+        water_effective: row.waterEffective,
+        grand_total: row.waterEffective == null
+          ? null
+          : row.ingredientPct + row.waterEffective,
+        water_qty: omitQuantities || row.waterEffective == null
+          ? undefined
+          : row.waterEffective / 100 * row.remaining,
+        items: row.items.map((item) => ({
+          ...item,
+          stock_remaining: omitQuantities || stockOf(item.chemical_name) == null
+            ? undefined
+            : stockOf(item.chemical_name) - needs[item.chemical_name],
+        })),
+      })),
+      items: Object.values(state.items).flat(),
+    };
+  };
   let runs = state.runs;
   const fetchMock = vi.fn(async (url, options) => {
     const u = String(url);
@@ -769,6 +813,8 @@ describe('Per-product formulation', () => {
     // 40% NaOH + 0% water is a warning, never a blocked save.
     expect(within(soda).getByText('Grand total 40.0%')).toBeTruthy();
     expect(within(soda).getByText(/do not add up to 100/)).toBeTruthy();
+    expect(within(soda).getByLabelText('Water quantity for Caustic Soda 50%')
+      .textContent).toBe('Water 0.00 KG');
   });
 
   it('refuses water outside 0-100 without calling the server', async () => {
@@ -786,6 +832,130 @@ describe('Per-product formulation', () => {
       .toHaveBeenCalledWith('Water must be between 0 and 100'));
     expect(fetchMock.mock.calls.some(
       ([, options]) => options?.method === 'PUT')).toBe(false);
+  });
+
+  it('shows how much chemical the invoice still needs and what will be left', async () => {
+    renderRecipes({ recipes: [RECIPE_ROW] });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    expect(within(soda).getAllByRole('columnheader').map((th) => th.textContent))
+      .toEqual(['#', 'Chemical', 'Percentage', 'Chemical needed',
+        'Current Stock', 'Stock remaining', 'Actions']);
+    // 40% of the 150 KG still to produce, from a stock of 500.
+    expect(within(soda).getByText('60.00 KG')).toBeTruthy();
+    expect(within(soda).getByText('440.00 KG')).toBeTruthy();
+    expect(within(soda).getByText(
+      /Quantities are for the 150.00 KG still to produce/)).toBeTruthy();
+  });
+
+  it("shows a shared chemical's invoice-wide remainder on every row", async () => {
+    renderRecipes({
+      recipes: [RECIPE_ROW],
+      items: {
+        'Soda Ash': [{
+          id: 102, chemical_id: 1, chemical_name: 'NaOH',
+          current_stock: 500, unit: 'KG', percentage: 20,
+        }],
+      },
+    });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    const ash = card('Soda Ash');
+    expect(within(soda).getByText('60.00 KG')).toBeTruthy();
+    expect(within(ash).getByText('10.00 KG')).toBeTruthy();
+    // 500 KG of NaOH minus the invoice-wide need of 70.
+    expect(within(soda).getByText('430.00 KG')).toBeTruthy();
+    expect(within(ash).getByText('430.00 KG')).toBeTruthy();
+  });
+
+  it('shows a negative remainder as a shortage', async () => {
+    renderRecipes({
+      recipes: [RECIPE_ROW],
+      firstItem: { chemical_name: 'Caustic Flakes', percentage: 40 },
+    });
+    await openRecipeDetail();
+
+    // 40% of 150 = 60 needed, but only 20 is in stock.
+    const shortage = within(card('Caustic Soda 50%')).getByText('-40.00 KG');
+    expect(shortage.className).toContain('text-rose-500');
+  });
+
+  it('renders the water quantity next to the grand total', async () => {
+    renderRecipes({ recipes: [RECIPE_ROW] });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    // 40% NaOH leaves 60% water of the 150 KG still to produce.
+    expect(within(soda).getByLabelText('Water quantity for Caustic Soda 50%')
+      .textContent).toBe('Water 90.00 KG');
+    // An empty product has no invented water quantity.
+    expect(within(card('Sodium Silicate'))
+      .queryByLabelText('Water quantity for Sodium Silicate')).toBeNull();
+  });
+
+  it('renders an em dash when the quantities are unavailable', async () => {
+    renderRecipes({ recipes: [RECIPE_ROW], omitQuantities: true });
+    await openRecipeDetail();
+
+    expect(within(card('Caustic Soda 50%')).getAllByText('—')).toHaveLength(2);
+  });
+
+  it('keeps the empty-formulation row spanning every column', async () => {
+    renderRecipes({ recipes: [RECIPE_ROW] });
+    await openRecipeDetail();
+
+    const empty = within(card('Soda Ash')).getByText(/No ingredients yet/);
+    expect(empty.closest('td').getAttribute('colspan')).toBe('7');
+  });
+
+  it('marks an unbalanced formulation as not balanced', async () => {
+    renderRecipes({
+      recipes: [RECIPE_ROW],
+      water: { 'Caustic Soda 50%': 25 },
+    });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    expect(within(soda).getByText('Not balanced')).toBeTruthy();
+    expect(within(soda).getByText(/production is blocked/)).toBeTruthy();
+    expect(within(soda).getByText('Grand total 65.0%')).toBeTruthy();
+  });
+
+  it('accepts a rounding hairline as balanced', async () => {
+    renderRecipes({
+      recipes: [RECIPE_ROW],
+      water: { 'Caustic Soda 50%': 59.99 },
+    });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    expect(within(soda).getByText('Ready')).toBeTruthy();
+    expect(within(soda).queryByText('Not balanced')).toBeNull();
+    expect(within(soda).queryByText(/do not add up to 100/)).toBeNull();
+  });
+
+  it('pins the 100 kg example on the card', async () => {
+    renderRecipes({
+      recipes: [RECIPE_ROW],
+      products: [{
+        product_name: 'Caustic Soda 50%', unit: 'KG', invoiced_qty: 100,
+        produced_qty: 0, remaining_qty: 100, line_count: 1,
+        lines: [{ unit: 'KG', quantity: 100 }], unconverted: [],
+      }],
+      firstItem: { chemical_name: 'NaOH', percentage: 95 },
+      water: { 'Caustic Soda 50%': 5 },
+      chemicals: [{ name: 'NaOH', current_qty: 100, unit: 'KG' }],
+    });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    expect(within(soda).getByText('95.00 KG')).toBeTruthy();
+    expect(within(soda).getByText('5.00 KG')).toBeTruthy();
+    expect(within(soda).getByLabelText('Water quantity for Caustic Soda 50%')
+      .textContent).toBe('Water 5.00 KG');
+    expect(within(soda).getByText('Ready')).toBeTruthy();
   });
 });
 

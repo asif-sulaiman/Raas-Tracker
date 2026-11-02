@@ -19,6 +19,7 @@ import EntityCombobox from '../components/ui/EntityCombobox';
 import Modal from '../components/modals/Modal';
 import KpiCard from '../components/cards/KpiCard';
 import { formatNumber } from '../utils/format';
+import { isBalanced } from '../utils/formulation';
 import { INVOICE_STATUS_LABELS } from '../utils/invoices';
 import { useAuth } from '../context/AuthContext';
 import { useConfirm } from '../context/ConfirmContext';
@@ -73,7 +74,7 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
     ? draftWater
     : (product.items.length ? 100 - ingredientPct : null);
   const grandTotal = waterPct == null ? null : ingredientPct + waterPct;
-  const offBalance = grandTotal != null && Math.abs(grandTotal - 100) > 1e-6;
+  const offBalance = grandTotal != null && !isBalanced(grandTotal);
 
   const available = chemicals.filter(
     (c) => !product.items.some((item) => item.chemical_name === c.name)
@@ -146,8 +147,14 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
               </p>
             </div>
           </div>
-          <Badge variant={product.formulated ? 'success' : 'warning'}>
-            {product.formulated ? 'Ready' : 'Empty formulation'}
+          <Badge
+            variant={
+              product.formulated && isBalanced(grandTotal) ? 'success' : 'warning'
+            }
+          >
+            {!product.formulated
+              ? 'Empty formulation'
+              : isBalanced(grandTotal) ? 'Ready' : 'Not balanced'}
           </Badge>
         </div>
 
@@ -158,6 +165,9 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
             Remaining {formatNumber(product.remaining_qty)} {product.unit}
           </p>
         </div>
+        <p className="mt-1.5 text-[11px] text-slate-400 dark:text-slate-500">
+          Quantities are for the {formatNumber(product.remaining_qty)} {product.unit} still to produce
+        </p>
 
         {product.line_count > 1 && (
           <p className="mt-1.5 text-[11px] text-slate-400 dark:text-slate-500">
@@ -182,7 +192,9 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
             <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">#</th>
             <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Chemical</th>
             <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Percentage</th>
+            <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Chemical needed</th>
             <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Current Stock</th>
+            <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Stock remaining</th>
             <th className="px-4 py-2.5 text-right text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Actions</th>
           </tr>
         </thead>
@@ -227,8 +239,34 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
                 )}
               </td>
               <td className="px-4 py-2.5">
+                <span className={clsx(
+                  'font-mono',
+                  item.required_qty == null
+                    ? 'text-slate-400 dark:text-slate-500'
+                    : 'text-slate-700 dark:text-slate-300',
+                )}>
+                  {item.required_qty == null
+                    ? '—'
+                    : `${formatNumber(item.required_qty)} ${item.unit}`}
+                </span>
+              </td>
+              <td className="px-4 py-2.5">
                 <span className={clsx('font-mono', item.current_stock > 0 ? 'text-slate-700 dark:text-slate-300' : 'text-rose-500')}>
                   {formatNumber(item.current_stock)} {item.unit}
+                </span>
+              </td>
+              <td className="px-4 py-2.5">
+                <span className={clsx(
+                  'font-mono',
+                  item.stock_remaining == null
+                    ? 'text-slate-400 dark:text-slate-500'
+                    : item.stock_remaining < 0
+                      ? 'text-rose-500'
+                      : 'text-slate-700 dark:text-slate-300',
+                )}>
+                  {item.stock_remaining == null
+                    ? '—'
+                    : `${formatNumber(item.stock_remaining)} ${item.unit}`}
                 </span>
               </td>
               <td className="px-4 py-2.5 text-right">
@@ -246,7 +284,7 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
           ))}
           {product.items.length === 0 && (
             <tr>
-              <td colSpan="5" className="px-4 py-6 text-center text-slate-400 dark:text-slate-500">
+              <td colSpan="7" className="px-4 py-6 text-center text-slate-400 dark:text-slate-500">
                 No ingredients yet. Add this product&apos;s chemicals below.
               </td>
             </tr>
@@ -285,6 +323,14 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
         <span className="text-[11px] text-slate-400 dark:text-slate-500">
           {trimmedWater === '' ? 'blank = the unformulated remainder' : 'stored percentage'}
         </span>
+        {product.water_qty != null && (
+          <span
+            aria-label={`Water quantity for ${product.product_name}`}
+            className="text-xs font-medium text-slate-500 dark:text-slate-400"
+          >
+            Water {formatNumber(product.water_qty)} {product.unit}
+          </span>
+        )}
         <span className="ml-auto text-sm font-semibold text-slate-700 dark:text-slate-200">
           {grandTotal == null
             ? 'Grand total —'
@@ -293,7 +339,7 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
         {offBalance && (
           <span className="flex items-center gap-1 text-xs font-medium text-amber-600 dark:text-amber-400">
             <AlertTriangle className="h-3.5 w-3.5" />
-            ingredients + water do not add up to 100%
+            ingredients + water do not add up to 100% — production is blocked until they do
           </span>
         )}
       </div>
