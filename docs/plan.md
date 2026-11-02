@@ -1475,11 +1475,14 @@ b795026 feat(recipes): block unbalanced products in the production modal
 079243d feat(recipes): report chemical needed and stock remaining per product
 ```
 
-**Verification.** Backend: `tests/test_recipe_invoice_model.py` 66 passed;
-recipe/production-adjacent suites 258 passed; `ruff` clean on the touched
-files; `pyright` 0 errors. Frontend: Recipes 35, ProductionRunModal 14,
-Reports 16, all green; `oxlint` 0 warnings. Full gate and `vite build` recorded
-below.
+**Verification (full gate, 2026-11-02).** Backend: **1470 passed / 8 skipped**
+in 1772.09s (`python -m pytest tests/ -q`); `tests/test_recipe_invoice_model.py`
+66 passed and the recipe/production-adjacent suites 258 passed before the full
+run; `ruff` stays at its 18 pre-existing baseline findings (12
+`flask_app.py`, 6 `sales.py`), none in the touched files; `pyright` 0 errors /
+15 baseline warnings. Frontend: **426/426 in 44 files**; Recipes 35,
+ProductionRunModal 14, Reports 16; `oxlint` 0 warnings / 0 errors on 119 files;
+`vite build` green and `dist/` copied to the gitignored `react_frontend/`.
 
 ---
 
