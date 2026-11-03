@@ -162,6 +162,98 @@ _REQUIRED_SIG_TOKENS: tuple = ("invoices.amount:numeric",)
 # cold start with --threads=N runs the DDL once instead of N times racing.
 _MIGRATION_LOCK_KEY = 0x52414153  # "RAAS"
 
+# ---- Pool shape and statement guards --------------------------------------
+# Supabase caps a project at 15 pooler clients and there is one pool per
+# serverless instance, so the pool must take nothing until it is asked, and
+# must give idle connections back long before the platform recycles the
+# instance. psycopg-pool's own defaults do the opposite (min_size kept,
+# timeout=30s, max_idle=600s, max_lifetime=3600s).
+_POOL_ACQUIRE_TIMEOUT_SECONDS = 10
+_POOL_MAX_IDLE_SECONDS = 60
+_POOL_MAX_LIFETIME_SECONDS = 600
+_CONNECT_TIMEOUT_SECONDS = 10
+_POOL_MAX_SIZE_DEFAULT = 4
+_POOL_MAX_SIZE_CEILING = 15
+
+# The database's own statement_timeout is 2min, which outlives both the
+# function's 60s budget and the browser's patience. These caps are per
+# transaction (see _timeout_statements), not per connection, because a
+# transaction-mode pooler hands the server backend to someone else at COMMIT.
+_STATEMENT_TIMEOUT_MS_DEFAULT = 25000
+_LOCK_TIMEOUT_MS_DEFAULT = 5000
+_IDLE_TX_TIMEOUT_MS_DEFAULT = 30000
+_TIMEOUT_MS_CEILING = 600000
+# A deployment migration queued 4.9s mean behind the advisory lock; it must not
+# be cut off by the per-request cap.
+_MIGRATION_STATEMENT_TIMEOUT_MS = 120000
+
+
+def _timeout_ms(name: str, default: int) -> int:
+    """Read a millisecond guard from the environment, clamped to a sane range.
+
+    Values are interpolated into SQL, so anything unparseable or out of range
+    falls back to the default instead of reaching the database.
+    """
+    try:
+        value = int(str(os.getenv(name)).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if 1 <= value <= _TIMEOUT_MS_CEILING else default
+
+
+def _timeout_statements() -> str:
+    """The three guards as ONE round trip.
+
+    PostgreSQL has no `SET a = 1, b = 2` form, and a bind parameter would make
+    psycopg use the extended protocol, which refuses multiple commands per
+    statement — hence the join over validated integers.
+    """
+    guards = (
+        ("statement_timeout", _timeout_ms("RAAS_STATEMENT_TIMEOUT_MS",
+                                          _STATEMENT_TIMEOUT_MS_DEFAULT)),
+        ("lock_timeout", _timeout_ms("RAAS_LOCK_TIMEOUT_MS",
+                                     _LOCK_TIMEOUT_MS_DEFAULT)),
+        ("idle_in_transaction_session_timeout",
+         _timeout_ms("RAAS_IDLE_TX_TIMEOUT_MS", _IDLE_TX_TIMEOUT_MS_DEFAULT)),
+    )
+    return "; ".join(f"SET LOCAL {name} TO {value}" for name, value in guards)
+
+
+def _max_pool_size() -> int:
+    """Per-instance connection cap: RAAS_POOL_MAX_SIZE, then the older
+    documented DB_POOL_MAX, then 4 (the waitress thread count).
+
+    Clamped to the pooler's 15 clients: a larger pool cannot be honoured and
+    would fail at connect time instead of at checkout.
+    """
+    for name in ("RAAS_POOL_MAX_SIZE", "DB_POOL_MAX"):
+        try:
+            value = int(str(os.getenv(name)).strip())
+        except (TypeError, ValueError):
+            continue
+        if 1 <= value <= _POOL_MAX_SIZE_CEILING:
+            return value
+    return _POOL_MAX_SIZE_DEFAULT
+
+
+def _conn_kwargs() -> dict:
+    """libpq kwargs for every physical connection.
+
+    `prepare_threshold=None` is what makes the app safe behind a
+    transaction-mode pooler; the keepalive pair exists because Supavisor
+    drops silent clients and a half-open connection only surfaces on its next
+    checkout.
+    """
+    return {
+        "prepare_threshold": None,
+        "connect_timeout": _CONNECT_TIMEOUT_SECONDS,
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 3,
+    }
+
+
 # Guards lazy pool construction (double-checked locking around _pool/_pool_dsn).
 _pool_lock = threading.Lock()
 
@@ -238,14 +330,18 @@ def _get_pool(dsn: Optional[str] = None) -> ConnectionPool:
                 _pool.close()
             _pool = ConnectionPool(
                 conninfo=effective_dsn,
-                min_size=1,
-                # Supabase's session pooler caps the project at 15 clients and
-                # this app runs one pool per instance. 4 matches the waitress
-                # thread count, so no request waits behind its own instance.
-                # Overridable because the concurrency suite needs 8 live
-                # connections in one process (RAAS_POOL_MAX_SIZE).
-                max_size=int(os.getenv("RAAS_POOL_MAX_SIZE", "4")),
-                kwargs={"prepare_threshold": None},
+                # Zero, not one: an instance that never touches the database
+                # must not hold a pooler client. min_size=1 pinned one per
+                # cold lambda, which is how 15 of them starved the project on
+                # 2026-11-02.
+                min_size=0,
+                max_size=_max_pool_size(),
+                # Fail the checkout instead of queueing a request for 30s
+                # behind an exhausted pool; _database_unavailable answers 503.
+                timeout=_POOL_ACQUIRE_TIMEOUT_SECONDS,
+                max_idle=_POOL_MAX_IDLE_SECONDS,
+                max_lifetime=_POOL_MAX_LIFETIME_SECONDS,
+                kwargs=_conn_kwargs(),
                 configure=_prepare_connection,
                 open=True,
             )
@@ -265,6 +361,10 @@ def get_connection(dsn: Optional[str] = None) -> psycopg.Connection:
     connection, not once per checkout (see `_prepare_connection`). Tests set
     `RAAS_SCHEMA_CHECK=always` to keep the old per-checkout probe so they can
     truncate tables between cases while reusing pooled connections.
+
+    Every checkout opens its transaction with the statement guards from
+    `_timeout_statements()`, so no request query can run for the database's
+    2-minute default.
 
     The returned connection is wrapped so that close() returns it to the pool
     instead of closing it, maintaining compatibility with existing code.
@@ -286,6 +386,15 @@ def get_connection(dsn: Optional[str] = None) -> psycopg.Connection:
                 pass
             pool.putconn(conn)
             raise
+    # Last, so the guards survive the checkout: the per-checkout probe above
+    # commits (in tests), which would end the transaction and drop a SET LOCAL
+    # applied before it. This statement opens the transaction every caller
+    # then works inside.
+    try:
+        conn.execute(_timeout_statements())
+    except Exception:
+        pool.putconn(conn)
+        raise
     return _PooledConnection(conn, pool)
 
 
@@ -389,6 +498,11 @@ def _create_tables(conn: psycopg.Connection) -> None:
     """
     try:
         conn.execute("SELECT pg_advisory_xact_lock(%s)", (_MIGRATION_LOCK_KEY,))
+        # ~40 idempotent DDL statements queued behind that lock measured 4.9s
+        # mean on the live project, so this transaction gets a wider cap than a
+        # request query. LOCAL: the next SET LOCAL (or COMMIT) restores it.
+        conn.execute(
+            f"SET LOCAL statement_timeout TO {_MIGRATION_STATEMENT_TIMEOUT_MS}")
         _run_migration(conn)
         _record_schema_state(conn)
         conn.commit()
