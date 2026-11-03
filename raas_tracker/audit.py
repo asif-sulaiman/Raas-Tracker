@@ -1,11 +1,8 @@
 """Audit log plus per-request actor state."""
 
 import psycopg
-import json
-import os
 import re
-from datetime import date, datetime
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any
 
 import threading as _threading
 
@@ -93,10 +90,10 @@ def request_ip() -> Optional[str]:
     return (request.remote_addr or "").strip()[:_MAX_IP_LEN] or None
 
 
-def log_audit_action(conn: psycopg.Connection, action: str, entity_type: str = None,
+def log_audit_action(conn: psycopg.Connection, action: str, entity_type: Optional[str] = None,
                      entity_id: int = None, user_id: Optional[str] = None,
-                     old_value: str = None, new_value: str = None,
-                     ip_address: str = None, atomic: bool = True) -> int:
+                     old_value: Optional[str] = None, new_value: Optional[str] = None,
+                     ip_address: Optional[str] = None, atomic: bool = True) -> int:
     """Log an audit action.
 
     Args:
@@ -127,7 +124,7 @@ def log_audit_action(conn: psycopg.Connection, action: str, entity_type: str = N
         ip_address = request_ip()
     # Bound every text column on the way in (see _bounded). entity_id stays an
     # int and is deliberately untouched.
-    action = _bounded(action, _MAX_ACTION_LEN)
+    action = _bounded(action, _MAX_ACTION_LEN) or ""
     entity_type = _bounded(entity_type, _MAX_ENTITY_TYPE_LEN)
     user_id = _bounded(user_id, _MAX_ACTOR_LEN)
     old_value = _bounded(old_value, _MAX_VALUE_LEN)
