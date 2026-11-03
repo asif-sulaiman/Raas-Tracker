@@ -14,10 +14,12 @@ Flask 3 + psycopg3 backend, React 19/Vite/Tailwind 4 frontend, PostgreSQL (Supab
 - **Dev backend:** `python flask_app.py` (requires `DATABASE_URL`; serves SPA on :5000)
 - **Dev frontend:** `cd raas-tracker-frontend && npm run dev` (proxies `/api` to :5000)
 - **Backend tests:** `python -m pytest tests/ -q`
+- **Backend lint:** `python -m ruff check .`
+- **Backend types:** `python -m pyright` (0 errors; warnings are the known baseline)
 - **Frontend tests:** `cd raas-tracker-frontend && npm test`
 - **Lint:** `cd raas-tracker-frontend && npx oxlint`
 - **Build:** `cd raas-tracker-frontend && npx vite build` (then copy `dist/` → `react_frontend/`)
-- **Full gate:** pytest + vitest + oxlint + vite build
+- **Full gate:** pytest + ruff + pyright + vitest + oxlint + vite build
 - **Production:** `waitress-serve --host=0.0.0.0 --port=$PORT --threads=4 wsgi:app`
 - **Launch (Windows):** `start_flask.bat` — refuses to start without `DATABASE_URL`
 
@@ -41,6 +43,14 @@ Flask 3 + psycopg3 backend, React 19/Vite/Tailwind 4 frontend, PostgreSQL (Supab
 - **Backend:** Python 3.10+, Pydantic v2 for API schemas, psycopg3 in
   transactional mode (`prepare_threshold=None`, pooler-friendly), parameterized
   queries only (`%s`), structured logging via the `raas` logger.
+- **The database runs behind a TRANSACTION pooler (`:6543`)** — no session `SET`, no
+  temp tables, no `LISTEN`, no session-scoped state: COMMIT hands that backend to
+  another client. Per-transaction settings go through `SET LOCAL`
+  (`db.py:_timeout_statements` caps a request at 25 s).
+- **Transient DB failure is a 503**, not a 500 — `PoolTimeout` and
+  `psycopg.OperationalError` are handled by exception class in `flask_app.py`; do not
+  catch them into a 500. On the client, every `fetch` goes through
+  `utils/api.js:withTimeout` so a hung request cannot strand a route spinner.
 - **Frontend:** React 19 function components + hooks, Tailwind 4, oxlint clean
   of errors, Vitest + React Testing Library.
 - **Money math is exact** — integer cents in `utils/format.js`, `::numeric`

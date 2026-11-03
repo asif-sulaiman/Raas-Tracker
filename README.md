@@ -12,7 +12,7 @@ PostgreSQL (Supabase) is the database in every environment.
 ```bash
 pip install -r requirements.txt
 # Point at Postgres first (required - the app refuses to start without it):
-#   $env:DATABASE_URL="postgresql://postgres.<ref>:<pw>@aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require"
+#   $env:DATABASE_URL="postgresql://postgres.<ref>:<pw>@aws-0-<region>.pooler.supabase.com:6543/postgres?sslmode=require"   (transaction pooler — see "Database Connection Pooling")
 python flask_app.py            # http://localhost:5000
 ```
 
@@ -56,17 +56,46 @@ username and per IP), per-key rate limits, audited auth events.
 | `CORS_ALLOWED_ORIGINS` | `""` | Comma-separated origins (empty = same-origin only) |
 | `RAAS_RATE_LIMITS` | `on` | `off` disables Flask-Limiter (tests) |
 | `RAAS_DATA_DIR` | repo root | Writable data dir (uploads, reports) |
-| `DB_POOL_MAX` | `10` | Per-process connection-pool ceiling |
+| `DB_POOL_MAX` | `4` | Per-process connection-pool ceiling (max 15; `RAAS_POOL_MAX_SIZE` wins if both are set) |
+| `RAAS_STATEMENT_TIMEOUT_MS` | `25000` | Per-transaction `statement_timeout` for every request query |
+| `RAAS_LOCK_TIMEOUT_MS` | `5000` | Per-transaction `lock_timeout` |
+| `RAAS_IDLE_TX_TIMEOUT_MS` | `30000` | Per-transaction `idle_in_transaction_session_timeout` |
 
 See `.env.example` for a template.
 
 ## Database Connection Pooling
 
-The app uses `psycopg_pool` for PostgreSQL connection pooling. The pool is configured with:
-- **min connections**: 1
-- **max connections**: 10 (configurable via `DB_POOL_MAX`)
+The app uses `psycopg_pool` against PostgreSQL, configured for a serverless
+deployment where one pool exists per instance and Supabase caps the project at
+15 pooler clients:
 
-For high-concurrency workloads, increase `DB_POOL_MAX` (e.g., `DB_POOL_MAX=20`). Each worker process maintains its own pool.
+- **min connections**: 0 — an instance that never touches the database holds no
+  pooler client
+- **max connections**: 4 (`DB_POOL_MAX`, or `RAAS_POOL_MAX_SIZE` which takes
+  precedence), clamped to 15 because a larger pool cannot be honoured
+- **acquire timeout**: 10 s — a saturated pool answers `503` + `Retry-After`
+  instead of queueing the request for 30 s and then failing with a bare 500
+- **max idle / max lifetime**: 60 s / 600 s — idle instances hand their client
+  slots back long before the platform recycles them
+- **connect timeout**: 10 s, with TCP keepalives so a pooler that drops silent
+  clients is noticed on checkout rather than two minutes later
+
+Every checkout opens its transaction with `SET LOCAL statement_timeout`,
+`lock_timeout` and `idle_in_transaction_session_timeout` (see the env table
+above). `SET LOCAL`, not a session `SET` and not connect-time `options`,
+because Supabase's poolers ignore `options` entirely and a transaction-mode
+pooler hands that backend to the next client at COMMIT. The migration
+transaction raises its own `statement_timeout` to 120 s so a deployment DDL
+queue is not cut off by the per-request cap.
+
+**Pooler mode:** use the **transaction pooler (`:6543`)** in `DATABASE_URL`.
+The session pooler (`:5432`) gives each instance a dedicated backend and caps
+the project at 15 clients, so ~15 warm Vercel instances are enough to make the
+whole app refuse connections (`too_many_connections`, and the cause of the
+2026-11-02 outage). The transaction pooler accepts far more clients and
+multiplexes them onto few backends; the app is written for it (server-side
+prepared statements are disabled, no session-level `SET`, no temp tables, and
+the migration lock is transaction-scoped).
 
 ## Optional Redis for Rate Limiting
 
@@ -132,19 +161,25 @@ use; the current path is online hosting against Supabase (no DB container).
 
 ```bash
 pip install -r requirements-dev.txt
+python -m ruff check .            # backend lint
+python -m pyright                 # backend types (0 errors; warnings are known)
 python -m pytest tests/ -q        # backend: 740+ tests, isolated PG DBs
 cd raas-tracker-frontend
 npm install && npx vitest run     # frontend unit tests
 npx oxlint && npx vite build      # lint + production build
 ```
 
+Pyright runs in `basic` mode over the app code only. `reportArgumentType`,
+`reportOptionalSubscript` and `reportOptionalMemberAccess` are off until
+psycopg rows carry types; the remaining warnings are the tracked baseline.
+
 Backend tests run against PostgreSQL: embedded zero-install PG locally
 (`pgserver`, no `TEST_DATABASE_URL`), a `postgres:16` service in CI, or any
 `TEST_DATABASE_URL` (e.g. Supabase). Each test truncates and reseeds, so the
 target database must be scratch — never production.
 
-CI (`.github/workflows/ci.yml`) runs pytest, oxlint, vitest and the build
-on every push and pull request to `main`.
+CI (`.github/workflows/ci.yml`) runs pytest, Ruff, Pyright, oxlint, vitest and
+the build on every push and pull request to `main`.
 
 ## Layout
 
