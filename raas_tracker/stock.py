@@ -5,8 +5,8 @@ import json
 import os
 import re
 import ipaddress
-from datetime import date, datetime
-from typing import Optional, List, Dict, Any, Union
+from datetime import date
+from typing import Optional, List, Dict, Any
 
 from .db import JSON_PATH, get_connection, logger
 from .audit import log_audit_action
@@ -190,7 +190,7 @@ def add_unit_conversion(conn: psycopg.Connection, from_unit: str, to_unit: str, 
                          atomic=False)
         conn.commit()
         return True
-    except Exception as e:
+    except Exception:
         logger.exception("Error adding conversion")
         return False
 
@@ -204,7 +204,7 @@ def delete_unit_conversion(conn: psycopg.Connection, from_unit: str, to_unit: st
         )
         conn.commit()
         return True
-    except Exception as e:
+    except Exception:
         logger.exception("Error deleting conversion")
         return False
 

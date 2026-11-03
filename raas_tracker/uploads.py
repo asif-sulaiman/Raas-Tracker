@@ -1,11 +1,9 @@
 """Upload parsing, comparison, approvals, and reconciliation."""
 
 import psycopg
-import json
-import os
 import re
 from datetime import date, datetime
-from typing import Optional, List, Dict, Any, Union
+from typing import List, Dict, Any
 
 from .audit import log_audit_action
 from .db import logger
@@ -21,7 +19,7 @@ def _now_str() -> str:
     `to_char(..., 'YYYY-MM-DD HH24:MI:SS')` that compares against these values
     (P1-18). Never use the SQL pattern codes here.
     """
-    from datetime import datetime, timezone
+    from datetime import timezone
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 def validate_expiry_date(expiry_date_str: str) -> tuple:
@@ -33,7 +31,7 @@ def validate_expiry_date(expiry_date_str: str) -> tuple:
     Returns:
         Tuple of (is_valid, parsed_date, status)
     """
-    from datetime import datetime, date
+    from datetime import date
     
     if not expiry_date_str:
         return True, None, "No expiry date"
@@ -455,7 +453,7 @@ def csv_safe(value: Any) -> Any:
     return value
 
 
-def export_comparison_report(results: Dict[str, Any], output_path: str) -> str:
+def export_comparison_report(results: Dict[str, Any], output_path: str) -> str | None:
     """Export comparison report to Excel with color-coded sheets.
     
     Args:
@@ -467,7 +465,8 @@ def export_comparison_report(results: Dict[str, Any], output_path: str) -> str:
     """
     try:
         from openpyxl import Workbook
-        from openpyxl.styles import PatternFill, Font, Alignment
+        from openpyxl.styles import PatternFill
+        from openpyxl.utils import get_column_letter
     except ImportError:
         logger.warning("openpyxl not installed. Run: pip install openpyxl")
         return None
@@ -479,8 +478,6 @@ def export_comparison_report(results: Dict[str, Any], output_path: str) -> str:
     red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
     yellow_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
     orange_fill = PatternFill(start_color="F4B084", end_color="F4B084", fill_type="solid")
-    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    header_font = Font(color="FFFFFF", bold=True)
     
     # Sheet 1: Summary
     ws_summary = wb.active
@@ -565,12 +562,12 @@ def export_comparison_report(results: Dict[str, Any], output_path: str) -> str:
     for ws in wb.worksheets:
         for column in ws.columns:
             max_length = 0
-            column_letter = column[0].column_letter
+            column_letter = get_column_letter(column[0].column)
             for cell in column:
                 try:
                     if len(str(cell.value)) > max_length:
                         max_length = len(str(cell.value))
-                except:
+                except Exception:
                     pass
             ws.column_dimensions[column_letter].width = min(max_length + 2, 30)
     
@@ -699,7 +696,7 @@ def approve_upload_row(conn: psycopg.Connection, workflow_id: int, reason_code: 
         
         conn.commit()
         return True
-    except Exception as e:
+    except Exception:
         # Roll back: the audit write commits (atomic=True), so without this the
         # UPDATE approval_workflow and whatever earlier statements this
         # transaction already flushed stay applied while the caller is told the
@@ -744,7 +741,7 @@ def reject_upload_row(conn: psycopg.Connection, workflow_id: int, reason_code: s
         
         conn.commit()
         return True
-    except Exception as e:
+    except Exception:
         # Roll back: see approve_upload_row.
         conn.rollback()
         logger.exception("Error rejecting row")
@@ -797,7 +794,7 @@ def approve_upload(conn: psycopg.Connection, upload_id: int, reviewed_by: str = 
         
         conn.commit()
         return True
-    except Exception as e:
+    except Exception:
         # Roll back: this loop creates workflow rows and approves them, and
         # each of those inner calls commits. Without an explicit rollback the
         # batch that failed leaves a partially approved upload behind while the
@@ -896,7 +893,7 @@ def lock_reconciliation_period(conn: psycopg.Connection, period_id: int, locked_
         
         conn.commit()
         return True
-    except Exception as e:
+    except Exception:
         # Roll back: a lock that reports failure but takes effect would block
         # every later correction to the period.
         conn.rollback()
@@ -1001,7 +998,7 @@ def adjust_stock_from_upload(conn: psycopg.Connection, upload_id: int,
         conn.commit()
         logger.info("Applied %s stock adjustments from upload %s", adjustments, upload_id)
         return True
-    except Exception as e:
+    except Exception:
         # Roll back: every UPDATE above is still uncommitted, so this is what
         # stops a failed batch from leaving stock half-corrected.
         conn.rollback()

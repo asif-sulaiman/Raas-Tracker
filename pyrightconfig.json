@@ -1,0 +1,15 @@
+{
+  "include": ["raas_tracker", "flask_app.py", "wsgi.py"],
+  "exclude": ["**/__pycache__", "**/node_modules"],
+  "typeCheckingMode": "basic",
+  "pythonVersion": "3.10",
+  "reportMissingTypeStubs": "none",
+  "reportUnusedImport": "none",
+  "reportUnusedVariable": "none",
+  "reportArgumentType": "none",
+  "reportOptionalSubscript": "none",
+  "reportOptionalMemberAccess": "none",
+  "reportGeneralTypeIssues": "warning",
+  "reportCallIssue": "warning",
+  "reportReturnType": "warning"
+}

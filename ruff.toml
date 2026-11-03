@@ -1,0 +1,34 @@
+target-version = "py310"
+line-length = 100
+
+extend-exclude = [
+  "react_frontend",
+  "dist",
+  "public",
+  "samples",
+  "uploads",
+  "reports",
+  "pg_dev",
+  ".opencode",
+  ".slim",
+  ".mimocode",
+  "chem_stock.py",
+  "parse_sales.py",
+  "parse_stock.py",
+  "check_schema.py",
+  "verify_schema.py",
+  "test_summary.py",
+  "test_summary2.py",
+  "scripts/migrate_sqlite_to_pg.py",
+]
+
+[lint]
+select = ["E4", "E7", "E9", "F"]
+
+[lint.per-file-ignores]
+# Imports after the env/sys.path setup are deliberate in the Flask entrypoint.
+"flask_app.py" = ["E402"]
+# auth.py is off-limits without approval (AGENTS.md); its unused imports stay.
+"raas_tracker/auth.py" = ["F401"]
+# Test cleanup is a separate pass; keep the gate focused on app code.
+"tests/*" = ["E402", "E741", "F401", "F541", "F841"]
