@@ -188,14 +188,14 @@ from chem_stock import (
     set_product_water,
     delete_recipe, generate_multi_recipe_report, export_report_to_csv,
     compare_stock_upload, save_upload, get_upload_history, get_upload_results,
-    get_unit_conversion, convert_quantity, get_all_unit_conversions, add_unit_conversion,
-    validate_expiry_date, get_all_reason_codes, get_pending_approvals, get_audit_logs,
+    get_all_unit_conversions, add_unit_conversion,
+    get_all_reason_codes, get_audit_logs,
     add_sale, get_all_sales, get_sale_by_id, move_sale_to_stage, advance_sale,
-    update_sale_lc, update_sale_payment, add_sale_item, update_sale_item,
+    update_sale_lc, add_sale_item, update_sale_item,
     delete_sale_item, delete_sale, get_sales_summary, record_sale_payment,
     update_sale_payment_record, delete_sale_payment_record, update_sale_full,
     get_stock_movements, list_companies, create_company, update_company,
-    delete_company, get_company, add_shipment, list_shipments, delete_shipment,
+    delete_company, get_company, add_shipment, delete_shipment,
     create_production_run, get_register_products, get_commercial_report,
     get_commercial_report_summary
 )
@@ -222,7 +222,6 @@ from raas_tracker._exceptions import (
 # ---- AuthN/Z: sessions (humans) OR api_keys (scripts) ----
 # The legacy RAAS_TOKEN env gate is retired: per-key api_keys provide
 # expiry, revocation, IP allowlists, and audit identity instead.
-from flask import g
 from chem_stock import (get_session_user, validate_api_key,
                         SESSION_TTL_HOURS, count_users, create_user, verify_user,
                         list_users, delete_user, create_session, revoke_session,
@@ -2176,7 +2175,7 @@ def _build_report(payload):
         report = generate_multi_recipe_report(conn, selections)
         recipes = [get_recipe_by_id(conn, s.recipe_id)
                    for s in payload.recipes]
-    except ValueError as e:
+    except ValueError:
         _rollback_close(conn)
         raise
     conn.close()
@@ -2382,7 +2381,6 @@ def api_commercial_report_export():
     if not rows:
         return jsonify({"error": "No data to export"}), 400
     import csv
-    import io
     from chem_stock import csv_safe
     output = io.StringIO()
     writer = csv.writer(output)
@@ -3287,7 +3285,6 @@ def api_list_sales():
 @limited()
 def api_sales_export():
     import csv
-    import io
     from flask import Response
     from datetime import date as _date
     conn = get_db()
@@ -3795,7 +3792,7 @@ def api_cron_maturity_check():
                         "invoice_reminders": len(invoice_reminders),
                         "lc_reminders": len(lc_reminders),
                         "emails_sent": emails_sent})
-    except Exception as e:
+    except Exception:
         # Roll back before returning 500. A failed run leaves statements this
         # handler issued after the last committing `notify()` still open; without
         # this the pooled connection carries them into the next request, which

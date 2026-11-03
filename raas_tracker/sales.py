@@ -3,15 +3,14 @@
 import math
 import psycopg
 import json
-import os
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any
 
 from .audit import log_audit_action
 from .notifications import (
-    notify_sale_stage, clear_dedupe, clear_maturity_dedupe,
+    notify_sale_stage, clear_maturity_dedupe,
     clear_invoice_reminders,
 )
 from ._numeric import finite_values as _finite
@@ -2133,7 +2132,7 @@ def create_invoice(conn: psycopg.Connection, sale_id: int, invoice_number: str,
     remaining_invoice_money(conn, sale_id)
 
     validated_lines = validate_invoice_lines(conn, sale_id, lines)
-    amount = _money(sum(l["line_total"] for l in validated_lines))
+    amount = _money(sum(line["line_total"] for line in validated_lines))
     # INV-REVISION: a create NEVER births 'paid'. 'paid' asserts money was
     # received, so only a payment record can set it (_sync_invoice_paid_status).
     # Deriving status from create-time arithmetic made a zero-amount invoice
@@ -2973,7 +2972,6 @@ def create_invoice_item(conn: psycopg.Connection, invoice_id: int,
     > 0. Quantities may exceed the PI line quantity (shipment advantage).
     Audits ``INVOICE_ITEM_ADD``.
     """
-    from decimal import Decimal as _Dec
     try:
         qty = float(quantity)
     except (TypeError, ValueError):
