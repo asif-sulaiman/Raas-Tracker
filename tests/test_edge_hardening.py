@@ -67,14 +67,17 @@ def _vercel():
 # `re.compile` and match the literal string `:path*`, passing every assertion
 # below while matching nothing at runtime.
 _GROUP_SHAPE = re.compile(r"^/\(\(.*\)\Z", re.S)
+# Simple group form used by the asset cache rule (`/assets/(.*)`). Same
+# reasoning: only a shape this helper evaluates correctly may be accepted.
+_SIMPLE_GROUP_SHAPE = re.compile(r"^/[A-Za-z0-9._/-]*\(\.\*\)\Z")
 
 
 def _matcher(source: str):
-    assert _GROUP_SHAPE.match(source), (
-        f"header source {source!r} is not the /((?...)*) form this helper "
-        "evaluates correctly. If the pattern language changed, fix the matcher "
-        "in this test rather than loosening the assertion — a silent "
-        "non-matching regex would pass every assertion below."
+    assert _GROUP_SHAPE.match(source) or _SIMPLE_GROUP_SHAPE.match(source), (
+        f"header source {source!r} is not a shape this helper evaluates "
+        "correctly. If the pattern language changed, fix the matcher in this "
+        "test rather than loosening the assertion — a silent non-matching "
+        "regex would pass every assertion below."
     )
     return re.compile("^" + source + r"\Z")
 

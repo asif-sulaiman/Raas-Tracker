@@ -23,8 +23,8 @@ def _indexes(conn):
     }
 
 
-def test_schema_version_is_nine():
-    assert dbmod._SCHEMA_VERSION == 9
+def test_schema_version_is_ten():
+    assert dbmod._SCHEMA_VERSION == 10
 
 
 def test_v9_recipe_shape_is_invoice_scoped(db):
@@ -101,16 +101,18 @@ def test_recipe_product_slot_names_are_unique_ignoring_case(db):
     db.rollback()
 
 
-def test_migration_is_idempotent_on_a_v9_database(pg_dsn):
+def test_migration_is_idempotent(pg_dsn):
     conn = dbmod.get_connection(pg_dsn)
     try:
         dbmod._create_tables(conn)
         dbmod._create_tables(conn)
         assert _columns(conn, "recipes") == {
             "id", "name", "created_date", "company_id", "invoice_id"}
+        # The stored version follows the code constant (bumped again for the
+        # PERF-3 indexes); a hardcoded literal here would fail every bump.
         assert conn.execute(
             "SELECT value FROM app_settings WHERE key = %s",
-            (dbmod._SCHEMA_VERSION_KEY,)).fetchone()[0] == "9"
+            (dbmod._SCHEMA_VERSION_KEY,)).fetchone()[0] == str(dbmod._SCHEMA_VERSION)
     finally:
         conn.rollback()
         conn.close()
