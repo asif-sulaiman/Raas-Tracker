@@ -4,7 +4,9 @@ import { ApiError } from '../utils/api';
 
 const AuthContext = createContext(null);
 const LOGOUT_EVENT_KEY = 'raas-logout';
-const POLL_INTERVAL_MS = 60 * 1000;
+// Revocation/expiry is still caught immediately by any API 401; the poll is
+// only the idle safety net, so it does not need a minute-by-minute round trip.
+const POLL_INTERVAL_MS = 5 * 60 * 1000;
 
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
