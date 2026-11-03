@@ -1670,6 +1670,142 @@ hashes identical to the browser-verified PERF-2 bundle.
 
 ---
 
+## ⚡ Phase PERF-4: connection pool, statement timeouts, request deadline (completed 2026-11-03)
+
+**Measured problem.** Verifying the authenticated routes against the live database
+moved the diagnosis away from query cost: `list_recipes`, the dashboard aggregates
+and the session lookup run **0.04–0.2 ms server-side**, with a ~122 ms
+round-trip floor from the function region to the database. The three real risks
+were capacity and unbounded waiting:
+
+- The app sat on the Supabase **session** pooler, which pins one server backend per
+  client. This project's `pool_size` is 15, so ~15 warm serverless instances
+  exhaust it — the 2026-11-02 outage (`EMAXCONNSESSION … pool_size: 15`), where the
+  fourth concurrent request could not get a connection.
+- psycopg-pool's defaults worked against us: `min_size=1` held a connection per
+  warm instance, `timeout=30s` made a caller wait half a minute, `max_idle=600s` /
+  `max_lifetime=3600s` kept connections past the platform's instance recycling.
+- The database's own `statement_timeout` is **2 min** — it outlives the function's
+  60 s budget and the browser's patience, so a stalled query holds a pooled
+  connection for minutes. Two 2-minute stalls were observed on the live database
+  during this phase's measurements (transient contention, not attributable to a
+  route); the same statements ran in 127–145 ms on retry.
+- A pool failure surfaced as a bare 500, and on the client a hung request left
+  `loading` true so `ProtectedRoute` rendered its spinner forever.
+
+**Decisions taken with the user.** Target the **transaction pooler (`:6543`)**, with
+`DATABASE_URL` swapped by the user in Vercel env and the local Windows user env (I do
+not touch `.env`). Explicit approval to edit the off-limits files for this task:
+`raas_tracker/db.py`, the `flask_app.py` error handlers, and `AuthContext.jsx`.
+
+**Changes**
+
+- `raas_tracker/db.py` — pool shape: `min_size=0`, `max_size` from `_max_pool_size()`
+  (`RAAS_POOL_MAX_SIZE` → `DB_POOL_MAX` → 4, clamped 1..15), acquire `timeout` 10 s,
+  `max_idle` 60 s, `max_lifetime` 600 s, and `_conn_kwargs()` on every physical
+  connection (`prepare_threshold=None`, `connect_timeout=10`, keepalives 1/30/10/3 —
+  Supavisor drops silent clients and a half-open connection otherwise surfaces on its
+  *next* checkout). New `_timeout_statements()` applies
+  `SET LOCAL statement_timeout / lock_timeout / idle_in_transaction_session_timeout`
+  (25 s / 5 s / 30 s, env-overridable) as **one parameterless multi-statement execute**
+  — PostgreSQL has no multi-assignment `SET`, and a bind parameter would force the
+  extended protocol, which refuses multiple commands. `SET LOCAL`, never a session
+  `SET`: a transaction-mode pooler gives the backend to another tenant at COMMIT.
+  Connect-time `options` is not the vehicle — **verified on live** that both poolers
+  ignore `-c statement_timeout=…` and the role default wins. The bundle is applied
+  *last* in `get_connection()`, after the `RAAS_SCHEMA_CHECK=always` probe, because
+  that probe commits in tests and would drop a `SET LOCAL` issued before it.
+  `_create_tables()` widens its own transaction to 120 s after taking the advisory
+  lock (the v10 DDL queue measured 4.9 s mean behind it; the request cap must not cut
+  a deployment migration in half).
+- `flask_app.py` — module-level `import psycopg` / `from psycopg_pool import
+  PoolTimeout`, and `_database_unavailable()` registered on both exception classes:
+  **503** `{"error": "database unavailable, retry shortly"}` + `Retry-After: 5`, cause
+  logged and never sent. `errors.TooManyConnections` — the actual outage error —
+  subclasses `OperationalError`, so it is covered. Flask dispatches by exception class
+  before the status-code handlers, so an ordinary bug is still a 500.
+- `raas-tracker-frontend/src/utils/api.js` — `DEFAULT_TIMEOUT_MS = 30000` and
+  `withTimeout(options, {timeoutMs})` returning `{options, didTimeOut(), done()}`. It
+  chains a caller-supplied `signal` (an already-aborted caller short-circuits with its
+  own reason; the deadline timer is skipped) so a debounced search or unmount abort
+  keeps `AbortError` semantics while a timeout reports distinctly.
+- `AuthContext.jsx` — `refresh()`, `login()` and `apiFetch()` all run through
+  `withTimeout` with `done()` in `finally`. A timeout maps to
+  `ApiError(0, "Request timed out — the server did not answer")` **before** the
+  existing `AbortError` passthrough; `login()` throws a retryable message instead of
+  hanging the button.
+- `components/auth/ProtectedRoute.jsx` — its `/api/auth/status` probe had the same
+  undeadlined-fetch bug as `/api/auth/me`: the forever-spinner test found it.
+- `README.md`, `.env.example`, `docs/SPEC.md` — pool/timeout tunables, the
+  `SET LOCAL` rationale, the transaction-pooler requirement, and the §6 error row
+  changed from `OperationalError → 500` to 503 + `Retry-After`. `SPEC.md` §3 also
+  gained the "Connection Pool & Statement Timeouts" section and its stale
+  `_SCHEMA_VERSION` note corrected to 10; `.env.example`'s header DSN example moved
+  from `:5432` to `:6543` (it contradicted the pool notes below it).
+
+**Tests**
+
+- `tests/test_db_pool_timeouts.py` (22) — pool shape read off the live pool object
+  (`min_size == 0`, `timeout == 10`, `max_idle <= 60`, `max_lifetime <= 600`,
+  `connect_timeout <= 10`, `prepare_threshold is None`); the cap resolved from each
+  env spelling, including junk/`0`/`500` → 4; the guard bundle's SQL shape (three
+  `SET LOCAL`, no `%s`); env overrides reach the checkout; `RAAS_STATEMENT_TIMEOUT_MS=1000`
+  + `SELECT pg_sleep(2)` really raises `QueryCanceled`; `SET LOCAL` does not leak onto
+  a bare connection; an injection value falls back to the default; the migration
+  widening asserted **behaviourally** through a recording connection proxy
+  (`widened[0] >= 60000`), not by regex over source; 503 for `PoolTimeout`,
+  `OperationalError` and `TooManyConnections`; the 503 body leaks no DSN or driver
+  detail; an ordinary bug is still a 500; four threads grow the lazy pool as expected.
+- `src/utils/api.test.js` (+8) — option passthrough, abort at the deadline, a caller
+  abort is not reported as a timeout, an already-aborted caller, `done()` cancels the
+  deadline and removes its listener, `timeoutMs: 0` disables, and the default sits
+  between 25 s and 60 s.
+- `src/App.test.jsx` (+1, the outage repro) — `/api/auth/me` never answers, the
+  spinner shows, and after `DEFAULT_TIMEOUT_MS` it is gone and the login page renders.
+
+**Deliberate limitation.** A route that wraps its own body in
+`except Exception: return jsonify(...), 500` (e.g. `api_delete_lc_record`) still 500s
+on an error raised *inside* the transaction, because the handler swallows it before
+Flask's exception-class dispatch sees it. The gate's checkout path — the dominant one,
+and the one that failed during the outage — now returns 503. Converting those bodies to
+`with`-block/`__exit__` rollback is a separate, per-route change.
+
+**Second, smaller limit.** The 30 s deadline covers `apiFetch`, `login`, `refresh` and
+`ProtectedRoute`'s status probe — the paths that render the app. Six raw `fetch` calls
+on the standalone public pages still have none (`Login` forgot-password, `Setup` status
++ submit, `ChangePassword`, `ResetPassword`, and `logout` in `AuthContext`);
+`Setup.jsx:22` is the same forever-spinner shape as the one this phase fixed. Extending
+`withTimeout` there is mechanical and was outside the approved file set.
+
+**Deploy step (user-owned, not done here).** `DATABASE_URL` must move from port
+`:5432` to `:6543` in Vercel project env and in the local Windows user variable, then a
+redeploy releases the old session-mode backends. Verify after the swap:
+`SELECT current_setting('statement_timeout')` still reads `2min` on a raw connection
+(the pooler ignores conninfo options) while a request query is cancelled at 25 s, and
+the 503 handler is what answers when the pool is saturated.
+
+**Verification (full gate, 2026-11-03).** Backend: `python -m pytest tests/ -q`
+reported **1520 passed / 1 failed / 8 skipped** in 1473.02 s. The one failure was
+`tests/test_edge_hardening.py::test_415_is_not_registered_by_class` — the tripwire
+that asserts nothing new was ever registered by exception class. The two 503
+handlers are exactly such a deliberate addition, so the tripwire did its job; it now
+asserts the by-class map **exactly** (`Exception` → `_handle_exception`, `PoolTimeout`
+and `psycopg.OperationalError` → `_database_unavailable`) and still pins that
+`HTTPException` is not captured, plus it reads the whole map instead of its first
+entry, which is what made it order-dependent. Re-run with its neighbours: **149
+passed**. Suite total after the fix: **1521 passed / 8 skipped** — no source file
+changed between the full run and the re-run. `ruff` stays at its 18 pre-existing
+baseline findings (12 `flask_app.py`, 6 `sales.py`), none in the touched files or
+tests; `pyright` 0 errors / **17** warnings — the documented 15 plus two
+`conn.execute` "no overloads match the provided arguments" entries on a non-literal
+str argument, the same class already reported at `db.py:653`/`db.py:1027`; not
+suppressed. Frontend: **443/443 in 46 files** (`api.test.js` +8, `App.test.jsx` +1),
+`oxlint` 0 warnings / 0 errors on 122 files, `vite build` green and — first time
+since the route split — no chunk over 500 kB (`charts` 387.85 kB is the largest);
+`dist/` copied to `react_frontend/`.
+
+---
+
 ## 📜 Public contract changes
 
 Every entry here is an **intentional** change to a response a client can
@@ -1678,6 +1814,7 @@ this is where to look.
 
 | Date | Change | Routes affected | Rationale |
 |---|---|---|---|
+| 2026-11-03 | **A saturated or unreachable database answers `503`, not `500`.** `psycopg_pool.PoolTimeout` (the 10 s acquire deadline) and `psycopg.OperationalError` — which covers `errors.TooManyConnections`, the error that produced the 2026-11-02 outage — now yield **503** `{"error": "database unavailable, retry shortly"}` with `Retry-After: 5`. The driver message is logged, never sent. Separately, every authenticated client request carries a 30 s deadline: a hung request now produces `ApiError(0, "Request timed out — the server did not answer")` instead of an endless route spinner. | every `/api/*` route reached through `_gate_api`'s checkout and any query that raises while holding a pooled connection (500 → 503) | RFC 9110 §15.6.4 is the honest answer for transient capacity — the client's request was fine and retrying may work; 500 asserts a server bug and tells the caller nothing about retrying. The deadline exists because `loading` stayed true forever when `/api/auth/me` never answered |
 | 2026-11-02 | **Production refuses an unbalanced formulation, and a shortage names the chemical.** `POST /api/recipes/by-id/<id>/produce` (and its name alias) now answers **400** when an output product's `ingredients + water` is not 100% within ±0.01 (`'<product>' formulation totals 95% - ingredients + water must equal 100% before production`), before any write. A deduction that would go below zero answers 400 `insufficient stock: <chemical> needs X <unit>, Y <unit> available` instead of the bare `insufficient stock`. Detail/production-source payloads additionally carry `water_qty`, `required_qty`, `stock_remaining` (additive). Reports, the CSV and booking readiness are unchanged. | `POST /api/recipes/by-id/<id>/produce`, `POST /api/recipes/<name>/produce` (new 400 condition; additive keys on `GET /api/recipes/by-id/<id>` and `GET /api/invoices/<id>/production-source`) | The operator asked for production to deduct exactly what the recipe needs; a formula that does not total 100% cannot say what that is, and a bare "insufficient stock" did not say which chemical was short |
 | 2026-10-15 | **Superseded 2026-10-25 — the tolerance was removed; no quantity answers 409 any more.** Originally: **A 5% over-invoice tolerance breach answers `409`, not `400`.** `ToleranceExceeded` (`raas_tracker/_exceptions.py`) is a conflict with what the sale has already been invoiced for — retrying the identical body will never succeed — so it is RFC 9110 §15.5.10. `POST /api/invoices/<id>/items` already returned 409; `POST /api/sales/<id>/invoices` and `POST /api/sales/<id>/invoices/batch` **hardcoded 400** for the same refusal, so the status depended on which door the request came in by. Both now go through `status_for(e)`. **Not a bug** — `tests/test_typed_errors.py::test_tolerance_breach_is_409_on_every_invoice_write_route` pins all three at once | `POST /api/sales/<id>/invoices`, `POST /api/sales/<id>/invoices/batch` (400 → 409) | One condition must yield one status; the phase's whole purpose. `POST /api/invoices/<id>/items` is unchanged |
 | 2026-10-17 | **A wrong or absent request `Content-Type` answers `415`, not `500`.** `request.get_json()` raises Werkzeug's `UnsupportedMediaType`, which had no handler, so Flask's lookup fell through to the catch-all `Exception` handler. A client that posted a JSON body as `text/plain` (or with no type at all) was told *"internal server error"* — a retry instruction for a fault that is permanently its own. `@app.errorhandler(415)` now answers `{"error": "unsupported media type (expected application/json)"}` | every JSON route (`request.get_json() or {}`) whose `Content-Type` is not JSON (500 → 415) | 415 is RFC 9110 §15.5.16 for exactly this, and it is the only honest answer: the body will never parse until the header changes. **Not authenticated-only** — an earlier draft of this row claimed it was. The three `_PUBLIC_API` routes `/api/auth/login`, `/api/auth/forgot-password` and `/api/auth/reset-password` take `_gate_api`'s `None` path and parse the body before any credential exists, so each went from an unauthenticated **500** to a 415: the change improves the unauthenticated surface rather than leaving it untouched. Pinned by `tests/test_edge_hardening.py::test_a_public_route_answers_415_unauthenticated` |
