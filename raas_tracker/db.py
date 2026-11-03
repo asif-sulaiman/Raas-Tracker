@@ -150,7 +150,7 @@ _SCHEMA_VERSION_KEY = "raas_schema_version"
 # 9 = RECIPE-WATER: recipe_products.water_percentage (nullable). NULL means the
 #     unformulated remainder (100 - ingredients); a value is an explicit,
 #     display-only water percentage per product. Additive only.
-_SCHEMA_VERSION = 9
+_SCHEMA_VERSION = 10
 
 # Frozen legacy tokens from builds that shipped them — do NOT add
 # per-migration entries. _SCHEMA_VERSION is authoritative; these only preserve
@@ -190,6 +190,35 @@ def resolve_dsn(dsn: Optional[str] = None) -> str:
     return dsn or os.getenv("DATABASE_URL") or DEFAULT_DATABASE_URL
 
 
+def _prepare_connection(conn: psycopg.Connection) -> None:
+    """Migrate and seed once, when the pool creates a physical connection.
+
+    Schema and seeds change only on a deployment (new `_SCHEMA_VERSION`) or a
+    manual database edit, and either is picked up by the next connection the
+    pool opens. Probing on every checkout instead put a schema query and two
+    seed COUNTs on every request — three extra round trips to a remote database
+    for a signal that almost never changes (Phase 1).
+
+    `RAAS_SCHEMA_CHECK=always` skips this so the suite can keep repairing
+    truncated/dropped tables per checkout; `get_connection` owns that path.
+    """
+    if os.getenv("RAAS_SCHEMA_CHECK") == "always":
+        return
+    try:
+        if not _schema_current(conn):
+            _create_tables(conn)
+        _ensure_seeds(conn)
+    except Exception:
+        # configure() runs before the pool registers the connection: a raise
+        # abandons it, and psycopg_pool does not close it. Close it here or a
+        # failing migration leaks one physical connection per retry.
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
+
+
 def _get_pool(dsn: Optional[str] = None) -> ConnectionPool:
     """Get or create the global connection pool.
 
@@ -210,8 +239,14 @@ def _get_pool(dsn: Optional[str] = None) -> ConnectionPool:
             _pool = ConnectionPool(
                 conninfo=effective_dsn,
                 min_size=1,
-                max_size=10,
+                # Supabase's session pooler caps the project at 15 clients and
+                # this app runs one pool per instance. 4 matches the waitress
+                # thread count, so no request waits behind its own instance.
+                # Overridable because the concurrency suite needs 8 live
+                # connections in one process (RAAS_POOL_MAX_SIZE).
+                max_size=int(os.getenv("RAAS_POOL_MAX_SIZE", "4")),
                 kwargs={"prepare_threshold": None},
+                configure=_prepare_connection,
                 open=True,
             )
             _pool_dsn = effective_dsn
@@ -219,40 +254,38 @@ def _get_pool(dsn: Optional[str] = None) -> ConnectionPool:
 
 
 def get_connection(dsn: Optional[str] = None) -> psycopg.Connection:
-    """Get a connection from the pool, ensuring schema/migrations/seeds.
+    """Get a connection from the pool.
 
     The connection runs in transactional mode: DML requires conn.commit()
     (or rolls back with conn.rollback()), matching previous backend semantics.
     Server-side statement preparation is disabled (prepare_threshold=None)
     so the app also works through transaction-mode poolers (e.g. Supabase).
 
-    Schema setup runs only when the recorded schema version differs from the
-    code's _SCHEMA_VERSION, or the live schema drifts from the recorded
-    signature (missing tables/columns after an upgrade or a manual DROP):
-    the common case is a single probe query, which keeps per-request (and
-    per-test) overhead to one round trip instead of the full DDL.
+    Schema setup runs in the pool's `configure` callback, once per physical
+    connection, not once per checkout (see `_prepare_connection`). Tests set
+    `RAAS_SCHEMA_CHECK=always` to keep the old per-checkout probe so they can
+    truncate tables between cases while reusing pooled connections.
 
     The returned connection is wrapped so that close() returns it to the pool
     instead of closing it, maintaining compatibility with existing code.
     """
     pool = _get_pool(dsn)
     conn = pool.getconn()
-    # Run schema check and seeds on each connection (cheap: one probe + two COUNTs)
-    # This maintains the original behavior where schema drift is detected per-request.
-    try:
-        if not _schema_current(conn):
-            _create_tables(conn)
-        _ensure_seeds(conn)
-    except Exception:
-        # If schema check/migration fails, discard the transaction (a failed
-        # migration leaves the connection aborted) and return it to the pool,
-        # then re-raise. The caller sees the same exception as before.
+    if os.getenv("RAAS_SCHEMA_CHECK") == "always":
         try:
-            conn.rollback()
+            if not _schema_current(conn):
+                _create_tables(conn)
+            _ensure_seeds(conn)
         except Exception:
-            pass
-        pool.putconn(conn)
-        raise
+            # If schema check/migration fails, discard the transaction (a failed
+            # migration leaves the connection aborted) and return it to the pool,
+            # then re-raise. The caller sees the same exception as before.
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            pool.putconn(conn)
+            raise
     return _PooledConnection(conn, pool)
 
 
@@ -1070,6 +1103,42 @@ def _run_migration(conn: psycopg.Connection) -> None:
     # the unique index / constraint cleanup applied to the same rows.
     from .companies import backfill_company_links  # local: avoids circular import
     backfill_company_links(conn)
+
+    # PERF-3: per-key lookups this schema had no index for. Each one backs a
+    # query that runs per request (the API-key rate-limit COUNT), per row
+    # (the recipes list's EXISTS on production_runs), or per detail view
+    # (sale board, upload detail, run detail, booking readiness). All were
+    # sequential scans; at today's data size this is hygiene for scale.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_api_key_rate_limits_key_hit "
+        "ON api_key_rate_limits (key_id, hit_at)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_production_runs_recipe_id "
+        "ON production_runs (recipe_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_production_run_links_invoice_id "
+        "ON production_run_links (invoice_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_production_run_items_run_id "
+        "ON production_run_items (run_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sales_stage_history_sale_id "
+        "ON sales_stage_history (sale_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sale_payments_sale_id "
+        "ON sale_payments (sale_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sale_payments_invoice_id "
+        "ON sale_payments (invoice_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shipments_sale_id "
+        "ON shipments (sale_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_upload_rows_upload_id "
+        "ON upload_rows (upload_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_approval_workflow_upload_id "
+        "ON approval_workflow (upload_id)")
     # Signature + schema version are stamped by _create_tables, in this same
     # transaction: nothing below commits.
 
