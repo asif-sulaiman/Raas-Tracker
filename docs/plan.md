@@ -1486,6 +1486,190 @@ ProductionRunModal 14, Reports 16; `oxlint` 0 warnings / 0 errors on 119 files;
 
 ---
 
+## ⚡ Phase PERF-1: round trips, anonymous gate, asset caching (completed 2026-11-03)
+
+**Measured problem.** The Vercel function ran in `iad1` while Supabase lives in
+`ap-northeast-1`, so every database round trip cost ~130 ms. Each request made
+~12–13 of them: `get_connection()` re-ran a schema probe and two seed `COUNT`s
+on *every checkout*, and `_resolve_identity()` opened the database even for a
+caller presenting no credential. `/api/auth/me` measured ~1.6 s warm. Static
+assets were served with `Cache-Control: no-cache`, so repeat visits
+re-downloaded the 1.06 MB bundle.
+
+**Changes**
+
+- `raas_tracker/db.py` — schema/seed probes moved into the psycopg pool's
+  `configure` callback: once per physical connection, not once per checkout.
+  `RAAS_SCHEMA_CHECK=always` keeps the per-checkout path and is set for the
+  whole test suite (tests truncate/drop tables while reusing pooled
+  connections). Pool `max_size` 10 → 4: the Supabase session pooler admits 15
+  clients per project, one pool runs per instance, and waitress uses 4 threads.
+  `RAAS_POOL_MAX_SIZE` overrides the cap; the suite raises it to 10 because the
+  concurrency tests hold 8 connections live at once.
+- `flask_app.py` — `_resolve_identity()` returns `None` before `get_db()` when
+  neither the session cookie nor `X-API-Key` is present. Any *presented* value,
+  including an invalid one, still goes through the database-backed checks.
+- `flask_app.py` / `vercel.json` — `/assets/*` is `public, max-age=31536000,
+  immutable` (Vite content hashes every file); `index.html` and the SPA
+  fallbacks stay `no-cache`. Vercel gets the same asset policy in its `headers`
+  block because it serves `public/` from its CDN without invoking Flask.
+- `vercel.json` — `"regions": ["hnd1"]` (Tokyo, beside Supabase).
+
+**Tests**
+
+- `tests/test_perf_phase1.py` — a warm pool issues zero probes per checkout;
+  forced mode still probes every checkout; the production pool cap defaults to
+  4; a failed `configure` closes the abandoned connection instead of leaking
+  it; anonymous `/api/*` answers 401 without opening a connection; a presented
+  cookie/key still hits the database; region and edge cache rules.
+- `tests/test_spa_fallback.py` — hashed asset is immutable, document is not.
+- `tests/test_edge_hardening.py` — the header matcher accepts the
+  `/assets/(.*)` source shape used by the cache rule.
+
+**Deliberately out of scope.** Supabase's transaction pooler (port 6543) was
+not switched on: the probe move makes session-pooler capacity comfortable, and
+transaction mode needs the migration/seed path re-verified first. Bundle
+splitting is Phase 2 (the build still emits one ~1.07 MB JS chunk).
+
+**Verification (full gate, 2026-11-03).** Backend: **1484 passed / 8 skipped**
+in 1440.05s (`python -m pytest tests/ -q`); `ruff` remains at its 18
+pre-existing baseline findings (12 `flask_app.py`, 6 `sales.py`), none in the
+touched modules or tests; `pyright` 0 errors / 15 baseline warnings. Frontend:
+**426/426 in 44 files**; `oxlint` 0 warnings / 0 errors on 119 files; `vite
+build` green (the pre-existing >500 kB chunk warning remains — splitting is
+Phase 2).
+
+---
+
+## ⚡ Phase PERF-2: one dashboard request, split routes, cache-aware client (completed 2026-11-03)
+
+**Measured problem.** Home issued seven API calls (chemicals, uploads, recipes,
+sales page, sales summary, LCs, audit preview), each its own pool checkout. The
+SPA shipped one ~1.07 MB JS chunk, so every first visit parsed Recharts before
+painting the dashboard shell. Auth polled `/api/auth/me` every minute, and no
+repeat dashboard read was cached anywhere.
+
+**Changes**
+
+- `flask_app.py` — `GET /api/dashboard` reads all seven datasets on **one**
+  pooled connection and returns the exact shapes of the standalone routes:
+  `{chemicals, uploads, recipes, sales:{sales,total}, sales_summary, lcs,
+  activity}`. `activity` carries the five newest audit rows for a human
+  `admin` and is `null` for everyone else, mirroring `/api/audit-logs`'
+  admin-only rule without failing the rest of the dashboard. The response gets
+  a strong ETag over its body, `Cache-Control: private, max-age=15` and
+  `Vary: Cookie, X-API-Key`; a matching `If-None-Match` answers **304**.
+- `raas-tracker-frontend/src/hooks/useCachedFetch.js` — keyed module cache with
+  `staleTime`. Cached data renders immediately; stale entries refresh in the
+  background without a skeleton; a failed refresh keeps the cached data. The
+  `loading` flag only covers a cold cache.
+- `raas-tracker-frontend/src/pages/Home.jsx` — one `/api/dashboard` call
+  replaces seven, with chemicals mapped exactly as before. The two Recharts
+  cards are `React.lazy` + `Suspense`, so the chart library leaves the first
+  payload.
+- `raas-tracker-frontend/src/App.jsx` — every page is `React.lazy` behind one
+  `Suspense` boundary; errors still land in the existing `ErrorBoundary`.
+- `raas-tracker-frontend/vite.config.js` — Rolldown `output.codeSplitting`
+  groups for React/router and the full Recharts dependency set, so the chart
+  chunk is shared by Home and Reports and fetched only with the lazy charts.
+- `raas-tracker-frontend/src/context/AuthContext.jsx` — idle identity poll
+  60 s → 5 min. A revoked session is still detected immediately by the next
+  API 401, so the poll is only the idle safety net.
+
+**Tests**
+
+- `tests/test_dashboard.py` — auth required; every section equals its standalone
+  endpoint with seeded data; non-admins get `activity: null` while
+  `/api/audit-logs` still 403s; exactly one `get_db()` per dashboard request;
+  `private` cache header; ETag 304 on a repeat and a **new** ETag after a write.
+- `raas-tracker-frontend/src/pages/Home.test.jsx` — a single `/api/dashboard`
+  request renders chemicals, sales and charts; admin activity shows three rows
+  while non-admin payloads hide the panel; a remount inside `staleTime` makes no
+  second request; a cold failure surfaces and Retry refetches.
+- `raas-tracker-frontend/src/App.test.jsx` — `/login`, `/setup` and `/reset`
+  render through the lazy Suspense boundary.
+
+**Build budget (`vite build`).** Entry `index` 68.34 kB + `react` 259.17 kB +
+`Home` 29.79 kB = **357.30 kB raw / 109.35 kB gzip**; the `charts` chunk
+(388.19 kB) is not part of the entry payload and downloads with the chart
+components. CSS is 74.16 kB (11.95 kB gzip). Before this phase the entry was a
+single ~1.07 MB JS chunk.
+
+**Verification (full gate, 2026-11-03).** Backend: **1489 passed / 8 skipped**
+in 1378.26s (`python -m pytest tests/ -q`); `ruff` remains at its 18
+pre-existing baseline findings, none in the touched files; `pyright` 0 errors /
+15 baseline warnings. Frontend: **434/434 in 46 files**; `oxlint` 0 warnings /
+0 errors on 122 files; `vite build` green and `dist/` refreshed into the
+gitignored `react_frontend/`.
+
+---
+
+## ⚡ Phase PERF-3: hot-path FK indexes + reference-data ETags (completed 2026-11-03)
+
+**Measured problem.** Ten per-key queries had no index and scanned their table:
+the API-key rate-limit COUNT (once per API-key-authenticated request), the
+recipes list's `EXISTS` on `production_runs` (once per row), the booking
+readiness gate on `production_run_links.invoice_id`, and the sale-board /
+upload-detail / run-detail lookups (`sales_stage_history`, `sale_payments`,
+`shipments`, `upload_rows`, `production_run_items`, `approval_workflow` — all
+by their foreign key). None of it is slow at today's data size; this is
+hygiene for scale plus a live-database health check to confirm nothing else
+is hiding. On the client side, the five reference lists re-sent their full
+body on every repeat view.
+
+**Changes**
+
+- `raas_tracker/db.py` — ten `CREATE INDEX IF NOT EXISTS` statements close the
+  idempotent-migration body of `_create_tables`, and `_SCHEMA_VERSION` 9 → 10
+  so warm databases pick the DDL up. `idx_api_key_rate_limits_key_hit` is
+  composite `(key_id, hit_at)` with `key_id` leading, because the hot COUNT
+  filters by key first and a window second. Deliberately *not* added:
+  `production_runs.sale_item_id` (always NULL today — see the known-limitation
+  on the production-readiness join), `recipe_items.chemical_id` (second column
+  of the existing unique index), `sessions.user_id` / `api_keys.created_by`
+  (rare, tiny), and `pg_trgm` (row counts are tiny; revisit when search slows).
+- `flask_app.py` — the dashboard's ETag block became `_revalidating_json()` and
+  now also covers `GET /api/chemicals`, `/api/companies`, `/api/recipes`,
+  `/api/unit-conversions`, `/api/reason-codes`. The reference lists get
+  `private, no-cache` (store, revalidate every use) rather than the
+  dashboard's `max-age=15`: each of their pages writes through the same URL
+  and immediately rereads it, and `apiFetch` uses the browser's default cache
+  mode — a freshness window would let that reread serve the pre-write body.
+
+**Live-database health check (read-only, 2026-11-03).** `pg_stat_statements`
+is already enabled. Top findings against production: no slow application query
+exists (the session lookup, the hottest app query, averages 0.28 ms); the
+dominant costs were the per-checkout schema/seed probes (16 145 calls, ~78 s
+total) and the deploy-time `pg_advisory_xact_lock` migration queue (18 calls,
+~4.9 s mean wait), both eliminated by PERF-1 in code but **still live because
+nothing from PERF-1/2/3 is deployed yet** — the numbers double as the
+before-picture for the eventual deploy verification. Catalog lookups
+(`pg_timezone_names` 144 ms mean, type introspection ~40 ms) are the iad1→Tokyo
+latency the `hnd1` region pin shrinks. The Supabase MCP `get_advisors` endpoint
+is currently broken (every call errors -32603); the check ran over a direct
+read-only connection instead.
+
+**Tests**
+
+- `tests/test_perf_phase3.py` — all ten indexes exist with the declared
+  columns; the rate-limit composite leads with `key_id`; `_SCHEMA_VERSION` is
+  10; each reference endpoint sends `private, no-cache` + `ETag` + `Vary` and
+  answers `If-None-Match` with 304; a write changes the chemicals ETag; auth is
+  still required on all five.
+- `tests/test_recipe_schema_v8.py` — the version pin moved to 10, and the
+  idempotence test now compares against `str(_SCHEMA_VERSION)` instead of a
+  hardcoded literal so the next bump cannot rot it.
+
+**Verification (full gate, 2026-11-03).** Backend: **1499 passed / 8 skipped**
+in 2328.20s (`python -m pytest tests/ -q`) — Phase 2's 1489 plus the ten new
+PERF-3 tests; `ruff` remains at its 18 pre-existing baseline findings, none in
+the touched modules or tests; `pyright` 0 errors / 15 baseline warnings.
+Frontend — no file touched this phase, re-run anyway: **434/434 in 46 files**,
+`oxlint` 0 warnings / 0 errors on 122 files, `vite build` green with chunk
+hashes identical to the browser-verified PERF-2 bundle.
+
+---
+
 ## 📜 Public contract changes
 
 Every entry here is an **intentional** change to a response a client can
