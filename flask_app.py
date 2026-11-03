@@ -95,6 +95,18 @@ app.config["MAX_CONTENT_LENGTH"] = _max_content_length_bytes(
 )
 REACT_BUILD_DIR = os.path.join(os.path.dirname(__file__), "react_frontend")
 
+# Vite content-hashes every file under assets/, so a URL can never point at
+# different bytes: cache it for a year. index.html names those hashes, so it
+# must always be revalidated or a deploy strands users on a deleted bundle.
+IMMUTABLE_CACHE = "public, max-age=31536000, immutable"
+
+
+def _send_index():
+    """Serve the SPA shell with revalidation pinned, independent of Flask defaults."""
+    resp = send_from_directory(REACT_BUILD_DIR, "index.html")
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
 # ProxyFix for correct remote_addr behind a trusted proxy (nginx, Cloudflare,
 # Vercel). Only `x_for` is gated, on TRUSTED_PROXY=1: `remote_addr` gates real
 # access controls — the API-key IP allowlist (auth.py:_ip_allowed), login
@@ -267,16 +279,25 @@ def _key_rate_ok(key_id: int) -> bool:
 
 
 def _resolve_identity():
-    """Return the request identity or None. Session cookie first, then API key."""
+    """Return the request identity or None. Session cookie first, then API key.
+
+    A caller that presents neither has nothing to validate, so the database is
+    not consulted at all: an anonymous request is refused by the gate without
+    paying the round trip. Any *presented* value — even an empty string — still
+    goes through the normal database-backed checks.
+    """
+    session_id = request.cookies.get(SESSION_COOKIE)
+    api_key = request.headers.get(API_KEY_HEADER)
+    if not session_id and not api_key:
+        return None
     conn = get_db()
     try:
-        user = get_session_user(conn, request.cookies.get(SESSION_COOKIE))
+        user = get_session_user(conn, session_id)
         if user:
             return {"type": "human", "id": user["id"],
                     "username": user["username"], "role": user["role"],
                     "must_change_password": bool(user.get("must_change_password"))}
-        key = validate_api_key(conn, request.headers.get(API_KEY_HEADER),
-                               request.remote_addr)
+        key = validate_api_key(conn, api_key, request.remote_addr)
         if key:
             return {"type": "api-key", "id": key["id"], "name": key["name"]}
         return None
@@ -457,7 +478,7 @@ def _not_found(_e):
     # Serving index.html as JS/CSS leaves the SPA permanently blank.
     if "." in os.path.basename(request.path or ""):
         return jsonify({"error": "not found"}), 404
-    return send_from_directory(REACT_BUILD_DIR, "index.html")
+    return _send_index()
 
 
 @app.errorhandler(405)
@@ -468,7 +489,7 @@ def _method_not_allowed(_e):
     # detailed log server-side — same contract as the other handlers.
     if request.path.startswith("/api"):
         return jsonify({"error": "method not allowed"}), 405
-    return send_from_directory(REACT_BUILD_DIR, "index.html")
+    return _send_index()
 
 
 @app.errorhandler(400)
@@ -1161,13 +1182,16 @@ def get_db():
 # ==================== SERVE REACT CRM ====================
 @app.route("/")
 def serve_root():
-    return send_from_directory(REACT_BUILD_DIR, "index.html")
+    return _send_index()
 
 
 @app.route("/<path:path>")
 def serve_static(path):
     if path and os.path.exists(os.path.join(REACT_BUILD_DIR, path)):
-        return send_from_directory(REACT_BUILD_DIR, path)
+        resp = send_from_directory(REACT_BUILD_DIR, path)
+        if path.startswith("assets/"):
+            resp.headers["Cache-Control"] = IMMUTABLE_CACHE
+        return resp
     # Missing file with an extension (e.g. a stale /assets/*.js bundle):
     # fail loudly with 404. Serving index.html here makes the browser
     # execute HTML as JS (MIME error) and leaves the SPA permanently blank.
@@ -1175,7 +1199,7 @@ def serve_static(path):
     # maps unknown routes to index.html — does not convert it back.
     if "." in os.path.basename(path or ""):
         return jsonify({"error": "not found"}), 404
-    return send_from_directory(REACT_BUILD_DIR, "index.html")
+    return _send_index()
 
 
 # ==================== API: COMPANIES (P0 master) ====================
@@ -1205,12 +1229,31 @@ def _clean_company(payload) -> dict:
             for k, v in data.items()}
 
 
+def _revalidating_json(payload, max_age=None):
+    """JSON response cacheable per browser: strong ETag over the body, private,
+    varying on the credential headers, 304 on a matching If-None-Match.
+
+    `max_age` gives a freshness window (the dashboard's aggregate). The
+    default `no-cache` is for lists their own page writes through and then
+    immediately rereads (add a chemical → reload the list): `apiFetch` uses the
+    browser's default cache mode, so any freshness window would let that
+    reread serve the pre-write body. `no-cache` still stores the body and pays
+    the request, but the ETag turns every unchanged reread into a 304.
+    """
+    resp = jsonify(payload)
+    resp.set_etag(hashlib.sha256(resp.get_data()).hexdigest())
+    resp.headers["Cache-Control"] = (
+        f"private, max-age={max_age}" if max_age is not None else "private, no-cache")
+    resp.headers["Vary"] = "Cookie, X-API-Key"
+    return resp.make_conditional(request)
+
+
 @app.route("/api/companies")
 def api_list_companies():
     conn = get_db()
     rows = list_companies(conn)
     conn.close()
-    return jsonify(rows)
+    return _revalidating_json(rows)
 
 
 @app.route("/api/register/products")
@@ -1301,7 +1344,7 @@ def api_chemicals():
     conn = get_db()
     chemicals = get_all_chemicals(conn)
     conn.close()
-    return jsonify(chemicals)
+    return _revalidating_json(chemicals)
 
 
 class ChemicalCreateIn(_FiniteModel):
@@ -1504,7 +1547,7 @@ def api_recipes():
                                invoice_id=invoice_id)
     finally:
         conn.close()
-    return jsonify(recipes)
+    return _revalidating_json(recipes)
 
 
 @app.route("/api/recipes/by-id/<int:recipe_id>")
@@ -2417,13 +2460,45 @@ def api_notifications_read():
     return jsonify({"marked": marked, "unread": unread})
 
 
+# ==================== API: DASHBOARD ====================
+# The Home page needs seven datasets; serving them from seven routes meant
+# seven pool checkouts and (after Phase 1) seven identity lookups. One aggregate
+# keeps the same shapes while paying one of each. The body includes admin-only
+# audit rows, so it is cacheable per browser only: `private`, short-lived, and
+# revalidated with an ETag afterwards.
+DASHBOARD_CACHE_MAX_AGE = 15
+
+
+@app.route("/api/dashboard")
+def api_dashboard():
+    identity = getattr(g, "current_identity", None) or {}
+    conn = get_db()
+    try:
+        payload = {
+            "chemicals": get_all_chemicals(conn),
+            "uploads": get_upload_history(conn),
+            "recipes": list_recipes(conn),
+            "sales": get_all_sales(conn, page=1, page_size=20),
+            "sales_summary": get_sales_summary(conn),
+            "lcs": list_lcs(conn),
+            # Mirrors `/api/audit-logs` being admin-only: non-admins get null
+            # instead of a 403 so the rest of the dashboard still loads.
+            "activity": (get_audit_logs(conn, limit=5)
+                         if identity.get("role") == "admin" else None),
+        }
+    finally:
+        conn.close()
+
+    return _revalidating_json(payload, max_age=DASHBOARD_CACHE_MAX_AGE)
+
+
 # ==================== API: REASON CODES ====================
 @app.route("/api/reason-codes")
 def api_reason_codes():
     conn = get_db()
     codes = get_all_reason_codes(conn)
     conn.close()
-    return jsonify(codes)
+    return _revalidating_json(codes)
 
 
 # ==================== API: UNIT CONVERSIONS ====================
@@ -2432,7 +2507,7 @@ def api_unit_conversions():
     conn = get_db()
     conversions = get_all_unit_conversions(conn)
     conn.close()
-    return jsonify(conversions)
+    return _revalidating_json(conversions)
 
 
 @app.route("/api/unit-conversions", methods=["POST"])

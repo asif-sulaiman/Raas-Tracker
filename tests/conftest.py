@@ -18,6 +18,17 @@ import pytest
 # rate-limit tests re-enable the limiter explicitly.
 os.environ["RAAS_RATE_LIMITS"] = "off"
 
+# Production probes schema + seeds once per physical pooled connection (in the
+# pool's `configure` callback). Tests truncate and drop tables between cases
+# while reusing those same connections, so they must keep the old per-checkout
+# probe. The one test that exercises the cached path deletes this key itself.
+os.environ["RAAS_SCHEMA_CHECK"] = "always"
+
+# Production caps one pool at 4 connections (waitress has 4 threads).
+# test_concurrency.py holds 8 connections live at once across threads, so the
+# suite raises the cap; the production default is asserted separately.
+os.environ["RAAS_POOL_MAX_SIZE"] = "10"
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from chem_stock import get_connection, create_first_admin, ensure_setup_token, create_user

@@ -10,6 +10,8 @@ without a built frontend and touches no database.
 """
 import flask_app
 
+IMMUTABLE_CACHE = "public, max-age=31536000, immutable"
+
 
 def _fake_build_dir(tmp_path):
     (tmp_path / "index.html").write_text("<div id=\"root\"></div>", encoding="utf-8")
@@ -57,3 +59,24 @@ def test_existing_asset_is_served(tmp_path, monkeypatch):
     r = client.get("/assets/index-abc123.js")
     assert r.status_code == 200
     assert b"console.log" in r.data
+
+
+def test_hashed_asset_is_cached_immutably(tmp_path, monkeypatch):
+    """Vite content-hashes `assets/*`, so the URL can never point at new bytes."""
+    monkeypatch.setattr(flask_app, "REACT_BUILD_DIR", _fake_build_dir(tmp_path))
+    client = flask_app.app.test_client()
+    r = client.get("/assets/index-abc123.js")
+    assert r.headers.get("Cache-Control") == IMMUTABLE_CACHE
+
+
+def test_index_html_is_never_cached(tmp_path, monkeypatch):
+    """The document names the current bundle hash; caching it would strand
+    users on a deleted asset after a deploy. Holds for `/` and for every
+    extensionless SPA route that falls back to the same file."""
+    monkeypatch.setattr(flask_app, "REACT_BUILD_DIR", _fake_build_dir(tmp_path))
+    client = flask_app.app.test_client()
+    for route in ("/", "/login", "/reports"):
+        r = client.get(route)
+        assert r.status_code == 200, route
+        cache = r.headers.get("Cache-Control", "")
+        assert "no-cache" in cache, f"{route} is cacheable: Cache-Control={cache!r}"
