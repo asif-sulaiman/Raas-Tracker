@@ -526,6 +526,13 @@ spaces and non-ASCII characters; clients send them `encodeURIComponent`-escaped
 | POST | `/api/keys` | Admin | Create key (returns raw once) |
 | DELETE | `/api/keys/<id>` | Admin | Revoke key |
 
+### Dashboard
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/api/dashboard` | Session/Key | One-request Home aggregate: `{chemicals, uploads, recipes, sales:{sales,total}, sales_summary, lcs, activity}`. Each section is identical to the payload of its standalone endpoint (`/api/chemicals`, `/api/uploads`, `/api/recipes`, `/api/sales?page=1&page_size=20`, `/api/sales/summary`, `/api/lcs`). `activity` is the five newest audit rows for a human `admin`, and `null` for everyone else (the standalone `/api/audit-logs` stays admin-only). Served on one pooled connection with `Cache-Control: private, max-age=15` and a strong `ETag`; a matching `If-None-Match` answers **304** |
+
+**Cacheable GETs.** The dashboard above and the five reference lists — `GET /api/chemicals`, `GET /api/companies`, `GET /api/recipes`, `GET /api/unit-conversions`, `GET /api/reason-codes` — all send `Vary: Cookie, X-API-Key`, a strong body `ETag`, and answer a matching `If-None-Match` with **304**. The dashboard is `private, max-age=15`; the reference lists are `private, no-cache` (stored but revalidated on every use) because each of their pages writes through the same URL and immediately rereads it — a freshness window would serve the pre-write body on that reread. Any write changes the ETag, so the validator itself never goes stale.
+
 ### Companies (list: any identity; mutations: admin)
 | Method | Path | Auth | Description |
 |---|---|---|---|
