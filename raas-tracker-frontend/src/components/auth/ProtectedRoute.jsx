@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Navigate, Outlet, useLocation } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
+import { withTimeout } from '../../utils/api';
 
 export default function ProtectedRoute() {
   const { user, loading } = useAuth();
@@ -9,7 +10,11 @@ export default function ProtectedRoute() {
 
   useEffect(() => {
     if (!loading && !user) {
-      fetch('/api/auth/status')
+      // Same deadline as every other request: a status check that never
+      // answers would leave this spinner on screen forever, which is the
+      // symptom the session check fix exists to remove.
+      const req = withTimeout({});
+      fetch('/api/auth/status', req.options)
         .then((r) => r.json())
         .then((data) => {
           // Defensive check: ensure data is an object and has setup_needed property
@@ -19,7 +24,8 @@ export default function ProtectedRoute() {
             setSetupNeeded(false);
           }
         })
-        .catch(() => setSetupNeeded(false));
+        .catch(() => setSetupNeeded(false))
+        .finally(() => req.done());
     }
   }, [loading, user]);
 

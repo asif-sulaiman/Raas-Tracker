@@ -1,6 +1,6 @@
 import { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { ApiError } from '../utils/api';
+import { ApiError, withTimeout } from '../utils/api';
 
 const AuthContext = createContext(null);
 const LOGOUT_EVENT_KEY = 'raas-logout';
@@ -20,8 +20,9 @@ export function AuthProvider({ children }) {
   }, [user]);
 
   const refresh = useCallback(async ({ silent = true } = {}) => {
+    const req = withTimeout({});
     try {
-      const res = await fetch('/api/auth/me');
+      const res = await fetch('/api/auth/me', req.options);
       if (res.ok) {
         const data = await res.json();
         // API-key identities carry no user session — treat as logged out for UI.
@@ -34,8 +35,11 @@ export function AuthProvider({ children }) {
         setUser(null);
       }
     } catch {
+      // A stalled first check used to leave `loading` true forever, which is
+      // the "white screen with Loading…" this deadline exists to prevent.
       if (!silent) setUser(null);
     } finally {
+      req.done();
       setLoading(false);
     }
   }, []);
@@ -49,11 +53,22 @@ export function AuthProvider({ children }) {
   }, [navigate]);
 
   const login = useCallback(async (username, password) => {
-    const res = await fetch('/api/auth/login', {
+    const req = withTimeout({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
     });
+    let res;
+    try {
+      res = await fetch('/api/auth/login', req.options);
+    } catch (err) {
+      if (req.didTimeOut()) {
+        throw new Error('Login timed out — the server did not answer. Try again.');
+      }
+      throw err;
+    } finally {
+      req.done();
+    }
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       const err = new Error(data.error || 'Login failed');
@@ -78,14 +93,21 @@ export function AuthProvider({ children }) {
   // Legacy tolerance: endpoints that still return 200 + {success:false}
   // come back as a normal response — callers must check data.success there.
   const apiFetch = useCallback(async (path, options) => {
+    const req = withTimeout(options || {});
     let res;
     try {
-      res = await fetch(path, options);
+      res = await fetch(path, req.options);
     } catch (err) {
       // Aborted requests (debounced search, unmount) propagate unwrapped
-      // so callers can silently ignore them.
+      // so callers can silently ignore them. A deadline is different: the
+      // request was ours to end, so it must read as a failure, not a cancel.
+      if (req.didTimeOut()) {
+        throw new ApiError(0, 'Request timed out — the server did not answer');
+      }
       if (err && err.name === 'AbortError') throw err;
       throw new ApiError(0, 'Network error — is the server running?');
+    } finally {
+      req.done();
     }
     if (res.status === 401 && userRef.current) {
       redirectToLogin(true);
