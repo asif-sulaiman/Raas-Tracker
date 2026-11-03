@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useCallback, lazy, Suspense } from 'react';
 import { Link } from 'react-router-dom';
 import {
   FlaskConical,
@@ -13,8 +13,6 @@ import {
   BookOpen
 } from 'lucide-react';
 import KpiCard from '../components/cards/KpiCard';
-import ReconciliationChart from '../components/cards/ReconciliationChart';
-import StockDistributionChart from '../components/cards/StockDistributionChart';
 import SalesPipelineOverview from '../components/cards/SalesPipelineOverview';
 import Badge from '../components/ui/Badge';
 import Button from '../components/ui/Button';
@@ -22,121 +20,61 @@ import { formatNumber, formatDate, formatDateTime } from '../utils/format';
 import { countOverdue } from '../utils/sales';
 import { buildTrendData, buildDistribution, uploadMismatches } from '../utils/dashboard';
 import { useAuth } from '../context/AuthContext';
+import useCachedFetch from '../hooks/useCachedFetch';
 
 const RECENT_DEFAULT = 5;
 const RECENT_MAX = 20;
+const ReconciliationChart = lazy(() => import('../components/cards/ReconciliationChart'));
+const StockDistributionChart = lazy(() => import('../components/cards/StockDistributionChart'));
+
+const DASHBOARD_KEY = '/api/dashboard';
+// The server marks the response private for 15s; the client keeps it a little
+// longer and refreshes in the background, so revisits paint instantly.
+const DASHBOARD_STALE_MS = 30 * 1000;
 
 export default function Home() {
   const { apiFetch } = useAuth();
-  const [chemicals, setChemicals] = useState([]);
-  const [chemLoading, setChemLoading] = useState(true);
-  const [chemError, setChemError] = useState(null);
-  const [recipes, setRecipes] = useState([]);
-  const [sales, setSales] = useState([]);
-  const [lcs, setLcs] = useState([]);
-  const [salesSummary, setSalesSummary] = useState(null);
-  const [salesLoading, setSalesLoading] = useState(true);
-  const [salesError, setSalesError] = useState(null);
   const [salesExpanded, setSalesExpanded] = useState(false);
-  const [uploads, setUploads] = useState([]);
-  const [uploadsError, setUploadsError] = useState(null);
-  const [activity, setActivity] = useState([]);
-  const [activityHidden, setActivityHidden] = useState(false);
 
-  // Fetch only — chemLoading starts true and chemError starts null; the Retry
-  // handler flips the loading/error state itself before calling this.
-  const loadChemicals = useCallback(async () => {
-    try {
-      const res = await apiFetch('/api/chemicals');
-      const chems = await res.json();
-      if (!Array.isArray(chems)) throw new Error('Unexpected response from server');
-      setChemicals(chems.map(c => ({
+  const fetchDashboard = useCallback(async () => {
+    const res = await apiFetch(DASHBOARD_KEY);
+    const data = await res.json();
+    if (!data || typeof data !== 'object') {
+      throw new Error('Unexpected response from server');
+    }
+    return data;
+  }, [apiFetch]);
+
+  const {
+    data: dashboard,
+    loading,
+    error,
+    refresh,
+  } = useCachedFetch(DASHBOARD_KEY, fetchDashboard, { staleTime: DASHBOARD_STALE_MS });
+
+  const chemicals = Array.isArray(dashboard?.chemicals)
+    ? dashboard.chemicals.map(c => ({
         ...c,
         balance_this_month: c.qty,
         status: c.qty === 0 ? 'low' : 'matched'
-      })));
-    } catch (err) {
-      setChemError(err.message || 'Could not load chemical stock');
-      setChemicals([]);
-    } finally {
-      setChemLoading(false);
-    }
-  }, [apiFetch]);
+      }))
+    : [];
+  const uploads = Array.isArray(dashboard?.uploads) ? dashboard.uploads : [];
+  const recipes = Array.isArray(dashboard?.recipes) ? dashboard.recipes : [];
+  const sales = Array.isArray(dashboard?.sales?.sales)
+    ? dashboard.sales.sales
+    : Array.isArray(dashboard?.sales) ? dashboard.sales : [];
+  const lcs = Array.isArray(dashboard?.lcs) ? dashboard.lcs : [];
+  const salesSummary = dashboard?.sales_summary ?? null;
+  const activity = Array.isArray(dashboard?.activity) ? dashboard.activity.slice(0, 3) : [];
+  // Non-admins get `activity: null` from the API; hide the panel for them.
+  const activityHidden = Boolean(dashboard) && !Array.isArray(dashboard.activity);
 
-  useEffect(() => {
-    (async () => {
-      await loadChemicals();
-    })();
-  }, [loadChemicals]);
-
-  // Fetch only — the Retry handler clears uploadsError before calling this.
-  const loadUploads = useCallback(async () => {
-    try {
-      const res = await apiFetch('/api/uploads');
-      const data = await res.json();
-      setUploads(Array.isArray(data) ? data : []);
-    } catch (err) {
-      setUploadsError(err.message || 'Could not load stock checks');
-      setUploads([]);
-    }
-  }, [apiFetch]);
-
-  useEffect(() => {
-    (async () => {
-      await loadUploads();
-    })();
-  }, [loadUploads]);
-
-  // Load recipes, sales, and summary lazily after initial render
-  // so the dashboard shows chemicals/uploads immediately
-  useEffect(() => {
-    let mounted = true;
-    (async () => {
-      try {
-        const [recsRes, salesRes, summaryRes, lcsRes] = await Promise.all([
-          apiFetch('/api/recipes'),
-          apiFetch('/api/sales?page=1&page_size=20').catch(() => null),
-          apiFetch('/api/sales/summary').catch(() => null),
-          apiFetch('/api/lcs').catch(() => null)
-        ]);
-        if (!mounted) return;
-        const recs = await recsRes.json();
-        if (Array.isArray(recs)) setRecipes(recs);
-        if (salesRes) {
-          const salesData = await salesRes.json();
-          if (salesData && Array.isArray(salesData.sales)) {
-            setSales(salesData.sales);
-          } else if (Array.isArray(salesData)) {
-            setSales(salesData);
-          }
-        }
-        if (summaryRes) {
-          const summaryData = await summaryRes.json();
-          if (summaryData) setSalesSummary(summaryData);
-        }
-        // Best-effort LC enrichment for nested recent-sales rows.
-        if (lcsRes) {
-          const lcsData = await lcsRes.json().catch(() => null);
-          if (Array.isArray(lcsData)) setLcs(lcsData);
-        }
-      } catch (err) {
-        if (mounted) setSalesError(err.message || 'Could not load sales data');
-      } finally {
-        if (mounted) setSalesLoading(false);
-      }
-    })();
-    // Recent activity is best-effort (audit log is admin-only): hide on failure.
-    (async () => {
-      try {
-        const res = await apiFetch('/api/audit-logs?limit=5');
-        const data = await res.json();
-        if (mounted && Array.isArray(data)) setActivity(data.slice(0, 3));
-      } catch {
-        if (mounted) setActivityHidden(true);
-      }
-    })();
-    return () => { mounted = false; };
-  }, [apiFetch]);
+  const chemLoading = loading;
+  const salesLoading = loading;
+  const chemError = error ? error.message || 'Could not load dashboard' : null;
+  const salesError = chemError;
+  const uploadsError = chemError;
 
   const overdueCount = countOverdue(sales);
   const visibleSales = salesExpanded ? sales.slice(0, RECENT_MAX) : sales.slice(0, RECENT_DEFAULT);
@@ -271,26 +209,30 @@ export default function Home() {
         <div className="rounded-xl border border-rose-200 dark:border-rose-800 bg-rose-50 dark:bg-rose-950/30 p-6 text-center" role="alert">
           <p className="text-sm font-semibold text-rose-700 dark:text-rose-300">Could not load stock checks</p>
           <p className="text-xs text-rose-600/80 dark:text-rose-400/80 mt-1">{uploadsError}</p>
-          <Button variant="primary" size="sm" onClick={() => { setUploadsError(null); loadUploads(); }} className="mt-3">
+          <Button variant="primary" size="sm" onClick={() => refresh()} className="mt-3">
             Retry
           </Button>
         </div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div className="lg:col-span-2">
-            <ReconciliationChart
-              title="Monthly Warehouse Reconciliation Performance"
-              data={trendData}
-              matchLabel={latestUpload ? `${Number(latestMatch).toFixed(1)}% Current Match` : null}
-            />
+            <Suspense fallback={<div className="h-72 animate-pulse rounded-xl bg-slate-100 dark:bg-slate-800" aria-hidden="true" />}>
+              <ReconciliationChart
+                title="Monthly Warehouse Reconciliation Performance"
+                data={trendData}
+                matchLabel={latestUpload ? `${Number(latestMatch).toFixed(1)}% Current Match` : null}
+              />
+            </Suspense>
           </div>
           <div>
-            <StockDistributionChart
-              title="Audit Resolution Breakdown"
-              data={distribution ? distribution.data : []}
-              caption={distribution ? distribution.caption : null}
-              matchPct={latestUpload ? `${Number(latestMatch).toFixed(1)}%` : null}
-            />
+            <Suspense fallback={<div className="h-72 animate-pulse rounded-xl bg-slate-100 dark:bg-slate-800" aria-hidden="true" />}>
+              <StockDistributionChart
+                title="Audit Resolution Breakdown"
+                data={distribution ? distribution.data : []}
+                caption={distribution ? distribution.caption : null}
+                matchPct={latestUpload ? `${Number(latestMatch).toFixed(1)}%` : null}
+              />
+            </Suspense>
           </div>
         </div>
       )}
@@ -330,7 +272,7 @@ export default function Home() {
             <div className="rounded-lg border border-rose-200 dark:border-rose-800 bg-rose-50 dark:bg-rose-950/30 p-5 text-center" role="alert">
               <p className="text-xs font-semibold text-rose-700 dark:text-rose-300">Could not load chemical stock</p>
               <p className="text-[11px] text-rose-600/80 dark:text-rose-400/80 mt-1">{chemError} — no stock figures are shown.</p>
-              <Button variant="primary" size="sm" onClick={() => { setChemLoading(true); setChemError(null); loadChemicals(); }} className="mt-3">
+              <Button variant="primary" size="sm" onClick={() => refresh()} className="mt-3">
                 Retry
               </Button>
             </div>
