@@ -7,6 +7,9 @@ import json
 import math
 import re
 import hashlib
+
+import psycopg
+from psycopg_pool import PoolTimeout
 from flask import Flask, request, jsonify, send_from_directory, g, redirect
 from flask.json.provider import DefaultJSONProvider
 from datetime import date, timedelta
@@ -620,6 +623,26 @@ def _rate_limit_exceeded(e):
 def _server_error(_e):
     app.logger.exception("unhandled server error")
     return jsonify({"error": "internal server error"}), 500
+
+
+@app.errorhandler(PoolTimeout)
+@app.errorhandler(psycopg.OperationalError)
+def _database_unavailable(exc):
+    """The database is unavailable; the application is not broken.
+
+    An exhausted pool or a lost connection used to surface as a bare 500 after
+    waiting out the pool's full acquire timeout, which is what the 2026-11-02
+    outage showed the user: a spinner, then "internal server error". 503 with
+    Retry-After is the honest answer for a transient condition.
+
+    The cause is logged, never sent: connection errors quote DSN-shaped text
+    and a response body is a public channel.
+    """
+    app.logger.warning("database unavailable: %s: %s", type(exc).__name__, exc)
+    resp = jsonify({"error": "database unavailable, retry shortly"})
+    resp.status_code = 503
+    resp.headers["Retry-After"] = "5"
+    return resp
 
 
 @app.errorhandler(Exception)

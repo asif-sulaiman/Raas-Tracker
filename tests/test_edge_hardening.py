@@ -45,7 +45,10 @@ import json
 import re
 from pathlib import Path
 
+import psycopg
 import pytest
+from psycopg_pool import PoolTimeout
+from werkzeug.exceptions import HTTPException
 
 import flask_app
 
@@ -395,10 +398,13 @@ def _by_code():
 
 
 def _by_class():
-    """Codes are ints; the only other entry is the `None` bucket that holds a
-    by-class registration (`Exception`)."""
-    return {k: next(iter(v.values())) for k, v in _handler_spec().items()
-            if not isinstance(k, int)}
+    """The by-class map itself — `spec[None][None]` is `{exception: handler}`.
+
+    Returned whole rather than one entry from it: the bucket holds several
+    classes now, and picking the first made the assertion depend on the order
+    the handlers happen to be registered in.
+    """
+    return dict(_handler_spec()[None])
 
 
 def test_415_is_registered_by_code_with_its_own_handler():
@@ -418,11 +424,22 @@ def test_415_is_not_registered_by_class():
     walking the exception's MRO — and it consults it for *every* status with no
     code handler of its own. Registering `HTTPException` by class, say, would
     capture every unhandled 4xx into one response shape. This asserts the 415
-    change added no by-class entry at all."""
-    assert set(_by_class()) == {None}, (
-        f"a new by-class handler appeared: {sorted(map(str, _by_class()))}"
+    change added no by-class entry at all.
+
+    PERF-4 did add by-class entries — two, for the database driver's transient
+    failures — so the map is now asserted exactly instead of merely "only the
+    catch-all". A later class handler has to be signed off here, which is the
+    point of the tripwire.
+    """
+    handlers = {k: v.__name__ for k, v in _by_class().items()}
+    assert handlers == {
+        Exception: "_handle_exception",
+        PoolTimeout: "_database_unavailable",
+        psycopg.OperationalError: "_database_unavailable",
+    }, handlers
+    assert HTTPException not in handlers, (
+        "a class handler now captures every unhandled 4xx"
     )
-    assert _by_class()[None].__name__ == "_handle_exception"
 
 
 def test_no_two_codes_share_one_handler():
