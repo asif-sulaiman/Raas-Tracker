@@ -2,6 +2,7 @@ import { Link } from 'react-router-dom';
 import { User, LogOut, KeyRound } from 'lucide-react';
 import Badge from '../ui/Badge';
 import NotificationBell from '../notifications/NotificationBell';
+import BrandLogo from '../BrandLogo';
 import { useAuth } from '../../context/AuthContext';
 
 export default function Header() {
@@ -9,12 +10,17 @@ export default function Header() {
 
   return (
     <header className="h-16 bg-white border-b border-gray-200 flex items-center justify-between px-6">
-      {/* Left: Title */}
-      <div className="flex items-center gap-4">
+      {/* Left: Title — links back to Home */}
+      <Link
+        to="/"
+        className="flex min-w-0 items-center gap-3 rounded-lg transition-opacity hover:opacity-80"
+        title="Go to Home"
+      >
+        <BrandLogo size="h-8 w-8" />
         <h1 className="text-xl font-semibold text-gray-800">
           RAAS Tracker
         </h1>
-      </div>
+      </Link>
 
       {/* Right: Actions */}
       <div className="flex items-center gap-4">

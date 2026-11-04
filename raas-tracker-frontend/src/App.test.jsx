@@ -55,6 +55,7 @@ describe('lazy routes', () => {
   it('renders the lazily loaded login page', async () => {
     renderAt('/login');
     expect(await screen.findByText('RAAS Tracker Login')).toBeTruthy();
+    expect(screen.getByAltText('RAAS Biotech logo')).toBeTruthy();
   });
 
   it('renders the lazily loaded setup page', async () => {
