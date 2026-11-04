@@ -1,4 +1,4 @@
-import { NavLink } from 'react-router-dom';
+import { Link, NavLink } from 'react-router-dom';
 import {
   Home,
   Upload,
@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { useState } from 'react';
 import { useAuth } from '../../context/AuthContext';
+import BrandLogo from '../BrandLogo';
 
 const navItems = [
   { path: '/', label: 'Home', icon: Home },
@@ -54,11 +55,18 @@ export default function Sidebar() {
       `}>
         {/* Header */}
         <div className="flex items-center justify-between h-16 px-4 border-b border-gray-200 dark:border-gray-700">
-          {!collapsed && (
-            <span className="text-lg font-semibold text-gray-800 dark:text-white">
-              RAAS Tracker
-            </span>
-          )}
+          <Link
+            to="/"
+            className="flex min-w-0 items-center gap-2 rounded-lg transition-opacity hover:opacity-80"
+            title="Go to Home"
+          >
+            <BrandLogo size="h-8 w-8" />
+            {!collapsed && (
+              <span className="text-lg font-semibold text-gray-800 dark:text-white truncate">
+                RAAS Tracker
+              </span>
+            )}
+          </Link>
           <button 
             onClick={() => setCollapsed(!collapsed)}
             className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400"

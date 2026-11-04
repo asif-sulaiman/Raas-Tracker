@@ -16,6 +16,7 @@ import KpiCard from '../components/cards/KpiCard';
 import SalesPipelineOverview from '../components/cards/SalesPipelineOverview';
 import Badge from '../components/ui/Badge';
 import Button from '../components/ui/Button';
+import BrandLogo from '../components/BrandLogo';
 import { formatNumber, formatDate, formatDateTime } from '../utils/format';
 import { countOverdue } from '../utils/sales';
 import { buildTrendData, buildDistribution, uploadMismatches } from '../utils/dashboard';
@@ -103,15 +104,18 @@ export default function Home() {
     <div className="space-y-6 max-w-7xl mx-auto">
       {/* Command strip */}
       <div className="flex flex-col gap-3 rounded-xl border border-slate-200/80 bg-white px-4 py-3 sm:flex-row sm:items-center sm:justify-between dark:border-slate-800 dark:bg-slate-900">
-        <div className="min-w-0">
-          <h1 className="text-base font-bold tracking-tight text-slate-900 dark:text-white">
-            RAAS Tracker
-          </h1>
-          <p className="mt-0.5 truncate text-xs text-slate-500 dark:text-slate-400">
-            {latestUpload
-              ? `${formatDate(latestUpload.upload_date)} · Last stock check ${latestUpload.filename || 'upload'} · ${Number(latestMatch).toFixed(1)}% match`
-              : 'No stock check yet'}
-          </p>
+        <div className="flex min-w-0 items-center gap-2.5">
+          <BrandLogo size="h-8 w-8" />
+          <div className="min-w-0">
+            <h1 className="text-base font-bold tracking-tight text-slate-900 dark:text-white">
+              RAAS Tracker
+            </h1>
+            <p className="mt-0.5 truncate text-xs text-slate-500 dark:text-slate-400">
+              {latestUpload
+                ? `${formatDate(latestUpload.upload_date)} · Last stock check ${latestUpload.filename || 'upload'} · ${Number(latestMatch).toFixed(1)}% match`
+                : 'No stock check yet'}
+            </p>
+          </div>
         </div>
         <Link to="/upload" className="shrink-0">
           <Button variant="primary" size="sm" icon={UploadCloud}>

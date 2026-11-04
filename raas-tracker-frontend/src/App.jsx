@@ -7,6 +7,7 @@ import { AuthProvider } from './context/AuthContext';
 import { NotificationProvider } from './context/NotificationContext';
 import { ConfirmProvider } from './context/ConfirmContext';
 import ErrorBoundary from './components/ui/ErrorBoundary';
+import BrandLogo from './components/BrandLogo';
 
 // Route-level splitting keeps Recharts and the heavier editors out of the
 // first payload; each page (and its vendors) downloads on first visit.
@@ -26,7 +27,8 @@ const ChangePassword = lazy(() => import('./pages/ChangePassword'));
 
 function RouteFallback() {
   return (
-    <div className="flex min-h-screen items-center justify-center bg-slate-50 dark:bg-slate-950" role="status" aria-label="Loading page">
+    <div className="flex min-h-screen flex-col items-center justify-center gap-4 bg-slate-50 dark:bg-slate-950" role="status" aria-label="Loading page">
+      <BrandLogo size="h-12 w-12" />
       <div className="h-8 w-8 animate-spin rounded-full border-2 border-slate-300 border-t-blue-600 dark:border-slate-700 dark:border-t-blue-400" />
     </div>
   );
