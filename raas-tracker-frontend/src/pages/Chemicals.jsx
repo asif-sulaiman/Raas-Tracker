@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import {
   Package,
   FlaskConical,
+  Boxes,
   Settings,
   Info,
   AlertTriangle,
@@ -10,6 +11,7 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import DataTable from '../components/tables/DataTable';
+import PackagingPanel from '../components/packaging/PackagingPanel';
 import Badge from '../components/ui/Badge';
 import Button from '../components/ui/Button';
 import Modal from '../components/modals/Modal';
@@ -36,6 +38,7 @@ const fieldCls =
 export default function Chemicals() {
   const { apiFetch, user } = useAuth();
   const isAdmin = user?.role === 'admin';
+  const [activeTab, setActiveTab] = useState('chemicals');
   const [chemicals, setChemicals] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -298,33 +301,72 @@ export default function Chemicals() {
     <div className="space-y-6 max-w-7xl mx-auto">
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
-          <h2 className="text-2xl font-bold text-slate-900 dark:text-white tracking-tight">Chemicals Inventory</h2>
-          <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">Complete catalog of all registered chemicals</p>
+          <h2 className="text-2xl font-bold text-slate-900 dark:text-white tracking-tight">
+            {activeTab === 'chemicals' ? 'Chemicals Inventory' : 'Packaging Register'}
+          </h2>
+          <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
+            {activeTab === 'chemicals'
+              ? 'Complete catalog of all registered chemicals'
+              : 'Bags, jars and drums counted as objects — not chemicals, never a recipe ingredient'}
+          </p>
         </div>
-        <div className="flex items-center gap-2">
-          {isAdmin && !loading && !error && (
-            <Button variant="primary" size="sm" icon={Plus} onClick={openAdd}>Add Chemical</Button>
-          )}
-          {loading || error ? (
-            <Badge variant="default">Unavailable</Badge>
-          ) : (
+        <div className="flex items-center gap-2 flex-wrap">
+          {activeTab === 'chemicals' && (
             <>
-              <Badge variant="success">{activeStock} Active</Badge>
-              <Badge variant="warning">{lowStock} Low</Badge>
-              <Badge variant="error">{outStock} Out</Badge>
+              {isAdmin && !loading && !error && (
+                <Button variant="primary" size="sm" icon={Plus} onClick={openAdd}>Add Chemical</Button>
+              )}
+              {loading || error ? (
+                <Badge variant="default">Unavailable</Badge>
+              ) : (
+                <>
+                  <Badge variant="success">{activeStock} Active</Badge>
+                  <Badge variant="warning">{lowStock} Low</Badge>
+                  <Badge variant="error">{outStock} Out</Badge>
+                </>
+              )}
+              <span className="w-px h-6 bg-slate-200 dark:bg-slate-700" aria-hidden="true" />
             </>
           )}
+          <button
+            onClick={() => setActiveTab('chemicals')}
+            aria-pressed={activeTab === 'chemicals'}
+            className={clsx(
+              'inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-colors cursor-pointer',
+              activeTab === 'chemicals'
+                ? 'bg-blue-600 text-white'
+                : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
+            )}
+          >
+            <FlaskConical className="h-4 w-4" /> Chemicals
+          </button>
+          <button
+            onClick={() => setActiveTab('packaging')}
+            aria-pressed={activeTab === 'packaging'}
+            className={clsx(
+              'inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-colors cursor-pointer',
+              activeTab === 'packaging'
+                ? 'bg-blue-600 text-white'
+                : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
+            )}
+          >
+            <Boxes className="h-4 w-4" /> Packaging
+          </button>
         </div>
       </div>
 
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <KpiCard title="Total Chemicals" value={loading || error ? '—' : totalChemicals} icon={FlaskConical} color="blue" trendLabel="registered items" />
-        <KpiCard title="Active Stock" value={loading || error ? '—' : activeStock} icon={Package} color="emerald" trendLabel="positive quantity" />
-        <KpiCard title="Out of Stock" value={loading || error ? '—' : outStock} icon={TrendingDown} color="rose" trendLabel="zero balance" />
-        <KpiCard title="Total Quantity" value={loading || error ? '—' : formatNumber(totalQty)} icon={AlertTriangle} color="amber" trendLabel="across all units" />
-      </div>
+      {activeTab === 'chemicals' && (
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          <KpiCard title="Total Chemicals" value={loading || error ? '—' : totalChemicals} icon={FlaskConical} color="blue" trendLabel="registered items" />
+          <KpiCard title="Active Stock" value={loading || error ? '—' : activeStock} icon={Package} color="emerald" trendLabel="positive quantity" />
+          <KpiCard title="Out of Stock" value={loading || error ? '—' : outStock} icon={TrendingDown} color="rose" trendLabel="zero balance" />
+          <KpiCard title="Total Quantity" value={loading || error ? '—' : formatNumber(totalQty)} icon={AlertTriangle} color="amber" trendLabel="across all units" />
+        </div>
+      )}
 
-      {loading ? (
+      {activeTab === 'packaging' ? (
+        <PackagingPanel isAdmin={isAdmin} />
+      ) : loading ? (
         <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 shadow-xs" aria-label="Loading chemical stock">
           <div className="h-5 w-40 rounded bg-slate-200 dark:bg-slate-700 mb-1 animate-pulse" />
           <div className="h-3 w-64 rounded bg-slate-100 dark:bg-slate-800 mb-4 animate-pulse" />
@@ -375,7 +417,7 @@ export default function Chemicals() {
         />
       )}
 
-      {isAdmin && !loading && !error && chemicals.length > 0 && (
+      {activeTab === 'chemicals' && isAdmin && !loading && !error && chemicals.length > 0 && (
         <StockHistory chemicals={chemicals} />
       )}
 
