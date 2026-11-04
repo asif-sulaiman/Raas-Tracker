@@ -2,7 +2,7 @@
 
 ## 1. Summary
 
-RAAS Tracker is a web-based application for chemical warehouse/factory inventory management, monthly reconciliation, recipe/production reports, file-upload-based stock comparison (PDF/Excel), and a sales pipeline (PI → LC → shipment → payment → completed) with per-invoice production/shipment tracking and PDF/`.docx` proforma invoice (PI) parsing. Flask backend serves a React 19 + Vite frontend. PostgreSQL (Supabase) is the database in every environment.
+RAAS Tracker is a web-based application for chemical warehouse/factory inventory management, monthly reconciliation, recipe/production reports, file-upload-based stock comparison (PDF/Excel), a counted packaging register (bags, jars and drums — containers as objects, never chemicals), and a sales pipeline (PI → LC → shipment → payment → completed) with per-invoice production/shipment tracking and PDF/`.docx` proforma invoice (PI) parsing. Flask backend serves a React 19 + Vite frontend. PostgreSQL (Supabase) is the database in every environment.
 
 ## 2. Problem & Goals
 
@@ -35,7 +35,10 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 ## 4. Features (Priority-Ordered)
 
 ### Must-have (MVP)
-1. **Chemical Inventory:** CRUD, unit conversion, reorder levels, stock delta updates
+1. **Chemical Inventory:** CRUD, unit conversion, reorder levels, stock delta updates —
+   plus a **Packaging** tab that counts containers (bags/jars/drums) as objects in their
+   own ledger. Packaging is not a chemical: it never enters a recipe, an upload, or a
+   reconciliation line
 2. **Monthly Reconciliation:** PDF/Excel upload → parse → DB compare → mismatch flag → approve → apply to stock
 3. **Recipe Management:** one recipe per invoice, sourced from the live pipeline (running LC → open PI → invoice in production), user-typed names, per-product formulation cards pulled automatically from the invoice's lines, ingredients (chemical + %), rename-only revision, production reports with per-product breakdowns (CSV)
 4. **Sales Pipeline:** Stages (PI → LC → shipment → payment → completed), PI parse (PDF/`.docx`), LC/shipment/payment entry, CSV export
@@ -142,6 +145,14 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 - A provisional row carries a **Provisional** badge, and a legend says those quantities come from the PI until an invoice line covers them
 - Every detail row has an **Actions** column whose Edit button opens the same sale/invoice editor the pipeline uses. Completed sales stay editable there: existing invoice lines are read-only, while sale fields, comments and payment records remain correctable (audited). An admin may still **add** an invoice to a completed sale — that is the late-invoicing path, and it reopens the sale and its LC (Flow 6, step 9). A save reloads the report and its KPI summary immediately
 
+### Flow 8: Packaging Register (counting containers, not chemicals)
+- The operator opens **Chemical Stock → Packaging**. Five seeded types show their pieces on site, capacity, the **packable KG** that capacity × pieces would hold, an alarm level and the last movement — all from one query, all read-only until someone acts
+- **Received / Issued / Returned / Damaged / Scrapped** record a signed number of pieces; **Physical count** is the one field where the person types *what they see* (e.g. 37 drums on the floor), and the server turns that into the ledger row `COUNT delta −3` — the previous count is never overwritten, so the correction itself is history
+- An issue that would take a type below zero is refused with the reason in the message; the count on screen stays what it was after a reload
+- Below the alarm level the bell gets `packaging_low` (warning); at zero it gets `packaging_out` (critical); recovering above the level clears the alert, and the two keys can never both be live on one type
+- Admins add container types and set alarm levels. An operator counts — same trust level as the monthly stock upload — and sees no add/alarm buttons
+- **Nothing here touches a chemical.** Packaging has its own tables and its own ledger; the monthly upload, the recipes, the reconciliation compare and the dashboard feed never read it, and a test asserts those row sets are identical with packaging data present
+
 ## 6. Data Model
 
 ### Core Tables
@@ -151,6 +162,8 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 | `recipes` | id, company_id (FK), invoice_id (FK, **unique**, NOT NULL), name, created_date | Recipe header. **One recipe per invoice**; `UNIQUE (company_id, name)` (all lookups are `lower()`) so a rename checks uniqueness ignoring case. The invoice is the recipe's identity, so there is no product, tonnage or water field |
 | `recipe_products` | id, recipe_id (FK), product_name, unit, water_percentage | One formulation slot per product on the invoice; unique on `(recipe_id, lower(product_name))`. Slots are synced from invoice lines — a new line adds an empty slot, duplicates merge, a removed line marks the slot off-invoice. `water_percentage` is `REAL NULL`: NULL means the auto remainder (`100 − ingredients`), and a stored value is the product's water. It is never deducted, but it counts in the 100% total that production requires |
 | `recipe_items` | id, recipe_product_id (FK), chemical_id (FK), percentage | One chemical's percentage in one product's formulation; unique on `(recipe_product_id, chemical_id)`, and a product's percentages may not exceed 100% |
+| `packaging_items` | id, label (unique, case-insensitive idx), capacity_kg `NUMERIC(12,3)`, unit (PCS), reorder_level (int) | Container master — the bags, jars and drums the plant counts. Seeded with `25 kg bag`, `30 kg jar`, `50 kg drum`, `120 kg drum`, `200 kg drum`; an admin may add more |
+| `packaging_movements` | id, item_id (FK), kind (RECEIVED \| ISSUED \| RETURNED \| DAMAGED \| SCRAPPED \| COUNT), delta (signed int), before_qty, after_qty, reason, actor, created_at | The packaging ledger. **There is no stored quantity column** — pieces on site are `SUM(delta)` — so the count cannot drift from its own history, and every row keeps the before/after it was written with |
 | `uploads` | id, filename, upload_date, file_type, status, total_chemicals, matched, mismatches..., match_percentage | Upload metadata |
 | `upload_rows` | id, upload_id (FK), chemical_name, batch_number, expiry_date, upload_unit, balance_last_month, balance_this_month, matched_in_db, unit_match | Upload detail rows |
 | `unit_conversions` | id, from_unit, to_unit, factor (unique pair) | Custom unit conversions |
@@ -173,7 +186,7 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 | `notifications` | id, type, title, body, severity, role_scope, entity_type, entity_id, dedupe_key | Notifications |
 
 ### Identity & Access
-- **Case-insensitive chemical name**: `idx_chemicals_name_lower` (lower(name) unique index)
+- **Case-insensitive chemical name**: `idx_chemicals_name_lower` (lower(name) unique index). Packaging labels match the same way and the lookup actually uses the index (`WHERE lower(label) = lower(%s)`)
 - **RLS not used** — application-level authorization (`_gate_api`, `admin_required`)
 - **API keys**: `ck_live_` prefix, SHA-256 hash, IP allowlist, expiry, revocation
 

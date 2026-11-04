@@ -1806,6 +1806,96 @@ since the route split — no chunk over 500 kB (`charts` 387.85 kB is the larges
 
 ---
 
+## 📦 Phase PACKAGING: a counted container register inside Chemical Stock (completed 2026-11-04)
+
+The user counts drums, bags and jars as physical objects — "drums are not chemical,
+how much drum we have, which should be counted" — and nothing in the model could hold
+that. `DRUM` existed only as a unit-conversion factor (1 DRUM = 200 L/KG) and as a
+hand-typed string on production runs (`packing: "30 Kg Drum"`). No row anywhere said
+how many containers were on site.
+
+**Why a new table and not rows in `chemicals`:** four readers treat every `chemicals`
+row as a formula ingredient or a reconciliation line (`uploads.py:75`,
+`recipes.py:499`, `recipes.py:1109`, `flask_app.py:2499`). A `kind` column would have
+to be filtered at all four; miss one and a 25 kg bag becomes a recipe ingredient. The
+slice therefore adds `packaging_items` + `packaging_movements` (schema **v11**) and
+changes **no** chemical code path. `tests/test_packaging.py::test_packaging_data_never_reaches_the_chemical_surface`
+asserts `get_all_chemicals()` is byte-identical with packaging data present.
+
+**Three chemical flaws deliberately not copied:**
+
+| Chemical stock does | Packaging does | Test |
+|---|---|---|
+| stores a mutable `current_qty REAL` that can drift from its own history | no quantity column at all — pieces are `SUM(delta)`, integers, `capacity_kg NUMERIC(12,3)` | `test_no_mutable_quantity_column_exists`, `test_pieces_are_integers_not_real` |
+| the adjust modal subtracts in the browser, so two people counting the same stack lose one edit (`Chemicals.jsx:77`) | a physical count arrives **absolute** and the service resolves the delta inside its own transaction under `SELECT … FOR UPDATE` | `test_physical_count_is_resolved_server_side` |
+| chemical history is regex-parsed out of `audit_logs.new_value` (`stock.py:404-474`) | history reads real indexed columns (`before_qty`, `after_qty`, `kind`, `actor`) with sargable date bounds | `test_history_is_a_direct_read` |
+
+**API** (`raas_tracker/packaging.py`, routes in the `API: PACKAGING` block): `GET
+/api/packaging` (one `GROUP BY`, `_revalidating_json` ETag), `POST /api/packaging/items`
+(admin), `POST /api/packaging/movements` (operator — same trust class as the monthly
+upload), `PUT /api/packaging/reorder` (admin), `GET /api/packaging/history`. All three
+writes ship with `@limited()` from the first commit, unlike the chemical write routes
+still on the 300/min read default, and `tests/test_authorization_roles.py` — which
+asserts **set equality**, not membership — was extended rather than bypassed.
+
+**Alerts:** `notify_packaging_short()` reuses `notify()` with `entity_type="packaging"`
+and mutually exclusive dedupe keys (`packaging:0:{id}` critical, `packaging:low:{id}`
+warning), so the bell and the table badge cannot disagree; recovery clears the key. No
+alert at creation — a brand-new type legitimately holds zero.
+
+**UI:** `pages/Chemicals.jsx` gains a tab bar (`Chemicals` | `Packaging`, the
+`Reports.jsx` `aria-pressed` idiom) and the chemical branch is untouched.
+`components/packaging/PackagingPanel.jsx` + `PackagingMovementModal.jsx` and
+`utils/packaging.js` — one status rule (0 = out, ≤ alarm = low), never the three
+conflicting rules in `utils/stock.js`, and packable KG accumulated in integer
+thousandths so a `3 × 0.1` total is exactly `0.3`.
+
+**Out of scope, deliberately:** no auto-deduction from the production `packing` text,
+sales or the monthly upload; no lot/expiry, no multi-warehouse; no repair of
+`current_qty REAL`, the client-derived delta, or the chemical history parser.
+
+**Verification (full gate, 2026-11-04).** Backend: `python -m pytest tests/ -q`
+first reported **1558 passed / 2 failed / 8 skipped** in 3142.87 s. Both failures were
+the same pre-existing tripwire, `test_schema_version_is_ten`, hard-pinned to
+`_SCHEMA_VERSION == 10` in `tests/test_perf_phase3.py` and `tests/test_recipe_schema_v8.py`
+— a bump of the version is exactly what that assertion forbids, so it fires on every
+correct migration and had already been renamed twice. Both are now
+`test_schema_version_at_least_ten` and assert `>= 10`: still a guard against lowering the
+version, no longer a false alarm when new DDL raises it. The reachability of the packaging
+DDL is not left unguarded — `test_packaging.py::test_migration_reapplies_packaging_tables`
+stamps `_SCHEMA_VERSION - 1` and proves the tables and seeds come back through the fast
+path, without pinning a number. Re-ran the two renamed files with `test_packaging.py`:
+**51 passed**, so the suite stands at **1560 passed / 8 skipped**. `ruff check .`: all
+checks passed. `pyright`: 0 errors / **17** warnings (the documented baseline, untouched).
+Frontend: **468 tests in 49 files** all passed, `oxlint` 0 warnings / 0 errors on 128
+files, `vite build` green (`charts` 387.85 kB still the largest chunk), `dist/` copied to
+`react_frontend/`.
+
+**Browser pass (2026-11-04, against an embedded Postgres — deliberately not the live
+Supabase data).** Schema v11 reaches production when the deployed app first opens a
+connection after this ships; a dev laptop counting drums must not migrate the customer
+database ahead of a deploy. All seven planned checks held: the tab listed the 5 seeded
+types at 0 pieces; `RECEIVED +40` on `200 kg drum` put 40 in the row, 40 in total pieces
+and 8,000 kg in packable KG, with history `before 0 → after 40`; a physical count of 37
+wrote a `COUNT` row of `delta -3` instead of overwriting anything; counting to 0 raised
+the bell and a later `RECEIVED +10` cleared it (`packaging` notifications read back empty);
+`-500` on a type holding 40 was refused and the count was unchanged after a refresh; an
+operator session could Record but saw no Add Type / Alarm controls; and the Chemicals tab
+still listed its own three rows (`120.5 KG`, `40 L`, `0 KG`) with KPIs `3 / 2 / 1 / 160.50`
+while packaging data sat in the ledger — no packaging type appeared in the chemical list,
+which is the live counterpart of the service-level separation test. Ledger after the pass: `RECEIVED 40 (0→40)`, `COUNT -3
+(40→37)`, `COUNT -37 (37→0)`, `RECEIVED 10 (0→10)`, `RECEIVED 5 (0→5)` on `30 kg jar`, with
+`SUM(delta)` equal to the last `after_qty` per type; audit held 4 × `PACKAGING_MOVEMENT`,
+`SET_PACKAGING_REORDER_LEVEL 0→5` and `ADD_PACKAGING_ITEM '1000 kg IBC tote'`.
+
+Two defects only a browser could show were found and fixed in this pass: the movement
+modal printed the piece count with two decimals (`40.00 PCS` next to a table showing `40`),
+and its live preview rendered `-463 PCS` for an over-issue the server would refuse — pieces
+now format as integers and the preview reads `—` whenever the result would be negative.
+The client-refused case was also confirmed in the network log to send no `POST` at all.
+
+---
+
 ## 📜 Public contract changes
 
 Every entry here is an **intentional** change to a response a client can
