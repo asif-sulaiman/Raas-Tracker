@@ -94,6 +94,9 @@ OPERATOR_ROUTES = [
     ("POST", "/api/reports/generate"),
     ("POST", "/api/reports/export"),
     ("POST", "/api/notifications/read"),
+    # Counting what arrived or what left is floor-level work, like the monthly
+    # stock upload and unit conversions.
+    ("POST", "/api/packaging/movements"),
 ]
 
 
@@ -420,6 +423,10 @@ VOLUME_BOUNDED_ROUTES = OPERATOR_ROUTES + [
     ("POST", "/api/lcs/<int:lc_id>/pis"),
     ("DELETE", "/api/lcs/<int:lc_id>/pis/<int:sale_id>"),
     ("POST", "/api/lcs/<int:lc_id>/move"),
+    # Packaging writes ship with their budget from the first commit, unlike the
+    # chemical write routes, which still sit on the 300/min read default.
+    ("POST", "/api/packaging/items"),
+    ("PUT", "/api/packaging/reorder"),
 ]
 
 

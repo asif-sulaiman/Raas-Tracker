@@ -64,10 +64,14 @@ def test_rate_limit_count_leads_with_the_key_column(db):
     assert definition.index("key_id") < definition.index("hit_at"), definition
 
 
-def test_schema_version_is_ten():
+def test_schema_version_at_least_ten():
     """The PERF-3 indexes are new DDL: the stored version must move with them
-    or the fast path skips the migration on every warm database."""
-    assert dbmod._SCHEMA_VERSION == 10
+    or the fast path skips the migration on every warm database.
+
+    A floor, not an equality pin — later DDL raises the version further and
+    that must not read as a regression here.
+    """
+    assert dbmod._SCHEMA_VERSION >= 10
 
 
 # ==================== reference-data ETags ====================

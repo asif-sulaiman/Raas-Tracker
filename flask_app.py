@@ -214,6 +214,14 @@ from raas_tracker.sales import (
     invoice_terms_for_sale,
 )
 from raas_tracker.stock import sync_reorder_notifications
+from raas_tracker.packaging import (
+    MOVEMENT_KINDS as PACKAGING_MOVEMENT_KINDS,
+    list_packaging_items, create_packaging_item, record_packaging_movement,
+    set_packaging_reorder_level, get_packaging_movements,
+)
+# Re-exported, not restated: the API's history ceiling must track the service's
+# clamp, and tests/test_packaging.py reads the limit off this module.
+from raas_tracker.packaging import MAX_HISTORY_LIMIT as PACKAGING_HISTORY_MAX_LIMIT  # noqa: F401
 # Phase 4-A: the HTTP status of a service refusal comes from its TYPE.
 from raas_tracker._exceptions import (
     InvoiceNotFound, LifecycleConflict, SaleItemNotFound, status_for,
@@ -1142,7 +1150,8 @@ def _req_float(data, field, default=0):
 
 
 from pydantic import (
-    BaseModel, ConfigDict, Field, ValidationError, field_validator)
+    BaseModel, ConfigDict, Field, ValidationError, field_validator,
+    model_validator)
 
 
 class _StrippedModel(BaseModel):
@@ -1464,6 +1473,144 @@ def api_chemicals_history():
     conn = get_db()
     rows = get_stock_movements(conn, chemical_id=chemical_id,
                                since=since, until=until, limit=limit)
+    conn.close()
+    return jsonify(rows)
+
+
+# ==================== API: PACKAGING ====================
+# Bags, jars and drums are counted objects, not ingredients, so they live in
+# `packaging_items` + `packaging_movements` and none of the chemical readers
+# (uploads, recipes, the dashboard feed) ever see them. The count is SUM(delta)
+# over the ledger: there is no stored quantity column to drift, and a physical
+# count arrives as an absolute number that the service turns into a delta —
+# unlike `/api/chemicals/update`, which trusts a delta the browser computed.
+@app.route("/api/packaging")
+def api_packaging_list():
+    conn = get_db()
+    rows = list_packaging_items(conn)
+    conn.close()
+    return _revalidating_json(rows)
+
+
+class PackagingItemCreateIn(_FiniteModel):
+    label: str = Field(min_length=1)
+    capacity_kg: float = Field(default=0, ge=0)
+    unit: str = Field(default="PCS", min_length=1)
+
+
+@app.route("/api/packaging/items", methods=["POST"])
+@admin_required
+@limited()
+def api_packaging_add_item():
+    try:
+        payload = PackagingItemCreateIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        item = create_packaging_item(conn, payload.label,
+                                     payload.capacity_kg, payload.unit)
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
+    conn.close()
+    if item is None:
+        return jsonify({"success": False,
+                        "error": f"Packaging '{payload.label}' already exists"}), 409
+    return jsonify({"success": True, **item})
+
+
+class PackagingMovementIn(_FiniteModel):
+    """One ledger row: a signed movement OR an absolute physical count."""
+
+    item_id: int | None = None
+    label: str | None = None
+    kind: str = Field(min_length=1)
+    delta: int | None = None
+    counted_qty: int | None = None
+    reason: str | None = Field(default=None, max_length=120)
+
+    @field_validator("kind")
+    @classmethod
+    def _known_kind(cls, value):
+        name = value.strip().upper()
+        if name not in PACKAGING_MOVEMENT_KINDS:
+            raise ValueError(
+                "kind must be one of " + ", ".join(PACKAGING_MOVEMENT_KINDS))
+        return name
+
+    @model_validator(mode="after")
+    def _one_of_delta_or_count(self):
+        if (self.delta is None) == (self.counted_qty is None):
+            raise ValueError("provide exactly one of delta or counted_qty")
+        return self
+
+
+@app.route("/api/packaging/movements", methods=["POST"])
+@operator_or_admin_required
+@limited()
+def api_packaging_record_movement():
+    try:
+        payload = PackagingMovementIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        row = record_packaging_movement(
+            conn, item_id=payload.item_id, label=payload.label, kind=payload.kind,
+            delta=payload.delta, counted_qty=payload.counted_qty,
+            reason=payload.reason)
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
+    conn.close()
+    if row is None:
+        return jsonify({"error": "packaging type not found"}), 404
+    return jsonify({"success": True, **row})
+
+
+class PackagingReorderIn(_FiniteModel):
+    label: str = Field(min_length=1)
+    reorder_level: int = Field(default=0, ge=0)
+
+
+@app.route("/api/packaging/reorder", methods=["PUT"])
+@admin_required
+@limited()
+def api_packaging_set_reorder():
+    try:
+        payload = PackagingReorderIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        updated = set_packaging_reorder_level(conn, payload.label,
+                                              payload.reorder_level)
+    except ValueError as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
+    conn.close()
+    if not updated:
+        return jsonify({"error": "packaging type not found"}), 404
+    return jsonify({"success": True, "label": payload.label,
+                    "reorder_level": payload.reorder_level})
+
+
+@app.route("/api/packaging/history")
+def api_packaging_history():
+    """Ledger rows, newest first — read from real columns, not audit text.
+
+    The ceiling on `limit` is the service's (`MAX_HISTORY_LIMIT`), which
+    `PACKAGING_HISTORY_MAX_LIMIT` is the same object re-exported for the API.
+    """
+    conn = get_db()
+    rows = get_packaging_movements(
+        conn,
+        item_id=request.args.get("item_id", type=int),
+        label=request.args.get("label"),
+        since=request.args.get("since"),
+        until=request.args.get("until"),
+        limit=request.args.get("limit", 200, type=int))
     conn.close()
     return jsonify(rows)
 
