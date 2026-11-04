@@ -128,6 +128,37 @@ def notify_reorder_status(conn: psycopg.Connection, chem_id: int, name: str,
         clear_dedupe(conn, low_key)
 
 
+def notify_packaging_short(conn: psycopg.Connection, item_id: int, label: str,
+                           qty: int, reorder_level: int) -> None:
+    """Sync packaging notifications with the counted pieces vs the alarm level.
+
+    Same shape as ``notify_reorder_status``, separate dedupe namespace: a drum
+    running out is a different call to action from a chemical running out, and
+    one bell row must not silence the other.
+
+    Callers invoke this AFTER their own commit — ``notify`` commits internally,
+    and committing mid-write would release the item row lock before the ledger
+    row and its audit entry land.
+    """
+    zero_key = f"packaging:0:{item_id}"
+    low_key = f"packaging:low:{item_id}"
+    if qty <= 0:
+        notify(conn, type="packaging_out", title=f"Out of packaging: {label}",
+               body=f"{label} has 0 pieces on site. Reorder containers.",
+               severity="critical", entity_type="packaging", entity_id=item_id,
+               dedupe_key=zero_key)
+        clear_dedupe(conn, low_key)
+    elif reorder_level > 0 and qty <= reorder_level:
+        notify(conn, type="packaging_low", title=f"Low packaging: {label}",
+               body=f"{label} is at {qty} pieces (alarm level {reorder_level}).",
+               severity="warning", entity_type="packaging", entity_id=item_id,
+               dedupe_key=low_key)
+        clear_dedupe(conn, zero_key)
+    else:
+        clear_dedupe(conn, zero_key)
+        clear_dedupe(conn, low_key)
+
+
 def notify_sale_stage(conn: psycopg.Connection, sale_id: int, client_name: str,
                       from_stage: str, to_stage: str) -> None:
     """Notify on payment_due entry (warning) and completion (info).

@@ -23,8 +23,10 @@ def _indexes(conn):
     }
 
 
-def test_schema_version_is_ten():
-    assert dbmod._SCHEMA_VERSION == 10
+def test_schema_version_at_least_ten():
+    """Floor, not equality pin: the v8 DDL must stay behind a version the fast
+    path re-runs, and later migrations raising it further is not a regression."""
+    assert dbmod._SCHEMA_VERSION >= 10
 
 
 def test_v9_recipe_shape_is_invoice_scoped(db):
