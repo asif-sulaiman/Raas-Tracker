@@ -155,7 +155,10 @@ _SCHEMA_VERSION_KEY = "raas_schema_version"
 #     register with its own ledger), the (item_id, created_at) history index and
 #     the case-insensitive unique label index. Additive only; nothing existing
 #     changed shape.
-_SCHEMA_VERSION = 11
+# 12 = WON'T-SHIP: sale_items.wont_ship — an admin's standing decision that a PI
+#     line's unshipped balance will never be invoiced, so the Commercial Report
+#     drops that line's provisional remainder row. Additive only.
+_SCHEMA_VERSION = 12
 
 # Frozen legacy tokens from builds that shipped them — do NOT add
 # per-migration entries. _SCHEMA_VERSION is authoritative; these only preserve
@@ -1161,6 +1164,15 @@ def _run_migration(conn: psycopg.Connection) -> None:
     # sale_items.item_no
     if "item_no" not in _table_columns(conn, "sale_items"):
         conn.execute("ALTER TABLE sale_items ADD COLUMN item_no TEXT")
+
+    # sale_items.wont_ship — on the PI line, not in the viewer's session: the
+    # report's provisional remainder is a claim about a document, so the decision
+    # that it will never ship has to be durable and shared. NOT NULL DEFAULT 0
+    # backfills every pre-v12 line as shippable, which keeps the report predicate
+    # a plain equality with no three-valued logic.
+    if "wont_ship" not in _table_columns(conn, "sale_items"):
+        conn.execute("ALTER TABLE sale_items ADD COLUMN wont_ship "
+                     "INTEGER NOT NULL DEFAULT 0")
 
     # sale_payments.invoice_id
     if "invoice_id" not in _table_columns(conn, "sale_payments"):
