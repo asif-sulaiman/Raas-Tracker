@@ -427,6 +427,9 @@ VOLUME_BOUNDED_ROUTES = OPERATOR_ROUTES + [
     # chemical write routes, which still sit on the 300/min read default.
     ("POST", "/api/packaging/items"),
     ("PUT", "/api/packaging/reorder"),
+    # Same rule for the newest admin write: a new route declares 15/min rather
+    # than joining the ~27 existing admin writes left on the read default.
+    ("PUT", "/api/sales/<int:sale_id>/items/<int:item_id>/wont-ship"),
 ]
 
 
