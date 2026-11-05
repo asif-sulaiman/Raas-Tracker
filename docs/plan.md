@@ -2047,6 +2047,60 @@ the prompt to the flag.
 
 ---
 
+## 🔧 Pipeline Value counts work in flight, not settled business (completed 2026-11-05)
+
+**Measured problem.** The user pointed at the board header: **PIPELINE VALUE $50,174 / 3
+sales**, with PI Issued, LC Received, Shipment Ongoing and Payment Due all reading **$0** and
+Completed reading **3 / $50,174**. Running production's own `get_sales_summary` against the live
+database reproduced it exactly — three sales, all `completed`, worth $648 + $4,600 + $45,432 —
+so the "pipeline" was entirely closed business. Home was worse: the same money printed under
+*"3 sales in flow"* and again under *"3 completed · $50,174 booked"*.
+
+**Root cause, one line.** `total_value = sum(v["value"] for v in summary.values())` — and
+`summary` is seeded from `SALE_STAGE_ORDER`, whose last entry is `completed`. `total_sales`
+made the same mistake with the count. The board's per-column *"PI total (visible)"* had always
+excluded completed (completed sales are archived off the board), which is why the header
+contradicted the columns directly beneath it.
+
+**The rule now:** `completed` is excluded from `total_pipeline_value` and `total_sales`, and
+keeps its own per-stage entry, so the figure is moved rather than hidden. Written as
+`stage != "completed"` rather than a whitelist of the four open stages, so a stage added later
+counts as in flight instead of vanishing from the sum — `test_an_unknown_stage_still_counts_as_in_flight`
+pins that intent, because the whitelist version would pass every other test in the file.
+
+**Accepted consequence, stated before shipping:** on this database the card now reads
+**$0 / 0 sales** until a PI is actually in flight. That is what an empty pipeline is worth, and
+the user chose it when offered the alternative of a second sub-line.
+
+**No frontend change.** Both consumers (`Sales.jsx`'s KpiCard and
+`SalesPipelineOverview`'s "sales in flow") already read these two keys, and Home's wording
+became true for the first time.
+
+**Verification (full gate, 2026-11-05).** Red first: `tests/test_sales_summary.py` ran
+**3 failed / 4 passed** against the pre-fix `get_sales_summary` — the pipeline-total, empty-board
+and dashboard tests each still saw the completed money summed in — then green with the rule in
+place. Backend: `python -m pytest tests/ -q` → **1594 passed / 8 skipped** in 1747.31 s, exit 0;
+the 7 over the **1587** the won't-ship layer ended on are exactly the new file. Focused set
+`test_sales_summary` + `test_sale_wont_ship` + `test_dashboard` + `test_commercial_report_kpis`
+→ **48 passed** in 79.71 s, so the retired-balance figures and the report's own money model still
+agree with the new total. `ruff check .`: all checks passed. `pyright`: 0 errors / **17** warnings
+— the documented baseline, none on the changed lines. Frontend: **476 tests in 49 files** all
+passed (141.69 s), `oxlint` 0 warnings / 0 errors, `vite build` green (2533 modules, 3.53 s). No
+file under `raas-tracker-frontend/` changed, so `react_frontend/` needed no copy —
+`git diff --stat -- react_frontend` is empty — and the served bundle hash stayed
+`index-C9JJMaS5.js`, the same as the won't-ship release.
+
+**Deployed, and what proves it.** PR #17: `backend` success in 220 s, `frontend` 62 s,
+`semgrep` 264 s (`Supabase Preview` reports `skipped` by design), rebased onto `main` as
+`7bd91cd`; Vercel production deployment `7574427801` → success. Because this fix is backend-only,
+the unchanged bundle hash proves nothing about it, so the live evidence is a **read-only probe**
+that ran production's `get_sales_summary` against the live database after the deploy:
+sales by stage `{'completed': 3}`, per-stage values $648 + $4,600 + $45,432 all in the
+`completed` row, `total_pipeline_value` **$0.00 / 0 sales** and `summary["completed"]`
+**3 / $50,174.20**. No browser pass was run for this change — there was no UI to drive.
+
+---
+
 ## 📜 Public contract changes
 
 Every entry here is an **intentional** change to a response a client can
@@ -2055,6 +2109,7 @@ this is where to look.
 
 | Date | Change | Routes affected | Rationale |
 |---|---|---|---|
+| 2026-11-05 | **`total_pipeline_value` and `total_sales` no longer include completed sales.** They summed every stage in `SALE_STAGE_ORDER`, `completed` included, so a database whose only sales are settled reported all of its closed business as the pipeline. `summary["completed"]` still carries its own count and value, so the Completed tile and Home's "N completed · $X booked" line are unchanged — the money moved out of the total, it was not hidden. | `GET /api/sales/summary`, `GET /api/dashboard` (`sales_summary.total_pipeline_value`, `.total_sales`) | The user's board read **$50,174 / 3 sales** as the pipeline beside four columns of **$0.00**, and Home printed the same $50,174 under *"3 sales in flow"* and again under *"3 completed"* — a completed sale is settled business, not work in flight |
 | 2026-11-05 | **A sale's `total_value` / `balance` became the accounted value, not the document total.** A PI line marked won't ship now counts only its invoiced quantity (capped at what the PI ordered) in the pipeline list, the pipeline CSV and the stage sums; `has_uninvoiced_remainder` no longer reports a retired line, and the legacy maturity scan drops a sale whose only unpaid money is retired. Consequences: a retired, never-invoiced line reads `total_value 0`; a legacy sale-level payment against such a line answers a **negative** `balance`; a fully or over-invoiced marked line is unchanged. Only sales that carry the mark move — every other row of every response is identical. | `GET /api/sales`, `GET /api/sales/export`, `GET /api/sales/summary`, `GET /api/dashboard` (`sales` and `sales_summary`), `/api/cron/maturity-check` (`checked` can drop) | Netting the remainder in the Commercial Report alone left the board, Home and the CSV still counting a balance the user had retired — "everywhere, not just the report" |
 | 2026-11-05 | **A commercial report row now names the PI line behind it, and an admin can retire a remainder.** Report rows gain the additive key `sale_item_id` (previously selected by the SQL but never serialised), and `PUT /api/sales/<id>/items/<iid>/wont-ship` (Admin, 15/min) stores `sale_items.wont_ship` (schema v12). A marked line yields **no** provisional remainder row in `/api/reports/live`, `/live/filtered`, `/live/summary` or the CSV, so its unshipped balance leaves Gross Sales/Due/Overdue. Invoiced rows and their money are untouched, and the mark never blocks invoicing. Responses are otherwise unchanged. | `GET /api/reports/live`, `/live/filtered`, `/live/summary`, `/live/export`, `GET /api/sales/<id>` (`items[].wont_ship`), `PUT /api/sales/<id>/items/<iid>/wont-ship` (new) | The user's PI `12322332` held $72 Due on a 50 KG balance that may never ship; a decision that belongs to the document, not to a viewer's filter |
 | 2026-11-03 | **A saturated or unreachable database answers `503`, not `500`.** `psycopg_pool.PoolTimeout` (the 10 s acquire deadline) and `psycopg.OperationalError` — which covers `errors.TooManyConnections`, the error that produced the 2026-11-02 outage — now yield **503** `{"error": "database unavailable, retry shortly"}` with `Retry-After: 5`. The driver message is logged, never sent. Separately, every authenticated client request carries a 30 s deadline: a hung request now produces `ApiError(0, "Request timed out — the server did not answer")` instead of an endless route spinner. | every `/api/*` route reached through `_gate_api`'s checkout and any query that raises while holding a pooled connection (500 → 503) | RFC 9110 §15.6.4 is the honest answer for transient capacity — the client's request was fine and retrying may work; 500 asserts a server bug and tells the caller nothing about retrying. The deadline exists because `loading` stayed true forever when `/api/auth/me` never answered |
