@@ -12,7 +12,8 @@ from raas_tracker.sales import create_invoice
 
 # Exact contract keys the API must emit per sale-item row.
 CONTRACT_KEYS = {
-    "sale_id", "customer_name", "pi_number", "pi_date", "lc_number", "lc_date",
+    "sale_id", "sale_item_id", "customer_name", "pi_number", "pi_date",
+    "lc_number", "lc_date",
     "product_name", "unit", "quantity", "unit_price", "total_price",
     "prod_date", "invoice_date", "latest_ship_date", "actual_ship_date",
     "received_amount", "due_amount", "receive_date", "maturity_date",
@@ -199,6 +200,10 @@ def test_row_shape_contract_keys(admin_client, db):
     assert set(row.keys()) == CONTRACT_KEYS
     assert row["payment_status"] in STATUSES
     assert row["sale_id"] == sid
+    # The line behind the row: a provisional row's won't-ship mark is addressed
+    # by (sale_id, sale_item_id), and the UI has no other handle on it.
+    assert row["sale_item_id"] == db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s", (sid,)).fetchone()[0]
     assert row["customer_name"] == "Shape Co"
     assert row["product_name"] == "Acid"
     assert row["unit"] == "DRUM"
