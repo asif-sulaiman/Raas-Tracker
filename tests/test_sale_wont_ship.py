@@ -166,3 +166,113 @@ def test_a_pi_save_neither_sets_nor_clears_the_mark(db):
                      [{"id": item_id, "product_name": "A",
                        "quantity": 450, "unit_price": 1.44, "unit": "KG"}], [])
     assert _stored(db, item_id) == 1
+
+
+# --------------------------------------------------------------------------- #
+# HTTP surface
+# --------------------------------------------------------------------------- #
+def _invoiced_line(db, pi="PI-WS-HTTP", quantity=450, unit_price=1.44, invoiced=400):
+    """The screenshot: one 450 KG line, 400 of it billed, so 50 KG stays provisional."""
+    sid, item_id = _line(db, pi=pi, quantity=quantity, unit_price=unit_price)
+    amount = round(invoiced * unit_price, 2)
+    inv_id = db.execute(
+        "INSERT INTO invoices (sale_id, invoice_number, status, amount) "
+        "VALUES (%s, %s, 'planned', 0) RETURNING id", (sid, f"INV-{pi}")).fetchone()[0]
+    db.execute(
+        """INSERT INTO invoice_items (invoice_id, sale_item_id, product_name,
+              unit, quantity, unit_price, line_total)
+           VALUES (%s, %s, 'A', 'KG', %s, %s, %s)""",
+        (inv_id, item_id, invoiced, unit_price, amount))
+    db.execute("UPDATE invoices SET amount = %s WHERE id = %s", (amount, inv_id))
+    db.execute("INSERT INTO sale_payments (sale_id, payment_date, payment_amount) "
+               "VALUES (%s, '2026-02-01', %s)", (sid, amount))
+    db.commit()
+    return sid, item_id
+
+
+def _figures(admin_client):
+    """(provisional rows, kpi triple) exactly as the Commercial tab reads them."""
+    rows = admin_client.get("/api/reports/live").get_json()
+    periods = admin_client.get(
+        "/api/reports/live/summary?group_by=none").get_json()["periods"]
+    kpis = periods[0]["kpis"]
+    return ([r for r in rows if r["is_provisional"]],
+            (kpis["gross_sales"], kpis["received"], kpis["due"]))
+
+
+def test_anonymous_is_refused(db):
+    c = flask_app.app.test_client()
+    assert c.put("/api/sales/1/items/1/wont-ship",
+                 json={"wont_ship": True}).status_code == 401
+
+
+def test_the_mark_is_an_admin_write(admin_client, user_client, db):
+    sid, item_id = _line(db)
+    r = user_client.put(f"/api/sales/{sid}/items/{item_id}/wont-ship",
+                        json={"wont_ship": True})
+    assert r.status_code == 403
+    assert r.get_json()["error"] == "admin required"
+    assert _stored(db, item_id) == 0
+
+    assert admin_client.put(f"/api/sales/{sid}/items/{item_id}/wont-ship",
+                            json={"wont_ship": True}).status_code == 200
+    assert _stored(db, item_id) == 1
+
+
+def test_the_flag_is_required_rather_than_assumed(admin_client, db):
+    """An empty body must not read as "clear the mark".
+
+    The field has no default, so a client that forgets it is told so instead of
+    quietly putting an unshipped balance back into the figures.
+    """
+    sid, item_id = _line(db)
+    set_sale_item_wont_ship(db, sid, item_id, 1)
+
+    r = admin_client.put(f"/api/sales/{sid}/items/{item_id}/wont-ship", json={})
+    assert r.status_code == 400
+    assert [d["field"] for d in r.get_json()["details"]] == ["wont_ship"]
+    assert _stored(db, item_id) == 1
+
+
+def test_a_line_of_another_sale_answers_404(admin_client, db):
+    owner_sid, item_id = _line(db, pi="PI-WS-OWNER")
+    other_sid, _ = _line(db, pi="PI-WS-OTHER")
+
+    r = admin_client.put(f"/api/sales/{other_sid}/items/{item_id}/wont-ship",
+                         json={"wont_ship": True})
+    assert r.status_code == 404
+    assert r.get_json()["error"] == "Item not found"
+    assert _stored(db, item_id) == 0
+    assert owner_sid != other_sid
+
+
+def test_the_mark_moves_the_live_figures_and_back(admin_client, db):
+    """One row action, end to end: the balance leaves the money and returns.
+
+    This is the request as the user made it — the 50 KG remainder of PI
+    12322332 held $648 gross and $72 due for a balance that may never ship.
+    """
+    sid, item_id = _invoiced_line(db)
+
+    provisional, kpis = _figures(admin_client)
+    assert [(r["pi_number"], r["quantity"], r["sale_item_id"])
+            for r in provisional] == [("PI-WS-HTTP", 50.0, item_id)]
+    assert kpis == (648, 576, 72)
+
+    r = admin_client.put(f"/api/sales/{sid}/items/{item_id}/wont-ship",
+                         json={"wont_ship": True})
+    assert r.status_code == 200
+    assert r.get_json() == {"message": "Item updated", "wont_ship": True}
+
+    provisional, kpis = _figures(admin_client)
+    assert provisional == []
+    assert kpis == (576, 576, 0)
+
+    # The editor is the only un-mark path, so it must show the stored mark and
+    # put the row back when it is cleared.
+    assert admin_client.get(f"/api/sales/{sid}").get_json()["items"][0]["wont_ship"] is True
+    assert admin_client.put(f"/api/sales/{sid}/items/{item_id}/wont-ship",
+                            json={"wont_ship": False}).status_code == 200
+    provisional, kpis = _figures(admin_client)
+    assert [r["sale_item_id"] for r in provisional] == [item_id]
+    assert kpis == (648, 576, 72)
