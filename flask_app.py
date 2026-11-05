@@ -3923,6 +3923,13 @@ def api_cron_maturity_check():
         today = date.today()
         # Legacy sale-level scan: only sales with no invoice. A sale WITH
         # invoices is reminded per invoice (actual ship date / maturity).
+        #
+        # A won't-ship line is worth nothing here, and this is the one place the
+        # shared sales._SALE_VALUE_SUM is not reused: its billed-quantity branch
+        # can only ever be 0, because the NOT EXISTS above already excludes every
+        # sale that has an invoice. Without this the reminder would ring daily for
+        # a balance the admin retired — payments can never catch up to money that
+        # no longer counts.
         rows = conn.execute("""
             SELECT s.id, s.client_name, s.maturity_date
             FROM sales s
@@ -3931,7 +3938,10 @@ def api_cron_maturity_check():
               AND COALESCE((SELECT ROUND(SUM(sp.payment_amount)::numeric, 2)::float8
                             FROM sale_payments sp
                             WHERE sp.sale_id = s.id), 0)
-                < COALESCE((SELECT ROUND(SUM(si.quantity * si.unit_price)::numeric, 2)::float8
+                < COALESCE((SELECT ROUND(SUM(CASE WHEN COALESCE(si.wont_ship, 0) = 1
+                                                   THEN 0
+                                                   ELSE si.quantity * si.unit_price
+                                              END)::numeric, 2)::float8
                             FROM sale_items si
                             WHERE si.sale_id = s.id), 0)
         """).fetchall()
