@@ -296,9 +296,10 @@ def get_sale_by_id(conn: psycopg.Connection, sale_id: int) -> Optional[Dict[str,
     sale["items"] = [
         {"id": r[0], "sale_id": r[1], "product_name": r[2],
          "quantity": r[3], "unit_price": r[4], "unit": r[5] or "KG",
-         "item_no": r[6]}
+         "item_no": r[6], "wont_ship": bool(r[7])}
         for r in conn.execute(
-            "SELECT id, sale_id, product_name, quantity, unit_price, unit, item_no "
+            "SELECT id, sale_id, product_name, quantity, unit_price, unit, item_no, "
+            "wont_ship "
             "FROM sale_items WHERE sale_id = %s ORDER BY id", (sale_id,)
         ).fetchall()
     ]
@@ -997,6 +998,50 @@ def update_sale_item(conn: psycopg.Connection, sale_id: int, item_id: int,
     return True
 
 
+def set_sale_item_wont_ship(conn: psycopg.Connection, sale_id: int, item_id: int,
+                            wont_ship: Any) -> Optional[bool]:
+    """Mark a PI line's unshipped balance as never shipping. False if unchanged.
+
+    The mark is a standing decision about the document, so it lives on the line
+    rather than in the viewer's session: ``sale_items.wont_ship`` removes that
+    line's provisional remainder from the Commercial Report for everyone.
+
+    Three-valued like ``update_sale_item``, and for the same reason — the route
+    has to tell the failure apart from the no-op:
+
+    * ``None`` — no such item under this sale (404). The ``AND sale_id`` is the
+      IDOR binding Phase 5 put on every writer of this table.
+    * ``False`` — already in that state. Nothing is written and nothing is
+      audited, because an audit row claiming a change that did not happen is a
+      false trail. A repeat can only come from a view that has not re-read yet:
+      the first mark makes the report row disappear.
+    * ``True`` — marked, audited.
+
+    No ``InvoicedLineConflict`` here: the mark never touches billed money, only
+    the unbilled remainder, and a marked line stays invoiceable — clearing the
+    mark is the way back, so refusing to set it on a partly-billed line would
+    block the one case the feature exists for.
+    """
+    flag = 1 if wont_ship else 0
+    old_row = conn.execute(
+        "SELECT wont_ship FROM sale_items WHERE id = %s AND sale_id = %s",
+        (item_id, sale_id)).fetchone()
+    if old_row is None:
+        conn.rollback()
+        return None
+    if int(old_row[0] or 0) == flag:
+        conn.rollback()
+        return False
+    conn.execute("UPDATE sale_items SET wont_ship = %s "
+                 "WHERE id = %s AND sale_id = %s", (flag, item_id, sale_id))
+    # atomic=False, commit below: the mark and its audit row are one unit.
+    log_audit_action(conn, "SALE_ITEM_WONT_SHIP", "sale_item", item_id,
+                     old_value=str(int(old_row[0] or 0)), new_value=str(flag),
+                     atomic=False)
+    conn.commit()
+    return True
+
+
 def delete_sale_item(conn: psycopg.Connection, sale_id: int, item_id: int) -> bool:
     """Delete a single line item from a sale.
 
@@ -1302,7 +1347,11 @@ def _commercial_report_base_sql(date_anchor_expr: str) -> str:
     """The per-row CTE shared by the flat report, summary and drill-down.
 
     One row per invoice line plus one ``is_provisional`` remainder row per PI
-    line when the PI quantity is not fully invoiced. Money is per row:
+    line when the PI quantity is not fully invoiced — except where the line is
+    marked ``wont_ship``, which drops its remainder here rather than in an outer
+    WHERE: allocation below runs over the rows that survive, so a payment that
+    had anchored to the suppressed row moves to the last real row instead of
+    vanishing with it. Money is per row:
 
     * an invoice's payments are allocated to its lines in line order, the last
       line absorbing any overpayment;
@@ -1408,6 +1457,7 @@ def _commercial_report_base_sql(date_anchor_expr: str) -> str:
             LEFT JOIN invoiced inv ON inv.sale_item_id = si.id
             WHERE GREATEST(COALESCE(si.quantity, 0)::numeric
                            - COALESCE(inv.qty, 0), 0) > 0
+              AND si.wont_ship = 0
         ),
         row_alloc AS (
             SELECT r.*,
@@ -1665,6 +1715,10 @@ def get_commercial_report(conn: psycopg.Connection, filters: dict = None) -> "tu
 
         report.append({
             "sale_id": sale_id,
+            # The line this row came from, so the UI can act on it — a
+            # provisional row's mark/un-mark is addressed by sale + line, and
+            # this is the only id it has.
+            "sale_item_id": sale_item_id,
             "customer_name": customer_name,
             "pi_number": pi_number,
             "pi_date": pi_date,

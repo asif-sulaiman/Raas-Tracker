@@ -13,6 +13,7 @@ that received/due/overdue never multiply by the row count.
 from raas_tracker.sales import (
     get_commercial_report,
     get_commercial_report_summary,
+    set_sale_item_wont_ship,
 )
 
 
@@ -67,6 +68,12 @@ def _pay(db, sid, amount, payment_date="2026-02-01"):
         "INSERT INTO sale_payments (sale_id, payment_date, payment_amount) "
         "VALUES (%s, %s, %s)", (sid, payment_date, amount))
     db.commit()
+
+
+def _line_id(db, sid, product):
+    return db.execute(
+        "SELECT id FROM sale_items WHERE sale_id = %s AND product_name = %s",
+        (sid, product)).fetchone()[0]
 
 
 def _kpis(db, **filters):
@@ -299,4 +306,158 @@ def test_report_kpi_due_equals_row_totals_minus_received(db):
     expected = sum(max(r["total_price"] - r["received_amount"], 0) for r in rows)
     assert kpis["due"] == expected == 80
     assert kpis["gross_sales"] == sum(r["total_price"] for r in rows) == 200
+
+
+# ---------- 6. a won't-ship line leaves the provisional figures ----------
+
+def _mark_product(db, product, flag=1):
+    """Mark the PI line behind a provisional row, acting on the row's own id.
+
+    Reading the target out of the report is deliberate: it is the only id the
+    frontend is handed, so if ``sale_item_id`` ever came back NULL the mark would
+    be unreachable from the screen that offers it.
+    """
+    rows, _total = get_commercial_report(db, {})
+    row = next(r for r in rows
+               if r["product_name"] == product and r["is_provisional"])
+    assert row["sale_item_id"] is not None, "provisional rows carry no line id"
+    return set_sale_item_wont_ship(db, row["sale_id"], row["sale_item_id"], flag)
+
+
+def test_wont_ship_drops_the_remainder_from_rows_and_kpis(db):
+    """The reported case: 450 ordered, 400 billed at 1.44, 50 KG left unshipped.
+
+    The remainder holds Gross Sales at 648 and Due at 72 for a balance that will
+    never ship. Marking the line takes both back down to what was billed, and
+    leaves Received where it was.
+    """
+    sid = _sale(db, "PI-WS-1", [
+        {"product_name": "A", "quantity": 450, "unit_price": 1.44},
+    ], invoice_qty={0: 400})
+    _pay(db, sid, 576)
+
+    rows, total = get_commercial_report(db, {})
+    assert total == len(rows) == 2
+    kpis = _kpis(db)
+    assert (kpis["gross_sales"], kpis["received"], kpis["due"]) == (648, 576, 72)
+
+    assert _mark_product(db, "A") is True
+
+    rows, total = get_commercial_report(db, {})
+    assert total == len(rows) == 1, "the provisional remainder is still shown"
+    assert rows[0]["is_provisional"] is False
+    kpis = _kpis(db)
+    assert (kpis["gross_sales"], kpis["received"], kpis["due"]) == (576, 576, 0)
+
+
+def test_wont_ship_keeps_the_flat_report_and_the_kpis_agreeing(db):
+    """Rows, drill-down items and KPI sums are one read of one CTE.
+
+    They are three shapes of the same query, so an exclusion that reached only
+    one of them would let the KPI cards, the table and Export CSV disagree —
+    which is the invariant the rest of this file exists to hold.
+    """
+    _sale(db, "PI-WS-2", [
+        {"product_name": "A", "quantity": 10, "unit_price": 10},
+        {"product_name": "B", "quantity": 5, "unit_price": 10},
+    ], invoice_qty={0: 10})
+
+    assert _mark_product(db, "B") is True
+
+    flat, total = get_commercial_report(db, {})
+    jan = next(p for p in get_commercial_report_summary(
+        db, {"group_by": "month", "date_anchor": "pi_date"})
+        if p["period_start"] == "2026-01-01")
+    assert total == len(flat) == len(jan["items"]) == 1
+    assert [r["product_name"] for r in flat] == ["A"]
+    assert [r["product_name"] for r in jan["items"]] == ["A"]
+    assert _kpis(db)["gross_sales"] == sum(r["total_price"] for r in flat) == 100
+
+
+def test_wont_ship_does_not_lose_a_payment_anchored_to_the_remainder(db):
+    """Suppressing the row that held a legacy payment moves the payment down.
+
+    A sale-level payment is allocated across the sale's rows in order, and the
+    last row absorbs the rest. Cutting the remainder inside the CTE — not in an
+    outer WHERE — recomputes that allocation, so Received survives on the row
+    that remains instead of disappearing with the row that did not.
+    """
+    sid = _sale(db, "PI-WS-3", [
+        {"product_name": "A", "quantity": 10, "unit_price": 10},
+        {"product_name": "B", "quantity": 5, "unit_price": 10},
+    ], invoice_qty={0: 10})
+    _pay(db, sid, 130)
+
+    before = {(r["product_name"], r["is_provisional"]): r["received_amount"]
+              for r in get_commercial_report(db, {})[0]}
+    assert before == {("A", False): 100, ("B", True): 30}
+
+    assert _mark_product(db, "B") is True
+
+    rows, _total = get_commercial_report(db, {})
+    assert [(r["product_name"], r["received_amount"], r["due_amount"])
+            for r in rows] == [("A", 130, 0)]
+    kpis = _kpis(db)
+    assert (kpis["gross_sales"], kpis["received"], kpis["due"]) == (100, 130, 0)
+
+
+def test_un_marking_a_line_brings_the_remainder_back(db):
+    """The mark is a durable view on the line, not a delete — reversible."""
+    sid = _sale(db, "PI-WS-4", [
+        {"product_name": "B", "quantity": 5, "unit_price": 10},
+    ], invoice_qty={})
+    item_id = _line_id(db, sid, "B")
+
+    assert set_sale_item_wont_ship(db, sid, item_id, 1) is True
+    assert get_commercial_report(db, {})[1] == 0
+
+    assert set_sale_item_wont_ship(db, sid, item_id, 0) is True
+    rows, total = get_commercial_report(db, {})
+    assert total == len(rows) == 1
+    assert rows[0]["is_provisional"] is True
+    assert _kpis(db)["gross_sales"] == 50
+
+
+def test_marking_a_fully_invoiced_line_changes_no_figure(db):
+    """No remainder exists, so the mark is accepted and simply invisible.
+
+    Deliberately not an error: the line is the thing being marked, and refusing
+    would depend on how much has been invoiced at the moment of the click.
+    """
+    sid = _sale(db, "PI-WS-5", [
+        {"product_name": "A", "quantity": 10, "unit_price": 10},
+    ])
+    item_id = _line_id(db, sid, "A")
+    before = _kpis(db)
+
+    assert set_sale_item_wont_ship(db, sid, item_id, 1) is True
+    assert _kpis(db) == before
+    assert len(get_commercial_report(db, {})[0]) == 1
+
+
+def test_a_sale_whose_only_rows_are_suppressed_leaves_the_report(db):
+    """Known corner, pinned rather than guarded.
+
+    When every row of a sale is a suppressed remainder, the sale drops out of
+    the report and its legacy payment drops out of Received with it. That is the
+    same outcome as deleting an uninvoiced line today: ``update_sale_full``
+    allows it, and the payment then has no row to allocate to. Not a new hole.
+    """
+    x = _sale(db, "PI-WS-X", [
+        {"product_name": "X", "quantity": 5, "unit_price": 10},
+    ], invoice_qty={})
+    _pay(db, x, 20)
+    _sale(db, "PI-WS-Y", [
+        {"product_name": "Y", "quantity": 1, "unit_price": 100},
+    ])
+
+    kpis = _kpis(db)
+    assert (kpis["gross_sales"], kpis["received"]) == (150, 20)
+
+    assert _mark_product(db, "X") is True
+
+    kpis = _kpis(db)
+    rows, _total = get_commercial_report(db, {})
+    assert [r["product_name"] for r in rows] == ["Y"]
+    assert (kpis["gross_sales"], kpis["received"]) == (100, 0)
 
