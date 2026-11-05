@@ -1896,6 +1896,157 @@ The client-refused case was also confirmed in the network log to send no `POST` 
 
 ---
 
+## 🚫 Phase WON'T-SHIP: a PI line can stop counting in the commercial figures (completed 2026-11-05)
+
+The user looked at PI `12322332` in the Commercial Report and saw two rows — an
+invoiced `400.00 KG / $576.00` and a **Provisional** `50.00 KG / $72.00` — with KPIs
+`Gross $648.00 / Received $576.00 / Due $72.00`. "আসলে যে পরিমান প্রভিশনাল হিসেবে থাকবে,
+সেটা শিপমেন্ট নাও হতে পারে… provisional ক্যাল্কুলেশন টা চাইলে কেটে দেওয়া যাবে" — that
+unshipped balance may never ship, and while it sits in the report it holds a receivable
+open forever. The ask was a switch that cuts it out so it stops counting in the figures.
+
+**Why the mark lives on the PI line (`sale_items.wont_ship`, schema **v12**), not on the
+report or in the viewer's session:** the decision that a balance will not ship belongs to
+the document. A report-only toggle would be someone's private view, would reset on refresh,
+and would leave the KPI cards, the table and Export CSV free to disagree. Storing it on the
+line means one predicate moves all four surfaces at once, because
+`_commercial_report_base_sql()` is the single place provisional rows are born and the flat
+report, the KPI summary, the month drill-down and the CSV all embed it.
+
+**Gone entirely, not zeroed or dimmed** (the user's choice): the row is not produced, so
+there is nothing left to reconcile.
+
+| Decision | Chosen | Why not the alternative |
+|---|---|---|
+| Where the state lives | `sale_items.wont_ship` (`INTEGER NOT NULL DEFAULT 0`, the same int-as-boolean spelling as `users.must_change_password`) | a `group_by`/`show` filter in the viewer's URL — per-user, lost on refresh, and the export would still carry it |
+| What the report does with it | suppression **inside** the `remainders` CTE | an outer `WHERE` reads the same, but `row_alloc` re-derives `is_last_row`/`prev_sale_total` over the surviving rows: a legacy sale-level payment anchored to the cut row would be **dropped with it** instead of moving to the last real row. Pinned by `test_wont_ship_does_not_lose_a_payment_anchored_to_the_remainder` |
+| Who may set it | `@admin_required` + `@limited()` (15/min), matching the sibling line-edit route's authority and the volume policy a *new* write must declare | operator-writable — the mark deletes money from a KPI the operator is measured on |
+| Where it is set | the report row **and** the PI editor; because a marked row leaves the report, the editor is the only un-mark path | a report-only toggle would trap the decision: nothing left on screen to undo it |
+
+**API:** `PUT /api/sales/<sale_id>/items/<item_id>/wont-ship` with `{wont_ship: bool}` —
+required, no default, so an empty body is a 400 field error rather than an implicit clear.
+The service returns three states and the route maps all three: `None` → 404 `Item not found`
+(the `AND sale_id` binding Phase 5 established for this table), `False` → 200 with **no audit
+row** (a repeat mark from a stale tab must not claim a change that did not happen), `True` →
+200 + `SALE_ITEM_WONT_SHIP` old→new, committed together with the ledger row like
+`update_sale_item`. `get_sale_by_id` now serialises `wont_ship` as a bool so the editor can
+render the stored state, and the report rows gained `sale_item_id` — the SQL already selected
+it, but the UI had never been handed the only id that can mark a provisional row.
+
+**Deliberately unchanged:** `update_sale_full` neither sets nor clears the mark (it updates
+`product_name/quantity/unit_price/unit` only, so a PI save cannot clobber a decision made
+from the report, and a newly inserted line starts unmarked); the mark does **not** block
+invoicing — a marked line can still be billed, and its invoiced row then shows normally and
+brings its money back into the figures through the `LEAST` branch, with no un-marking
+required. What a PI *says* it is worth stays the document's business: `get_sale_pi_total`
+(invoice headroom, variance, the legacy maturity dedupe) and the editor's product totals keep
+reading the full ordered quantity.
+
+## 🚫 WON'T-SHIP, second half: the retired balance leaves every figure (same day)
+
+The report-only cut left the rest of the app counting the money the admin had retired: the
+pipeline board read `Value $648 / Balance $72` for the same PI whose report rows said $576,
+Home's stage tiles and total pipeline carried that $72, the pipeline CSV exported it, and two
+questions kept being asked about it — *"Create more invoices?"* after every shipment, and the
+daily maturity bell, which no payment can ever answer because the money it tracks no longer
+counts. The user's rule is why the exclusion reaches everywhere: *"PI কত টাকার তা হিসাবের
+মুল না… যেটা un invoiced থাকবে, সেটা এখন শো করতেসে, সেরকমই শো করবে… যখন আমি শিপ করব না
+un-invoiced পার্ট টুকু, তখন আমি সেটা সকল হিসাবে থেকে ডিলেট করে দিব… তা ডিলেট করলে তা সকল
+হিসাব থেকে মুছে যাবে"*.
+
+| Question asked | Answer | What it meant for the code |
+|---|---|---|
+| How far does the exclusion reach? | "Board, report, nowhere… everywhere" | One shared expression, interpolated by every query that computes a PI's value — the board, the CSV, the stage tiles and `/api/dashboard` all net the same amount |
+| Should an un-invoiced balance that is **not** retired also go? | No — "সেটা এখন শো করতেসে, সেরকমই শো করবে", because the rest may still be invoiced or shipped | Only a marked line is netted out; an ordinary remainder keeps its Provisional row and its money |
+| One click that moves the figures with no confirmation? | "it is not removing from PI, just removing from calculation" | **No confirm dialog anywhere** — not on the report's row action, not on the editor's checkbox |
+| Show the retired balance anywhere (badge, editor note, "show excluded" filter)? | "no need to show it anywhere" | **No new UI**: no board badge, no report filter, no editor line — only the figures change |
+| Durable mark, or really edit the PI line? | Keep the mark | The document still says 450 KG / $648 while the accounts say $576 — the accepted consequence, stated in `docs/PRD.md` |
+
+**One definition of what a PI is worth** (`sales._SALE_VALUE_SUM` with its
+`_INVOICED_QTY_JOIN`): the full ordered value, except on a marked line, where the invoiced
+quantity counts — `LEAST(invoiced_qty, pi_qty)`, so a line billed above its PI can never turn
+the mark into a raise, and void invoices never count, which is the same reading the report's
+`invoiced` CTE and `_attach_invoice_summaries` already use. `get_all_sales` and
+`get_sales_summary` each inlined `SUM(quantity * unit_price)` before and now interpolate it;
+`balance` is `total_value − total_paid`, so the board column and the export follow with no
+code of their own. `has_uninvoiced_remainder` gained the same predicate in the outer `WHERE`
+of a query that already joins billed quantity per line, which drops the marked line from both
+of its sums at once. The maturity scan is the one place the shared expression is deliberately
+**not** reused: it reads only sales with no invoice at all, so its billed branch would always
+be 0 and `CASE WHEN wont_ship = 1 THEN 0 …` is the honest, simpler form — commented in place.
+
+**Accepted corner, pinned rather than clamped:** a legacy sale-level payment with no invoice,
+on a sale whose only line is retired, now reads a **negative Balance** ($0 accounted value
+against $576 held). `GREATEST(..., 0)` would hide it and would hide a genuine overpayment in
+the same column too, so the number stays as computed and
+`test_a_retired_line_under_a_legacy_payment_reads_negative` names it. A sale whose only line
+is retired and never invoiced nets to $0.00 and keeps its `item_count`. No new index, no
+migration, no `_SCHEMA_VERSION` bump — this half adds no DDL.
+
+**Documented, not guarded:** a sale whose *only* rows are suppressed remainders leaves the
+report entirely, taking its legacy sale-level payment out of `received`. That is the same
+outcome as deleting an uninvoiced line today through `update_sale_full`'s removal path, and
+`test_a_sale_whose_only_rows_are_suppressed_leaves_the_report` pins it as behaviour rather
+than letting it read as a bug, and the decision stays reversible anyway: `SaleDetailModal`
+is mounted on the Sales Pipeline board as well as the report, so a sale with no report rows
+at all still has its checkbox. No new index: the predicate runs over rows the query already
+visits, and `sale_items` is small.
+
+**Frontend:** `CommercialTable`'s existing Actions cell gains a second, conditional button
+(`Ban`, `Mark <PI> as won't ship`) rendered only when `row.is_provisional &&
+row.sale_item_id != null` — a new column would have broken the 21-cell skeleton contract;
+`pages/Reports.jsx` PUTs the mark, toasts, then calls the already-existing
+`refreshCommercial()`, which reloads rows **and** the `group_by=none` KPI summary together.
+`SaleDetailModal`'s Products table gains a **Won't ship** checkbox column, admin-only, in
+both the read-only and the editing rows, and each toggle writes **immediately** instead of
+riding on PI Save — a failed save must not silently lose the decision, and the save cannot
+carry it. An unsaved new row shows the box disabled so the control does not vanish mid-edit.
+
+**Verification (full gate, 2026-11-05).** Backend: `python -m pytest tests/ -q` →
+**1587 passed / 8 skipped** in 1591.81 s, exit 0 — the 7 over the 1580 the first half ended
+on are exactly the pipeline-figure tests. Before that, the focused set ran red first and then
+green: `test_sale_wont_ship`, `test_commercial_report`, `test_commercial_report_kpis`,
+`test_authorization_roles`, `test_dashboard`, `test_lcs`, `test_maturity_reminders`,
+`test_invoice_reminders`, `test_sales`, `test_sales_capture` and `test_rate_limits` →
+**321 passed** in 305.81 s. (The plan named `tests/test_sales_export.py`; no such file exists —
+`/api/sales/export` is exercised by `test_commercial_report.py:1345`, `test_rate_limits.py:26`
+and the new CSV test, which reads the exported columns against the board rather than living in
+a module of its own.) `ruff check .`: all checks passed. `pyright`: 0 errors / **17** warnings —
+the documented baseline, with none on a line this layer touched. Frontend: **476 tests in 49
+files** all passed (131.64 s), `oxlint` 0 warnings / 0 errors on 128 files, `vite build` green
+and `dist/` copied to `react_frontend/` (`assets/index-C9JJMaS5.js`, built after the last
+source edit so the bundle the browser pass drove is the committed code).
+
+**Browser pass (2026-11-05, against an embedded Postgres holding a seeded copy of the user's
+own PI `12322332` — 450 KG @ 1.44, 400 invoiced, $576 paid — with `PI-SECOND` ($100) as the
+untouched control).** A dev laptop must not migrate the customer database ahead of a deploy,
+so the whole pass ran on the throwaway schema. Marking the remainder from the report row's
+**Actions** moved every figure in one click, with no dialog: Home's "PI Issued" tile read
+**2 sales / $748 → $676** and *Total pipeline value* **$748 → $676** while the tile still
+counted 2 sales; the Sales board card dropped **$648.00 → $576.00** and its Balance **$72.00 →
+$0.00**, with the column footer *"PI total (visible)"* and the board header *PIPELINE VALUE*
+both **$748 → $676**; the Commercial Report went from 3 rows to 2, the `50.00 KG / $72.00`
+Provisional row stopped existing, **Gross $748 → $676** and **Due $172 → $100** with **Received
+$576** unchanged, and the month drill-down agreed with the KPI cards. The downloaded pipeline
+CSV read `648.0,576.0,72.0` before and `576.0,576.0,0.0` after with `PI-SECOND`'s row
+byte-identical in both — the export reuses `get_all_sales`, so it followed the shared
+expression without a change of its own. In the editor the box survived a reload still checked
+while the Products header stayed **"Products (1) — $648.00"**, which is the document/account
+split shown above; Audit Logs recorded 4 × `SALE_ITEM_WONT_SHIP` on `sale_item #1` with actor
+`admin`, one pair from each of the two controls. Un-marking restored every number listed here
+exactly, including the `50.00 KG / $72.00` row and Due $172. The harness was left unmarked.
+
+**Not exercised in the browser, proved over HTTP instead:** the ship-time *"Create more
+invoices?"* prompt. The seeded invoice is `planned` and its Book button is disabled (*"Produce
+this invoice before booking a shipment"*), and the throwaway database has no recipes or stock to
+produce against — so forcing a shipment there would have tested something other than what is
+claimed. What `Sales.jsx:212` actually gates on is `has_uninvoiced_remainder`, and that was read
+from the live `/api/sales` payload across the same mark/un-mark cycle: **`True → False → True`**.
+`tests/test_sale_wont_ship.py` pins the same three states server-side and `Sales.test.jsx` pins
+the prompt to the flag.
+
+---
+
 ## 📜 Public contract changes
 
 Every entry here is an **intentional** change to a response a client can
@@ -1904,6 +2055,8 @@ this is where to look.
 
 | Date | Change | Routes affected | Rationale |
 |---|---|---|---|
+| 2026-11-05 | **A sale's `total_value` / `balance` became the accounted value, not the document total.** A PI line marked won't ship now counts only its invoiced quantity (capped at what the PI ordered) in the pipeline list, the pipeline CSV and the stage sums; `has_uninvoiced_remainder` no longer reports a retired line, and the legacy maturity scan drops a sale whose only unpaid money is retired. Consequences: a retired, never-invoiced line reads `total_value 0`; a legacy sale-level payment against such a line answers a **negative** `balance`; a fully or over-invoiced marked line is unchanged. Only sales that carry the mark move — every other row of every response is identical. | `GET /api/sales`, `GET /api/sales/export`, `GET /api/sales/summary`, `GET /api/dashboard` (`sales` and `sales_summary`), `/api/cron/maturity-check` (`checked` can drop) | Netting the remainder in the Commercial Report alone left the board, Home and the CSV still counting a balance the user had retired — "everywhere, not just the report" |
+| 2026-11-05 | **A commercial report row now names the PI line behind it, and an admin can retire a remainder.** Report rows gain the additive key `sale_item_id` (previously selected by the SQL but never serialised), and `PUT /api/sales/<id>/items/<iid>/wont-ship` (Admin, 15/min) stores `sale_items.wont_ship` (schema v12). A marked line yields **no** provisional remainder row in `/api/reports/live`, `/live/filtered`, `/live/summary` or the CSV, so its unshipped balance leaves Gross Sales/Due/Overdue. Invoiced rows and their money are untouched, and the mark never blocks invoicing. Responses are otherwise unchanged. | `GET /api/reports/live`, `/live/filtered`, `/live/summary`, `/live/export`, `GET /api/sales/<id>` (`items[].wont_ship`), `PUT /api/sales/<id>/items/<iid>/wont-ship` (new) | The user's PI `12322332` held $72 Due on a 50 KG balance that may never ship; a decision that belongs to the document, not to a viewer's filter |
 | 2026-11-03 | **A saturated or unreachable database answers `503`, not `500`.** `psycopg_pool.PoolTimeout` (the 10 s acquire deadline) and `psycopg.OperationalError` — which covers `errors.TooManyConnections`, the error that produced the 2026-11-02 outage — now yield **503** `{"error": "database unavailable, retry shortly"}` with `Retry-After: 5`. The driver message is logged, never sent. Separately, every authenticated client request carries a 30 s deadline: a hung request now produces `ApiError(0, "Request timed out — the server did not answer")` instead of an endless route spinner. | every `/api/*` route reached through `_gate_api`'s checkout and any query that raises while holding a pooled connection (500 → 503) | RFC 9110 §15.6.4 is the honest answer for transient capacity — the client's request was fine and retrying may work; 500 asserts a server bug and tells the caller nothing about retrying. The deadline exists because `loading` stayed true forever when `/api/auth/me` never answered |
 | 2026-11-02 | **Production refuses an unbalanced formulation, and a shortage names the chemical.** `POST /api/recipes/by-id/<id>/produce` (and its name alias) now answers **400** when an output product's `ingredients + water` is not 100% within ±0.01 (`'<product>' formulation totals 95% - ingredients + water must equal 100% before production`), before any write. A deduction that would go below zero answers 400 `insufficient stock: <chemical> needs X <unit>, Y <unit> available` instead of the bare `insufficient stock`. Detail/production-source payloads additionally carry `water_qty`, `required_qty`, `stock_remaining` (additive). Reports, the CSV and booking readiness are unchanged. | `POST /api/recipes/by-id/<id>/produce`, `POST /api/recipes/<name>/produce` (new 400 condition; additive keys on `GET /api/recipes/by-id/<id>` and `GET /api/invoices/<id>/production-source`) | The operator asked for production to deduct exactly what the recipe needs; a formula that does not total 100% cannot say what that is, and a bare "insufficient stock" did not say which chemical was short |
 | 2026-10-15 | **Superseded 2026-10-25 — the tolerance was removed; no quantity answers 409 any more.** Originally: **A 5% over-invoice tolerance breach answers `409`, not `400`.** `ToleranceExceeded` (`raas_tracker/_exceptions.py`) is a conflict with what the sale has already been invoiced for — retrying the identical body will never succeed — so it is RFC 9110 §15.5.10. `POST /api/invoices/<id>/items` already returned 409; `POST /api/sales/<id>/invoices` and `POST /api/sales/<id>/invoices/batch` **hardcoded 400** for the same refusal, so the status depended on which door the request came in by. Both now go through `status_for(e)`. **Not a bug** — `tests/test_typed_errors.py::test_tolerance_breach_is_409_on_every_invoice_write_route` pins all three at once | `POST /api/sales/<id>/invoices`, `POST /api/sales/<id>/invoices/batch` (400 → 409) | One condition must yield one status; the phase's whole purpose. `POST /api/invoices/<id>/items` is unchanged |
