@@ -159,6 +159,7 @@ from raas_tracker.sales import (
     list_shipments,
     move_sale_to_stage,
     record_sale_payment,
+    set_sale_item_wont_ship,
     update_sale_full,
     update_sale_item,
     update_sale_lc,

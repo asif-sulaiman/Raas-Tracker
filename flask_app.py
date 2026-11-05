@@ -192,6 +192,7 @@ from chem_stock import (
     get_all_reason_codes, get_audit_logs,
     add_sale, get_all_sales, get_sale_by_id, move_sale_to_stage, advance_sale,
     update_sale_lc, add_sale_item, update_sale_item,
+    set_sale_item_wont_ship,
     delete_sale_item, delete_sale, get_sales_summary, record_sale_payment,
     update_sale_payment_record, delete_sale_payment_record, update_sale_full,
     get_stock_movements, list_companies, create_company, update_company,
@@ -3797,6 +3798,45 @@ class ShipmentIn(_StrippedModel):
     invoice_number: str | None = None
     invoice_date: str | None = None
     notes: str | None = None
+
+
+class SaleItemWontShipIn(_StrippedModel):
+    # Required, no default: an empty body must not read as "clear the mark".
+    # Every other field in this family is optional because it is a patch, but
+    # this route sets one state rather than patching several, so a missing key
+    # is a client bug and answering it with a silent un-mark would be a surprise.
+    wont_ship: bool
+
+
+@app.route("/api/sales/<int:sale_id>/items/<int:item_id>/wont-ship", methods=["PUT"])
+@limited()
+@admin_required
+def api_set_item_wont_ship(sale_id, item_id):
+    """Mark a PI line's unshipped balance as never shipping, or clear it.
+
+    The Commercial Report's provisional remainder row for that line stops
+    existing, so Gross Sales and Due drop with it — for every reader, and across
+    a refresh, because the decision belongs to the document.
+    """
+    try:
+        body = SaleItemWontShipIn(**(request.get_json() or {}))
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        ok = set_sale_item_wont_ship(conn, sale_id, item_id, body.wont_ship)
+    except ValueError as e:
+        _rollback_close(conn)
+        return jsonify({"error": str(e)}), status_for(e)
+    conn.close()
+    if ok is None:
+        # Bound to the sale in the URL, like the sibling PUT/DELETE: a line id
+        # alone must not address another PI's line.
+        return jsonify({"error": "Item not found"}), 404
+    # `ok is False` is a legitimate 200: the report row is already gone, so any
+    # repeat can only come from a view that has not re-read yet.
+    return jsonify({"message": "Item updated",
+                    "wont_ship": bool(body.wont_ship)})
 
 
 @app.route("/api/sales/<int:sale_id>/items/<int:item_id>", methods=["PUT"])
