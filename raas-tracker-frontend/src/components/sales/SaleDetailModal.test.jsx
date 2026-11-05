@@ -41,7 +41,7 @@ function jsonResponse(data, ok = true, status = 200) {
 
 function installFetch({
   role = 'admin', deletes = [], failGetsAfterPut = false, notFound = false,
-  detail = DETAIL, invoices = [],
+  detail = DETAIL, invoices = [], wontShip = [], failWontShip = false,
 } = {}) {
   let putSeen = false;
   vi.stubGlobal('fetch', vi.fn(async (url, options) => {
@@ -49,6 +49,12 @@ function installFetch({
     const method = options?.method || 'GET';
     if (u.includes('/api/auth/me')) {
       return jsonResponse({ id: 1, username: role, role });
+    }
+    if (u.match(/\/api\/sales\/5\/items\/\d+\/wont-ship$/) && method === 'PUT') {
+      const body = JSON.parse(options.body);
+      if (failWontShip) return jsonResponse({ error: 'Nope' }, false, 500);
+      wontShip.push(body);
+      return jsonResponse({ message: 'Item updated', wont_ship: body.wont_ship });
     }
     if (u.includes('/invoice-lines') && method === 'GET') {
       return jsonResponse({ lines: [], has_line_less_invoices: false });
@@ -81,11 +87,12 @@ function installFetch({
 
 function renderDetail(opts = {}) {
   installFetch(opts);
+  const onSaved = opts.onSaved || vi.fn();
   return render(
     <MemoryRouter>
       <AuthProvider>
         <ConfirmProvider>
-          <SaleDetailModal saleId={5} onClose={vi.fn()} onSaved={vi.fn()} />
+          <SaleDetailModal saleId={5} onClose={vi.fn()} onSaved={onSaved} />
         </ConfirmProvider>
       </AuthProvider>
     </MemoryRouter>
@@ -305,12 +312,18 @@ describe('SaleDetailModal item sign guard', () => {
   // body that has no `items`, which is fine for the comment-save tests but makes
   // a successful item save render `sale.items.length` on undefined.
   let puts = [];
+  let wontShipPuts = [];
   function installEditorFetch() {
     puts = [];
+    wontShipPuts = [];
     vi.stubGlobal('fetch', vi.fn(async (url, options) => {
       const u = String(url);
       const method = options?.method || 'GET';
       if (u.includes('/api/auth/me')) return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
+      if (u.match(/\/api\/sales\/5\/items\/\d+\/wont-ship$/) && method === 'PUT') {
+        wontShipPuts.push(JSON.parse(options.body));
+        return jsonResponse({ message: 'Item updated' });
+      }
       if (u.match(/\/api\/sales\/5$/) && method === 'PUT') {
         puts.push(JSON.parse(options.body));
         return jsonResponse(DETAIL);
@@ -385,5 +398,63 @@ describe('SaleDetailModal item sign guard', () => {
     await waitFor(() => expect(puts).toHaveLength(1));
     expect(puts[0].items[0]).toMatchObject({ product_name: 'Cotton', quantity: 100, unit_price: 3.25 });
     expect(onSaved).toHaveBeenCalledTimes(1);
+  });
+
+  // The mark is a standing decision on the PI line, so it must stay reachable
+  // while the header is being edited — and must not ride on the PI Save, which
+  // the server deliberately ignores for this field.
+  it('writes the mark at once while editing, instead of queueing it for Save', async () => {
+    await openEditor(vi.fn());
+    fireEvent.click(screen.getByRole('checkbox', { name: /Cotton/ }));
+
+    await waitFor(() => expect(wontShipPuts).toEqual([{ wont_ship: true }]));
+    expect(puts).toHaveLength(0);
+    expect(screen.getByRole('checkbox', { name: /Cotton/ }).checked).toBe(true);
+  });
+});
+
+describe('SaleDetailModal won\'t-ship mark', () => {
+  it('cuts the line out on click and tells the report to reload', async () => {
+    const wontShip = [];
+    const onSaved = vi.fn();
+    renderDetail({ role: 'admin', wontShip, onSaved });
+
+    const mark = await screen.findByRole('checkbox', { name: /Cotton/ });
+    expect(mark.checked).toBe(false);
+    fireEvent.click(mark);
+
+    await waitFor(() => expect(wontShip).toEqual([{ wont_ship: true }]));
+    // The checkbox reflects the write immediately, and the report is refreshed.
+    expect(screen.getByRole('checkbox', { name: /Cotton/ }).checked).toBe(true);
+    expect(onSaved).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders an already-marked line as checked', async () => {
+    renderDetail({
+      role: 'admin',
+      detail: {
+        ...DETAIL,
+        items: [{ ...DETAIL.items[0], wont_ship: true }],
+      },
+    });
+
+    expect((await screen.findByRole('checkbox', { name: /Cotton/ })).checked).toBe(true);
+  });
+
+  it('keeps the mark unchecked when the write is refused', async () => {
+    const { toast } = await import('sonner');
+    renderDetail({ role: 'admin', failWontShip: true });
+
+    const mark = await screen.findByRole('checkbox', { name: /Cotton/ });
+    fireEvent.click(mark);
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalled());
+    expect(screen.getByRole('checkbox', { name: /Cotton/ }).checked).toBe(false);
+  });
+
+  it('hides the mark from users who may not write it', async () => {
+    renderDetail({ role: 'user' });
+    expect(await screen.findByText('Cotton')).toBeTruthy();
+    expect(screen.queryByRole('checkbox', { name: /Cotton/ })).toBeNull();
   });
 });

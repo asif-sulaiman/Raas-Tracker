@@ -225,6 +225,26 @@ export default function Reports() {
     else fetchCommercialSummary();
   }, [searchParams, fetchCommercialReport, fetchCommercialSummary]);
 
+  // The provisional remainder of a PI line may never ship. Marking the line is
+  // a durable admin decision, so the row leaves the report, the KPIs and the
+  // export together — and the only way back is the checkbox in the PI editor.
+  const markWontShip = useCallback(async (row) => {
+    try {
+      await apiFetch(
+        `/api/sales/${row.sale_id}/items/${row.sale_item_id}/wont-ship`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ wont_ship: true }),
+        }
+      );
+      toast.success(`${row.pi_number || `Sale ${row.sale_id}`} remainder no longer counts`);
+      refreshCommercial();
+    } catch (err) {
+      toast.error(err?.message || 'Could not remove that remainder');
+    }
+  }, [apiFetch, refreshCommercial]);
+
   // Fetch when filters change (searchParams changes). Filter writers
   // (CommercialFilters, CommercialCalendarNavigator) always reset page=1 in
   // the URL, so only a deliberate page change re-requests another slice.
@@ -626,11 +646,14 @@ export default function Reports() {
             pageSize={PAGE_SIZE}
             totalRows={totalRows}
             onEditSale={setEditSaleId}
+            onMarkWontShip={markWontShip}
           />
           <p className="text-[11px] text-slate-400 dark:text-slate-500">
             Provisional rows are the uninvoiced remainder of a PI line; an invoice
             row replaces that quantity as it is invoiced. Completed sales stay in
-            the report and can be corrected from Actions.
+            the report and can be corrected from Actions. A remainder that will
+            never ship can be cut from the figures with its row action — undo it
+            from the &quot;Won&#39;t ship&quot; box in the PI editor.
           </p>
         </div>
       );

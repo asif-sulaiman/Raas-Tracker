@@ -80,6 +80,28 @@ function InvoiceLinesSection({ saleId, sale, onChanged }) {
   );
 }
 
+// Admin-only, so the whole column is dropped for other roles. A brand-new row
+// has no line id to mark yet, and is disabled rather than hidden — a control
+// that appears only after a save reads as a different form.
+function WontShipCell({ item, onToggle, className }) {
+  const isNew = !item.id;
+  return (
+    <td className={className}>
+      <input
+        type="checkbox"
+        checked={!!item.wont_ship}
+        disabled={isNew}
+        onChange={(e) => onToggle(item, e.target.checked)}
+        aria-label={`Won't ship ${item.product_name || 'new line'}`}
+        title={isNew
+          ? 'Save the PI before marking this line'
+          : "Cut this line's unshipped remainder from the commercial report"}
+        className="h-4 w-4 cursor-pointer rounded border-slate-300 dark:border-slate-600 disabled:cursor-not-allowed disabled:opacity-40"
+      />
+    </td>
+  );
+}
+
 export default function SaleDetailModal({ saleId, onClose, onSaved }) {
   const { apiFetch, user } = useAuth();
   const isAdmin = user?.role === 'admin';
@@ -150,7 +172,7 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
     setEditItems(sale.items.map((i) => ({
       key: `db-${i.id}`, id: i.id,
       product_name: i.product_name, quantity: i.quantity, unit_price: i.unit_price,
-      unit: i.unit || 'KG',
+      unit: i.unit || 'KG', wont_ship: !!i.wont_ship,
     })));
     setRemovedIds([]);
     setSaleError(null);
@@ -224,6 +246,26 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
       setSaleError(detail || err.message || 'Failed to save changes');
     } finally {
       setSavingSale(false);
+    }
+  };
+
+  // The mark is a standing decision on the PI line, and the PI save deliberately
+  // neither sets nor clears it — so it writes on click instead of riding on
+  // Save, where an unrelated validation error would silently lose it.
+  const toggleWontShip = async (item, flag) => {
+    try {
+      await apiFetch(`/api/sales/${saleId}/items/${item.id}/wont-ship`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ wont_ship: flag }),
+      });
+      const patch = (list) => (list || []).map((x) => (x.id === item.id ? { ...x, wont_ship: flag } : x));
+      setSale((prev) => (prev ? { ...prev, items: patch(prev.items) } : prev));
+      setEditItems(patch);
+      toast.success(flag ? "Line won't ship — cut from the report" : 'Line counts again');
+      onSaved?.();
+    } catch (err) {
+      toast.error(err.message || 'Could not update the mark');
     }
   };
 
@@ -401,7 +443,7 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
                   variant="secondary"
                   size="sm"
                   icon={Plus}
-                  onClick={() => setEditItems((prev) => [...prev, { key: `new-${Date.now()}`, id: null, product_name: '', quantity: 0, unit_price: 0, unit: 'KG' }])}
+                  onClick={() => setEditItems((prev) => [...prev, { key: `new-${Date.now()}`, id: null, product_name: '', quantity: 0, unit_price: 0, unit: 'KG', wont_ship: false }])}
                 >
                   Add Row
                 </Button>
@@ -416,6 +458,7 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
                     <th className="px-2.5 py-2">Unit</th>
                     <th className="px-2.5 py-2 text-right">Unit Price</th>
                     <th className="px-2.5 py-2 text-right">Total</th>
+                    {isAdmin && <th className="px-2.5 py-2">Won&#39;t ship</th>}
                     {editing && <th className="px-2.5 py-2 w-10"></th>}
                   </tr>
                 </thead>
@@ -443,6 +486,9 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
                         <td className="px-2.5 py-1.5 text-right font-semibold">
                           ${formatNumber(lineTotal(i.quantity, i.unit_price))}
                         </td>
+                        {isAdmin && (
+                          <WontShipCell item={i} onToggle={toggleWontShip} className="px-2.5 py-1.5" />
+                        )}
                         <td className="px-2.5 py-1.5">
                           <button onClick={() => removeEditItem(i.key)} className="p-1 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40 rounded-lg cursor-pointer" title="Remove row">
                             <Trash2 className="h-4 w-4" />
@@ -460,6 +506,9 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
                         <td className="px-2.5 py-2 text-right font-semibold">
                           ${formatNumber((i.quantity || 0) * (i.unit_price || 0))}
                         </td>
+                        {isAdmin && (
+                          <WontShipCell item={i} onToggle={toggleWontShip} className="px-2.5 py-2" />
+                        )}
                       </tr>
                     ))
                   )}

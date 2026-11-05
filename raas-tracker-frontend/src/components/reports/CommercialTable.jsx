@@ -1,5 +1,5 @@
 import { Fragment, useState } from 'react';
-import { ChevronDown, ChevronRight, ChevronLeft, Pencil } from 'lucide-react';
+import { ChevronDown, ChevronRight, ChevronLeft, Pencil, Ban } from 'lucide-react';
 import { formatNumber, formatDate } from '../../utils/format';
 import Badge from '../ui/Badge';
 import Button from '../ui/Button';
@@ -147,7 +147,7 @@ function EmptyState() {
   );
 }
 
-function DetailTable({ rows, currentPage, pageSize, totalRows, onPageChange, onEditSale }) {
+function DetailTable({ rows, currentPage, pageSize, totalRows, onPageChange, onEditSale, onMarkWontShip }) {
   const paymentBadge = (status) => (
     <Badge variant={paymentBadgeVariant(status)} size="xs">
       {status || 'Pending'}
@@ -223,17 +223,34 @@ function DetailTable({ rows, currentPage, pageSize, totalRows, onPageChange, onE
                   {row.payment_comment || '-'}
                 </td>
                 <td className={TD}>
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    icon={Pencil}
-                    onClick={() => onEditSale?.(row.sale_id)}
-                    title="Edit sale"
-                    aria-label={`Edit sale ${row.pi_number || row.sale_id}`}
-                    className="!px-2"
-                  >
-                    {null}
-                  </Button>
+                  <div className="flex items-center gap-1">
+                    {/* A provisional row is an unshipped balance that may never
+                        ship; the line id is the only handle that can cut it. */}
+                    {row.is_provisional && row.sale_item_id != null && (
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        icon={Ban}
+                        onClick={() => onMarkWontShip?.(row)}
+                        title="Remove this remainder from the figures"
+                        aria-label={`Mark ${row.pi_number || row.sale_id} as won't ship`}
+                        className="!px-2"
+                      >
+                        {null}
+                      </Button>
+                    )}
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      icon={Pencil}
+                      onClick={() => onEditSale?.(row.sale_id)}
+                      title="Edit sale"
+                      aria-label={`Edit sale ${row.pi_number || row.sale_id}`}
+                      className="!px-2"
+                    >
+                      {null}
+                    </Button>
+                  </div>
                 </td>
               </tr>
             ))}
@@ -370,6 +387,7 @@ export default function CommercialTable({
   totalRows = 0,
   isLoading = false,
   onEditSale,
+  onMarkWontShip,
 }) {
   // DETAIL MODE (groupBy === 'none')
   if (groupBy === 'none') {
@@ -391,6 +409,7 @@ export default function CommercialTable({
         totalRows={totalRows}
         onPageChange={onPageChange}
         onEditSale={onEditSale}
+        onMarkWontShip={onMarkWontShip}
       />
     );
   }

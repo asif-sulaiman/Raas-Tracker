@@ -305,6 +305,44 @@ describe('CommercialTable - Detail Mode (groupBy=none)', () => {
     expect(onEditSale).toHaveBeenLastCalledWith(2);
   });
 
+  it('offers a won\'t-ship action on a provisional row that names its PI line', () => {
+    const onMarkWontShip = vi.fn();
+    const rows = [
+      { ...mockDetailData.rows[0], is_provisional: true, sale_item_id: 42 },
+      mockDetailData.rows[1],
+    ];
+    render(
+      <CommercialTable
+        data={{ rows }}
+        groupBy="none"
+        onPageChange={onPageChange}
+        onMarkWontShip={onMarkWontShip}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: "Mark PI-001 as won't ship" }));
+    expect(onMarkWontShip).toHaveBeenCalledWith(rows[0]);
+  });
+
+  it('hides the won\'t-ship action from invoiced rows and rows with no line id', () => {
+    const rows = [
+      { ...mockDetailData.rows[0], is_provisional: false, sale_item_id: 42 },
+      { ...mockDetailData.rows[1], is_provisional: true, sale_item_id: null },
+    ];
+    render(
+      <CommercialTable
+        data={{ rows }}
+        groupBy="none"
+        onPageChange={onPageChange}
+        onMarkWontShip={vi.fn()}
+      />
+    );
+
+    expect(
+      screen.queryByRole('button', { name: /as won't ship/ })
+    ).toBeNull();
+  });
+
   it('draws one skeleton cell per detail column (21)', () => {
     render(<CommercialTable data={mockDetailData} groupBy="none" onPageChange={onPageChange} isLoading />);
 

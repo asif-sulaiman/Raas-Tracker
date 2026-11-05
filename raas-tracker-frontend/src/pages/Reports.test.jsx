@@ -293,6 +293,31 @@ describe('Commercial report provisional rows and editing', () => {
 
     await waitFor(() => expect(reportReads()).toBeGreaterThan(before));
   });
+
+  it('cuts a provisional remainder out of the report from its own row', async () => {
+    const { fetchMock } = renderReports({
+      report: [makeRow(1, { is_provisional: true, sale_item_id: 42 })],
+      filteredTotal: '1',
+    });
+    await openCommercialTab();
+
+    const reportReads = () =>
+      fetchMock.mock.calls.filter(([u]) => String(u).includes('/api/reports/live/filtered')).length;
+    const before = reportReads();
+
+    fireEvent.click(await screen.findByRole('button', { name: "Mark PI-1 as won't ship" }));
+
+    await waitFor(() => {
+      const put = fetchMock.mock.calls.find(
+        ([u, options]) => String(u) === '/api/sales/1/items/42/wont-ship' && options?.method === 'PUT'
+      );
+      expect(put).toBeTruthy();
+      expect(JSON.parse(put[1].body)).toEqual({ wont_ship: true });
+    });
+    // A row that disappears from the report only counts as fixed once the
+    // figures are re-read: the KPIs come from a second request.
+    await waitFor(() => expect(reportReads()).toBeGreaterThan(before));
+  });
 });
 
 const RECIPE_ROWS = [
