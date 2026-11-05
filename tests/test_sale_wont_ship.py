@@ -17,11 +17,13 @@ properties that make that safe:
    recomputed over the surviving rows instead of dropping a payment that was
    anchored to the removed one.
 """
+import flask_app
 from raas_tracker import db as dbmod
 from raas_tracker.sales import (
     add_sale,
     get_sale_by_id,
     set_sale_item_wont_ship,
+    update_sale_full,
 )
 
 
@@ -158,8 +160,6 @@ def test_a_pi_save_neither_sets_nor_clears_the_mark(db):
     cleared it the mark would be unusable. Silence is the contract, so it is
     pinned rather than left to chance.
     """
-    from raas_tracker.sales import update_sale_full
-
     sid, item_id = _line(db, quantity=450, unit_price=1.44)
     set_sale_item_wont_ship(db, sid, item_id, 1)
     update_sale_full(db, sid, {"pi_number": "PI-WS"},
