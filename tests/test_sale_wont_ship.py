@@ -8,14 +8,24 @@ $72 due against $576 actually billed.
 
 The mark lives on the PI line (``sale_items.wont_ship``), not on the report row
 or in the viewer's session, because the decision that a balance will not ship
-belongs to the document and must apply for everyone. These tests pin the two
-properties that make that safe:
+belongs to the document and must apply for everyone. The report alone was only
+half the ask: what a PI says it is worth is not the account, what was invoiced
+is, so a retired balance leaves every figure the app calls an account — while an
+un-invoiced balance that has *not* been retired stays in them and keeps its
+Provisional row, because it may still be invoiced or shipped later.
+
+These tests pin the properties that make that safe:
 
 1. the mark suppresses only the *remainder* — invoiced money and the payments
    allocated to it stay in the report untouched;
 2. suppression happens inside the ``remainders`` CTE, so payment allocation is
    recomputed over the surviving rows instead of dropping a payment that was
-   anchored to the removed one.
+   anchored to the removed one;
+3. the board, the stage tiles and the pipeline CSV net the same amount from one
+   shared definition, so no two figures ever disagree about one PI;
+4. the ship-time "will you invoice the rest?" nag and the daily maturity bell
+   both go quiet on a retired balance — a question that can never be answered
+   is not a reminder.
 """
 import flask_app
 from raas_tracker import db as dbmod
@@ -276,3 +286,150 @@ def test_the_mark_moves_the_live_figures_and_back(admin_client, db):
     provisional, kpis = _figures(admin_client)
     assert [r["sale_item_id"] for r in provisional] == [item_id]
     assert kpis == (648, 576, 72)
+
+
+# --------------------------------------------------------------------------- #
+# the pipeline figures
+#
+# The report was only half the ask. The user's rule: "PI কত টাকার তা হিসাবের
+# মুল না" — what a PI is worth is not the account, what was invoiced is. So a
+# retired balance leaves *every* figure the app calls an account, and an
+# un-invoiced balance that has not been retired stays in them and keeps its
+# Provisional row, because it may still be invoiced or shipped later.
+# --------------------------------------------------------------------------- #
+def _board(admin_client, sid):
+    """One sale exactly as the pipeline board renders it."""
+    return next(s for s in admin_client.get("/api/sales").get_json()["sales"]
+                if s["id"] == sid)
+
+
+def test_the_board_nets_a_retired_balance_out(admin_client, db):
+    """Value and Balance become the accounted money, not the document total.
+
+    PI 12322332 on the user's screen: 450 KG @ 1.44 = $648 with $576 billed.
+    Marking the remainder puts the $72 back the way every other figure reads
+    it, and clearing it takes the mark — never the PI line — so $648 returns.
+    """
+    sid, item_id = _invoiced_line(db, pi="PI-WS-BOARD")
+
+    row = _board(admin_client, sid)
+    assert (row["total_value"], row["balance"], row["item_count"]) == (648, 72, 1)
+
+    set_sale_item_wont_ship(db, sid, item_id, 1)
+    row = _board(admin_client, sid)
+    assert (row["total_value"], row["balance"], row["item_count"]) == (576, 0, 1)
+
+    set_sale_item_wont_ship(db, sid, item_id, 0)
+    assert _board(admin_client, sid)["total_value"] == 648
+
+
+def test_the_stage_tiles_net_the_retired_balance(admin_client, db):
+    """Home's pipeline total is the same sum, so it nets the same way.
+
+    The sale still counts: retiring its remainder is a money decision, not a
+    deletion, so the stage keeps its row in ``count``.
+    """
+    sid, item_id = _invoiced_line(db, pi="PI-WS-SUMMARY")
+
+    before = admin_client.get("/api/sales/summary").get_json()
+    assert (before["pi_issued"]["count"], before["pi_issued"]["value"],
+            before["total_pipeline_value"]) == (1, 648, 648)
+
+    set_sale_item_wont_ship(db, sid, item_id, 1)
+    after = admin_client.get("/api/sales/summary").get_json()
+    assert (after["pi_issued"]["count"], after["pi_issued"]["value"],
+            after["total_pipeline_value"]) == (1, 576, 576)
+
+
+def test_the_pipeline_csv_agrees_with_the_board(admin_client, db):
+    """The export is the board on paper — a figure the board nets must be netted here too."""
+    import csv
+    import io
+
+    sid, item_id = _invoiced_line(db, pi="PI-WS-CSV")
+
+    def row():
+        text = admin_client.get("/api/sales/export").get_data(as_text=True)
+        return next(r for r in csv.DictReader(io.StringIO(text)) if r["id"] == str(sid))
+
+    assert (row()["total_value_usd"], row()["balance_usd"]) == ("648.0", "72.0")
+    set_sale_item_wont_ship(db, sid, item_id, 1)
+    assert (row()["total_value_usd"], row()["balance_usd"]) == ("576.0", "0.0")
+
+
+def test_a_retired_remainder_stops_the_ship_time_nag(admin_client, db):
+    """``has_uninvoiced_remainder`` asks "will you invoice the rest?" after every ship.
+
+    On a retired balance that question is un-answerable — the rest is never
+    coming — so the flag must read the PI the same way the money does. One
+    predicate in the query that already joins invoiced quantity per line takes
+    the marked line out of both sums at once.
+    """
+    sid, item_id = _invoiced_line(db, pi="PI-WS-NAG")
+    assert _board(admin_client, sid)["has_uninvoiced_remainder"] is True
+
+    set_sale_item_wont_ship(db, sid, item_id, 1)
+    assert _board(admin_client, sid)["has_uninvoiced_remainder"] is False
+
+    set_sale_item_wont_ship(db, sid, item_id, 0)
+    assert _board(admin_client, sid)["has_uninvoiced_remainder"] is True
+
+
+def test_a_marked_line_never_counts_above_the_pi_document(admin_client, db):
+    """The retired part is capped at ordered quantity — ``LEAST`` is not decoration.
+
+    500 KG billed against a 450 KG PI: the accounted value of a marked line is
+    its billed quantity, so an over-invoiced line must not turn the mark into
+    a raise. $720 would be more than the PI ever said.
+    """
+    sid, item_id = _invoiced_line(db, pi="PI-WS-OVER", invoiced=500)
+    assert _board(admin_client, sid)["total_value"] == 648
+
+    set_sale_item_wont_ship(db, sid, item_id, 1)
+    assert _board(admin_client, sid)["total_value"] == 648
+
+
+def test_a_retired_line_under_a_legacy_payment_reads_negative(admin_client, db):
+    """The accepted corner, pinned rather than clamped.
+
+    A sale-level payment, no invoice, and its only line retired: the PI now
+    accounts for $0 while $576 is still held, so Balance shows -$576.
+    ``GREATEST(..., 0)`` would hide this — and would hide a genuine
+    overpayment in the same column, which is money the operator needs to see.
+    """
+    sid, item_id = _line(db, pi="PI-WS-LEGACY")
+    db.execute("INSERT INTO sale_payments (sale_id, payment_date, payment_amount) "
+               "VALUES (%s, '2026-02-01', 576)", (sid,))
+    db.commit()
+    row = _board(admin_client, sid)
+    assert (row["total_value"], row["balance"]) == (648, 72)
+
+    set_sale_item_wont_ship(db, sid, item_id, 1)
+    row = _board(admin_client, sid)
+    assert (row["total_value"], row["balance"]) == (0, -576)
+
+
+def test_a_retired_legacy_sale_raises_no_maturity_reminder(client, monkeypatch, db):
+    """A bell that can never be cleared is a bug, not a reminder.
+
+    The scan is limited to sales with no invoice, so no billed quantity exists
+    here and the retired line nets to nothing outright — a payment can never
+    catch up to a balance the admin retired, so the sale must leave the check.
+    """
+    monkeypatch.setenv("CRON_SECRET", "test-secret")
+    headers = {"Authorization": "Bearer test-secret"}
+    from datetime import date as _date
+
+    sid = add_sale(db, {"pi_number": "PI-WS-DUE", "client_name": "WS Co",
+                        "pi_date": "2026-01-10", "maturity_date": _date.today().isoformat()},
+                   [{"product_name": "A", "quantity": 100, "unit_price": 50,
+                     "unit": "KG"}])
+    item_id = db.execute("SELECT id FROM sale_items WHERE sale_id = %s",
+                         (sid,)).fetchone()[0]
+
+    assert client.post("/api/cron/maturity-check",
+                       headers=headers).get_json()["checked"] == 1
+
+    set_sale_item_wont_ship(db, sid, item_id, 1)
+    body = client.post("/api/cron/maturity-check", headers=headers).get_json()
+    assert (body["checked"], body["notified"]) == (0, 0)

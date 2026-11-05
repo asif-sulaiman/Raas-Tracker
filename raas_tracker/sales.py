@@ -44,6 +44,33 @@ def _now_str() -> str:
 
 SALE_STAGE_ORDER = ["pi_issued", "lc_received", "shipment_ongoing", "payment_due", "completed"]
 
+# What a PI is worth in the accounts. One definition, because three queries need
+# it (the board, the stage tiles, and the CSV built from the board) and a figure
+# that drifts between them is the bug this feature exists to avoid.
+#
+# The document total, except on a line an admin marked won't ship: that line
+# counts only what was actually invoiced. ``LEAST`` caps it at the ordered
+# quantity so a marked line billed above its PI cannot turn the mark into a
+# raise, and void invoices are excluded for the same reason the Commercial
+# Report and ``_attach_invoice_summaries`` exclude them — those three must never
+# disagree about what counts as billed.
+#
+# ``balance`` is derived from this (value - paid), so the board column, the
+# pipeline CSV and the maturity scan all net a retired balance with no code of
+# their own.
+_INVOICED_QTY_JOIN = """LEFT JOIN (
+            SELECT ii.sale_item_id, SUM(ii.quantity) AS qty
+              FROM invoice_items ii
+              JOIN invoices i ON i.id = ii.invoice_id
+             WHERE i.status <> 'void'
+             GROUP BY ii.sale_item_id
+        ) inv ON inv.sale_item_id = si.id"""
+
+_SALE_VALUE_SUM = """ROUND(SUM(CASE WHEN COALESCE(si.wont_ship, 0) = 1
+                        THEN LEAST(COALESCE(inv.qty, 0), si.quantity) * si.unit_price
+                        ELSE si.quantity * si.unit_price
+                   END)::numeric, 2)::float8"""
+
 
 class InvoicedLineConflict(LifecycleConflict):
     """A PI line that invoice_items already point at cannot be re-based.
@@ -171,13 +198,14 @@ def get_all_sales(conn: psycopg.Connection, stage: Optional[str] = None,
                s.lc_number, s.lc_date, s.shipment_date, s.payment_date, s.payment_amount,
                s.created_at, s.updated_at, s.company_id, s.maturity_date, s.comments,
                COALESCE(c.name, s.client_name),
-                COALESCE(ROUND(SUM(si.quantity * si.unit_price)::numeric, 2)::float8, 0) AS total_value,
-                COUNT(si.id) AS item_count,
+               COALESCE(""" + _SALE_VALUE_SUM + """, 0) AS total_value,
+               COUNT(si.id) AS item_count,
                COALESCE(spa.total_paid, 0) AS total_paid,
                s.shipment_status, s.lc_id,
                COUNT(*) OVER() AS total_count
         FROM sales s
         LEFT JOIN sale_items si ON si.sale_id = s.id
+        """ + _INVOICED_QTY_JOIN + """
         LEFT JOIN companies c ON c.id = s.company_id
         LEFT JOIN sale_payments_agg spa ON spa.sale_id = s.id
     """
@@ -227,6 +255,11 @@ def _attach_invoice_summaries(conn: psycopg.Connection,
     its way (and its maturity), and ``has_uninvoiced_remainder`` tells the UI
     a PI still has quantity without an invoice, so shipping the last invoice
     can ask whether more are coming before the LC advances.
+
+    A line marked won't ship is dropped from this scan entirely, so the question
+    is not asked about a balance the admin already retired — it is the same money
+    rule the board reads, in the query that already joins billed quantity per
+    line.
     """
     sale_ids = [s["id"] for s in sales]
     by_sale: Dict[int, List[Dict[str, Any]]] = {sid: [] for sid in sale_ids}
@@ -263,6 +296,7 @@ def _attach_invoice_summaries(conn: psycopg.Connection,
                       GROUP BY ii.sale_item_id
                  ) inv ON inv.sale_item_id = si.id
                 WHERE si.sale_id = ANY(%s)
+                  AND COALESCE(si.wont_ship, 0) = 0
                 GROUP BY si.sale_id
                HAVING SUM(si.quantity) > SUM(COALESCE(inv.qty, 0))""",
             (sale_ids,)).fetchall()
@@ -1302,9 +1336,10 @@ def get_sales_summary(conn: psycopg.Connection) -> Dict[str, Any]:
     rows = conn.execute("""
         SELECT s.stage,
                COUNT(DISTINCT s.id) AS cnt,
-                COALESCE(ROUND(SUM(si.quantity * si.unit_price)::numeric, 2)::float8, 0) AS val
+               COALESCE(""" + _SALE_VALUE_SUM + """, 0) AS val
         FROM sales s
         LEFT JOIN sale_items si ON si.sale_id = s.id
+        """ + _INVOICED_QTY_JOIN + """
         GROUP BY s.stage
     """).fetchall()
     for r in rows:
