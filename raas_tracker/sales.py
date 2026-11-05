@@ -1331,7 +1331,16 @@ def delete_sale(conn: psycopg.Connection, sale_id: int) -> bool:
 
 
 def get_sales_summary(conn: psycopg.Connection) -> Dict[str, Any]:
-    """Aggregate counts per stage + total pipeline value."""
+    """Aggregate counts per stage + the value still moving through the pipeline.
+
+    ``total_pipeline_value`` and ``total_sales`` deliberately exclude
+    ``completed``: a settled sale is not work in flight, and summing it made the
+    board header claim closed business as the pipeline — on a database whose
+    three sales were all completed, "$50,174 / 3 sales" beside four empty
+    columns. Completed keeps its own tile, so the figure is moved, not hidden.
+    The test is "not completed" rather than a whitelist of the four open stages,
+    so a stage added later counts as in flight instead of vanishing from the sum.
+    """
     summary: Dict[str, Any] = {stage: {"count": 0, "value": 0} for stage in SALE_STAGE_ORDER}
     rows = conn.execute("""
         SELECT s.stage,
@@ -1344,10 +1353,9 @@ def get_sales_summary(conn: psycopg.Connection) -> Dict[str, Any]:
     """).fetchall()
     for r in rows:
         summary[r[0]] = {"count": r[1], "value": r[2]}
-    total_value = sum(v["value"] for v in summary.values())
-    total_sales = sum(v["count"] for v in summary.values())
-    summary["total_pipeline_value"] = total_value
-    summary["total_sales"] = total_sales
+    open_totals = [v for stage, v in summary.items() if stage != "completed"]
+    summary["total_pipeline_value"] = sum(v["value"] for v in open_totals)
+    summary["total_sales"] = sum(v["count"] for v in open_totals)
     return summary
 
 
