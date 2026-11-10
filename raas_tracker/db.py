@@ -532,6 +532,16 @@ def _create_tables(conn: psycopg.Connection) -> None:
         # request query. LOCAL: the next SET LOCAL (or COMMIT) restores it.
         conn.execute(
             f"SET LOCAL statement_timeout TO {_MIGRATION_STATEMENT_TIMEOUT_MS}")
+        # The same guard a request query gets, and it matters more here. This
+        # migration runs in the pool's configure callback, BEFORE
+        # `get_connection` applies `_timeout_statements()`, so without this line
+        # a DDL lock request waits out the 120s statement cap above while
+        # everything behind it in the lock queue waits too — the shape of the
+        # outage this project has already lived through. Giving up fast is
+        # correct: the migration is one transaction that commits exactly once,
+        # so the stored version stays behind and the next connection retries.
+        conn.execute(f"SET LOCAL lock_timeout TO "
+                     f"{_timeout_ms('RAAS_LOCK_TIMEOUT_MS', _LOCK_TIMEOUT_MS_DEFAULT)}")
         _run_migration(conn)
         _record_schema_state(conn)
         conn.commit()
@@ -1419,7 +1429,8 @@ def _run_migration(conn: psycopg.Connection) -> None:
         "WHERE conname = 'chk_recipe_item_source') THEN "
         "ALTER TABLE recipe_items ADD CONSTRAINT chk_recipe_item_source CHECK ( "
         "(source_type = 'in_house' AND outward_purchase_line_id IS NULL) OR "
-        "(source_type = 'outward' AND outward_purchase_line_id IS NOT NULL) ); "
+        "(source_type = 'outward' AND outward_purchase_line_id IS NOT NULL) ) "
+        "NOT VALID; "
         "END IF; END $$;")
     conn.execute(
         "DO $$ BEGIN "
@@ -1427,7 +1438,8 @@ def _run_migration(conn: psycopg.Connection) -> None:
         "WHERE conname = 'chk_run_item_source') THEN "
         "ALTER TABLE production_run_items ADD CONSTRAINT chk_run_item_source CHECK ( "
         "(source_type = 'in_house' AND outward_purchase_line_id IS NULL) OR "
-        "(source_type = 'outward' AND outward_purchase_line_id IS NOT NULL) ); "
+        "(source_type = 'outward' AND outward_purchase_line_id IS NOT NULL) ) "
+        "NOT VALID; "
         "END IF; END $$;")
     # The domain is separate from the pairing so an out-of-domain value is
     # refused on its own terms. These two remain the only legal values: Slice 3
@@ -1439,15 +1451,29 @@ def _run_migration(conn: psycopg.Connection) -> None:
         "IF NOT EXISTS (SELECT 1 FROM pg_constraint "
         "WHERE conname = 'chk_recipe_item_source_type') THEN "
         "ALTER TABLE recipe_items ADD CONSTRAINT chk_recipe_item_source_type "
-        "CHECK (source_type IN ('in_house', 'outward')); "
+        "CHECK (source_type IN ('in_house', 'outward')) NOT VALID; "
         "END IF; END $$;")
     conn.execute(
         "DO $$ BEGIN "
         "IF NOT EXISTS (SELECT 1 FROM pg_constraint "
         "WHERE conname = 'chk_run_item_source_type') THEN "
         "ALTER TABLE production_run_items ADD CONSTRAINT chk_run_item_source_type "
-        "CHECK (source_type IN ('in_house', 'outward')); "
+        "CHECK (source_type IN ('in_house', 'outward')) NOT VALID; "
         "END IF; END $$;")
+    # Added NOT VALID and validated one step later, on purpose. A plain
+    # `ADD CONSTRAINT ... CHECK` takes ACCESS EXCLUSIVE and scans the table, so
+    # on a live database it queues behind whatever read is in flight and every
+    # query behind that queue waits with it. NOT VALID enforces the rule for
+    # every new row immediately, and `VALIDATE CONSTRAINT` does the scan under
+    # SHARE UPDATE EXCLUSIVE, which readers and writers keep working through.
+    # The rows already on the shelf satisfy the pairing by construction — both
+    # columns arrive in this same migration, source_type defaulted to 'in_house'
+    # with no outward line — so validation can be slow but cannot fail.
+    for table, name in (("recipe_items", "chk_recipe_item_source"),
+                       ("production_run_items", "chk_run_item_source"),
+                       ("recipe_items", "chk_recipe_item_source_type"),
+                       ("production_run_items", "chk_run_item_source_type")):
+        conn.execute(f"ALTER TABLE {table} VALIDATE CONSTRAINT {name}")
     # Reverse lookup for is_line_referenced(): freezing a purchase line must not
     # cost a sequential scan of the run history on every correction.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_production_run_items_outward_line "
