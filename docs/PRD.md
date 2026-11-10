@@ -51,13 +51,16 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 9. **Reason Codes:** Categorized reasons for mismatches/approvals (MEASUREMENT_ERROR, UNIT_CONVERSION…)
 10. **Setup Token:** First-admin creation (single-use, 60-min TTL, console-printed)
 11. **Go for Production & Invoicing:** a fixed-invoice production run with per-product quantities, linked to that invoice; per-invoice lifecycle (planned → produced → booked → shipped → paid), shipment sub-step badges on the pipeline, invoice panel + paid/total completion on the sale detail
+12. **Chemical Purchase Register:** multi-line receipts with an audited correction trail — `expected_version` optimistic lock, a mandatory reason, and a cancellation that reverses stock exactly once
+13. **In-house vs outward delivery:** a receipt either adds to our stock (`in_house`) or records material the **client** already delivered to us (`outward`), which never moves a balance and is later cited as evidence on that client's own recipe
+14. **PI demo recipes and net purchasing:** a planning formulation attached to a proforma invoice itself — draftable the day the PI exists, before any LC or invoice — whose activated snapshot drives one projected "how much do I still have to buy" figure per chemical across every unfinished PI
 
 ### Future
-12. Multi-warehouse support
-13. Batch/lot tracking
-14. Role-based field-level permissions
-15. Advanced reporting (dashboard charts, trends)
-16. Email/webhook notifications
+15. Multi-warehouse support
+16. Batch/lot tracking
+17. Role-based field-level permissions
+18. Advanced reporting (dashboard charts, trends)
+19. Email/webhook notifications
 
 ## 5. User Flows
 
@@ -156,6 +159,29 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 - Admins add container types and set alarm levels. An operator counts — same trust level as the monthly stock upload — and sees no add/alarm buttons
 - **Nothing here touches a chemical.** Packaging has its own tables and its own ledger; the monthly upload, the recipes, the reconciliation compare and the dashboard feed never read it, and a test asserts those row sets are identical with packaging data present
 
+### Flow 9: Chemical Purchase Receipt — in-house stock vs the client's own material
+- The operator opens **Chemical Stock → Purchases** and posts a receipt: supplier, purchase number, date, and **any number of material lines** (one chemical per receipt, `UNIQUE (purchase_id, chemical_id)`), each with a quantity and unit. Every line is typed at posting, so no line can be blank or non-positive
+- They choose a **delivery type**, and the choice changes what the receipt does to the books. **In house** adds to our stock. **Outward** adds nothing: it records material the *client* delivered to us, so it must name that client, and it never appears in a balance, a depletion or a reorder alert
+- The pairing is enforced by the database, not just the form: an in-house receipt carrying a client, or an outward receipt without one, is refused. Both mistakes are silent corruption rather than a display problem — an outward line counted as stock would be deducted twice over, once by the client's delivery and once by our own shelf
+- **Correcting a posted receipt is audited and versioned.** The editor opens with every quantity prefilled, the operator changes only what is wrong and types a reason. The save carries the `version` it read; if someone else corrected it first, the save is refused rather than silently overwriting them. Unchanged lines are not resubmitted at all
+- **A line that has already been cited as evidence freezes.** Once a recipe or a production run sources from an outward line, that line cannot be corrected — nor can the receipt's supplier, number or date, because the run snapshotted them — and the whole receipt cannot be cancelled. Unreferenced lines of the same receipt keep their correction trail. Freezing blocks *editing*, never *using*: the picker still offers a frozen line, flagged
+- The outward material is then spent inside that client's recipe. In the formulation card each ingredient row says where it comes from — **In house** (default, so every recipe written before this feature keeps behaving exactly as it did) or **Outward**, which opens a picker of that client's own outward receipt lines. The client is not a free choice: it is the client the recipe's own invoice belongs to, so a picker can never offer another client's delivery
+- At production, an outward ingredient **reduces demand without reducing stock**. It is written to the run with `deducted_qty = 0` and no stock movement at all, next to the in-house rows that do draw down, and the run carries an immutable snapshot of the evidence — supplier, purchase number and date, client, source quantity and unit — so the record survives any later edit to the receipt it cites
+- On screen and in exports, an outward row shows its evidence and **no shortage, no available balance** — there is no number to show, because the material never stood on our shelf. Reorder alerts fire only for the in-house side, or a client-supplied material would start a purchase order for stock we were never meant to hold
+
+### Flow 10: PI Demo Recipe — planning a proforma before anything exists
+- The planner opens a PI on the pipeline board and clicks **Demo recipe**. Nothing else has to exist yet: no LC, no invoice, no production recipe. The screen lists the PI's own product lines and asks, per line, what the demo formulation is — which chemicals, what percentage of each, and how much water
+- **A plan, not an order.** Saving a demo recipe touches no stock, no production run and no recipe register. Its only job is to answer "what will this PI need, and what do I still have to buy for it?" while the PI is still open
+- **Draft and active are two different things.** The draft is the scratchpad; the operator saves it as often as they like and each save bumps its revision. The *active* snapshot changes only when they press **Activate**, and it records which draft revision it came from. A draft saved after an activation does not quietly alter the live figures
+- **Activation is a gate over the plan, not over the shelf.** It refuses a formulation whose ingredients and water do not reach 100%, a product with no ingredients at all, a percentage outside 0–100, a product name no longer on the PI, and units that cannot be converted to the chemical's own unit. It deliberately does **not** refuse a shortage — forecasting a shortage is the point. A refused activation writes nothing, so the previous active snapshot survives untouched
+- **Two people, one draft.** A save names the revision it read. If someone else saved first, the screen keeps the operator's typing and says the plan changed underneath them instead of overwriting their colleague
+- **Water is either computed or chosen.** Left blank it is the remainder after the ingredients; typed in, it wins. Either way activating stores the resolved number, so the active plan cannot disagree with itself later
+- **Chemical Stock then shows one projected buy per chemical.** `Projected Quantity` = what every unfinished PI still needs, minus what is actually on the shelf — with each kilogram of stock spent **once**, across all the PIs that want it. `Required Quantity` is the gross demand before stock
+- **A line marked won't ship keeps its remaining work.** Ordered 100, invoiced 60, remainder retired: the owed quantity is still 60, and the projection asks for the material that 60 will consume, minus whatever has already been produced
+- **An unknown stays unknown.** A chemical whose demand cannot be resolved shows `—`, never `0`. A zero tells a buyer there is nothing to order; a dash tells them nobody has planned it yet. When that happens the page also says so out loud — open PIs with no activated plan, and activated plans that no longer cover their PI's products
+- **Closing the loop:** a PI counts as finished only when its stage is *Completed*. Shipping proves nothing and `paid` is an invoice status, so a shipped-but-unpaid PI keeps its demand in the projection; reopen a completed PI and it comes straight back
+- The projection is one read over one database snapshot with a fixed handful of queries — it never runs one query per PI — and the answer is cached only as an ETag, so a changed plan changes the page but a re-visit does not recompute it
+
 ## 6. Data Model
 
 ### Core Tables
@@ -164,7 +190,12 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 | `chemicals` | id, name (unique, case-insensitive idx), current_qty, balance_last_month, unit, last_updated, reorder_level | Chemical master data |
 | `recipes` | id, company_id (FK), invoice_id (FK, **unique**, NOT NULL), name, created_date | Recipe header. **One recipe per invoice**; `UNIQUE (company_id, name)` (all lookups are `lower()`) so a rename checks uniqueness ignoring case. The invoice is the recipe's identity, so there is no product, tonnage or water field |
 | `recipe_products` | id, recipe_id (FK), product_name, unit, water_percentage | One formulation slot per product on the invoice; unique on `(recipe_id, lower(product_name))`. Slots are synced from invoice lines — a new line adds an empty slot, duplicates merge, a removed line marks the slot off-invoice. `water_percentage` is `REAL NULL`: NULL means the auto remainder (`100 − ingredients`), and a stored value is the product's water. It is never deducted, but it counts in the 100% total that production requires |
-| `recipe_items` | id, recipe_product_id (FK), chemical_id (FK), percentage | One chemical's percentage in one product's formulation; unique on `(recipe_product_id, chemical_id)`, and a product's percentages may not exceed 100% |
+| `recipe_items` | id, recipe_product_id (FK), chemical_id (FK), percentage, source_type (`in_house` \| `outward`), outward_purchase_line_id (FK, nullable) | One chemical's percentage in one product's formulation; unique on `(recipe_product_id, chemical_id)`, and a product's percentages may not exceed 100%. `source_type` defaults to `in_house` with a NULL line, and a DB CHECK pairs them: `in_house` ⟺ no line, `outward` ⟹ a line. A percentage is *what the formula needs*; the source is *where it comes from* — the same chemical in the same product may legitimately come from stock in one slot and from the client's delivery in another, so requirements group by chemical **and** source, not chemical alone |
+| `chemical_purchases` | id, supplier_name, purchase_number, purchase_date, delivery_type (`in_house` \| `outward`), client_id (FK, NULL unless outward), cancelled + cancelled_at/by/reason, **version**, created_by, timestamps | Purchase receipt header. `chk_purchase_delivery_client` pairs the delivery type with the client, and `version` is the optimistic lock a correction must echo. A receipt whose line has been cited as recipe/run evidence freezes that line, its identity fields and the whole-receipt cancel |
+| `chemical_purchase_items` | id, purchase_id (FK), chemical_id (FK `ON DELETE RESTRICT`), quantity `NUMERIC(18,6)` > 0, unit | Material lines on one receipt. Unique on `(purchase_id, chemical_id)` — one line per material, so a correction has exactly one row to patch and a referenced line is unambiguous |
+| `pi_demos` | id, sale_id (FK, **unique**, `ON DELETE CASCADE`), draft_revision (int > 0), active_revision, activated_at, activated_by | One planning plan per proforma invoice. The PI is the plan's identity, so a second plan on the same PI is a 409, not a duplicate row, and deleting the PI deletes the plan with it. `active_revision` is NULL until the first successful activation |
+| `pi_demo_products` | id, demo_id (FK), scope (`draft` \| `active`), product_name, unit, water_percentage `NUMERIC(9,6)` NULL | The formulation slots, in **two working sets on one table**: `draft` is the editor's scratchpad, `active` is the sole operational snapshot. Unique on `(demo_id, scope, lower(trim(product_name)))` via an expression index, so trailing spaces cannot smuggle in a second "Alpha". A NULL water is the auto remainder; an active row's water can never be NULL or out of 0–100 (`chk_pi_demo_active_water`) |
+| `pi_demo_items` | id, demo_product_id (FK), chemical_id (FK `ON DELETE RESTRICT`), percentage 0–100 | One chemical's share of one scoped product row. Unique on `(demo_product_id, chemical_id)` — the same chemical cannot be entered twice in one formulation. An active snapshot's rows are a copy, which is why an old activation still reads the same after the draft moves on |
 | `packaging_items` | id, label (unique, case-insensitive idx), capacity_kg `NUMERIC(12,3)`, unit (PCS), reorder_level (int) | Container master — the bags, jars and drums the plant counts. Seeded with `25 kg bag`, `30 kg jar`, `50 kg drum`, `120 kg drum`, `200 kg drum`; an admin may add more |
 | `packaging_movements` | id, item_id (FK), kind (RECEIVED \| ISSUED \| RETURNED \| DAMAGED \| SCRAPPED \| COUNT), delta (signed int), before_qty, after_qty, reason, actor, created_at | The packaging ledger. **There is no stored quantity column** — pieces on site are `SUM(delta)` — so the count cannot drift from its own history, and every row keeps the before/after it was written with |
 | `uploads` | id, filename, upload_date, file_type, status, total_chemicals, matched, mismatches..., match_percentage | Upload metadata |
@@ -179,7 +210,7 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 | `shipments` | id, sale_id (FK), ship_date, invoice_number, invoice_date, notes | Actual shipments, partials as rows (P1) |
 | `invoices` | id, sale_id (FK), invoice_number, status (planned → produced → booked → shipped → paid), amount, approx/actual ship dates, maturity_date, notes | Per-invoice shipment lifecycle; a sale may hold several. `maturity_date` is stamped at ship time from the LC terms |
 | `letters_of_credit` | id, lc_number, company_id (FK), lc_date, expiry_date (= latest date of shipment), bank_ref, stage, payment_terms (at_sight \| deferred), tenor_days, notes | LC header; owns the PIs' pipeline journey and the payment terms invoices mature under. `expiry_date` is the **latest date of shipment**: shipment after it is invalid, so the bell warns 7 days out and escalates once it passes. Kept under its legacy column name; the UI and the commercial report call it "Latest Date of Shipment" |
-| `production_runs` + `production_run_items` | run: recipe/order/batch/dates/material_number/packing/invoice_number/notes; items: frozen formula + deducted qtys | Immutable batch log (P1 DDL, P3 executes) |
+| `production_runs` + `production_run_items` | run: recipe/order/batch/dates/material_number/packing/invoice_number/notes; items: frozen formula + deducted qtys + source_type/outward_purchase_line_id + the evidence snapshot (purchase_number, purchase_date, supplier_name, client_name, source_qty, source_unit) | Immutable batch log (P1 DDL, P3 executes). An outward item is written with `deducted_qty = 0` and no stock movement, carrying a **snapshot** of the receipt it cites, so the run's evidence still reads the same after any later correction to that receipt |
 | `production_run_outputs` | id, run_id (FK), recipe_product_id (FK), product_name, unit, qty_produced | What one run actually made, per invoice product. Unique on `(run_id, lower(product_name))`; readiness and `Prod. Date` read outputs, never a sale-level flag |
 | `production_run_links` | id, run_id (FK), sale_id (FK), invoice_id (FK) | Ties a production run to the sale(s)/invoice(s) it fulfils |
 | `sale_payments` | id, sale_id, invoice_id (FK), payment_date, payment_amount, notes, created_at | Payment records |
@@ -190,7 +221,7 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 
 ### Identity & Access
 - **Case-insensitive chemical name**: `idx_chemicals_name_lower` (lower(name) unique index). Packaging labels match the same way and the lookup actually uses the index (`WHERE lower(label) = lower(%s)`)
-- **RLS not used** — application-level authorization (`_gate_api`, `admin_required`)
+- **RLS not used** — application-level authorization (`_gate_api`, `admin_required`). One exception, deliberately: the two purchase tables (`chemical_purchases`, `chemical_purchase_items`) have RLS **enabled with no policies**, so they are backend-owned — no browser role has any reach to them, while the Flask role (table owner) bypasses RLS and the service reads and writes normally
 - **API keys**: `ck_live_` prefix, SHA-256 hash, IP allowlist, expiry, revocation
 
 ## 7. Edge Cases & Error Handling
