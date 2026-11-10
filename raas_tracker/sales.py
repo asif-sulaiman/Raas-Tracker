@@ -86,6 +86,138 @@ class InvoicedLineConflict(LifecycleConflict):
     """
 
 
+class PostProductionRenameConflict(LifecycleConflict):
+    """409 — a produced PI product cannot be renamed to a different identity.
+
+    ``production_run_outputs.product_name`` is a NAME snapshot and no production
+    table carries a ``sale_item_id``, so the only thread joining a batch record
+    back to the document it was built for is that name. Renaming the PI line
+    afterwards detaches the history from its evidence — the run still says the
+    old product exists, while the PI says it never did.
+
+    This prevents NEW mismatches only. It never rewrites a historical snapshot,
+    and it never fires for a change that preserves the trimmed, case-insensitive
+    identity (``"  GUARDPROD "`` -> ``"GuardProd"``), which is descriptive.
+    """
+
+
+class ClientMoveConflict(LifecycleConflict):
+    """409 — moving a PI to another client would orphan its outward sources.
+
+    An outward ingredient source is a receipt DELIVERED TO A NAMED CLIENT, and
+    ``recipes.validate_source`` refuses a line whose client differs from the
+    invoice's owning client. Re-pointing the PI at another company therefore
+    turns every saved source into a formulation that can no longer be produced,
+    and leaves the runs already booked against another client's delivery.
+    """
+
+
+def _identity(name: Any) -> str:
+    """The trimmed, case-insensitive product identity every reader compares on."""
+    return (name or "").strip().lower()
+
+
+def _produced_identities(conn: psycopg.Connection, sale_id: int) -> set:
+    """Product names this PI's production history was recorded under.
+
+    The primary provenance chain is ``production_run_links.sale_id ->
+    production_runs -> production_run_outputs``. The second branch (through the
+    link's ``invoice_id``) is the line-level fallback for a run whose link row
+    names an invoice of this sale; both are scoped to THIS sale, so neither can
+    pull another PI's history in.
+    """
+    return {r[0] for r in conn.execute(
+        """SELECT DISTINCT lower(trim(o.product_name))
+             FROM production_run_links l
+             JOIN production_run_outputs o ON o.run_id = l.run_id
+            WHERE l.sale_id = %s
+           UNION
+           SELECT DISTINCT lower(trim(o.product_name))
+             FROM production_run_links l
+             JOIN invoices i ON i.id = l.invoice_id
+             JOIN production_run_outputs o ON o.run_id = l.run_id
+            WHERE i.sale_id = %s""", (sale_id, sale_id)).fetchall() if r[0]}
+
+
+def _assert_product_identities_stable(
+        conn: psycopg.Connection, sale_id: int,
+        renames: List[tuple]) -> None:
+    """Refuse an identity-changing rename of anything this PI has produced.
+
+    ``renames`` is ``[(sale_item_id, old_name, new_name), ...]`` for the lines a
+    write is about to touch. Three rules, in this order:
+
+    1. A change that preserves ``_identity`` is not an identity change, so a
+       capitalisation/whitespace fix on a produced product stays allowed.
+    2. Attribution is per product, so duplicate PI lines of the same product are
+       all held by the same history — one of them "being free" is not a way
+       round the guard.
+    3. If a historical name matches no line of this PI the snapshot predates the
+       document and cannot be attributed to one row: that ambiguity FAILS CLOSED
+       and every identity-changing edit on the PI is refused, so a drifted
+       history can never be used as an escape hatch.
+    """
+    changed = [(old, new) for _item_id, old, new in renames
+               if _identity(old) != _identity(new)]
+    if not changed:
+        return
+    produced = _produced_identities(conn, sale_id)
+    if not produced:
+        return
+    on_pi = {r[0] for r in conn.execute(
+        "SELECT DISTINCT lower(trim(product_name)) FROM sale_items"
+        " WHERE sale_id = %s", (sale_id,)).fetchall()}
+    if produced - on_pi:
+        raise PostProductionRenameConflict(
+            "cannot rename this product: production history exists for this PI"
+            " and its product names no longer match its lines, so no line's"
+            " identity can be verified against it")
+    held = sorted({_identity(old) for old, _new in changed
+                   if _identity(old) in produced})
+    if held:
+        raise PostProductionRenameConflict(
+            "cannot rename a product this PI has produced ("
+            + ", ".join(held) + "): the run snapshots that name and has no line"
+            " id to re-point, so renaming it detaches the batch history from"
+            " the document it belongs to")
+
+
+def _assert_client_move_allowed(conn: psycopg.Connection, sale_id: int,
+                                new_company_id: Optional[int]) -> None:
+    """Refuse a PI client change that strands an outward ingredient source.
+
+    ``IS DISTINCT FROM`` keeps the comparison NULL-safe, so a PI that is losing
+    or gaining a client is measured against the receipts its sources name.
+    """
+    held = conn.execute(
+        """SELECT DISTINCT p.purchase_number
+             FROM recipe_items ri
+             JOIN recipe_products rp ON rp.id = ri.recipe_product_id
+             JOIN recipes rc ON rc.id = rp.recipe_id
+             JOIN invoices i ON i.id = rc.invoice_id
+             JOIN chemical_purchase_items cpi
+               ON cpi.id = ri.outward_purchase_line_id
+             JOIN chemical_purchases p ON p.id = cpi.purchase_id
+            WHERE i.sale_id = %s AND ri.source_type = 'outward'
+              AND p.client_id IS DISTINCT FROM %s
+           UNION
+           SELECT DISTINCT p.purchase_number
+             FROM production_run_items pri
+             JOIN production_run_links l ON l.run_id = pri.run_id
+             JOIN chemical_purchase_items cpi
+               ON cpi.id = pri.outward_purchase_line_id
+             JOIN chemical_purchases p ON p.id = cpi.purchase_id
+            WHERE l.sale_id = %s AND pri.source_type = 'outward'
+              AND p.client_id IS DISTINCT FROM %s""",
+        (sale_id, new_company_id, sale_id, new_company_id)).fetchall()
+    if held:
+        raise ClientMoveConflict(
+            "cannot move this PI to another client: its recipe is sourced from"
+            " outward purchase line(s) of the current client ("
+            + ", ".join(str(r[0]) for r in held)
+            + "), which the new client does not own")
+
+
 def _positive_values(pairs: List[tuple]) -> None:
     """Raise ValueError unless every (field, value) pair is strictly positive.
 
@@ -959,8 +1091,10 @@ def update_sale_item(conn: psycopg.Connection, sale_id: int, item_id: int,
     comes from invoice_items, and the next invoice's amount is derived from the
     PI total: moving quantity/price under existing invoice lines would size the
     next invoice off a total that no longer matches what was billed, and
-    invoice_items.line_total would keep the old money. product_name and unit are
-    descriptive only, so they stay editable.
+    invoice_items.line_total would keep the old money. unit is descriptive only,
+    so it stays editable. product_name stays editable too — EXCEPT once the PI
+    has been produced, where the name is the batch history's only provenance
+    (see ``_assert_product_identities_stable``).
 
     Phase 2-B: a supplied quantity/unit_price must be finite and strictly > 0.
     Two placement decisions, both load-bearing:
@@ -999,6 +1133,13 @@ def update_sale_item(conn: psycopg.Connection, sale_id: int, item_id: int,
         _finite(quantity, unit_price)
         _positive_values(
             [("quantity", quantity), ("unit_price", unit_price)])
+    # Slice 2: `product_name` used to be classified as "descriptive only", and
+    # it is — until the product has been produced. After a run the name IS the
+    # only provenance the batch history has, so the identity is frozen even
+    # though the money columns of the same row are the only ones gated above.
+    if product_name is not None:
+        _assert_product_identities_stable(
+            conn, sale_id, [(item_id, old_row[0], product_name)])
     old_item = {"product_name": old_row[0], "quantity": old_row[1],
                 "unit_price": old_row[2], "unit": old_row[3]}
     
@@ -1175,8 +1316,11 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
                 for i in old_sale.get("items", [])
             ],
         }
-        existing_ids = {r[0] for r in conn.execute(
-            "SELECT id FROM sale_items WHERE sale_id = %s", (sale_id,)).fetchall()}
+        stored_rows = conn.execute(
+            "SELECT id, product_name FROM sale_items WHERE sale_id = %s",
+            (sale_id,)).fetchall()
+        existing_ids = {r[0] for r in stored_rows}
+        stored_names = {r[0]: r[1] for r in stored_rows}
 
         pi_number = (header.get("pi_number") or "").strip()
         if not pi_number:
@@ -1235,6 +1379,22 @@ def update_sale_full(conn: psycopg.Connection, sale_id: int, header: Dict[str, A
         for rid in removed_ids:
             if rid not in existing_ids:
                 raise ValueError(f"removed id {rid} does not belong to sale {sale_id}")
+
+        # Slice 2 guards, both in the validate-everything phase so a refusal
+        # writes nothing: this route replaces the whole document, and a
+        # half-applied header rename behind a refused line is exactly the
+        # partial state its one-transaction contract forbids.
+        try:
+            new_company_id = None if company_id is None else int(company_id)
+            current_company_id = None if row[1] is None else int(row[1])
+        except (TypeError, ValueError):
+            raise ValueError("company_id must be an integer")
+        if new_company_id != current_company_id:
+            _assert_client_move_allowed(conn, sale_id, new_company_id)
+        _assert_product_identities_stable(
+            conn, sale_id,
+            [(it["id"], stored_names[it["id"]], it["product_name"])
+             for it in seen if it["id"] is not None])
 
         conn.execute(
             """UPDATE sales SET pi_number = %s, pi_date = %s, client_name = %s,

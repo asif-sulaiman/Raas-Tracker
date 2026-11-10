@@ -185,19 +185,219 @@ def _invoice_product_lines(conn: psycopg.Connection,
     return list(groups.values())
 
 
+# --------------------------------------------------------------------------- #
+# outward sourcing (Slice 2)
+# --------------------------------------------------------------------------- #
+
+# One read of a purchase line plus everything a source must agree with: the
+# header's delivery type / client / cancellation, the line's material and unit
+# snapshot, and the chemical's *registered* unit. `companies` is a LEFT JOIN so
+# an in-house line (which carries no client) still returns a row and is refused
+# for the right reason - "not an outward delivery", not "not found".
+_SOURCE_SELECT = """
+    SELECT i.id, i.purchase_id, i.chemical_id, i.quantity, i.unit,
+           p.delivery_type, p.client_id, p.cancelled, p.purchase_number,
+           p.purchase_date, p.supplier_name, co.name, ch.name, ch.unit
+      FROM chemical_purchase_items i
+      JOIN chemical_purchases p ON p.id = i.purchase_id
+      JOIN chemicals ch ON ch.id = i.chemical_id
+      LEFT JOIN companies co ON co.id = p.client_id
+"""
+
+
+def _iso(value: Any) -> Any:
+    """date/datetime -> ISO text, so a DATE column reads back as ``YYYY-MM-DD``.
+
+    psycopg hands DATE back as ``datetime.date``; the service contracts return
+    text so a route response and a direct caller see the same shape.
+    """
+    if value is None:
+        return None
+    iso = getattr(value, "isoformat", None)
+    return iso() if callable(iso) else value
+
+
+def _invoice_client_id(conn: psycopg.Connection, invoice_id: int) -> int:
+    """The client an invoice belongs to, through its sale."""
+    row = conn.execute(
+        """SELECT s.company_id FROM invoices i
+             JOIN sales s ON s.id = i.sale_id
+            WHERE i.id = %s""", (invoice_id,)).fetchone()
+    if not row:
+        raise InvoiceNotFound(f"Invoice {invoice_id} not found")
+    return row[0]
+
+
+def check_source_pairing(source_type: Optional[str],
+                         outward_purchase_line_id: Optional[int],
+                         *, required: bool = True) -> str:
+    """The (source_type, line) pairing rule, shared by every write path.
+
+    The DB CHECK (`chk_recipe_item_source`) is the backstop, not the only
+    check: a 400 naming the field beats an IntegrityError surfacing as a 500.
+    """
+    if source_type is None:
+        if required:
+            raise ValueError("source_type is required - 'in_house' or 'outward'")
+        return "in_house"
+    if source_type not in ("in_house", "outward"):
+        raise ValueError(
+            f"unknown source_type '{source_type}' - use 'in_house' or 'outward'")
+    if source_type == "outward" and outward_purchase_line_id is None:
+        raise ValueError(
+            "an outward ingredient needs outward_purchase_line_id - the "
+            "purchase line it is sourced from")
+    if source_type == "in_house" and outward_purchase_line_id is not None:
+        raise ValueError(
+            "outward_purchase_line_id is only valid with source_type 'outward'")
+    return source_type
+
+
+def validate_source(conn: psycopg.Connection, *, chemical_id: int,
+                    outward_purchase_line_id: Optional[int],
+                    invoice_id: Optional[int] = None,
+                    invoice_client_id: Optional[int] = None) -> Dict[str, Any]:
+    """Prove one purchase line is a legal source for this ingredient.
+
+    Every refusal names what failed, because the picker, the saved formulation
+    and the production run all reach this same rule and an operator has to be
+    able to tell "wrong client" from "cancelled delivery" from "different
+    material". Returns the immutable snapshot fields the run records.
+
+    A line that production has already referenced is **valid to use**: frozen
+    means uneditable, never unusable. And nothing here caps the requirement at
+    the delivered quantity - the need is `percentage x output`, the receipt is
+    only evidence of where the material came from.
+    """
+    if outward_purchase_line_id is None:
+        raise ValueError("an outward ingredient needs a purchase line id")
+    if invoice_client_id is None:
+        if invoice_id is None:
+            raise ValueError("invoice_id or invoice_client_id is required")
+        invoice_client_id = _invoice_client_id(conn, invoice_id)
+
+    src = conn.execute(_SOURCE_SELECT + " WHERE i.id = %s",
+                       (outward_purchase_line_id,)).fetchone()
+    if not src:
+        raise ValueError(
+            f"outward purchase line {outward_purchase_line_id} not found")
+    (line_id, purchase_id, line_chemical_id, quantity, line_unit,
+     delivery_type, purchase_client_id, cancelled, purchase_number,
+     purchase_date, supplier_name, client_name, chemical_name,
+     registered_unit) = src
+
+    if cancelled:
+        raise ValueError(
+            f"purchase {purchase_number} is cancelled - a cancelled delivery "
+            f"cannot source '{chemical_name}'")
+    if delivery_type != "outward":
+        raise ValueError(
+            f"purchase {purchase_number} is an in-house delivery - only an "
+            f"outward purchase line can source a recipe ingredient "
+            f"(line {line_id})")
+    if line_chemical_id != chemical_id:
+        raise ValueError(
+            f"purchase line {line_id} delivered '{chemical_name}', not the "
+            "material this ingredient formulates - the source line must carry "
+            "the same material")
+    if (line_unit or "").upper() != (registered_unit or "").upper():
+        raise ValueError(
+            f"purchase line {line_id} is in {line_unit} but '{chemical_name}' "
+            f"is registered in {registered_unit} - an outward source must be "
+            "in the material's registered unit")
+    if purchase_client_id != invoice_client_id:
+        raise ValueError(
+            f"purchase {purchase_number} belongs to client "
+            f"'{client_name}', not this invoice's client - an outward source "
+            "must be a delivery to the same client")
+
+    return {
+        "outward_purchase_line_id": line_id,
+        "purchase_id": purchase_id,
+        "purchase_number": purchase_number,
+        "purchase_date": _iso(purchase_date),
+        "supplier_name": supplier_name,
+        "client_id": purchase_client_id,
+        "client_name": client_name,
+        "source_qty": float(quantity or 0),
+        "source_unit": line_unit,
+    }
+
+
+def _lock_outward_sources(conn: psycopg.Connection,
+                          requirements: List[Dict[str, Any]], *,
+                          invoice_id: int) -> None:
+    """Lock, then re-read, every outward source before a run writes anything.
+
+    Saving the formulation validated the line; that answer is minutes old by
+    the time anyone presses produce. A correction or cancellation committed in
+    between would otherwise leave a run whose evidence points at a receipt that
+    no longer exists - or at another client's receipt.
+
+    Lock order is the one the whole service agrees on: invoice (already held)
+    -> purchase headers, ascending id -> chemicals, ascending id. Headers first
+    because a purchase correction takes the header then the materials, so the
+    two paths queue in the same direction instead of deadlocking.
+    """
+    line_ids = sorted({row["outward_purchase_line_id"] for row in requirements
+                       if row["source_type"] == "outward"})
+    if not line_ids:
+        return
+    invoice_client_id = _invoice_client_id(conn, invoice_id)
+    purchase_ids = sorted(
+        row[0] for row in conn.execute(
+            "SELECT purchase_id FROM chemical_purchase_items "
+            "WHERE id = ANY(%s::int[]) AND purchase_id IS NOT NULL",
+            (line_ids,)).fetchall())
+    for purchase_id in purchase_ids:
+        conn.execute(
+            "SELECT 1 FROM chemical_purchases WHERE id = %s FOR UPDATE",
+            (purchase_id,))
+    # requirements is already ascending by chemical_id (see
+    # _aggregate_requirements), so this walk is the same order the deduction
+    # loop would take anyway; update_stock re-locks in-house rows as a no-op.
+    for row in requirements:
+        conn.execute("SELECT 1 FROM chemicals WHERE id = %s FOR UPDATE",
+                     (row["chemical_id"],))
+    for row in requirements:
+        if row["source_type"] != "outward":
+            continue
+        row.update(validate_source(
+            conn, chemical_id=row["chemical_id"],
+            outward_purchase_line_id=row["outward_purchase_line_id"],
+            invoice_client_id=invoice_client_id))
+
+
 def _slot_items(conn: psycopg.Connection,
                 recipe_id: int) -> Dict[int, List[Dict[str, Any]]]:
+    """One formulation slot's items, with their sourcing.
+
+    The outward display fields ride along on the LEFT JOIN so a formulation
+    read says *where* each ingredient comes from without a second query per
+    row. A line that was cancelled or corrected since the recipe was saved
+    still shows what it is: refusing to display it would hide the reason the
+    next run refuses.
+    """
     rows = conn.execute(
         """SELECT rp.id, ri.id, ri.percentage, c.id, c.name,
-                  c.current_qty, c.unit
+                  c.current_qty, c.unit, ri.source_type,
+                  ri.outward_purchase_line_id, p.purchase_number,
+                  p.purchase_date, p.supplier_name, co.name, i2.quantity,
+                  i2.unit
              FROM recipe_products rp
              LEFT JOIN recipe_items ri ON ri.recipe_product_id = rp.id
              LEFT JOIN chemicals c ON c.id = ri.chemical_id
+             LEFT JOIN chemical_purchase_items i2
+                      ON i2.id = ri.outward_purchase_line_id
+             LEFT JOIN chemical_purchases p ON p.id = i2.purchase_id
+             LEFT JOIN companies co ON co.id = p.client_id
             WHERE rp.recipe_id = %s
             ORDER BY rp.id, c.name""",
         (recipe_id,)).fetchall()
     items: Dict[int, List[Dict[str, Any]]] = {}
-    for slot_id, item_id, pct, chem_id, chem_name, current, unit in rows:
+    for (slot_id, item_id, pct, chem_id, chem_name, current, unit,
+         source_type, line_id, purchase_number, purchase_date, supplier_name,
+         client_name, source_qty, source_unit) in rows:
         bucket = items.setdefault(slot_id, [])
         if item_id is None:
             continue
@@ -206,6 +406,14 @@ def _slot_items(conn: psycopg.Connection,
             "chemical_name": chem_name, "current_stock": current,
             "unit": unit, "percentage": float(pct or 0),
             "required_per_unit": (float(pct or 0) / 100.0),
+            "source_type": source_type or "in_house",
+            "outward_purchase_line_id": line_id,
+            "purchase_number": purchase_number,
+            "purchase_date": _iso(purchase_date),
+            "supplier_name": supplier_name,
+            "client_name": client_name,
+            "source_qty": None if source_qty is None else float(source_qty),
+            "source_unit": source_unit,
         })
     return items
 
@@ -337,8 +545,14 @@ def _attach_material_quantities(conn: psycopg.Connection,
                     unsafe[item["chemical_id"]] = True
                 else:
                     qty = (item["percentage"] / 100.0) * remaining * rate
-                    needs[item["chemical_id"]] = (
-                        needs.get(item["chemical_id"], 0.0) + qty)
+                    # Gross use is shown for every row, but only an in-house
+                    # need draws on the stock projection. An outward row is
+                    # covered by the client's own delivery: subtracting it from
+                    # our balance - again, after a run already deducted it -
+                    # would report material we never held as short.
+                    if item["source_type"] != "outward":
+                        needs[item["chemical_id"]] = (
+                            needs.get(item["chemical_id"], 0.0) + qty)
             else:
                 unsafe[item["chemical_id"]] = True
             item["required_qty"] = None if qty is None else round(qty, 6)
@@ -346,7 +560,9 @@ def _attach_material_quantities(conn: psycopg.Connection,
     for product in products:
         for item in product["items"]:
             chemical_id = item["chemical_id"]
-            if unsafe.get(chemical_id):
+            if item["source_type"] == "outward":
+                item["stock_remaining"] = None
+            elif unsafe.get(chemical_id):
                 item["stock_remaining"] = None
             else:
                 item["stock_remaining"] = round(
@@ -542,15 +758,28 @@ def _slot_percentage_total(conn: psycopg.Connection,
 
 
 def add_recipe_item(conn: psycopg.Connection, recipe_id: int, product_name: str,
-                    chemical_name: str, percentage: float) -> bool:
-    """Add (or replace) one chemical in one product's formulation."""
+                    chemical_name: str, percentage: float, *,
+                    source_type: Optional[str] = "in_house",
+                    outward_purchase_line_id: Optional[int] = None) -> bool:
+    """Add (or replace) one chemical in one product's formulation.
+
+    ``source_type`` defaults to in-house, so every Slice 1 caller is unchanged.
+    An outward item is only accepted once ``validate_source`` has proved the
+    line is this invoice's client's own outward delivery of the same material,
+    in the material's registered unit, and not cancelled.
+    """
     finite_values(percentage)
     if percentage < 0:
         raise ValueError("percentage must be 0 or greater")
+    source = check_source_pairing(source_type, outward_purchase_line_id)
     recipe = _require_recipe(conn, recipe_id)
     # Resolve the chemical before touching a slot: an unknown chemical must not
     # leave an uncommitted ghost-slot INSERT for the caller's close() to commit.
     chem = _chemical(conn, chemical_name)
+    if source == "outward":
+        validate_source(conn, chemical_id=chem[0],
+                        outward_purchase_line_id=outward_purchase_line_id,
+                        invoice_id=recipe["invoice_id"])
     slot_id = _slot_for_product(conn, recipe, product_name)
 
     existing = conn.execute(
@@ -565,12 +794,15 @@ def add_recipe_item(conn: psycopg.Connection, recipe_id: int, product_name: str,
             f"ingredients for {product_name} total {total:g}% - the maximum is 100%")
 
     item_id = conn.execute(
-        "INSERT INTO recipe_items (recipe_product_id, chemical_id, percentage) "
-        "VALUES (%s, %s, %s) RETURNING id",
-        (slot_id, chem[0], percentage)).fetchone()[0]
+        """INSERT INTO recipe_items (recipe_product_id, chemical_id, percentage,
+                                     source_type, outward_purchase_line_id)
+           VALUES (%s, %s, %s, %s, %s) RETURNING id""",
+        (slot_id, chem[0], percentage, source, outward_purchase_line_id)).fetchone()[0]
     log_audit_action(
         conn, "RECIPE_ITEM_ADD", "recipe_item", item_id,
-        new_value=f"{recipe['name']}:{product_name}:{chem[1]}:{percentage}",
+        new_value=(f"{recipe['name']}:{product_name}:{chem[1]}:{percentage}"
+                   f":{source}"
+                   + (f":{outward_purchase_line_id}" if source == "outward" else "")),
         atomic=False)
     conn.commit()
     return True
@@ -609,13 +841,23 @@ def set_product_water(conn: psycopg.Connection, recipe_id: int,
 
 
 def update_recipe_item(conn: psycopg.Connection, recipe_id: int, item_id: int,
-                       new_percentage: float) -> bool:
+                       new_percentage: float, *,
+                       source_type: Optional[str] = None,
+                       outward_purchase_line_id: Optional[int] = None) -> bool:
+    """Edit one ingredient: its share and, for Slice 2, where it is sourced.
+
+    A caller that names no source keeps the row's existing one — a formulation
+    tuned from the Slice 1 screen sends only the percentage, and silently
+    reverting an outward row to in-house there would make the run deduct stock
+    the client's own delivery already covers.
+    """
     finite_values(new_percentage)
     if new_percentage < 0:
         raise ValueError("percentage must be 0 or greater")
-    _require_recipe(conn, recipe_id)
+    recipe = _require_recipe(conn, recipe_id)
     row = conn.execute(
-        """SELECT ri.id, ri.percentage, ri.recipe_product_id
+        """SELECT ri.id, ri.percentage, ri.recipe_product_id, ri.chemical_id,
+                  ri.source_type, ri.outward_purchase_line_id
              FROM recipe_items ri
              JOIN recipe_products rp ON rp.id = ri.recipe_product_id
             WHERE ri.id = %s AND rp.recipe_id = %s""",
@@ -628,11 +870,36 @@ def update_recipe_item(conn: psycopg.Connection, recipe_id: int, item_id: int,
         raise ValueError(
             f"ingredients for this product total {total:g}% - "
             "the maximum is 100%")
-    conn.execute(
-        "UPDATE recipe_items SET percentage = %s WHERE id = %s",
-        (new_percentage, item_id))
+
+    old_source = row[4] or "in_house"
+    old_line = row[5]
+    if source_type is None and outward_purchase_line_id is None:
+        source, line = old_source, old_line
+    else:
+        source = check_source_pairing(
+            source_type if source_type is not None else old_source,
+            outward_purchase_line_id)
+        line = outward_purchase_line_id
+    if source == "outward":
+        # Validated before the UPDATE: a refused switch must leave the row
+        # exactly as it was, not half-written with a source that fails.
+        validate_source(conn, chemical_id=row[3],
+                        outward_purchase_line_id=line,
+                        invoice_id=recipe["invoice_id"])
+    if (source, line) == (old_source, old_line):
+        conn.execute(
+            "UPDATE recipe_items SET percentage = %s WHERE id = %s",
+            (new_percentage, item_id))
+    else:
+        conn.execute(
+            """UPDATE recipe_items
+                  SET percentage = %s, source_type = %s,
+                      outward_purchase_line_id = %s
+                WHERE id = %s""",
+            (new_percentage, source, line, item_id))
     log_audit_action(conn, "RECIPE_ITEM_UPDATE", "recipe_item", item_id,
-                     old_value=str(row[1]), new_value=str(new_percentage),
+                     old_value=f"{row[1]}:{old_source}:{old_line}",
+                     new_value=f"{new_percentage}:{source}:{line}",
                      atomic=False)
     conn.commit()
     return True
@@ -735,13 +1002,24 @@ def _aggregate_requirements(conn: psycopg.Connection, recipe: Dict[str, Any],
                             outputs: List[Dict[str, Any]],
                             require_balanced: bool = False
                             ) -> List[Dict[str, Any]]:
-    """Convert per-product needs into one row per chemical, in stock units.
+    """Convert per-product needs into one row per **source**, in stock units.
 
     A product's formulation percentages apply to that product's quantity. Each
     need is converted from the slot's unit to the chemical's stock unit before
-    the products are summed, so giving two products the same chemical produces
+    the rows are summed, so giving two products the same chemical produces
     exactly one deduction. A missing conversion is a 400 naming both units:
     guessing KG would silently over- or under-deduct.
+
+    Grouping is by ``(chemical_id, source_type, outward_purchase_line_id)``,
+    not by chemical alone: the same material drawn once from our store and once
+    from the client's outward delivery is two consumption records, and folding
+    them together would deduct the client's material from our shelf. Two
+    different outward lines are two rows too — each one is its own evidence.
+
+    A requirement is *always* ``percentage x output quantity``. It is never
+    capped by, nor derived from, the quantity that was delivered: a 25 KG
+    delivery does not make 40 KG of formulation impossible, and nothing here
+    depletes a receipt.
 
     ``require_balanced`` is production-only: ingredients + water must total
     100% within ``_BALANCE_TOLERANCE``. Reports keep the default ``False`` so
@@ -749,7 +1027,7 @@ def _aggregate_requirements(conn: psycopg.Connection, recipe: Dict[str, Any],
     """
     products = {p["product_name"].lower(): p
                 for p in list_recipe_products(conn, recipe["id"])}
-    aggregated: Dict[int, Dict[str, Any]] = {}
+    aggregated: Dict[tuple, Dict[str, Any]] = {}
     for output in outputs:
         product = products.get(output["product_name"].lower())
         if not product or not product["on_invoice"]:
@@ -785,14 +1063,36 @@ def _aggregate_requirements(conn: psycopg.Connection, recipe: Dict[str, Any],
                     f"{item['unit']} for chemical '{item['chemical_name']}' "
                     f"on '{product['product_name']}' - add it in "
                     "Unit Conversions")
-            row = aggregated.setdefault(item["chemical_id"], {
-                "chemical_id": item["chemical_id"],
-                "chemical_name": item["chemical_name"],
-                "unit": item["unit"],
-                "current_stock": item["current_stock"],
-                "required_qty": 0.0,
-                "products": [],
-            })
+            source_type = item["source_type"] or "in_house"
+            line_id = item["outward_purchase_line_id"]
+            key = (item["chemical_id"], source_type, line_id)
+            row = aggregated.get(key)
+            if row is None:
+                row = aggregated[key] = {
+                    "chemical_id": item["chemical_id"],
+                    "chemical_name": item["chemical_name"],
+                    "unit": item["unit"],
+                    "source_type": source_type,
+                    "outward_purchase_line_id": line_id,
+                    # An outward row has no in-house balance to test: the
+                    # material never stood on our shelf, so showing a number
+                    # here would invite a shortage warning about stock we were
+                    # never meant to hold.
+                    "current_stock": (None if source_type == "outward"
+                                      else item["current_stock"]),
+                    "required_qty": 0.0,
+                    "products": [],
+                }
+                if source_type == "outward":
+                    # The snapshot travels with the row so the run can record
+                    # where the material came from without re-reading the
+                    # purchase per product.
+                    row["purchase_number"] = item["purchase_number"]
+                    row["purchase_date"] = item["purchase_date"]
+                    row["supplier_name"] = item["supplier_name"]
+                    row["client_name"] = item["client_name"]
+                    row["source_qty"] = item["source_qty"]
+                    row["source_unit"] = item["source_unit"]
             row["required_qty"] += converted
             row["products"].append({
                 "product_name": product["product_name"],
@@ -800,28 +1100,69 @@ def _aggregate_requirements(conn: psycopg.Connection, recipe: Dict[str, Any],
                 "percentage": item["percentage"],
                 "required_qty": converted,
             })
-    return sorted(aggregated.values(), key=lambda r: r["chemical_name"])
+    for row in aggregated.values():
+        # What this row takes out of the store: everything for an in-house
+        # row, nothing for an outward one.
+        row["deducted_qty"] = (0.0 if row["source_type"] == "outward"
+                               else row["required_qty"])
+    # Slice 1: lock chemicals in ascending chemical_id order, matching the
+    # purchase service (purchases.create_purchase sorts entries by chem_id).
+    # update_stock still locks by name (1:1 with id); only the call order changes,
+    # so production and purchase corrections cannot deadlock on overlapping sets.
+    # The source half of the key only breaks ties within one chemical, so the
+    # lock walk stays ascending.
+    return sorted(aggregated.values(),
+                  key=lambda r: (r["chemical_id"],
+                                 r["outward_purchase_line_id"] or 0))
+
+
+def _stock_status(current_stock: Any, required: float, *,
+                  outward: bool) -> tuple:
+    """``(shortage, status)`` for one report row.
+
+    An outward row answers "how much is used", not "what does the store have":
+    the material arrived on the client's own delivery, so there is no balance
+    to compare against, nothing to warn about, and reporting a shortage would
+    invite a purchase that duplicates material already delivered.
+    """
+    if outward:
+        return None, "OUTWARD"
+    diff = current_stock - required
+    status = ("SHORTAGE" if diff < 0
+              else "EXACT" if diff == 0 else "SURPLUS")
+    return diff, status
 
 
 def generate_report(conn: psycopg.Connection, company_id: int, recipe_id: int,
                     outputs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Have/need per chemical for the given per-product production quantities."""
+    """Have/need per chemical for the given per-product production quantities.
+
+    Gross use and stock impact are different questions: see `_stock_status`.
+    """
     recipe = _require_recipe(conn, recipe_id)
     if recipe["company_id"] != company_id:
         raise ResourceMissing(f"Recipe {recipe_id} not found for this company")
     normalized = _normalized_outputs(outputs)
     report = []
     for row in _aggregate_requirements(conn, recipe, normalized):
-        required = row["required_qty"]
-        shortage = row["current_stock"] - required
+        outward = row["source_type"] == "outward"
+        shortage, status = _stock_status(row["current_stock"],
+                                         row["required_qty"], outward=outward)
         report.append({
             "chemical_name": row["chemical_name"],
             "current_stock": row["current_stock"],
-            "required_total": required,
+            "required_total": row["required_qty"],
             "unit": row["unit"],
             "shortage": shortage,
-            "status": ("SHORTAGE" if shortage < 0
-                       else "EXACT" if shortage == 0 else "SURPLUS"),
+            "status": status,
+            "source_type": row["source_type"],
+            "outward_purchase_line_id": row["outward_purchase_line_id"],
+            "purchase_number": row.get("purchase_number"),
+            "purchase_date": row.get("purchase_date"),
+            "supplier_name": row.get("supplier_name"),
+            "client_name": row.get("client_name"),
+            "source_qty": row.get("source_qty"),
+            "source_unit": row.get("source_unit"),
             "products": row["products"],
         })
     return report
@@ -839,12 +1180,24 @@ def generate_multi_recipe_report(conn: psycopg.Connection,
         recipe = _require_recipe(conn, selection["recipe_id"])
         outputs = _normalized_outputs(selection.get("outputs") or [])
         for row in _aggregate_requirements(conn, recipe, outputs):
-            key = (row["chemical_name"].lower(), row["unit"].upper())
+            # Same key rule as the single-recipe report: a chemical sourced
+            # from a client's delivery and from our shelf are two lines, or the
+            # outward need would be charged against stock we never hold.
+            key = (row["chemical_name"].lower(), row["unit"].upper(),
+                   row["source_type"], row["outward_purchase_line_id"])
             target = combined.setdefault(key, {
                 "chemical_name": row["chemical_name"],
                 "current_stock": row["current_stock"],
                 "required_total": 0.0,
                 "unit": row["unit"],
+                "source_type": row["source_type"],
+                "outward_purchase_line_id": row["outward_purchase_line_id"],
+                "purchase_number": row.get("purchase_number"),
+                "purchase_date": row.get("purchase_date"),
+                "supplier_name": row.get("supplier_name"),
+                "client_name": row.get("client_name"),
+                "source_qty": row.get("source_qty"),
+                "source_unit": row.get("source_unit"),
                 "recipes": [],
                 "products": [],
             })
@@ -858,13 +1211,10 @@ def generate_multi_recipe_report(conn: psycopg.Connection,
 
     report = []
     for data in combined.values():
-        shortage = data["current_stock"] - data["required_total"]
-        report.append({
-            **data,
-            "shortage": shortage,
-            "status": ("SHORTAGE" if shortage < 0
-                       else "EXACT" if shortage == 0 else "SURPLUS"),
-        })
+        shortage, status = _stock_status(
+            data["current_stock"], data["required_total"],
+            outward=data["source_type"] == "outward")
+        report.append({**data, "shortage": shortage, "status": status})
     report.sort(key=lambda x: x["chemical_name"])
     return report
 
@@ -918,6 +1268,10 @@ def create_production_run(
         conn, recipe, normalized, require_balanced=True)
 
     try:
+        # Purchase headers -> chemicals -> sources, before the first write of
+        # the run: a concurrent correction or cancel must lose this race, not
+        # slip between validation and evidence.
+        _lock_outward_sources(conn, requirements, invoice_id=invoice_id)
         prod_date = production_date or date.today().isoformat()
         total_qty = sum(o["quantity"] for o in normalized)
         run_id = conn.execute(
@@ -962,6 +1316,29 @@ def create_production_run(
             (_now_str(), sale_id))
 
         for row in requirements:
+            if row["source_type"] == "outward":
+                # The client's delivery IS the source: nothing stands in our
+                # store to deduct, and the receipt is not depleted by being
+                # used. The row is the evidence, recorded exactly as the source
+                # looked under the lock taken above, so the run stays
+                # auditable after the purchase is corrected or the recipe is
+                # re-formulated.
+                conn.execute(
+                    """INSERT INTO production_run_items
+                       (run_id, chemical_id, chemical_name, required_qty,
+                        deducted_qty, unit, source_type,
+                        outward_purchase_line_id, purchase_number,
+                        purchase_date, supplier_name, client_name,
+                        source_qty, source_unit)
+                       VALUES (%s, %s, %s, %s, 0, %s, 'outward', %s, %s,
+                               %s, %s, %s, %s, %s)""",
+                    (run_id, row["chemical_id"], row["chemical_name"],
+                     row["required_qty"], row["unit"],
+                     row["outward_purchase_line_id"], row["purchase_number"],
+                     row["purchase_date"], row["supplier_name"],
+                     row["client_name"], row["source_qty"],
+                     row["source_unit"]))
+                continue
             try:
                 success = update_stock(
                     conn, row["chemical_name"], -row["required_qty"],
@@ -981,8 +1358,9 @@ def create_production_run(
             conn.execute(
                 """INSERT INTO production_run_items
                    (run_id, chemical_id, chemical_name, required_qty,
-                    deducted_qty, unit)
-                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                    deducted_qty, unit, source_type,
+                    outward_purchase_line_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, 'in_house', NULL)""",
                 (run_id, row["chemical_id"], row["chemical_name"],
                  row["required_qty"], row["required_qty"], row["unit"]))
 
@@ -996,13 +1374,16 @@ def create_production_run(
         conn.rollback()
         raise
 
+    # Only an in-house deduction can pull a chemical below its reorder level.
+    # Notifying for an outward row would raise a buy alert for material the
+    # client has already delivered to us.
+    in_house_names = [row["chemical_name"] for row in requirements
+                      if row["source_type"] == "in_house"]
     if atomic:
         conn.commit()
-        sync_reorder_notifications(
-            conn, [row["chemical_name"] for row in requirements])
+        sync_reorder_notifications(conn, in_house_names)
     else:
-        deferred_reorder.extend(
-            row["chemical_name"] for row in requirements)
+        deferred_reorder.extend(in_house_names)
 
     final_report = generate_report(conn, company_id, recipe_id, normalized)
     logger.info("Created production run %s for recipe '%s' (%s outputs)",
@@ -1045,16 +1426,23 @@ def print_report(report_data: List[Dict[str, Any]], recipe_name: str,
     for item in report_data:
         unit = item["unit"]
         diff = item["shortage"]
-        if item["status"] == "SHORTAGE":
+        status = item["status"]
+        if status == "SHORTAGE":
             status_str = "[SHORTAGE]"
             total_shortage += abs(diff)
             shortage_count += 1
-        elif item["status"] == "EXACT":
+        elif status == "EXACT":
             status_str = "[EXACT]"
+        elif status == "OUTWARD":
+            # Sourced from the client's own delivery: no balance, no diff.
+            status_str = "[OUTWARD]"
         else:
             status_str = "[SURPLUS]"
-        print(f"  {item['chemical_name']:<30} {item['current_stock']:>8.1f} {unit} "
-              f"{item['required_total']:>8.1f} {unit} {diff:>+8.1f} {unit} {status_str:<10}")
+        have = "     n/a" if item["current_stock"] is None \
+            else f"{item['current_stock']:>8.1f}"
+        delta = "     n/a" if diff is None else f"{diff:>+8.1f} {unit}"
+        print(f"  {item['chemical_name']:<30} {have} {unit} "
+              f"{item['required_total']:>8.1f} {unit} {delta} {status_str:<10}")
     print("-" * 72)
     print(f"  chemicals: {len(report_data)}  shortage: {shortage_count}")
     print("=" * 72)
@@ -1070,9 +1458,13 @@ def export_report_to_csv(report_data: List[Dict[str, Any]], recipe_name: str,
         output_path = os.path.join(
             os.path.dirname(__file__), f"report_{safe_name}.csv")
 
-    total_shortage = sum(abs(item["shortage"]) for item in report_data
-                         if item["shortage"] < 0)
-    shortage_count = sum(1 for item in report_data if item["shortage"] < 0)
+    # ``shortage`` is None for an outward row (no stock impact at all), so the
+    # summary must skip those rows rather than compare None to 0 - a numeric
+    # format or comparison on None is a 500 in the export route.
+    shortages = [abs(item["shortage"]) for item in report_data
+                 if item["shortage"] is not None and item["shortage"] < 0]
+    total_shortage = sum(shortages)
+    shortage_count = len(shortages)
 
     with open(output_path, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
@@ -1088,7 +1480,8 @@ def export_report_to_csv(report_data: List[Dict[str, Any]], recipe_name: str,
                 f"{p['product_name']}: {p['required_qty']:.2f} {item['unit']}"
                 for p in item.get("products") or [])
             writer.writerow([
-                csv_safe(item["chemical_name"]), item["current_stock"],
+                csv_safe(item["chemical_name"]),
+                "" if item["current_stock"] is None else item["current_stock"],
                 csv_safe(item["unit"]), item["required_total"],
                 item["shortage"], csv_safe(item["status"]),
                 csv_safe(breakdown)])

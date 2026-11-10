@@ -97,6 +97,14 @@ OPERATOR_ROUTES = [
     # Counting what arrived or what left is floor-level work, like the monthly
     # stock upload and unit conversions.
     ("POST", "/api/packaging/movements"),
+    # Slice 3 PI demos: planning a formulation is floor work like the PI line
+    # itself. All three also carry the 15/min write budget, because a draft save
+    # replaces N product rows and N ingredients and activation rewrites the whole
+    # active set — see VOLUME_BOUNDED_ROUTES, which picks these up from this
+    # list rather than repeating them.
+    ("POST", "/api/sales/<int:sale_id>/demo-recipe"),
+    ("PUT", "/api/sales/<int:sale_id>/demo-recipe/draft"),
+    ("POST", "/api/sales/<int:sale_id>/demo-recipe/activate"),
 ]
 
 
@@ -217,6 +225,132 @@ def test_user_and_key_management_are_unreachable_for_a_plain_user(user_client):
 def test_chemicals_routes_use_the_decorator(method, path):
     """Three copies of the admin predicate was one too many; _require_admin is gone."""
     assert _role_of_for(method, path) == "admin"
+
+
+# ---------- chemical purchases (Slice 1): admin writes, open reads ----------
+
+@pytest.mark.parametrize("method,path", [
+    ("POST", "/api/chemical-purchases"),
+    ("PUT", "/api/chemical-purchases/<int:purchase_id>"),
+    ("POST", "/api/chemical-purchases/<int:purchase_id>/cancel"),
+])
+def test_purchase_mutation_routes_are_admin_only(method, path):
+    """Posting/correcting/cancelling a receipt moves stock: human-admin only."""
+    assert (method, path) in _mutating_rules(), f"{method} {path} is not a route"
+    assert _role_of_for(method, path) == "admin"
+
+
+@pytest.mark.parametrize("path", [
+    "/api/chemical-purchases",
+    "/api/chemical-purchases/<int:purchase_id>",
+    "/api/chemical-purchases/outward-sources",
+    "/api/chemicals/catalog",
+    "/api/chemicals/inventory",
+])
+def test_purchase_read_routes_are_not_admin_gated(path):
+    """Reads stay open to any authenticated identity (_gate_api 401s anon); no
+    admin stamp means a signed-in operator/user can still read them.
+
+    The outward-source picker is in that set: the recipe editor that picks a
+    source is not an admin-only screen, so the lookup must not be.
+    """
+    _rule_for("GET", path)  # raises if the route is missing
+    assert _role_of_for("GET", path) != "admin"
+
+
+def test_outward_sources_read_is_open_to_a_plain_user(user_client):
+    """Behavioural half of the assertion above: a `user` may pick a source, but
+    an anonymous caller is refused and the client filter is mandatory."""
+    assert user_client.get("/api/chemical-purchases/outward-sources").status_code == 400
+    assert user_client.get(
+        "/api/chemical-purchases/outward-sources?client_id=1").status_code == 200
+    # No session at all: `_gate_api` refuses before the view ever runs.
+    assert flask_app.app.test_client().get(
+        "/api/chemical-purchases/outward-sources").status_code == 401
+
+
+# ---------- PI demo recipes (Slice 3): operator writes, open reads ----------
+
+DEMO_WRITE_ROUTES = [
+    ("POST", "/api/sales/<int:sale_id>/demo-recipe"),
+    ("PUT", "/api/sales/<int:sale_id>/demo-recipe/draft"),
+    ("POST", "/api/sales/<int:sale_id>/demo-recipe/activate"),
+]
+
+DEMO_READ_PATH = "/api/sales/<int:sale_id>/demo-recipe"
+
+
+@pytest.mark.parametrize("method,path", DEMO_WRITE_ROUTES)
+def test_demo_recipe_writes_declare_the_operator_class(method, path):
+    """Planning a formulation is floor work, like the PI line itself.
+
+    It writes no stock and runs no production, so admin-only would block the
+    operator who has to answer "what do we still need to buy".
+    """
+    assert (method, path) in _mutating_rules(), f"{method} {path} is not a route"
+    assert _role_of_for(method, path) == "operator", (
+        f"{method} {path} must state its class with @operator_or_admin_required")
+
+
+@pytest.mark.parametrize("method,path", DEMO_WRITE_ROUTES)
+def test_demo_recipe_writes_declare_the_write_budget(method, path):
+    limit = _stamps_for(method, path).get("_raas_limit")
+    assert limit == flask_app.WRITE_LIMIT_PER_MINUTE == 15, (
+        f"{method} {path} falls back to the 300/min read default: {limit!r}")
+
+
+def test_demo_recipe_read_is_not_admin_gated():
+    """GET is a read: no admin stamp, so a signed-in operator can open the plan.
+
+    The route must exist at all before the class can be read, which is why this
+    resolves the rule explicitly instead of only checking the stamp.
+    """
+    _rule_for("GET", DEMO_READ_PATH)
+    assert _role_of_for("GET", DEMO_READ_PATH) != "admin"
+
+
+def test_a_demo_read_is_open_to_a_plain_user_and_closed_to_anonymous(user_client, db):
+    """Behavioural half: `user` gets the demo's own 404, not a 403, and an
+    anonymous session is refused by `_gate_api` before the view runs.
+    """
+    from raas_tracker.sales import add_sale
+
+    sid = add_sale(db, {"pi_number": "PI-ROLE-DEMO", "client_name": "Role Co"},
+                   [{"product_name": "A", "quantity": 10, "unit_price": 1, "unit": "KG"}])
+    assert user_client.get(f"/api/sales/{sid}/demo-recipe").status_code == 404
+    assert flask_app.app.test_client().get(
+        f"/api/sales/{sid}/demo-recipe").status_code == 401
+
+
+def test_a_demo_write_needs_a_session_but_not_an_admin(db, user_client):
+    """What is enforced here is authentication; the role split stays with admin.
+
+    Planning a demo is an operator-class write, and in this schema that means
+    *any* authenticated identity: `users.role` has exactly two values, `admin`
+    and `user`, and `operator_or_admin_required` deliberately admits both — the
+    same call `POST /api/sales`, `POST /api/upload` and the packaging movements
+    make. Refusing a signed-in `user` here would strand the person who has to
+    answer "what do we still need to buy", and would smuggle a role-model change
+    into a planning feature. The control this slice actually ships is the gate
+    in front of every `/api` route: with no session the writes die before the
+    view runs and nothing is stored.
+    """
+    from raas_tracker.sales import add_sale
+
+    sid = add_sale(db, {"pi_number": "PI-ROLE-DEMO-W", "client_name": "Role Co"},
+                   [{"product_name": "A", "quantity": 10, "unit_price": 1, "unit": "KG"}])
+    anon = flask_app.app.test_client()
+    assert anon.post(f"/api/sales/{sid}/demo-recipe", json={}).status_code == 401
+    assert anon.put(f"/api/sales/{sid}/demo-recipe/draft", json={
+        "expected_revision": 1, "products": []}).status_code == 401
+    assert anon.post(f"/api/sales/{sid}/demo-recipe/activate",
+                     json={"expected_revision": 1}).status_code == 401
+    assert db.execute("SELECT COUNT(*) FROM pi_demos WHERE sale_id = %s",
+                      (sid,)).fetchone()[0] == 0
+
+    # And the floor is not locked: the same identity that fills the PI can plan
+    # it, so the declared class matches what the route does.
+    assert user_client.post(f"/api/sales/{sid}/demo-recipe", json={}).status_code == 201
 
 
 def test_require_admin_helper_is_fully_removed():
@@ -430,6 +564,11 @@ VOLUME_BOUNDED_ROUTES = OPERATOR_ROUTES + [
     # Same rule for the newest admin write: a new route declares 15/min rather
     # than joining the ~27 existing admin writes left on the read default.
     ("PUT", "/api/sales/<int:sale_id>/items/<int:item_id>/wont-ship"),
+    # Slice 1 chemical purchases: one POST/PUT/cancel fans out to N stock writes
+    # in a single transaction, so each declares the 15/min write budget.
+    ("POST", "/api/chemical-purchases"),
+    ("PUT", "/api/chemical-purchases/<int:purchase_id>"),
+    ("POST", "/api/chemical-purchases/<int:purchase_id>/cancel"),
 ]
 
 

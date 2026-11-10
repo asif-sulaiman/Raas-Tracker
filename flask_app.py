@@ -13,7 +13,9 @@ from psycopg_pool import PoolTimeout
 from flask import Flask, request, jsonify, send_from_directory, g, redirect
 from flask.json.provider import DefaultJSONProvider
 from datetime import date, timedelta
+from decimal import Decimal
 from functools import wraps
+from typing import Literal
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -215,6 +217,14 @@ from raas_tracker.sales import (
     invoice_terms_for_sale,
 )
 from raas_tracker.stock import sync_reorder_notifications
+from raas_tracker.purchases import (
+    create_purchase, get_purchases, get_purchase, update_purchase,
+    cancel_purchase, get_catalog, get_inventory, get_outward_sources,
+)
+from raas_tracker.pi_demos import (
+    begin_read_snapshot, create_demo, get_demo, save_draft, activate_demo,
+    project_purchasing,
+)
 from raas_tracker.packaging import (
     MOVEMENT_KINDS as PACKAGING_MOVEMENT_KINDS,
     list_packaging_items, create_packaging_item, record_packaging_movement,
@@ -1478,6 +1488,253 @@ def api_chemicals_history():
     return jsonify(rows)
 
 
+# ==================== API: CHEMICAL PURCHASES (Slice 1) ====================
+# In-house/outward receipts. Reads are any authenticated identity; every
+# mutation is human-admin-only and volume-bounded (15/min) because one POST
+# fans out to N stock writes. The service owns the transaction (commit/rollback
+# + post-commit notifications); the route only releases the connection and maps
+# the refusal TYPE to a status via status_for. `_FiniteModel` rejects non-finite
+# Decimals at the edge; the service re-checks the critical invariants.
+
+
+@app.route("/api/chemicals/catalog")
+def api_chemicals_catalog():
+    """Every chemical identity (including outward-only) for entry selectors."""
+    conn = get_db()
+    try:
+        rows = get_catalog(conn)
+    finally:
+        conn.close()
+    return _revalidating_json(rows)
+
+
+@app.route("/api/chemicals/inventory")
+def api_chemicals_inventory():
+    """Slice 1 inventory and the Slice 3 net purchasing forecast, one snapshot.
+
+    The forecast runs first and the inventory reads follow it inside the same
+    REPEATABLE READ transaction, so a material's shelf quantity and the demand
+    computed against it come from one instant rather than two — and both land
+    on the same row, because a buyer must never be shown two tables that can
+    disagree about what is on the shelf.
+    """
+    conn = get_db()
+    try:
+        # Ends and re-arms the checkout's transaction so the isolation can be
+        # set before the first data query — legal only because this endpoint
+        # writes nothing. See `pi_demos.begin_read_snapshot`.
+        begin_read_snapshot(conn)
+        forecast = project_purchasing(conn)
+        body = get_inventory(conn)
+    except Exception:
+        _rollback_close(conn)
+        app.logger.exception("Chemical inventory failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    by_id = {row["chemical_id"]: row for row in forecast["materials"]}
+    for material in body["materials"]:
+        need = by_id.get(material["id"])
+        material["required_quantity"] = (need or {}).get("required_quantity")
+        material["projected_quantity"] = (need or {}).get("projected_quantity")
+    body["coverage"] = forecast["coverage"]
+    body["unstocked_requirements"] = forecast["unstocked_requirements"]
+    return _revalidating_json(body)
+
+
+class PurchaseLineIn(_FiniteModel):
+    chemical_name: str = Field(min_length=1)
+    chemical_id: int | None = None
+    quantity: Decimal = Field(gt=0, max_digits=18, decimal_places=6)
+    unit: str = Field(min_length=1)
+    is_new: bool = False
+    reorder_level: Decimal | None = Field(default=None, ge=0,
+                                          max_digits=18, decimal_places=6)
+
+
+class PurchaseCreateIn(_StrippedModel):
+    supplier_name: str = Field(min_length=1)
+    purchase_number: str = Field(min_length=1)
+    purchase_date: date
+    delivery_type: Literal["in_house", "outward"]
+    client_id: int | None = None
+    # One POST fans out to one stock write per line: bound the fan-out.
+    lines: list[PurchaseLineIn] = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def _delivery_client(self):
+        if self.delivery_type == "in_house" and self.client_id is not None:
+            raise ValueError("an in_house purchase must not name a client")
+        if self.delivery_type == "outward" and self.client_id is None:
+            raise ValueError("an outward purchase requires a client")
+        return self
+
+
+class PurchaseLinePatchIn(_FiniteModel):
+    id: int
+    quantity: Decimal = Field(gt=0, max_digits=18, decimal_places=6)
+
+
+class PurchaseUpdateIn(_StrippedModel):
+    expected_version: int = Field(gt=0)
+    reason: str = Field(min_length=1)
+    supplier_name: str | None = None
+    purchase_number: str | None = None
+    purchase_date: date | None = None
+    line_patches: list[PurchaseLinePatchIn] | None = Field(default=None,
+                                                          max_length=100)
+
+
+class PurchaseCancelIn(_StrippedModel):
+    expected_version: int = Field(gt=0)
+    reason: str = Field(min_length=1)
+
+
+@app.route("/api/chemical-purchases", methods=["GET"])
+def api_list_purchases():
+    conn = get_db()
+    try:
+        body = get_purchases(
+            conn,
+            delivery_type=request.args.get("delivery_type"),
+            client_id=request.args.get("client_id", type=int),
+            chemical_id=request.args.get("chemical_id", type=int),
+            include_cancelled=request.args.get("include_cancelled") == "true",
+            page=request.args.get("page", 1, type=int),
+            per_page=request.args.get("per_page", 20, type=int))
+    finally:
+        conn.close()
+    return _revalidating_json(body)
+
+
+@app.route("/api/chemical-purchases/outward-sources", methods=["GET"])
+def api_outward_purchase_sources():
+    """Outward receipt lines this client may source a recipe ingredient from.
+
+    A read, so it is deliberately NOT admin-gated: the screen that picks a
+    source is the recipe editor, which operators and users open too. `client_id`
+    is mandatory — offering another client's delivery to a picker is the exact
+    cross-tenant mistake the source rule exists to prevent.
+
+    A frozen (already-referenced) line is returned with `frozen: true` rather
+    than dropped: freezing blocks edits to the receipt, never using it.
+    """
+    bad = _bad_int_query_param(("client_id", "chemical_id"))
+    if bad:
+        return bad
+    client_id = request.args.get("client_id", type=int)
+    if client_id is None:
+        return jsonify({
+            "error": "Invalid query parameter",
+            "details": [{"field": "client_id", "message": "is required"}],
+        }), 400
+    conn = get_db()
+    try:
+        body = get_outward_sources(
+            conn, client_id=client_id,
+            chemical_id=request.args.get("chemical_id", type=int))
+    except ValueError as e:
+        # A typed refusal (400/409). Anything else — a pool timeout or an
+        # OperationalError — propagates to the app's 503 handlers, so a read
+        # route can never turn a transient DB failure into a 500.
+        _rollback(conn)
+        return jsonify({"error": str(e)}), status_for(e)
+    finally:
+        conn.close()
+    return _revalidating_json({"sources": body})
+
+
+@app.route("/api/chemical-purchases/<int:purchase_id>", methods=["GET"])
+def api_get_purchase(purchase_id):
+    conn = get_db()
+    try:
+        body = get_purchase(conn, purchase_id)
+    finally:
+        conn.close()
+    if body is None:
+        return jsonify({"error": "purchase not found"}), 404
+    return _revalidating_json(body)
+
+
+@app.route("/api/chemical-purchases", methods=["POST"])
+@admin_required
+@limited()
+def api_create_purchase():
+    try:
+        payload = PurchaseCreateIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        body = create_purchase(
+            conn, supplier_name=payload.supplier_name,
+            purchase_number=payload.purchase_number,
+            purchase_date=payload.purchase_date,
+            delivery_type=payload.delivery_type, client_id=payload.client_id,
+            lines=[line.model_dump() for line in payload.lines], actor=_actor())
+    except ValueError as e:
+        _rollback_close(conn)
+        return jsonify({"error": str(e)}), status_for(e)
+    except Exception:
+        _rollback_close(conn)
+        app.logger.exception("Purchase create failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    return jsonify(body), 201
+
+
+@app.route("/api/chemical-purchases/<int:purchase_id>", methods=["PUT"])
+@admin_required
+@limited()
+def api_update_purchase(purchase_id):
+    try:
+        payload = PurchaseUpdateIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        body = update_purchase(
+            conn, purchase_id, expected_version=payload.expected_version,
+            reason=payload.reason, supplier_name=payload.supplier_name,
+            purchase_number=payload.purchase_number,
+            purchase_date=payload.purchase_date,
+            line_patches=([p.model_dump() for p in payload.line_patches]
+                          if payload.line_patches is not None else None),
+            actor=_actor())
+    except ValueError as e:
+        _rollback_close(conn)
+        return jsonify({"error": str(e)}), status_for(e)
+    except Exception:
+        _rollback_close(conn)
+        app.logger.exception("Purchase update failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    return jsonify(body), 200
+
+
+@app.route("/api/chemical-purchases/<int:purchase_id>/cancel", methods=["POST"])
+@admin_required
+@limited()
+def api_cancel_purchase(purchase_id):
+    try:
+        payload = PurchaseCancelIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        body = cancel_purchase(conn, purchase_id,
+                               expected_version=payload.expected_version,
+                               reason=payload.reason, actor=_actor())
+    except ValueError as e:
+        _rollback_close(conn)
+        return jsonify({"error": str(e)}), status_for(e)
+    except Exception:
+        _rollback_close(conn)
+        app.logger.exception("Purchase cancel failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    return jsonify(body), 200
+
+
 # ==================== API: PACKAGING ====================
 # Bags, jars and drums are counted objects, not ingredients, so they live in
 # `packaging_items` + `packaging_movements` and none of the chemical readers
@@ -1641,12 +1898,47 @@ class RecipeItemIn(_FiniteModel):
         str_strip_whitespace=True, allow_inf_nan=False, extra="forbid")
     chemical: str = Field(min_length=1)
     percentage: float = Field(ge=0, le=100)
+    # Slice 2: where the ingredient comes from. Both default to the Slice 1
+    # shape, so a caller that says nothing still means in-house stock.
+    source_type: Literal["in_house", "outward"] = "in_house"
+    outward_purchase_line_id: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _source_pairing(self):
+        if self.source_type == "in_house" and self.outward_purchase_line_id is not None:
+            raise ValueError("outward_purchase_line_id needs source_type 'outward'")
+        if self.source_type == "outward" and self.outward_purchase_line_id is None:
+            raise ValueError("an outward ingredient needs outward_purchase_line_id")
+        return self
 
 
 class RecipePercentageIn(_FiniteModel):
     model_config = ConfigDict(
         str_strip_whitespace=True, allow_inf_nan=False, extra="forbid")
     percentage: float = Field(ge=0, le=100)
+    source_type: Literal["in_house", "outward"] = "in_house"
+    outward_purchase_line_id: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _source_pairing(self):
+        if self.source_type == "in_house" and self.outward_purchase_line_id is not None:
+            raise ValueError("outward_purchase_line_id needs source_type 'outward'")
+        if self.source_type == "outward" and self.outward_purchase_line_id is None:
+            raise ValueError("an outward ingredient needs outward_purchase_line_id")
+        return self
+
+
+def _recipe_source_update(payload):
+    """Source fields for a PUT, or ``(None, None)`` when the caller was silent.
+
+    The model defaults ``source_type`` to 'in_house', which is right for a POST
+    but wrong for a PUT: a Slice 1 screen that edits only the percentage would
+    otherwise clear an outward row's source and start deducting stock the
+    client's delivery already covers.
+    """
+    if {"source_type", "outward_purchase_line_id"} & payload.model_fields_set:
+        return payload.source_type, payload.outward_purchase_line_id
+    return None, None
 
 
 class RecipeWaterIn(_FiniteModel):
@@ -1873,7 +2165,9 @@ def api_add_recipe_item_by_product(recipe_id, product):
     conn = get_db()
     try:
         success = add_recipe_item(conn, recipe_id, product, payload.chemical,
-                                  payload.percentage)
+                                  payload.percentage,
+                                  source_type=payload.source_type,
+                                  outward_purchase_line_id=payload.outward_purchase_line_id)
     except ValueError as e:
         _rollback_close(conn)
         return jsonify({"error": str(e)}), status_for(e)
@@ -1894,8 +2188,11 @@ def api_update_recipe_item_by_id(recipe_id, item_id):
         return _validation_error_response(e)
     conn = get_db()
     try:
+        source_type, line_id = _recipe_source_update(payload)
         success = update_recipe_item(conn, recipe_id, item_id,
-                                     payload.percentage)
+                                     payload.percentage,
+                                     source_type=source_type,
+                                     outward_purchase_line_id=line_id)
     except ValueError as e:
         _rollback_close(conn)
         return jsonify({"error": str(e)}), status_for(e)
@@ -2865,8 +3162,12 @@ def _run_detail(conn, recipe_id, run_id):
     if not run:
         return None
     items = conn.execute(
-        """SELECT chemical_name, required_qty, deducted_qty, unit
-             FROM production_run_items WHERE run_id = %s""", (run_id,)).fetchall()
+        """SELECT chemical_name, required_qty, deducted_qty, unit,
+                  source_type, outward_purchase_line_id, purchase_number,
+                  purchase_date, supplier_name, client_name, source_qty,
+                  source_unit
+             FROM production_run_items WHERE run_id = %s
+            ORDER BY id""", (run_id,)).fetchall()
     outputs = conn.execute(
         """SELECT product_name, unit, qty_produced
              FROM production_run_outputs WHERE run_id = %s
@@ -2875,9 +3176,19 @@ def _run_detail(conn, recipe_id, run_id):
         "id": run[0], "order_number": run[1], "batch_number": run[2],
         "production_date": run[3], "qty_produced": run[4], "notes": run[5],
         "created_at": run[6],
+        # The immutable sourcing evidence of the run. `source_qty` is NUMERIC
+        # -> Decimal, which the JSON provider refuses, so it is floated; the
+        # DATE is likewise rendered as ISO text.
         "items": [
             {"chemical_name": i[0], "required_qty": i[1],
-             "deducted_qty": i[2], "unit": i[3]}
+             "deducted_qty": i[2], "unit": i[3],
+             "source_type": i[4] or "in_house",
+             "outward_purchase_line_id": i[5],
+             "purchase_number": i[6],
+             "purchase_date": i[7].isoformat() if i[7] is not None else None,
+             "supplier_name": i[8], "client_name": i[9],
+             "source_qty": None if i[10] is None else float(i[10]),
+             "source_unit": i[11]}
             for i in items
         ],
         "outputs": [
@@ -3837,6 +4148,141 @@ def api_set_item_wont_ship(sale_id, item_id):
     # repeat can only come from a view that has not re-read yet.
     return jsonify({"message": "Item updated",
                     "wont_ship": bool(body.wont_ship)})
+
+
+# --------------------------------------------------------------------------- #
+# PI demo recipes (Slice 3) — planning formulations and the net buying list
+#
+# A demo recipe answers "what do I still have to buy" while the PI is open, so
+# it must be creatable the moment a PI is, savable while incomplete, and inert
+# until activated. None of these routes touches stock, production or recipes.
+# --------------------------------------------------------------------------- #
+class DemoIngredientIn(_FiniteModel):
+    chemical: str = Field(min_length=1)
+    percentage: float = Field(ge=0, le=100)
+
+
+class DemoProductIn(_FiniteModel):
+    product_name: str = Field(min_length=1)
+    unit: str = Field(min_length=1)
+    # None means "derive it at activation"; the active row then stores a number.
+    water_percentage: float | None = Field(default=None, ge=0, le=100)
+    items: list[DemoIngredientIn] = Field(default_factory=list, max_length=100)
+
+
+class DemoDraftIn(_StrippedModel):
+    expected_revision: int = Field(gt=0)
+    products: list[DemoProductIn] = Field(max_length=200)
+
+
+class DemoActivateIn(_StrippedModel):
+    expected_revision: int = Field(gt=0)
+
+
+def _demo_rejection(conn, e):
+    """Roll back a refused demo write, then answer with the service's own status.
+
+    The activation gate names the offending product in ``details``, and the
+    editor can only act on the plan product by product — a bare 400 would say
+    the formulation is wrong without saying which half of it.
+    """
+    _rollback_close(conn)
+    payload = {"error": str(e)}
+    details = getattr(e, "details", None)
+    if details:
+        payload["details"] = details
+    return jsonify(payload), status_for(e)
+
+
+@app.route("/api/sales/<int:sale_id>/demo-recipe", methods=["GET"])
+def api_get_demo_recipe(sale_id):
+    """The PI's demo recipe, or 404 — reading must never create one.
+
+    "Nobody has planned this PI" and "this PI is planned with nothing in it"
+    are different facts, and the coverage report can only keep telling them
+    apart while a miss stays a miss.
+    """
+    conn = get_db()
+    try:
+        demo = get_demo(conn, sale_id)
+    except Exception:
+        _rollback_close(conn)
+        app.logger.exception("PI demo read failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    if demo is None:
+        return jsonify({"error": "Demo recipe not found"}), 404
+    return jsonify({"demo": demo})
+
+
+@app.route("/api/sales/<int:sale_id>/demo-recipe", methods=["POST"])
+@operator_or_admin_required
+@limited()
+def api_create_demo_recipe(sale_id):
+    """Open a demo for a PI: no LC and no invoice needed, none looked up."""
+    conn = get_db()
+    try:
+        demo = create_demo(conn, sale_id, actor=_actor())
+    except ValueError as e:
+        return _demo_rejection(conn, e)
+    except Exception:
+        _rollback_close(conn)
+        app.logger.exception("PI demo create failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    return jsonify({"demo": demo}), 201
+
+
+@app.route("/api/sales/<int:sale_id>/demo-recipe/draft", methods=["PUT"])
+@operator_or_admin_required
+@limited()
+def api_save_demo_draft(sale_id):
+    """Replace the draft working set; the active formula keeps buying against."""
+    try:
+        payload = DemoDraftIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        demo = save_draft(conn, sale_id, expected_revision=payload.expected_revision,
+                          products=[p.model_dump() for p in payload.products],
+                          actor=_actor())
+    except ValueError as e:
+        return _demo_rejection(conn, e)
+    except Exception:
+        _rollback_close(conn)
+        app.logger.exception("PI demo draft save failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    return jsonify({"demo": demo})
+
+
+@app.route("/api/sales/<int:sale_id>/demo-recipe/activate", methods=["POST"])
+@operator_or_admin_required
+@limited()
+def api_activate_demo_recipe(sale_id):
+    """Publish the draft as the operational formula, or refuse and change nothing.
+
+    A refusal is about the formula — balance, coverage, reachable units — never
+    about a shortage on the shelf, which is what the forecast exists to report.
+    """
+    try:
+        payload = DemoActivateIn.model_validate(request.get_json() or {})
+    except ValidationError as e:
+        return _validation_error_response(e)
+    conn = get_db()
+    try:
+        demo = activate_demo(conn, sale_id,
+                             expected_revision=payload.expected_revision,
+                             actor=_actor())
+    except ValueError as e:
+        return _demo_rejection(conn, e)
+    except Exception:
+        _rollback_close(conn)
+        app.logger.exception("PI demo activation failed")
+        return jsonify({"error": "internal server error"}), 500
+    conn.close()
+    return jsonify({"demo": demo})
 
 
 @app.route("/api/sales/<int:sale_id>/items/<int:item_id>", methods=["PUT"])

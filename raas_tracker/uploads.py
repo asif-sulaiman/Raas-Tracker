@@ -970,10 +970,17 @@ def adjust_stock_from_upload(conn: psycopg.Connection, upload_id: int,
                                        chemical_name, upload_unit, chem_unit)
                         continue
                 
-                # Update stock
+                # Update stock. Slice 1: a hidden (outward-only) identity that
+                # receives stock is promoted to in_house_registered so it
+                # rejoins the stock list, the inventory view and reorder alerts.
+                # Never demote — a zero count keeps a once-stocked material
+                # visible — and never touch the unit: a material with purchase
+                # history keeps its registered unit.
                 conn.execute(
-                    "UPDATE chemicals SET current_qty = %s, last_updated = %s WHERE id = %s",
-                    (new_qty, date.isoformat(date.today()), chem_id)
+                    "UPDATE chemicals SET current_qty = %s, last_updated = %s, "
+                    "in_house_registered = CASE WHEN %s THEN TRUE "
+                    "ELSE in_house_registered END WHERE id = %s",
+                    (new_qty, date.isoformat(date.today()), new_qty > 0, chem_id)
                 )
                 
                 # Queue the adjustment. Provenance goes in new_value, not

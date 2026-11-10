@@ -433,3 +433,60 @@ def test_a_retired_legacy_sale_raises_no_maturity_reminder(client, monkeypatch, 
     set_sale_item_wont_ship(db, sid, item_id, 1)
     body = client.post("/api/cron/maturity-check", headers=headers).get_json()
     assert (body["checked"], body["notified"]) == (0, 0)
+
+
+# --------------------------------------------------------------------------- #
+# Slice 3: the retired remainder has to survive into planning and into the
+# purchasing projection, or the money and the buying list disagree about one PI.
+# --------------------------------------------------------------------------- #
+def _pi_demos_project(db):
+    """Slice 3's read-only net purchasing projection (`Task 5b-2` lands it)."""
+    from raas_tracker import pi_demos
+
+    return pi_demos.project_purchasing(db)
+
+
+def test_a_retired_remainder_still_needs_a_formula_and_projects_the_balance(admin_client, db):
+    """450 ordered, 400 billed, 100 produced, then retired: the target is the
+    billed 400, so 300 output units still need a formulation and a balance.
+
+    A projection that dropped the marked line wholesale would tell the plant
+    there is nothing to buy for a PI that still owes 300 KG.
+    """
+    from test_pi_demos import _chem, _create_ok, _plan, _product, _produce, _rows
+
+    sid, item_id = _invoiced_line(db, pi="PI-WS-PROJ", quantity=450, invoiced=400)
+    invoice = db.execute("SELECT id FROM invoices WHERE sale_id = %s",
+                         (sid,)).fetchone()[0]
+    _produce(db, sid, item_id, "A", "KG", 100, invoice)
+    _chem(db, "Chem WS", qty=0)
+    assert set_sale_item_wont_ship(db, sid, item_id, 1) is True
+
+    _create_ok(admin_client, sid)
+    unformulated = _plan(admin_client, db, sid, [])
+    assert unformulated.status_code == 400, unformulated.get_json()
+
+    activated = _plan(admin_client, db, sid, [_product("A", [("Chem WS", 50)])])
+    assert activated.status_code == 200, activated.get_json()
+    row = _rows(_pi_demos_project(db))["chem ws"]
+    assert row["required_quantity"] == 150.0, row   # 300 remaining units x 50%
+    assert row["projected_quantity"] == 150.0, row
+
+
+def test_a_fully_retired_line_needs_no_formula_and_adds_no_demand(admin_client, db):
+    """Retired with nothing billed, the target is `min(450, 0)` = 0: no
+    formulation is required, and none of its material enters the buying list.
+    """
+    from test_pi_demos import _chem, _create_ok, _plan, _required, _rows
+
+    sid, item_id = _line(db, pi="PI-WS-ZERO", quantity=450)
+    _chem(db, "Chem Gone", qty=100)
+    assert set_sale_item_wont_ship(db, sid, item_id, 1) is True
+
+    _create_ok(admin_client, sid)
+    assert _plan(admin_client, db, sid, []).status_code == 200
+
+    rows = _rows(_pi_demos_project(db))
+    assert _required(rows, "Chem Gone") == 0.0, rows
+    assert db.execute("SELECT COUNT(*) FROM pi_demo_products WHERE scope = 'active'"
+                      ).fetchone()[0] == 0

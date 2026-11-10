@@ -61,10 +61,24 @@ def import_from_json(json_path: str = JSON_PATH) -> Dict[str, int]:
                 "SELECT id FROM chemicals WHERE UPPER(name) = %s", (name.upper(),)
             ).fetchone()
             if existing:
-                conn.execute(
-                    "UPDATE chemicals SET current_qty = %s, balance_last_month = %s, unit = %s, last_updated = %s WHERE UPPER(name) = %s",
-                    (float(qty), float(last_qty), unit, date.isoformat(date.today()), name.upper())
-                )
+                # Slice 1: a material with purchase history keeps its registered
+                # unit — every posted receipt and production conversion is keyed
+                # to it, so a file import must reconcile quantities only, never
+                # silently re-denominate the identity. No history -> unit may change.
+                has_history = conn.execute(
+                    "SELECT 1 FROM chemical_purchase_items WHERE chemical_id = %s LIMIT 1",
+                    (existing[0],)
+                ).fetchone() is not None
+                if has_history:
+                    conn.execute(
+                        "UPDATE chemicals SET current_qty = %s, balance_last_month = %s, last_updated = %s WHERE UPPER(name) = %s",
+                        (float(qty), float(last_qty), date.isoformat(date.today()), name.upper())
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE chemicals SET current_qty = %s, balance_last_month = %s, unit = %s, last_updated = %s WHERE UPPER(name) = %s",
+                        (float(qty), float(last_qty), unit, date.isoformat(date.today()), name.upper())
+                    )
             else:
                 conn.execute(
                     "INSERT INTO chemicals (name, current_qty, balance_last_month, unit, last_updated) VALUES (%s, %s, %s, %s, %s)",
@@ -86,10 +100,19 @@ def import_from_json(json_path: str = JSON_PATH) -> Dict[str, int]:
 
 
 def get_all_chemicals(conn: psycopg.Connection) -> List[Dict[str, Any]]:
-    """Return all chemicals with current stock levels."""
+    """Return in-house chemicals with current stock levels.
+
+    Slice 1: only ``in_house_registered = TRUE`` rows. An outward-only material
+    (bought for a client, never stocked on site) is not part of the in-house
+    stock list, the inventory view or the CLI listing; the catalog
+    (purchases.get_catalog) is the selector that still shows every identity.
+    A hidden material is promoted to registered the moment something stocks it
+    (an in-house purchase or an approved upload), so it rejoins this list.
+    """
     cursor = conn.execute(
         "SELECT id, name, current_qty, balance_last_month, unit, last_updated, "
-        "COALESCE(reorder_level, 0) FROM chemicals ORDER BY name"
+        "COALESCE(reorder_level, 0) FROM chemicals "
+        "WHERE in_house_registered = TRUE ORDER BY name"
     )
     return [
         {"id": row[0], "name": row[1], "qty": row[2], "balance_last_month": row[3], "unit": row[4],
@@ -221,7 +244,8 @@ def sync_reorder_notifications(conn: psycopg.Connection,
     """
     for name in dict.fromkeys(n for n in (chemical_names or []) if n):
         row = conn.execute(
-            "SELECT id, name, current_qty, reorder_level FROM chemicals WHERE name = %s",
+            "SELECT id, name, current_qty, reorder_level FROM chemicals "
+            "WHERE name = %s AND in_house_registered = TRUE",
             (name,)
         ).fetchone()
         if row:
@@ -255,7 +279,8 @@ def update_stock(conn: psycopg.Connection, name: str, delta: float, unit: str = 
     """
     # Get chemical info with FOR UPDATE to lock the row
     chemical = conn.execute(
-        "SELECT id, name, current_qty, unit, reorder_level FROM chemicals WHERE name = %s FOR UPDATE",
+        "SELECT id, name, current_qty, unit, reorder_level, in_house_registered "
+        "FROM chemicals WHERE name = %s FOR UPDATE",
         (name,)
     ).fetchone()
     
@@ -268,7 +293,7 @@ def update_stock(conn: psycopg.Connection, name: str, delta: float, unit: str = 
     # `float(sys.argv[3])`.
     finite_values(delta)
 
-    chem_id, chem_name, current_qty, chem_unit, reorder_level = chemical
+    chem_id, chem_name, current_qty, chem_unit, reorder_level, registered = chemical
     
     # Normalize unit - if user provides unit, validate it matches or is KG
     if unit.upper() != chem_unit.upper() and unit.upper() != "KG":
@@ -298,7 +323,10 @@ def update_stock(conn: psycopg.Connection, name: str, delta: float, unit: str = 
                      old_value=str(current_qty),
                      new_value=f"{new_qty} ({reason_text})" if reason_text else str(new_qty),
                      atomic=atomic)
-    if atomic:
+    if atomic and registered:
+        # Slice 1: an outward-only (hidden) material is not on-site stock, so it
+        # must not raise reorder alerts — mirrors sync_reorder_notifications,
+        # which already filters in_house_registered = TRUE on the deferred path.
         notify_reorder_status(conn, chem_id, chem_name, new_qty, reorder_level)
 
     logger.info("Updated '%s': %s %s -> %s %s (change: %s %s)",
@@ -347,7 +375,8 @@ def add_chemical(conn: psycopg.Connection, name: str, qty: float, unit: str = "K
         return False
     try:
         row = conn.execute(
-            "INSERT INTO chemicals (name, current_qty, unit, last_updated) VALUES (%s, %s, %s, %s) RETURNING id",
+            "INSERT INTO chemicals (name, current_qty, unit, last_updated, in_house_registered) "
+            "VALUES (%s, %s, %s, %s, TRUE) RETURNING id",
             (name, qty, unit, date.isoformat(date.today()))
         ).fetchone()
         # atomic=False, commit below: the INSERT and its audit row are one unit.
@@ -362,6 +391,62 @@ def add_chemical(conn: psycopg.Connection, name: str, qty: float, unit: str = "K
         conn.rollback()
         logger.warning("Chemical '%s' already exists. Use update_stock instead.", name)
         return False
+
+
+def register_chemical_in_transaction(conn: psycopg.Connection, name: str,
+                                     unit: str, reorder_level,
+                                     in_house_registered: bool) -> Dict[str, Any]:
+    """Resolve (or create) a chemical identity inside the CALLER's transaction.
+
+    Transaction-aware: no commit and no rollback here. A purchase posts several
+    lines as one unit, so a new material's INSERT must live or die with the
+    whole receipt — unlike ``add_chemical``, which self-commits.
+
+    Identity is case-insensitive (``idx_chemicals_name_lower``). ``INSERT ...
+    ON CONFLICT (lower(name)) DO NOTHING`` converges a concurrent same-name
+    registration on the existing row instead of raising; the re-SELECT then
+    reads the canonical identity and ``FOR UPDATE`` locks it. An existing row's
+    unit / reorder_level / registration flag are never overwritten by the
+    suppressed INSERT — the caller promotes a hidden material explicitly when
+    it stocks it.
+
+    Returns ``{id, name, current_qty, unit, reorder_level, in_house_registered}``.
+    The CALLER owns lock ordering: resolve every line first, then acquire the
+    ``FOR UPDATE`` locks in ascending ``chemical_id`` order (see
+    ``purchases.create_purchase``) so two multi-line writers cannot deadlock.
+
+    Raises ValueError on a blank name or a negative / non-finite reorder level.
+    """
+    clean_name = (name or "").strip()
+    if not clean_name:
+        raise ValueError("chemical_name is required")
+    level = float(reorder_level) if reorder_level is not None else 0.0
+    finite_values(level)
+    if level < 0:
+        raise ValueError("reorder_level must be 0 or greater")
+    clean_unit = (unit or "").strip().upper()
+    if not clean_unit:
+        raise ValueError("unit is required")
+    conn.execute(
+        "INSERT INTO chemicals (name, current_qty, unit, reorder_level, "
+        "last_updated, in_house_registered) "
+        "VALUES (%s, 0, %s, %s, %s, %s) "
+        "ON CONFLICT (lower(name)) DO NOTHING",
+        (clean_name, clean_unit, level, date.isoformat(date.today()),
+         bool(in_house_registered)),
+    )
+    row = conn.execute(
+        "SELECT id, name, current_qty, unit, reorder_level, in_house_registered "
+        "FROM chemicals WHERE lower(name) = lower(%s) FOR UPDATE",
+        (clean_name,),
+    ).fetchone()
+    if row is None:
+        # The ON CONFLICT suppressed the INSERT yet no row is visible: only
+        # possible if a concurrent writer rolled back between the two
+        # statements. Fail closed rather than post against a phantom identity.
+        raise ValueError(f"chemical '{clean_name}' could not be resolved")
+    return {"id": row[0], "name": row[1], "current_qty": row[2], "unit": row[3],
+            "reorder_level": row[4] or 0, "in_house_registered": row[5]}
 
 
 _QTY_ACTIONS = ("ADJUST_STOCK", "ADD_CHEMICAL")
