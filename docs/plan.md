@@ -2109,6 +2109,8 @@ this is where to look.
 
 | Date | Change | Routes affected | Rationale |
 |---|---|---|---|
+| 2026-11-10 | **`GET /api/chemicals/inventory` gained a forecast, and `coverage` stopped being a placeholder.** Every `materials[]` row now also carries `required_quantity` and `projected_quantity` (`null` when the demand is not knowable — never `0`), the body gains `coverage` (always an object: `state` `complete` \| `incomplete` \| `no_active_plans`, `open_pis_without_plan[]`, `incomplete_plans[]`) and `unstocked_requirements[]`, and the ETag is computed over that complete body. `GET /api/chemicals` is unchanged and stays lightweight. | `GET /api/chemicals/inventory` (additive keys; `coverage` **None → object**; new ETag semantics) | A buyer must not be shown a shelf table and a demand table that can disagree about what is on the shelf — so both are read from one REPEATABLE READ snapshot in one request. Slice 1's own test asserted `coverage is None`; that assertion described the *un-composed* endpoint and is now obsolete |
+| 2026-11-10 | **Four new PI demo routes** (schema v15): `GET/POST /api/sales/<id>/demo-recipe`, `PUT …/demo-recipe/draft`, `POST …/demo-recipe/activate`. GET is any authenticated identity and **404s when nobody has planned the PI** — it never auto-creates; the three writes are operator-class + 15/min, answer **400** `{error, details:[{field,message}]}` for a gate refusal, **404** for a missing or already-bound PI, and **409** for a revision conflict or a second demo on one PI. No stock, production or recipe row is written by any of them. | `POST /api/sales/<id>/demo-recipe` (new, 201), `GET` (new, 404-vs-empty), `PUT …/draft`, `POST …/activate` | "What do we still have to buy for the PIs we have signed but not built?" is only askable before an LC or invoice exists, and answering it required a plan that is explicitly *not* a production order |
 | 2026-11-05 | **`total_pipeline_value` and `total_sales` no longer include completed sales.** They summed every stage in `SALE_STAGE_ORDER`, `completed` included, so a database whose only sales are settled reported all of its closed business as the pipeline. `summary["completed"]` still carries its own count and value, so the Completed tile and Home's "N completed · $X booked" line are unchanged — the money moved out of the total, it was not hidden. | `GET /api/sales/summary`, `GET /api/dashboard` (`sales_summary.total_pipeline_value`, `.total_sales`) | The user's board read **$50,174 / 3 sales** as the pipeline beside four columns of **$0.00**, and Home printed the same $50,174 under *"3 sales in flow"* and again under *"3 completed"* — a completed sale is settled business, not work in flight |
 | 2026-11-05 | **A sale's `total_value` / `balance` became the accounted value, not the document total.** A PI line marked won't ship now counts only its invoiced quantity (capped at what the PI ordered) in the pipeline list, the pipeline CSV and the stage sums; `has_uninvoiced_remainder` no longer reports a retired line, and the legacy maturity scan drops a sale whose only unpaid money is retired. Consequences: a retired, never-invoiced line reads `total_value 0`; a legacy sale-level payment against such a line answers a **negative** `balance`; a fully or over-invoiced marked line is unchanged. Only sales that carry the mark move — every other row of every response is identical. | `GET /api/sales`, `GET /api/sales/export`, `GET /api/sales/summary`, `GET /api/dashboard` (`sales` and `sales_summary`), `/api/cron/maturity-check` (`checked` can drop) | Netting the remainder in the Commercial Report alone left the board, Home and the CSV still counting a balance the user had retired — "everywhere, not just the report" |
 | 2026-11-05 | **A commercial report row now names the PI line behind it, and an admin can retire a remainder.** Report rows gain the additive key `sale_item_id` (previously selected by the SQL but never serialised), and `PUT /api/sales/<id>/items/<iid>/wont-ship` (Admin, 15/min) stores `sale_items.wont_ship` (schema v12). A marked line yields **no** provisional remainder row in `/api/reports/live`, `/live/filtered`, `/live/summary` or the CSV, so its unshipped balance leaves Gross Sales/Due/Overdue. Invoiced rows and their money are untouched, and the mark never blocks invoicing. Responses are otherwise unchanged. | `GET /api/reports/live`, `/live/filtered`, `/live/summary`, `/live/export`, `GET /api/sales/<id>` (`items[].wont_ship`), `PUT /api/sales/<id>/items/<iid>/wont-ship` (new) | The user's PI `12322332` held $72 Due on a 50 KG balance that may never ship; a decision that belongs to the document, not to a viewer's filter |
@@ -2176,6 +2178,110 @@ When starting any task above:
 - **Secrets:** `RAAS_SECRET` (local + Vercel), `DATABASE_URL` (local `setx` + Vercel), `PRODUCTION=1` (Vercel)
 - **Password rotation:** Run `setx` locally + update Vercel env → redeploy
 - **Do not push** without explicit user instruction
+
+---
+
+## 🔒 Phase CHEMICAL-PURCHASES: Lock ordering (Slice 1, audited 2026-11-08)
+
+Canonical acquisition chain (top → bottom, never back-acquire):
+
+```
+LC → sale → invoice/recipe → purchase headers → chemicals
+```
+
+Concrete sequences for intersecting writers:
+
+| Writer | Sequence | Sort key |
+|---|---|---|
+| `create_production_run` | invoice(FU) → sale(FKS/UPD) → chemicals(FU) | **chemical_id ascending** (changed from name) |
+| `purchase.create` (new) | purchase_header(INS) → chemicals(FU/INS) | chemical_id ascending |
+| `purchase.correct/cancel` (new) | purchase_header(FU) → chemicals(FU) | chemical_id ascending |
+| `stock.update_stock` | chemicals(FU by name) | caller determines order |
+| `uploads.adjust_stock_from_upload` | chemicals(UPD, upload-row order) | unsorted (pre-existing, not fixed) |
+| `stock.import_from_json` | chemicals(UPD/INS, file order) | unsorted (pre-existing, not fixed) |
+| `lcs.attach_pis/detach_pi/move_lc_stage` | LC(FU) → sales(FU) | sale id ascending |
+| `sales.create_invoice/batch` | sale(FU) → sale_items(FU) → invoices(INS) | sale_item id ascending |
+| `sales.record_invoice_payment/ship_invoice` | invoice(FU) → sale(UPD) | single row |
+
+**Decision:** Production `_aggregate_requirements` (`recipes.py:803`) sorts by
+`chemical_id` ascending. Purchases acquire chemical locks in the same order.
+This is rename-stable and uniform. No existing test asserts name-order of
+production_run_items.
+
+**Pre-existing inversions NOT fixed in Slice 1:**
+- Sale↔invoice: production/payment/ship lock invoice-first; create_invoice
+  locks sale-first. Purchases never lock sale/invoice, so they cannot
+  participate in that cycle.
+- Reconciliation/import: unsorted chemical acquisition. Self-contained
+  transactions; no purchase intersection.
+
+**New-material race:** `INSERT … ON CONFLICT (lower(name)) DO NOTHING` +
+re-SELECT + `FOR UPDATE`. Unique index `idx_chemicals_name_lower` enforces
+identity; no assumed existing-row lock.
+
+**Concurrency tests (Slice 1):**
+- A: purchase correction vs production on overlapping chemicals (barrier)
+- B: two purchases with reversed row order (both must acquire id-ascending)
+- C: concurrent new-material registration (identity race)
+- D: repeated cancellation (idempotent guard under FU)
+
+---
+
+## 🧪 Phase PI-DEMOS: plan a PI before it exists, and forecast the buying (Slice 3, built 2026-11-10)
+
+Implements the third slice of the Chemical Stock redesign (slices 1 and 2 are
+recorded above and in `docs/SPEC.md` §"Where a recipe's material comes from").
+Schema **v15**; nothing existing changed shape.
+
+**What shipped:** `raas_tracker/pi_demos.py` (create / get / save_draft /
+activate_demo / project_purchasing / arm_snapshot), four routes in `flask_app.py`
+(`GET|POST /api/sales/<id>/demo-recipe`, `PUT …/draft`, `POST …/activate`), and the
+inventory route rewired so the forecast and the shelf are read from **one**
+REPEATABLE READ snapshot. Frontend: `PiDemoEditor.jsx`, the demo entry in
+`SaleDetailModal.jsx`, the Projected Quantity column + coverage alerts in
+`Chemicals.jsx`.
+
+**Lock order (extends the chain above, never inverts it):**
+`sales(FU) → pi_demos(FU OF d) → pi_demo_products/items(DELETE+INSERT)`, chemical
+ids ascending where a formulation names several. `create_demo` inserts on
+`pi_demos.sale_id` and maps `UniqueViolation → 409`, `ForeignKeyViolation → 404`,
+so a concurrent create and a deleted PI both answer with their own fact instead
+of a 500. Purchases never take a sale lock and demos never take a chemical lock,
+so neither new writer can join the pre-existing sale↔invoice inversion.
+
+**Rulings taken while building (the plan was silent or self-contradictory):**
+
+- **`coverage` is always an object.** Slice 1's `test_chemical_purchases._material`
+  asserted `coverage is None` — a statement about an endpoint that had no
+  projection. Once Slice 3 composes the forecast into that same response, the
+  placeholder is gone and the test now pins the real shape. The behaviour change
+  is the point of the slice, not a regression.
+- **Demo writes are operator-class, and operator-class means *any authenticated
+  identity*.** The RED half wrote `test_a_plain_user_cannot_write_a_demo` expecting
+  **403**, but `users.role` has exactly two values (`admin`, `user`) and
+  `operator_or_admin_required` deliberately admits both — `POST /api/sales`,
+  `POST /api/upload` and the packaging movements are already reachable by a plain
+  `user`. Refusing one here would be a role-model change smuggled into a planning
+  feature. The test became
+  `test_a_demo_write_needs_a_session_but_not_an_admin`: no session → 401 and
+  nothing stored; a signed-in `user` → the write works. The three routes also
+  joined `OPERATOR_ROUTES`, which the declared-vs-stamped cross-check requires.
+- **The projection does not end a transaction it does not own.** `_begin_snapshot`
+  sets `SET LOCAL transaction_isolation` only when no transaction is open; when
+  one is already open it reads the isolation and **logs** a warning rather than
+  committing away someone else's work. The inventory route — a pure read — ends
+  and re-arms its own transaction (`commit → _timeout_statements() → arm_snapshot`)
+  before calling, so the forecast always gets the guarantee it is allowed to
+  assume. Exactly one statement is issued per call either way, which is what makes
+  `2 × baseline` a meaningful assertion.
+- **`GET` never creates, and unknown never becomes zero.** Both are the same
+  invariant seen from two ends: "nobody has planned this PI" must stay a fact the
+  coverage report can surface, so a miss is a 404 and an unresolvable figure is
+  `null`.
+
+**Verification:** focused set (8 files, 250 cases) green; `ruff check raas_tracker/
+tests/` clean. Full-suite gate, pyright and the browser flow are the remaining
+step (task #10) — this line is not a claim that they have run.
 
 ---
 
