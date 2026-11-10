@@ -561,3 +561,575 @@ def test_get_pool_builds_one_pool_on_cold_start(pg_dsn, monkeypatch):
 def test_get_pool_is_stable_for_one_dsn(pg_dsn):
     """Unchanged DSN behaviour: the same pool object is reused."""
     assert dbmod._get_pool(pg_dsn) is dbmod._get_pool(pg_dsn)
+
+
+# --------------------------------------------------------------------------- #
+# v13 — CHEMICAL-PURCHASES: tables, column, constraints, RLS, version bump
+# --------------------------------------------------------------------------- #
+def test_v13_chemical_purchases_schema(db, pg_dsn):
+    """The receipt register migrates in: both tables, the in_house_registered
+    column, the delivery/client + quantity + version + unique CHECKs, RLS on the
+    backend-owned tables, and the stamped version. The CHECKs are probed by
+    insert so they are the final authority, not just the Pydantic model."""
+    assert dbmod._SCHEMA_VERSION >= 13
+    tables = _public_tables(pg_dsn)
+    assert "chemical_purchases" in tables
+    assert "chemical_purchase_items" in tables
+    assert "in_house_registered" in _table_columns(db, "chemicals")
+
+    stored = _setting(pg_dsn, dbmod._SCHEMA_VERSION_KEY)
+    assert stored is not None and int(stored[0]) == dbmod._SCHEMA_VERSION
+
+    # RLS enabled (no policies => no anon/authenticated reach; the Flask owner
+    # role bypasses it) and the named constraints are present.
+    raw = _raw(pg_dsn)
+    try:
+        for t in ("chemical_purchases", "chemical_purchase_items"):
+            row = raw.execute(
+                "SELECT relrowsecurity FROM pg_class WHERE relname = %s",
+                (t,)).fetchone()
+            assert row is not None and row[0] is True, f"{t} RLS not enabled"
+        names = {r[0] for r in raw.execute(
+            "SELECT conname FROM pg_constraint WHERE conrelid IN "
+            "('chemical_purchases'::regclass, 'chemical_purchase_items'::regclass)"
+        ).fetchall()}
+        assert "chk_purchase_delivery_client" in names
+        assert "uq_purchase_item_material" in names
+    finally:
+        raw.close()
+
+    # Setup: a company, two chemicals, a valid outward receipt and one item.
+    cid = db.execute("INSERT INTO companies (name) VALUES ('V13 Co') "
+                     "RETURNING id").fetchone()[0]
+    chem_a = db.execute("INSERT INTO chemicals (name, unit) VALUES ('V13 A', 'KG') "
+                        "RETURNING id").fetchone()[0]
+    chem_b = db.execute("INSERT INTO chemicals (name, unit) VALUES ('V13 B', 'KG') "
+                        "RETURNING id").fetchone()[0]
+    pid = db.execute(
+        "INSERT INTO chemical_purchases (supplier_name, purchase_number, "
+        "purchase_date, delivery_type, client_id, created_by) "
+        "VALUES ('S', 'PO-V13', '2026-01-15', 'outward', %s, 'admin') RETURNING id",
+        (cid,)).fetchone()[0]
+    db.execute("INSERT INTO chemical_purchase_items (purchase_id, chemical_id, "
+               "quantity, unit) VALUES (%s, %s, 10, 'KG')", (pid, chem_a))
+    db.commit()
+
+    # in_house must reject a client.
+    with pytest.raises(psycopg.IntegrityError):
+        db.execute(
+            "INSERT INTO chemical_purchases (supplier_name, purchase_number, "
+            "purchase_date, delivery_type, client_id, created_by) "
+            "VALUES ('S', 'PO-X1', '2026-01-15', 'in_house', %s, 'admin')", (cid,))
+    db.rollback()
+    # outward must reject a null client.
+    with pytest.raises(psycopg.IntegrityError):
+        db.execute(
+            "INSERT INTO chemical_purchases (supplier_name, purchase_number, "
+            "purchase_date, delivery_type, client_id, created_by) "
+            "VALUES ('S', 'PO-X2', '2026-01-15', 'outward', NULL, 'admin')")
+    db.rollback()
+    # version must be > 0.
+    with pytest.raises(psycopg.IntegrityError):
+        db.execute(
+            "INSERT INTO chemical_purchases (supplier_name, purchase_number, "
+            "purchase_date, delivery_type, client_id, created_by, version) "
+            "VALUES ('S', 'PO-X3', '2026-01-15', 'outward', %s, 'admin', 0)", (cid,))
+    db.rollback()
+    # quantity must be > 0 (a different chemical isolates the CHECK from the
+    # unique constraint).
+    with pytest.raises(psycopg.IntegrityError):
+        db.execute("INSERT INTO chemical_purchase_items (purchase_id, chemical_id, "
+                   "quantity, unit) VALUES (%s, %s, 0, 'KG')", (pid, chem_b))
+    db.rollback()
+    # one item per (purchase, chemical).
+    with pytest.raises(psycopg.IntegrityError):
+        db.execute("INSERT INTO chemical_purchase_items (purchase_id, chemical_id, "
+                   "quantity, unit) VALUES (%s, %s, 5, 'KG')", (pid, chem_a))
+    db.rollback()
+
+
+def test_v13_in_house_registered_default_true_and_idempotent_rerun(db, pg_dsn):
+    """in_house_registered defaults TRUE (ordinary chemicals stay visible) and
+    re-running the migration twice is a no-op — the DDL is idempotent and the
+    version stays stamped at the code constant."""
+    # An insert that omits the column lands registered (default TRUE).
+    chem_id = db.execute(
+        "INSERT INTO chemicals (name, unit) VALUES ('V13 Default', 'KG') "
+        "RETURNING id").fetchone()[0]
+    db.commit()
+    assert db.execute("SELECT in_house_registered FROM chemicals WHERE id = %s",
+                      (chem_id,)).fetchone()[0] is True
+    # Release the read transaction's ACCESS SHARE lock so the DDL below can take
+    # its ACCESS EXCLUSIVE lock on chemicals without blocking behind this conn.
+    db.commit()
+    # The default is declared in the catalog, not merely backfilled onto rows.
+    raw = _raw(pg_dsn)
+    try:
+        default = raw.execute(
+            "SELECT column_default FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = 'chemicals' "
+            "AND column_name = 'in_house_registered'").fetchone()[0]
+        assert default is not None and "true" in default.lower()
+    finally:
+        raw.close()
+
+    # Idempotent re-run: two consecutive _create_tables calls on a migrated DB
+    # raise nothing and leave both new tables present and the version stamped.
+    conn = dbmod.get_connection(pg_dsn)
+    try:
+        dbmod._create_tables(conn)
+        dbmod._create_tables(conn)
+    finally:
+        conn.close()
+    stored = _setting(pg_dsn, dbmod._SCHEMA_VERSION_KEY)
+    assert stored is not None and int(stored[0]) == dbmod._SCHEMA_VERSION
+    tables = _public_tables(pg_dsn)
+    assert "chemical_purchases" in tables
+    assert "chemical_purchase_items" in tables
+
+
+# --------------------------------------------------------------------------- #
+# v14 — MATERIAL SOURCES: source columns, pairing CHECKs, run evidence, defaults
+# --------------------------------------------------------------------------- #
+def _v14_chain(db):
+    """Raw parent chain for the v14 probes: company, chemicals, an outward
+    purchase + line, and an invoiced recipe with one product slot and one run.
+
+    Built with SQL only (no Flask, no service layer) so the migration is the
+    thing under test. Returns the ids the probes need.
+    """
+    cid = db.execute("INSERT INTO companies (name) VALUES ('V14 Co') "
+                    "RETURNING id").fetchone()[0]
+    chem_a = db.execute("INSERT INTO chemicals (name, unit) VALUES ('V14 A', 'KG') "
+                        "RETURNING id").fetchone()[0]
+    chem_b = db.execute("INSERT INTO chemicals (name, unit) VALUES ('V14 B', 'KG') "
+                        "RETURNING id").fetchone()[0]
+    pid = db.execute(
+        "INSERT INTO chemical_purchases (supplier_name, purchase_number, "
+        "purchase_date, delivery_type, client_id, created_by) "
+        "VALUES ('S', 'PO-V14', '2026-02-01', 'outward', %s, 'admin') RETURNING id",
+        (cid,)).fetchone()[0]
+    line_id = db.execute(
+        "INSERT INTO chemical_purchase_items (purchase_id, chemical_id, quantity, "
+        "unit) VALUES (%s, %s, 12, 'KG') RETURNING id", (pid, chem_a)).fetchone()[0]
+    sale_id = db.execute("INSERT INTO sales (stage, client_name) "
+                        "VALUES ('invoiced', 'V14 Client') RETURNING id").fetchone()[0]
+    sale_item_id = db.execute(
+        "INSERT INTO sale_items (sale_id, product_name, quantity, unit_price, unit) "
+        "VALUES (%s, 'V14 Product', 100, 5, 'KG') RETURNING id", (sale_id,)).fetchone()[0]
+    invoice_id = db.execute(
+        "INSERT INTO invoices (sale_id, invoice_number, status) "
+        "VALUES (%s, 'INV-V14', 'planned') RETURNING id", (sale_id,)).fetchone()[0]
+    recipe_id = db.execute(
+        "INSERT INTO recipes (name, company_id, invoice_id) "
+        "VALUES ('V14 Recipe', %s, %s) RETURNING id", (cid, invoice_id)).fetchone()[0]
+    product_id = db.execute(
+        "INSERT INTO recipe_products (recipe_id, product_name, unit) "
+        "VALUES (%s, 'V14 Product', 'KG') RETURNING id", (recipe_id,)).fetchone()[0]
+    run_id = db.execute(
+        "INSERT INTO production_runs (recipe_id, sale_item_id, qty_produced) "
+        "VALUES (%s, %s, 100) RETURNING id", (recipe_id, sale_item_id)).fetchone()[0]
+    db.commit()
+    return {"company_id": cid, "chem_a": chem_a, "chem_b": chem_b,
+            "purchase_id": pid, "line_id": line_id, "sale_id": sale_id,
+            "sale_item_id": sale_item_id, "invoice_id": invoice_id,
+            "recipe_id": recipe_id, "product_id": product_id, "run_id": run_id}
+
+
+def test_v14_source_columns_constraints_and_index(db, pg_dsn):
+    """v14 lands the source columns on both tables, the two named pairing
+    CHECKs, the source_type domain CHECKs, the NUMERIC(18,6) evidence column and
+    the FK-support index -- and the version is stamped."""
+    assert dbmod._SCHEMA_VERSION >= 14
+
+    assert {"source_type", "outward_purchase_line_id"} <= _table_columns(
+        db, "recipe_items")
+    assert {"source_type", "outward_purchase_line_id", "purchase_number",
+            "purchase_date", "supplier_name", "client_name", "source_qty",
+            "source_unit"} <= _table_columns(db, "production_run_items")
+
+    raw = _raw(pg_dsn)
+    try:
+        stored = _setting(pg_dsn, dbmod._SCHEMA_VERSION_KEY)
+        assert stored is not None and int(stored[0]) == dbmod._SCHEMA_VERSION
+
+        # New numeric evidence column is NUMERIC(18,6); existing REAL stays REAL.
+        col = raw.execute(
+            "SELECT data_type, numeric_precision, numeric_scale "
+            "FROM information_schema.columns WHERE table_schema = 'public' "
+            "AND table_name = 'production_run_items' "
+            "AND column_name = 'source_qty'").fetchone()
+        assert col is not None and col[0] == "numeric", col
+        assert (col[1], col[2]) == (18, 6), col
+
+        names = {r[0] for r in raw.execute(
+            "SELECT conname FROM pg_constraint WHERE conrelid IN "
+            "('recipe_items'::regclass, 'production_run_items'::regclass)"
+        ).fetchall()}
+        assert "chk_recipe_item_source" in names
+        assert "chk_run_item_source" in names
+        # The domain CHECKs are separately named, so the pairing probe below
+        # cannot pass by accident on an out-of-domain value.
+        assert "chk_recipe_item_source_type" in names
+        assert "chk_run_item_source_type" in names
+
+        # The new index supports is_line_referenced()'s reverse lookup.
+        defs = {r[0] for r in raw.execute(
+            "SELECT indexdef FROM pg_indexes WHERE tablename = "
+            "'production_run_items'").fetchall()}
+        assert any("outward_purchase_line_id" in d for d in defs), defs
+    finally:
+        raw.close()
+
+
+def test_v14_pairing_checks_reject_invalid_source_rows(db, pg_dsn):
+    """Both named CHECKs are the final authority, not the Pydantic model: the two
+    invalid pairings (in_house+line, outward+NULL) and an out-of-domain
+    source_type are refused on BOTH tables, while the valid pairings land and a
+    referenced line is RESTRICT-protected from deletion."""
+    ids = _v14_chain(db)
+
+    def add_item(chemical_id, source_type, line_id):
+        db.execute(
+            "INSERT INTO recipe_items (recipe_product_id, chemical_id, percentage, "
+            "source_type, outward_purchase_line_id) VALUES (%s, %s, 50, %s, %s)",
+            (ids["product_id"], chemical_id, source_type, line_id))
+
+    def add_run_item(chemical_id, source_type, line_id):
+        db.execute(
+            "INSERT INTO production_run_items (run_id, chemical_id, chemical_name, "
+            "required_qty, unit, source_type, outward_purchase_line_id) "
+            "VALUES (%s, %s, 'V14', 10, 'KG', %s, %s)",
+            (ids["run_id"], chemical_id, source_type, line_id))
+
+    # recipe_items: in_house must not carry a line.
+    with pytest.raises(psycopg.IntegrityError):
+        add_item(ids["chem_b"], "in_house", ids["line_id"])
+    db.rollback()
+    # recipe_items: outward must carry a line.
+    with pytest.raises(psycopg.IntegrityError):
+        add_item(ids["chem_b"], "outward", None)
+    db.rollback()
+    # recipe_items: only the two Slice-2 sources exist (no pi_demos value yet).
+    with pytest.raises(psycopg.IntegrityError):
+        add_item(ids["chem_b"], "pi_demos", ids["line_id"])
+    db.rollback()
+    # production_run_items: the same three refusals.
+    with pytest.raises(psycopg.IntegrityError):
+        add_run_item(ids["chem_a"], "in_house", ids["line_id"])
+    db.rollback()
+    with pytest.raises(psycopg.IntegrityError):
+        add_run_item(ids["chem_a"], "outward", None)
+    db.rollback()
+    with pytest.raises(psycopg.IntegrityError):
+        add_run_item(ids["chem_a"], "supplier", ids["line_id"])
+    db.rollback()
+
+    add_item(ids["chem_a"], "in_house", None)
+    add_item(ids["chem_b"], "outward", ids["line_id"])
+    add_run_item(ids["chem_a"], "outward", ids["line_id"])
+    db.commit()
+
+    # ON DELETE RESTRICT: a line a recipe already uses cannot be dropped.
+    with pytest.raises(psycopg.IntegrityError):
+        db.execute("DELETE FROM chemical_purchase_items WHERE id = %s",
+                   (ids["line_id"],))
+    db.rollback()
+
+
+def test_v14_legacy_rows_default_to_in_house_and_rerun_is_a_noop(db, pg_dsn):
+    """A legacy-shaped INSERT that omits the new columns is in_house with no line
+    and NULL evidence, and re-running the migration twice changes nothing."""
+    ids = _v14_chain(db)
+    db.execute("INSERT INTO recipe_items (recipe_product_id, chemical_id, percentage) "
+               "VALUES (%s, %s, 50)", (ids["product_id"], ids["chem_a"]))
+    db.execute("INSERT INTO production_run_items (run_id, chemical_id, chemical_name, "
+               "required_qty, deducted_qty, unit) VALUES (%s, %s, 'V14', 10, 10, 'KG')",
+               (ids["run_id"], ids["chem_a"]))
+    db.commit()
+
+    item = db.execute(
+        "SELECT source_type, outward_purchase_line_id FROM recipe_items "
+        "WHERE recipe_product_id = %s", (ids["product_id"],)).fetchone()
+    assert item[0] == "in_house" and item[1] is None
+    run_item = db.execute(
+        "SELECT source_type, outward_purchase_line_id, purchase_number, "
+        "purchase_date, supplier_name, client_name, source_qty, source_unit "
+        "FROM production_run_items WHERE run_id = %s", (ids["run_id"],)).fetchone()
+    assert run_item[0] == "in_house"
+    assert all(value is None for value in run_item[1:]), run_item
+
+    # The DEFAULT is declared in the catalog, not merely backfilled onto rows.
+    raw = _raw(pg_dsn)
+    try:
+        for table in ("recipe_items", "production_run_items"):
+            default = raw.execute(
+                "SELECT column_default FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = %s "
+                "AND column_name = 'source_type'", (table,)).fetchone()[0]
+            assert default is not None and "in_house" in default, table
+    finally:
+        raw.close()
+
+    # Idempotent re-run: nothing raises, the version stays stamped, and rows
+    # already written keep their source values. The fixture's own read
+    # transaction must be closed first -- it holds ACCESS SHARE on the tables
+    # the migration re-runs ALTER against, which would cancel on lock_timeout
+    # rather than prove anything about the DDL (same reason the tests above
+    # commit before forcing the migration path).
+    db.commit()
+    conn = dbmod.get_connection(pg_dsn)
+    try:
+        dbmod._create_tables(conn)
+        dbmod._create_tables(conn)
+    finally:
+        conn.close()
+    assert int(_setting(pg_dsn, dbmod._SCHEMA_VERSION_KEY)[0]) == dbmod._SCHEMA_VERSION
+    assert db.execute("SELECT COUNT(*) FROM recipe_items WHERE source_type = "
+                      "'in_house' AND outward_purchase_line_id IS NULL "
+                      "AND recipe_product_id = %s",
+                      (ids["product_id"],)).fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM production_run_items "
+                      "WHERE source_type = 'in_house'").fetchone()[0] == 1
+
+
+# --------------------------------------------------------------------------- #
+# v15 — PI DEMOS: draft/active planning formulations, expression identity,
+#       bounds, RLS, and the idempotent re-run
+# --------------------------------------------------------------------------- #
+def _v15_chain(db, pi="PI-V15"):
+    """Raw parent chain for the v15 probes: one PI with a line, one chemical,
+    one demo, one draft product slot and one ingredient.
+
+    SQL only (no Flask, no service layer) so the migration itself is the thing
+    under test: the CHECKs and the expression index must be the final authority
+    even for a writer that bypasses every Pydantic model.
+    """
+    sale_id = db.execute("INSERT INTO sales (stage, client_name) "
+                         "VALUES ('pi_issued', %s) RETURNING id", (pi,)).fetchone()[0]
+    db.execute("INSERT INTO sale_items (sale_id, product_name, quantity, unit_price, unit) "
+               "VALUES (%s, 'V15 Product', 100, 5, 'KG')", (sale_id,))
+    chem_id = db.execute("INSERT INTO chemicals (name, unit) VALUES ('V15 A', 'KG') "
+                         "RETURNING id").fetchone()[0]
+    demo_id = db.execute("INSERT INTO pi_demos (sale_id) VALUES (%s) RETURNING id",
+                         (sale_id,)).fetchone()[0]
+    product_id = db.execute(
+        "INSERT INTO pi_demo_products (demo_id, scope, product_name, unit, "
+        "water_percentage) VALUES (%s, 'draft', 'V15 Product', 'KG', 40) "
+        "RETURNING id", (demo_id,)).fetchone()[0]
+    db.execute("INSERT INTO pi_demo_items (demo_product_id, chemical_id, percentage) "
+               "VALUES (%s, %s, 60)", (product_id, chem_id))
+    db.commit()
+    return {"sale_id": sale_id, "chem_id": chem_id, "demo_id": demo_id,
+            "product_id": product_id}
+
+
+def _add_demo_product(db, demo_id, scope, name, unit="KG", water=None):
+    return db.execute(
+        "INSERT INTO pi_demo_products (demo_id, scope, product_name, unit, "
+        "water_percentage) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+        (demo_id, scope, name, unit, water)).fetchone()[0]
+
+
+def test_v15_pi_demo_tables_columns_constraints_and_rls(db, pg_dsn):
+    """v15 lands the three demo tables with the prescribed shape: the version is
+    bumped and stamped, there is no active_formula JSONB column anywhere, the new
+    numerics are NUMERIC(9,6) (existing REAL recipe columns stay REAL), the named
+    constraints exist, and all three tables are RLS-enabled with no policy."""
+    assert dbmod._SCHEMA_VERSION == 15
+    tables = _public_tables(pg_dsn)
+    assert {"pi_demos", "pi_demo_products", "pi_demo_items"} <= tables
+
+    stored = _setting(pg_dsn, dbmod._SCHEMA_VERSION_KEY)
+    assert stored is not None and int(stored[0]) == dbmod._SCHEMA_VERSION
+
+    assert {"sale_id", "draft_revision", "active_revision", "activated_at",
+            "activated_by"} <= _table_columns(db, "pi_demos")
+    assert {"demo_id", "scope", "product_name", "unit",
+            "water_percentage"} <= _table_columns(db, "pi_demo_products")
+    assert {"demo_product_id", "chemical_id", "percentage"} <= _table_columns(
+        db, "pi_demo_items")
+    # The active scope's child rows are the SOLE operational snapshot: a JSON
+    # copy of the same facts is free to disagree with the rows it describes.
+    assert "active_formula" not in _table_columns(db, "pi_demos")
+
+    raw = _raw(pg_dsn)
+    try:
+        for table in ("pi_demos", "pi_demo_products", "pi_demo_items"):
+            row = raw.execute(
+                "SELECT relrowsecurity FROM pg_class WHERE relname = %s",
+                (table,)).fetchone()
+            assert row is not None and row[0] is True, f"{table} RLS not enabled"
+            # No policy at all is the protection: a browser role sees nothing.
+            assert raw.execute(
+                "SELECT COUNT(*) FROM pg_policies WHERE tablename = %s",
+                (table,)).fetchone()[0] == 0, table
+
+        for table, column in (("pi_demo_products", "water_percentage"),
+                              ("pi_demo_items", "percentage")):
+            col = raw.execute(
+                "SELECT data_type, numeric_precision, numeric_scale "
+                "FROM information_schema.columns WHERE table_schema = 'public' "
+                "AND table_name = %s AND column_name = %s",
+                (table, column)).fetchone()
+            assert col is not None and col[0] == "numeric", (table, col)
+            assert (col[1], col[2]) == (9, 6), (table, col)
+
+        names = {r[0] for r in raw.execute(
+            "SELECT conname FROM pg_constraint WHERE conrelid IN "
+            "('pi_demos'::regclass, 'pi_demo_products'::regclass, "
+            "'pi_demo_items'::regclass)").fetchall()}
+        assert "chk_pi_demo_active_water" in names
+        assert "uq_pi_demo_item_chemical" in names
+
+        # The product identity is an EXPRESSION index: lower(trim(...)) cannot
+        # live inside a table-level UNIQUE constraint, so it must be a real
+        # unique index over the expression.
+        defs = {r[0] for r in raw.execute(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' "
+            "AND tablename = 'pi_demo_products'").fetchall()}
+        identity = [d for d in defs if "idx_pi_demo_products_identity" in d]
+        assert identity, defs
+        # PostgreSQL renders the expression as lower(TRIM(BOTH FROM ...)), so the
+        # probe reads the folded definition rather than a literal spelling.
+        folded = re.sub(r"\s+", "", identity[0]).lower()
+        assert "lower(trim(bothfromproduct_name))" in folded, identity
+        assert "demo_id,scope," in folded, identity
+        assert "uniqueindex" in folded, identity
+
+        # pi_demo_items.chemical_id is RESTRICT-protected, so the reverse lookup
+        # needs its own index; demo_id is covered by the identity index's
+        # leading column and must not be duplicated.
+        item_defs = {r[0] for r in raw.execute(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' "
+            "AND tablename = 'pi_demo_items'").fetchall()}
+        assert any("chemical_id" in d for d in item_defs), item_defs
+    finally:
+        raw.close()
+
+    # The Flask role (table owner, RLS-bypassing) still reads them: enabling RLS
+    # with no policies must not lock the service out of its own tables.
+    for table in ("pi_demos", "pi_demo_products", "pi_demo_items"):
+        assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+
+def test_v15_pi_demo_checks_and_identity_are_enforced(db, pg_dsn):
+    """Every v15 rule is a real constraint, probed by writing against it: one
+    demo per PI, the scope domain, the 0..100 bounds on percentage and water, the
+    active-water NOT NULL CHECK, a draft percentage of exactly zero (legal: only
+    activation requires positive), the normalized product identity (case and
+    whitespace only), the one-ingredient-per-chemical uniqueness, and the two
+    FK directions."""
+    ids = _v15_chain(db)
+    demo_id = ids["demo_id"]
+
+    # one demo per PI (the unique sale_id, so no extra index is needed).
+    with pytest.raises(psycopg.IntegrityError):
+        db.execute("INSERT INTO pi_demos (sale_id) VALUES (%s)", (ids["sale_id"],))
+    db.rollback()
+
+    # scope domain.
+    with pytest.raises(psycopg.IntegrityError):
+        _add_demo_product(db, demo_id, "archived", "V15 Product")
+    db.rollback()
+    # water above the bound.
+    with pytest.raises(psycopg.IntegrityError):
+        _add_demo_product(db, demo_id, "draft", "Over Water", water=100.5)
+    db.rollback()
+    # water below the bound.
+    with pytest.raises(psycopg.IntegrityError):
+        _add_demo_product(db, demo_id, "draft", "Negative Water", water=-1)
+    db.rollback()
+    # an active row may not carry a NULL/auto water: the stored value must be the
+    # RESOLVED one, so no projection can re-derive it differently per reader.
+    with pytest.raises(psycopg.IntegrityError):
+        _add_demo_product(db, demo_id, "active", "V15 Product", water=None)
+    db.rollback()
+    # a draft row may: NULL water means "auto" while the plan is unfinished.
+    assert _add_demo_product(db, demo_id, "draft", "Auto Water", water=None)
+    db.rollback()
+
+    # ingredient percentage bounds (0 is legal on a draft, 100.5 and -1 are not).
+    def add_item(chem_id, percentage):
+        db.execute("INSERT INTO pi_demo_items (demo_product_id, chemical_id, "
+                   "percentage) VALUES (%s, %s, %s)",
+                   (ids["product_id"], chem_id, percentage))
+
+    other_chem = db.execute("INSERT INTO chemicals (name, unit) VALUES ('V15 B', 'KG') "
+                            "RETURNING id").fetchone()[0]
+    db.commit()
+    with pytest.raises(psycopg.IntegrityError):
+        add_item(other_chem, 100.5)
+    db.rollback()
+    with pytest.raises(psycopg.IntegrityError):
+        add_item(other_chem, -0.5)
+    db.rollback()
+    add_item(other_chem, 0)
+    db.commit()
+
+    # one ingredient per chemical per product.
+    with pytest.raises(psycopg.IntegrityError):
+        add_item(other_chem, 10)
+    db.rollback()
+
+    # the expression identity: same name differing only in case/whitespace is
+    # refused within one scope, and the SAME name in the OTHER scope is legal --
+    # the draft and the activated snapshot are two working sets, not one.
+    with pytest.raises(psycopg.IntegrityError):
+        _add_demo_product(db, demo_id, "draft", "  V15 product  ")
+    db.rollback()
+    active_id = _add_demo_product(db, demo_id, "active", "V15 Product", water=40)
+    db.commit()
+    assert active_id != ids["product_id"]
+    # a different PI's demo may use the same product name: identity is scoped.
+    other_sale = db.execute("INSERT INTO sales (stage, client_name) "
+                            "VALUES ('pi_issued', 'PI-V15-OTHER') RETURNING id").fetchone()[0]
+    other_demo = db.execute("INSERT INTO pi_demos (sale_id) VALUES (%s) RETURNING id",
+                            (other_sale,)).fetchone()[0]
+    assert _add_demo_product(db, other_demo, "draft", "V15 Product", water=None)
+    db.commit()
+
+    # an unknown demo / product is refused, and a chemical a formulation uses is
+    # RESTRICT-protected while an unused product cascades away with its demo.
+    with pytest.raises(psycopg.IntegrityError):
+        db.execute("INSERT INTO pi_demo_items (demo_product_id, chemical_id, "
+                   "percentage) VALUES (999999, %s, 10)", (ids["chem_id"],))
+    db.rollback()
+    with pytest.raises(psycopg.IntegrityError):
+        db.execute("DELETE FROM chemicals WHERE id = %s", (ids["chem_id"],))
+    db.rollback()
+    db.execute("DELETE FROM pi_demos WHERE id = %s", (other_demo,))
+    db.commit()
+    assert db.execute("SELECT COUNT(*) FROM pi_demo_products WHERE demo_id = %s",
+                      (other_demo,)).fetchone()[0] == 0
+
+
+def test_v15_rerun_is_a_noop_and_preserves_rows(db, pg_dsn):
+    """Re-running the migration twice on a migrated database raises nothing,
+    keeps the stamped version, and leaves the demo rows -- and their revisions --
+    exactly as written. The activation copy is business state; a DDL retry must
+    never reset it."""
+    ids = _v15_chain(db)
+    before = db.execute(
+        "SELECT scope, product_name, unit, water_percentage FROM pi_demo_products "
+        "WHERE demo_id = %s ORDER BY id", (ids["demo_id"],)).fetchall()
+    revision = db.execute("SELECT draft_revision, active_revision FROM pi_demos "
+                          "WHERE id = %s", (ids["demo_id"],)).fetchone()
+    # Close the fixture's read transaction: it holds ACCESS SHARE on tables the
+    # migration re-runs DDL against (same reason as the v13/v14 re-run tests).
+    db.commit()
+
+    conn = dbmod.get_connection(pg_dsn)
+    try:
+        dbmod._create_tables(conn)
+        dbmod._create_tables(conn)
+    finally:
+        conn.close()
+
+    assert int(_setting(pg_dsn, dbmod._SCHEMA_VERSION_KEY)[0]) == dbmod._SCHEMA_VERSION
+    after = db.execute(
+        "SELECT scope, product_name, unit, water_percentage FROM pi_demo_products "
+        "WHERE demo_id = %s ORDER BY id", (ids["demo_id"],)).fetchall()
+    assert after == before
+    assert db.execute("SELECT draft_revision, active_revision FROM pi_demos "
+                      "WHERE id = %s", (ids["demo_id"],)).fetchone() == revision

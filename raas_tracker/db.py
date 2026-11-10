@@ -158,7 +158,28 @@ _SCHEMA_VERSION_KEY = "raas_schema_version"
 # 12 = WON'T-SHIP: sale_items.wont_ship — an admin's standing decision that a PI
 #     line's unshipped balance will never be invoiced, so the Commercial Report
 #     drops that line's provisional remainder row. Additive only.
-_SCHEMA_VERSION = 12
+# 13 = CHEMICAL-PURCHASES: chemical_purchases + chemical_purchase_items (an
+#     in-house/outward receipt register with optimistic-lock version, cancel
+#     fields and one item per material), and chemicals.in_house_registered so an
+#     outward-only material stays out of the in-house stock list, the inventory
+#     view and reorder alerts until something stocks it. Additive only: existing
+#     chemicals default to registered (TRUE).
+# 14 = MATERIAL-SOURCES: recipe_items.source_type + outward_purchase_line_id (an
+#     ingredient may be sourced from a client's outward purchase line instead of
+#     in-house stock) and production_run_items' immutable per-run source evidence
+#     (source_type, line id, purchase_number/date, supplier/client, source_qty in
+#     NUMERIC(18,6) + source_unit). Additive only: the DEFAULT keeps every
+#     existing row 'in_house' with no line, so no legacy formulation or batch
+#     history changes meaning.
+# 15 = PI-DEMOS: pi_demos + pi_demo_products + pi_demo_items — a per-PI draft/
+#     active formulation used only for planning. Nothing existing changed shape:
+#     no stock, production or recipe column is touched, and the active scope's
+#     child rows are the SOLE operational formula snapshot (deliberately no
+#     active_formula JSONB, so a half-written JSON blob can never disagree with
+#     the rows it is supposed to describe). Additive only, and RLS-enabled
+#     because these tables are backend-owned planning state with no browser role
+#     that should read them.
+_SCHEMA_VERSION = 15
 
 # Frozen legacy tokens from builds that shipped them — do NOT add
 # per-migration entries. _SCHEMA_VERSION is authoritative; these only preserve
@@ -1305,6 +1326,184 @@ def _run_migration(conn: psycopg.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_approval_workflow_upload_id "
         "ON approval_workflow (upload_id)")
+
+    # v13 CHEMICAL-PURCHASES: an in-house/outward receipt register with its own
+    # line items, plus chemicals.in_house_registered so an outward-only material
+    # (bought for a client, never stocked on site) stays out of the in-house
+    # stock list, the inventory view and reorder alerts until something stocks
+    # it. Additive only: existing chemicals default to registered (TRUE). The
+    # delivery/client invariant is a DB CHECK so it is the final authority even
+    # for a writer that bypasses the Pydantic model.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chemical_purchases (
+            id SERIAL PRIMARY KEY,
+            supplier_name TEXT NOT NULL,
+            purchase_number TEXT NOT NULL,
+            purchase_date DATE NOT NULL,
+            delivery_type TEXT NOT NULL CHECK (delivery_type IN ('in_house', 'outward')),
+            client_id INTEGER REFERENCES companies(id),
+            cancelled BOOLEAN NOT NULL DEFAULT FALSE,
+            cancelled_at TIMESTAMPTZ,
+            cancelled_by TEXT,
+            cancellation_reason TEXT,
+            version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+            created_by TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CONSTRAINT chk_purchase_delivery_client CHECK (
+                (delivery_type = 'in_house' AND client_id IS NULL) OR
+                (delivery_type = 'outward' AND client_id IS NOT NULL)
+            )
+        );
+        CREATE TABLE IF NOT EXISTS chemical_purchase_items (
+            id SERIAL PRIMARY KEY,
+            purchase_id INTEGER NOT NULL REFERENCES chemical_purchases(id),
+            chemical_id INTEGER NOT NULL REFERENCES chemicals(id) ON DELETE RESTRICT,
+            quantity NUMERIC(18,6) NOT NULL CHECK (quantity > 0),
+            unit TEXT NOT NULL,
+            CONSTRAINT uq_purchase_item_material UNIQUE (purchase_id, chemical_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_purchase_items_purchase
+            ON chemical_purchase_items(purchase_id);
+        CREATE INDEX IF NOT EXISTS idx_purchase_items_chemical
+            ON chemical_purchase_items(chemical_id);
+        CREATE INDEX IF NOT EXISTS idx_purchases_delivery_client
+            ON chemical_purchases(delivery_type, client_id);
+        CREATE INDEX IF NOT EXISTS idx_purchases_date
+            ON chemical_purchases(purchase_date, id);
+        ALTER TABLE chemicals
+            ADD COLUMN IF NOT EXISTS in_house_registered BOOLEAN NOT NULL DEFAULT TRUE;
+        -- Backend-owned: no policies means no anon/authenticated reach. The
+        -- Flask role (table owner / superuser) bypasses RLS, so the service
+        -- reads and writes normally while a browser-role key sees nothing.
+        ALTER TABLE chemical_purchases ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE chemical_purchase_items ENABLE ROW LEVEL SECURITY;
+    """)
+    # v14 MATERIAL-SOURCES: a recipe ingredient may be sourced from a client's
+    # outward purchase line instead of in-house stock, and every production run
+    # then records the immutable evidence of where that material actually came
+    # from (the run must stay auditable after the purchase is corrected or the
+    # recipe re-formulated). Additive only: the DEFAULT keeps every existing row
+    # 'in_house' with no line, so no legacy formulation or batch history changes
+    # meaning. The pairing is a DB CHECK, not only a Pydantic rule: an
+    # 'in_house' row carrying a line would deduct stock the client's delivery
+    # already covers, and an 'outward' row without a line has no source to
+    # report -- both are silent data corruption, not a display problem.
+    conn.execute("""
+        ALTER TABLE recipe_items
+            ADD COLUMN IF NOT EXISTS source_type TEXT NOT NULL DEFAULT 'in_house';
+        ALTER TABLE recipe_items
+            ADD COLUMN IF NOT EXISTS outward_purchase_line_id INTEGER
+                REFERENCES chemical_purchase_items(id) ON DELETE RESTRICT;
+        ALTER TABLE production_run_items
+            ADD COLUMN IF NOT EXISTS source_type TEXT NOT NULL DEFAULT 'in_house';
+        ALTER TABLE production_run_items
+            ADD COLUMN IF NOT EXISTS outward_purchase_line_id INTEGER
+                REFERENCES chemical_purchase_items(id) ON DELETE RESTRICT;
+        ALTER TABLE production_run_items
+            ADD COLUMN IF NOT EXISTS purchase_number TEXT;
+        ALTER TABLE production_run_items
+            ADD COLUMN IF NOT EXISTS purchase_date DATE;
+        ALTER TABLE production_run_items
+            ADD COLUMN IF NOT EXISTS supplier_name TEXT;
+        ALTER TABLE production_run_items
+            ADD COLUMN IF NOT EXISTS client_name TEXT;
+        ALTER TABLE production_run_items
+            ADD COLUMN IF NOT EXISTS source_qty NUMERIC(18,6);
+        ALTER TABLE production_run_items
+            ADD COLUMN IF NOT EXISTS source_unit TEXT;
+    """)
+    conn.execute(
+        "DO $$ BEGIN "
+        "IF NOT EXISTS (SELECT 1 FROM pg_constraint "
+        "WHERE conname = 'chk_recipe_item_source') THEN "
+        "ALTER TABLE recipe_items ADD CONSTRAINT chk_recipe_item_source CHECK ( "
+        "(source_type = 'in_house' AND outward_purchase_line_id IS NULL) OR "
+        "(source_type = 'outward' AND outward_purchase_line_id IS NOT NULL) ); "
+        "END IF; END $$;")
+    conn.execute(
+        "DO $$ BEGIN "
+        "IF NOT EXISTS (SELECT 1 FROM pg_constraint "
+        "WHERE conname = 'chk_run_item_source') THEN "
+        "ALTER TABLE production_run_items ADD CONSTRAINT chk_run_item_source CHECK ( "
+        "(source_type = 'in_house' AND outward_purchase_line_id IS NULL) OR "
+        "(source_type = 'outward' AND outward_purchase_line_id IS NOT NULL) ); "
+        "END IF; END $$;")
+    # The domain is separate from the pairing so an out-of-domain value is
+    # refused on its own terms. These two remain the only legal values: Slice 3
+    # models a demo formulation in its own tables (pi_demos/pi_demo_products/
+    # pi_demo_items) and never writes a source_type onto recipe or run rows, so
+    # there is no 'pi_demos' source to add here.
+    conn.execute(
+        "DO $$ BEGIN "
+        "IF NOT EXISTS (SELECT 1 FROM pg_constraint "
+        "WHERE conname = 'chk_recipe_item_source_type') THEN "
+        "ALTER TABLE recipe_items ADD CONSTRAINT chk_recipe_item_source_type "
+        "CHECK (source_type IN ('in_house', 'outward')); "
+        "END IF; END $$;")
+    conn.execute(
+        "DO $$ BEGIN "
+        "IF NOT EXISTS (SELECT 1 FROM pg_constraint "
+        "WHERE conname = 'chk_run_item_source_type') THEN "
+        "ALTER TABLE production_run_items ADD CONSTRAINT chk_run_item_source_type "
+        "CHECK (source_type IN ('in_house', 'outward')); "
+        "END IF; END $$;")
+    # Reverse lookup for is_line_referenced(): freezing a purchase line must not
+    # cost a sequential scan of the run history on every correction.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_production_run_items_outward_line "
+                 "ON production_run_items (outward_purchase_line_id)")
+    # v15 PI-DEMOS: a per-PI draft/active formulation for planning only. One
+    # demo per PI (unique sale_id) with two working sets of child rows: an
+    # editable draft scope and the currently activated snapshot scope. The
+    # active CHILD ROWS are the sole operational formula -- there is deliberately
+    # no active_formula JSONB column, because a JSON copy of the same facts can
+    # drift from the rows it claims to describe while the rows stay authoritative.
+    # Nothing here touches stock, production or recipes: a demo is a plan, and
+    # forecasting a shortage is the point, so activation never consults balances.
+    #
+    # The normalized product identity MUST be an expression unique index:
+    # lower(trim(...)) is not a plain column list, so it cannot live inside a
+    # table-level UNIQUE constraint.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pi_demos (
+            id SERIAL PRIMARY KEY,
+            sale_id INTEGER NOT NULL UNIQUE REFERENCES sales(id) ON DELETE CASCADE,
+            draft_revision INTEGER NOT NULL DEFAULT 1 CHECK (draft_revision > 0),
+            active_revision INTEGER,
+            activated_at TIMESTAMPTZ,
+            activated_by TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE TABLE IF NOT EXISTS pi_demo_products (
+            id SERIAL PRIMARY KEY,
+            demo_id INTEGER NOT NULL REFERENCES pi_demos(id) ON DELETE CASCADE,
+            scope TEXT NOT NULL CHECK (scope IN ('draft','active')),
+            product_name TEXT NOT NULL,
+            unit TEXT NOT NULL,
+            water_percentage NUMERIC(9,6) CHECK (water_percentage >= 0 AND water_percentage <= 100),
+            CONSTRAINT chk_pi_demo_active_water CHECK (scope <> 'active' OR water_percentage IS NOT NULL)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pi_demo_products_identity
+            ON pi_demo_products (demo_id, scope, lower(trim(product_name)));
+        CREATE TABLE IF NOT EXISTS pi_demo_items (
+            id SERIAL PRIMARY KEY,
+            demo_product_id INTEGER NOT NULL REFERENCES pi_demo_products(id) ON DELETE CASCADE,
+            chemical_id INTEGER NOT NULL REFERENCES chemicals(id) ON DELETE RESTRICT,
+            percentage NUMERIC(9,6) NOT NULL CHECK (percentage >= 0 AND percentage <= 100),
+            CONSTRAINT uq_pi_demo_item_chemical UNIQUE (demo_product_id, chemical_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_pi_demo_items_product ON pi_demo_items(demo_product_id);
+        -- The RESTRICT FK is the one that needs its own index: without it,
+        -- deleting or renaming a material has to scan every demo formulation.
+        CREATE INDEX IF NOT EXISTS idx_pi_demo_items_chemical ON pi_demo_items(chemical_id);
+        -- Backend-owned: enabling RLS with NO policies means anon/authenticated
+        -- see nothing at all, while the Flask role (table owner) bypasses RLS and
+        -- reads and writes as usual.
+        ALTER TABLE pi_demos ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE pi_demo_products ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE pi_demo_items ENABLE ROW LEVEL SECURITY;
+    """)
     # Signature + schema version are stamped by _create_tables, in this same
     # transaction: nothing below commits.
 
