@@ -19,6 +19,12 @@ import Button from '../components/ui/Button';
 import Badge from '../components/ui/Badge';
 import { formatNumber } from '../utils/format';
 import { isBalanced } from '../utils/formulation';
+import {
+  NO_STOCK_LABEL,
+  isOutward,
+  sourceLabel,
+  outwardEvidence,
+} from '../utils/ingredientSource';
 import { useAuth } from '../context/AuthContext';
 import { toast } from 'sonner';
 import CommercialFilters from '../components/reports/CommercialFilters';
@@ -404,7 +410,14 @@ export default function Reports() {
   };
 
   const totalShortage = report ? report.report.filter(r => r.status === 'SHORTAGE').length : 0;
-  const totalOk = report ? report.report.filter(r => r.status !== 'SHORTAGE').length : 0;
+  // A client delivery is neither available on our shelf nor short of it, so it
+  // is counted apart from both.
+  const totalOutward = report
+    ? report.report.filter((r) => isOutward(r)).length
+    : 0;
+  const totalOk = report
+    ? report.report.filter((r) => r.status !== 'SHORTAGE' && !isOutward(r)).length
+    : 0;
 
   const PAGE_SIZE = 50;
   const commercialPage = Math.max(1, parseInt(searchParams.get('page') || '1', 10) || 1);
@@ -910,16 +923,22 @@ export default function Reports() {
                   <thead>
                     <tr className="border-b border-slate-100 dark:border-slate-800">
                       <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Chemical</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Source</th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Current Stock</th>
-                      <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Required</th>
-                      <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Difference</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Gross use</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Stock impact</th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Status</th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Recipes</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-50 dark:divide-slate-800/50">
-                    {report.report.map((item) => (
-                      <tr key={item.chemical_name} className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40">
+                    {report.report.map((item) => {
+                      const outward = isOutward(item);
+                      return (
+                      <tr
+                        key={`${item.chemical_name}::${item.source_type || 'in_house'}::${item.outward_purchase_line_id ?? ''}`}
+                        className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40"
+                      >
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-2">
                             <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-slate-100 dark:bg-slate-800">
@@ -928,9 +947,53 @@ export default function Reports() {
                             <span className="font-medium text-slate-900 dark:text-white">{item.chemical_name}</span>
                           </div>
                         </td>
-                        <td className="px-4 py-3 text-slate-700 dark:text-slate-300 font-mono">{formatNumber(item.current_stock)} {item.unit}</td>
+                        <td className="px-4 py-3">
+                          <p className="text-xs font-medium text-slate-600 dark:text-slate-300">
+                            {sourceLabel(item)}
+                          </p>
+                          {outward && (
+                            <p
+                              aria-label={`Outward source for ${item.chemical_name}`}
+                              className="mt-0.5 flex flex-wrap gap-x-1.5 text-[11px] text-slate-500 dark:text-slate-400"
+                            >
+                              {/* One part per element: a receipt number buried
+                                  inside one long string cannot be read back. */}
+                              {[
+                                ...outwardEvidence(item),
+                                `Received ${formatNumber(item.source_qty)} ${item.source_unit || item.unit}`,
+                              ].filter(Boolean).map((part, i) => (
+                                <span key={`${part}-${i}`}>
+                                  {i > 0 && (
+                                    <span aria-hidden="true" className="mr-1.5 text-slate-300 dark:text-slate-600">
+                                      ·
+                                    </span>
+                                  )}
+                                  {part}
+                                </span>
+                              ))}
+                            </p>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 font-mono text-slate-700 dark:text-slate-300">
+                          {outward ? (
+                            // The API answers null here on purpose: no balance
+                            // and no shortage may be printed for what we never
+                            // held.
+                            <span className="text-[11px] font-sans font-medium text-slate-500 dark:text-slate-400">
+                              {NO_STOCK_LABEL}
+                            </span>
+                          ) : (
+                            <>{formatNumber(item.current_stock)} {item.unit}</>
+                          )}
+                        </td>
                         <td className="px-4 py-3 text-slate-700 dark:text-slate-300 font-mono">{formatNumber(item.required_total)} {item.unit}</td>
                         <td className="px-4 py-3">
+                          {outward ? (
+                            <span className="flex items-center gap-1 font-mono font-semibold text-slate-500 dark:text-slate-400">
+                              <Minus className="h-3 w-3" />
+                              —
+                            </span>
+                          ) : (
                           <span className={clsx('font-mono font-semibold flex items-center gap-1', {
                             'text-emerald-600 dark:text-emerald-400': item.shortage > 0,
                             'text-slate-500 dark:text-slate-400': item.shortage === 0,
@@ -939,16 +1002,26 @@ export default function Reports() {
                             {item.shortage > 0 ? <TrendingUp className="h-3 w-3" /> : item.shortage < 0 ? <TrendingDown className="h-3 w-3" /> : <Minus className="h-3 w-3" />}
                             {item.shortage > 0 ? '+' : ''}{formatNumber(item.shortage)} {item.unit}
                           </span>
+                          )}
                         </td>
                         <td className="px-4 py-3">
+                          {outward ? (
+                            <Badge variant="info" dot>Client delivered</Badge>
+                          ) : (
                           <Badge variant={
                             item.status === 'SHORTAGE' ? 'error' : item.status === 'EXACT' ? 'info' : 'success'
                           } dot>
                             {item.status}
                           </Badge>
+                          )}
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex flex-wrap gap-1">
+                            {outward && (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 font-mono text-slate-600 dark:text-slate-400">
+                                {`Deducted ${formatNumber(0)} ${item.unit}`}
+                              </span>
+                            )}
                             {item.products && item.products.map((p, i) => (
                               <span key={`p-${i}`} className="text-[10px] px-1.5 py-0.5 rounded bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300">
                                 {p.product_name}: {formatNumber(p.required_qty)} {item.unit} ({p.percentage}%)
@@ -962,7 +1035,8 @@ export default function Reports() {
                           </div>
                         </td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -1002,6 +1076,10 @@ export default function Reports() {
                   <div className="flex justify-between py-1.5 border-b border-slate-100 dark:border-slate-800">
                     <span className="text-slate-500 dark:text-slate-400">Available</span>
                     <span className="font-semibold text-emerald-600 dark:text-emerald-400">{totalOk}</span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-slate-100 dark:border-slate-800">
+                    <span className="text-slate-500 dark:text-slate-400">Client-supplied</span>
+                    <span className="font-semibold text-slate-800 dark:text-white">{totalOutward}</span>
                   </div>
                   <div className="flex justify-between py-1.5">
                     <span className="text-slate-500 dark:text-slate-400">Shortages</span>

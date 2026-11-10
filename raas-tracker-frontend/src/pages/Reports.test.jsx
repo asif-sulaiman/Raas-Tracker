@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import React from 'react';
-import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, cleanup, fireEvent, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { AuthProvider } from '../context/AuthContext';
 import { ConfirmProvider } from '../context/ConfirmContext';
@@ -529,5 +529,109 @@ describe('Production report selections', () => {
     await screen.findByLabelText('Quantity for Cleaner');
 
     expect(screen.queryByText(/formula totals/)).toBeNull();
+  });
+});
+
+const MIXED_SOURCE_REPORT = {
+  report: [
+    {
+      chemical_name: 'NaOH', current_stock: 500, required_total: 1000,
+      unit: 'KG', shortage: -500, status: 'SHORTAGE',
+      source_type: 'in_house', outward_purchase_line_id: null,
+      products: [{
+        product_name: 'Cleaner', quantity: 2500, percentage: 40, required_qty: 1000,
+      }],
+      recipes: [{ recipe_name: 'INV-014 · Cleaner', qty_from_this_recipe: 1000 }],
+    },
+    {
+      // The same chemical, delivered by the client: its own row, never merged
+      // into the shelf figure.
+      chemical_name: 'NaOH', current_stock: null, required_total: 200,
+      unit: 'KG', shortage: null, status: 'OUTWARD',
+      source_type: 'outward', outward_purchase_line_id: 71,
+      purchase_number: 'PO-OUT', purchase_date: '2026-10-30',
+      supplier_name: 'SupCo', client_name: 'Globex',
+      source_qty: 900, source_unit: 'KG',
+      products: [{
+        product_name: 'Cleaner', quantity: 1000, percentage: 20, required_qty: 200,
+      }],
+      recipes: [{ recipe_name: 'INV-014 · Cleaner', qty_from_this_recipe: 200 }],
+    },
+  ],
+  recipes: [RECIPE_ROWS[0]],
+  qty: 3500,
+};
+
+async function generateMixed(opts = {}) {
+  renderReports({
+    recipes: RECIPE_ROWS,
+    productionSources: PRODUCTION_SOURCES,
+    generated: MIXED_SOURCE_REPORT,
+    ...opts,
+  });
+  await pickRecipe('INV-014');
+  await screen.findByLabelText('Quantity for Cleaner');
+  fireEvent.click(screen.getByRole('button', { name: /Generate Report/ }));
+  return screen.findByText('PO-OUT');
+}
+
+describe('Production report sourcing', () => {
+  it('keeps a client-delivered need on its own row beside the shelf need', async () => {
+    await generateMixed();
+
+    expect(await screen.findByText('PO-OUT')).toBeTruthy();
+    // Two rows for one chemical: a shared key would collapse or warn.
+    expect(screen.getAllByText('NaOH')).toHaveLength(2);
+    const headers = screen.getAllByRole('columnheader').map((th) => th.textContent);
+    expect(headers).toContain('Gross use');
+    expect(headers).toContain('Stock impact');
+    expect(headers).not.toContain('Required');
+  });
+
+  it('shows the outward evidence with deducted 0 and no balance to compare', async () => {
+    const outwardCell = await generateMixed();
+    const row = outwardCell.closest('tr');
+
+    expect(within(row).getByText('Outward')).toBeTruthy();
+    expect(within(row).getByText('Not in our stock')).toBeTruthy();
+    expect(within(row).getByText('Deducted 0.00 KG')).toBeTruthy();
+
+    const evidence = within(row).getByLabelText('Outward source for NaOH');
+    expect(evidence.textContent).toContain('SupCo');
+    expect(evidence.textContent).toContain('2026-10-30');
+    expect(evidence.textContent).toContain('Globex');
+    expect(evidence.textContent).toContain('Received 900.00 KG');
+
+    // Nothing here may read as our shelf, a shortage or an availability pill.
+    expect(within(row).queryByText('500.00 KG')).toBeNull();
+    expect(within(row).queryByText('0.00 KG')).toBeNull();
+    expect(within(row).queryByText('-500.00 KG')).toBeNull();
+    expect(within(row).queryByText('SHORTAGE')).toBeNull();
+
+    // The in-house neighbour keeps its own figures.
+    const shelfRow = screen.getByText('-500.00 KG').closest('tr');
+    expect(within(shelfRow).getByText('500.00 KG')).toBeTruthy();
+    expect(within(shelfRow).getByText('In house')).toBeTruthy();
+  });
+
+  it('counts client-supplied needs apart from what is available or short', async () => {
+    await generateMixed();
+    expect(await screen.findByText('PO-OUT')).toBeTruthy();
+
+    const supplied = screen.getByText('Client-supplied').closest('div');
+    expect(within(supplied).getByText('1')).toBeTruthy();
+    const available = screen.getByText('Available').closest('div');
+    expect(within(available).getByText('0')).toBeTruthy();
+    const shortages = screen.getByText('Shortages').closest('div');
+    expect(within(shortages).getByText('1')).toBeTruthy();
+  });
+
+  it('does not bill an outward need against the shelf in the products column', async () => {
+    await generateMixed();
+    const outwardCell = await screen.findByText('PO-OUT');
+    const row = outwardCell.closest('tr');
+
+    expect(within(row).getByText('Cleaner: 200.00 KG (20%)')).toBeTruthy();
+    expect(screen.getByText('Cleaner: 1,000.00 KG (40%)')).toBeTruthy();
   });
 });

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Pencil, Trash2, Check, X, Plus, Loader2 } from 'lucide-react';
 import Modal from '../modals/Modal';
 import Badge from '../ui/Badge';
@@ -7,6 +7,7 @@ import ProductInput from '../ui/ProductInput';
 import EntityCombobox from '../ui/EntityCombobox';
 import InvoicePanel from './InvoicePanel';
 import InvoiceEditor from './InvoiceEditor';
+import PiDemoEditor from '../recipes/PiDemoEditor';
 import { formatNumber, formatDate, formatDateTime, sumLineTotals, lineTotal } from '../../utils/format';
 import { STAGE_LABELS, STAGE_BADGE } from '../../utils/sales';
 import { useAuth } from '../../context/AuthContext';
@@ -122,15 +123,25 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
   const [refreshError, setRefreshError] = useState(null);
   const [comments, setComments] = useState('');
   const [savingComments, setSavingComments] = useState(false);
+  // Demo recipe entry: a read-only GET decides between Create (404), Open
+  // (200) and a retryable error. Opening the editor never writes from here.
+  const [demoState, setDemoState] = useState('loading');
+  const [demoError, setDemoError] = useState(null);
+  const [demoEditorOpen, setDemoEditorOpen] = useState(false);
+  // Late responses for a PI the operator already navigated away from must not
+  // overwrite the current sale or demo.
+  const saleIdRef = useRef(saleId);
 
   const refresh = async (id) => {
     try {
       const res = await apiFetch(`/api/sales/${id}`);
       const data = await res.json();
+      if (id !== saleIdRef.current) return;
       setSale(data.error ? null : data);
       setComments(data && !data.error ? (data.comments || '') : '');
       setRefreshError(null);
     } catch (err) {
+      if (id !== saleIdRef.current) return;
       // Only a real 404 means the sale is gone. A network/5xx failure must keep
       // what is already on screen rather than claiming the sale does not exist.
       if (err?.status === 404) {
@@ -144,7 +155,33 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
     }
   };
 
+  const loadDemo = async (id) => {
+    setDemoState('loading');
+    setDemoError(null);
+    try {
+      await apiFetch(`/api/sales/${id}/demo-recipe`);
+      if (id !== saleIdRef.current) return;
+      setDemoState('ready');
+    } catch (err) {
+      if (id !== saleIdRef.current) return;
+      if (err?.status === 404) {
+        setDemoState('missing');
+      } else {
+        setDemoState('error');
+        setDemoError(err?.message || 'Could not load the demo recipe');
+      }
+    }
+  };
+
+  const handleDemoClose = () => {
+    setDemoEditorOpen(false);
+    refresh(saleId);
+    loadDemo(saleId);
+    onSaved?.();
+  };
+
   useEffect(() => {
+    saleIdRef.current = saleId;
     if (saleId) {
       // Always mounted (saleId toggles visibility) and the parent's open handler lives
       // in pages/Sales.jsx, so loading/editing state has to resync from the prop here.
@@ -154,11 +191,15 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
       setEditing(false);
       setSaleError(null);
       setRefreshError(null);
+      setDemoEditorOpen(false);
       refresh(saleId);
+      loadDemo(saleId);
     } else {
       setSale(null);
+      setDemoState('loading');
+      setDemoEditorOpen(false);
     }
-    // `refresh` is a plain per-render function — adding it would refetch on every render.
+    // `refresh`/`loadDemo` are plain per-render functions — adding them would refetch on every render.
     // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [saleId]);
 
@@ -405,6 +446,27 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
             <span className="text-xs text-slate-400">
               Created {formatDateTime(sale.created_at)}
             </span>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {demoState === 'ready' && (
+              <Button variant="secondary" size="sm" onClick={() => setDemoEditorOpen(true)}>
+                Open Demo Recipe
+              </Button>
+            )}
+            {demoState === 'missing' && (
+              <Button variant="primary" size="sm" onClick={() => setDemoEditorOpen(true)}>
+                Create Demo Recipe
+              </Button>
+            )}
+            {demoState === 'error' && (
+              <>
+                <p className="text-xs font-medium text-rose-600 dark:text-rose-400">{demoError}</p>
+                <Button variant="secondary" size="sm" onClick={() => loadDemo(saleId)}>
+                  Retry demo recipe
+                </Button>
+              </>
+            )}
           </div>
 
           {editing ? (
@@ -683,6 +745,7 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
         </div>
       )}
     </Modal>
+    <PiDemoEditor saleId={saleId} isOpen={demoEditorOpen} onClose={handleDemoClose} />
     </>
   );
 }

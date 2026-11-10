@@ -17,6 +17,14 @@ vi.mock('sonner', () => {
   return { toast: toastFn };
 });
 
+vi.mock('../components/recipes/PiDemoEditor', () => ({
+  default: ({ saleId, isOpen, onClose }) => isOpen ? (
+    <div role="dialog" aria-label={`Demo editor for sale ${saleId}`}>
+      <button onClick={onClose}>Close demo editor</button>
+    </div>
+  ) : null,
+}));
+
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
@@ -122,6 +130,19 @@ const SALES = [
   },
 ];
 
+// One client-owned outward receipt line, as /outward-sources hands it back.
+const OUTWARD_SOURCE = {
+  line_id: 71, purchase_id: 7, purchase_number: 'PO-OUT',
+  purchase_date: '2026-10-30', supplier_name: 'SupCo', client_id: 7,
+  client_name: 'Globex', chemical_id: 1, chemical_name: 'NaOH',
+  quantity: 900, unit: 'KG', frozen: false,
+};
+
+// Frozen means uneditable in the register — it must stay pickable here.
+const FROZEN_SOURCE = {
+  ...OUTWARD_SOURCE, line_id: 72, purchase_number: 'PO-FROZEN', frozen: true,
+};
+
 function installFetch({
   lcs = OPEN_LCS,
   lcDetail = LC_DETAIL,
@@ -136,6 +157,9 @@ function installFetch({
   chemicals = CHEMICALS,
   products = BASE_PRODUCTS,
   omitQuantities = false,
+  outwardSources = [],
+  sourcesError = null,
+  demosHandler = () => jsonResponse({ demos: [], coverage: null }),
 } = {}) {
   const state = {
     recipes: [...recipes],
@@ -217,9 +241,13 @@ function installFetch({
           : row.waterEffective / 100 * row.remaining,
         items: row.items.map((item) => ({
           ...item,
-          stock_remaining: omitQuantities || stockOf(item.chemical_name) == null
-            ? undefined
-            : stockOf(item.chemical_name) - needs[item.chemical_name],
+          // An outward row never stood on our shelf: the API answers null here
+          // on purpose, so a false shortage cannot be manufactured.
+          stock_remaining: item.source_type === 'outward'
+            ? null
+            : (omitQuantities || stockOf(item.chemical_name) == null
+              ? undefined
+              : stockOf(item.chemical_name) - needs[item.chemical_name]),
         })),
       })),
       items: Object.values(state.items).flat(),
@@ -231,6 +259,19 @@ function installFetch({
     const method = options?.method || 'GET';
     if (u.includes('/api/auth/me')) {
       return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
+    }
+    if (u === '/api/pi-demos') return demosHandler();
+    if (u.includes('/api/chemical-purchases/outward-sources')) {
+      if (sourcesError) {
+        return jsonResponse(sourcesError.body, false, sourcesError.status);
+      }
+      const clientId = new URL(u, 'http://localhost')
+        .searchParams.get('client_id');
+      return jsonResponse({
+        sources: outwardSources.filter(
+          (s) => String(s.client_id) === String(clientId),
+        ),
+      });
     }
     if (u.includes('/produce') && method === 'POST') {
       state.runs = true;
@@ -247,9 +288,17 @@ function installFetch({
       }
       const body = JSON.parse(options.body);
       for (const name of Object.keys(state.items)) {
-        state.items[name] = state.items[name].map((i) => (
-          i.id === itemId ? { ...i, percentage: body.percentage } : i
-        ));
+        state.items[name] = state.items[name].map((i) => (i.id === itemId ? {
+          ...i,
+          percentage: body.percentage,
+          // Omitting both source fields preserves the stored source.
+          ...('source_type' in body
+            ? {
+              source_type: body.source_type,
+              outward_purchase_line_id: body.outward_purchase_line_id ?? null,
+            }
+            : {}),
+        } : i));
       }
       return jsonResponse({ success: true });
     }
@@ -261,6 +310,15 @@ function installFetch({
       state.items[product] = [...(state.items[product] || []), {
         id: state.nextId, chemical_id: 2, chemical_name: body.chemical,
         current_stock: 100, unit: 'KG', percentage: body.percentage,
+        source_type: body.source_type ?? 'in_house',
+        outward_purchase_line_id: body.outward_purchase_line_id ?? null,
+        ...(body.source_type === 'outward'
+          ? {
+            purchase_number: 'PO-OUT', purchase_date: '2026-10-30',
+            supplier_name: 'SupCo', client_name: 'Globex',
+            source_qty: 900, source_unit: 'KG',
+          }
+          : {}),
       }];
       return jsonResponse({ success: true });
     }
@@ -338,10 +396,10 @@ function installFetch({
   return { fetchMock, state, runs: () => runs };
 }
 
-function renderRecipes(opts = {}) {
+function renderRecipes({ initialEntries, ...opts } = {}) {
   const { fetchMock, state } = installFetch(opts);
   const utils = render(
-    <MemoryRouter>
+    <MemoryRouter initialEntries={initialEntries}>
       <AuthProvider>
         <ConfirmProvider>
           <Recipes />
@@ -620,7 +678,12 @@ describe('Per-product formulation', () => {
       expect(post).toBeTruthy();
       expect(decodeURIComponent(String(post[0])))
         .toContain('/api/recipes/by-id/3/products/Soda Ash/items');
-      expect(JSON.parse(post[1].body)).toEqual({ chemical: 'NaOH', percentage: 60 });
+      expect(JSON.parse(post[1].body)).toEqual({
+        chemical: 'NaOH',
+        percentage: 60,
+        source_type: 'in_house',
+        outward_purchase_line_id: null,
+      });
     });
 
     // The card re-reads the recipe so it can never show a stale formulation.
@@ -634,7 +697,9 @@ describe('Per-product formulation', () => {
     const ash = card('Soda Ash');
     fireEvent.focus(within(ash).getByLabelText('Chemical for Soda Ash'));
 
-    expect((await screen.findAllByRole('option')).map((o) => o.textContent))
+    // Scoped to the popup: the footer's own source select also has options.
+    const listbox = await screen.findByRole('listbox');
+    expect(within(listbox).getAllByRole('option').map((o) => o.textContent))
       .toEqual(['NaOH', 'Caustic Flakes', 'Soda Ash']);
     // The card is overflow-hidden; the list must live outside it.
     expect(ash.contains(screen.getByRole('listbox'))).toBe(false);
@@ -643,7 +708,8 @@ describe('Per-product formulation', () => {
     fireEvent.change(within(ash).getByLabelText('Chemical for Soda Ash'), {
       target: { value: 'caust' },
     });
-    expect(screen.getAllByRole('option').map((o) => o.textContent)).toEqual([
+    expect(within(screen.getByRole('listbox')).getAllByRole('option')
+      .map((o) => o.textContent)).toEqual([
       'Caustic Flakes',
     ]);
   });
@@ -840,7 +906,7 @@ describe('Per-product formulation', () => {
 
     const soda = card('Caustic Soda 50%');
     expect(within(soda).getAllByRole('columnheader').map((th) => th.textContent))
-      .toEqual(['#', 'Chemical', 'Percentage', 'Chemical needed',
+      .toEqual(['#', 'Chemical', 'Percentage', 'Source', 'Chemical needed',
         'Current Stock', 'Stock remaining', 'Actions']);
     // 40% of the 150 KG still to produce, from a stock of 500.
     expect(within(soda).getByText('60.00 KG')).toBeTruthy();
@@ -907,7 +973,7 @@ describe('Per-product formulation', () => {
     await openRecipeDetail();
 
     const empty = within(card('Soda Ash')).getByText(/No ingredients yet/);
-    expect(empty.closest('td').getAttribute('colspan')).toBe('7');
+    expect(empty.closest('td').getAttribute('colspan')).toBe('8');
   });
 
   it('marks an unbalanced formulation as not balanced', async () => {
@@ -1047,5 +1113,326 @@ describe('Recipe list', () => {
     // 3 products, 1 formulated.
     expect(screen.getByText('2')).toBeTruthy();
     expect(screen.queryByText(/Recipes with Water/)).toBeNull();
+  });
+});
+
+const OUTWARD_ITEM = {
+  id: 105, chemical_id: 1, chemical_name: 'NaOH', current_stock: 500,
+  unit: 'KG', percentage: 40, source_type: 'outward',
+  outward_purchase_line_id: 71, purchase_number: 'PO-OUT',
+  purchase_date: '2026-10-30', supplier_name: 'SupCo',
+  client_name: 'Globex', source_qty: 900, source_unit: 'KG',
+};
+
+async function openSourceEditor(soda, chemical = 'NaOH') {
+  fireEvent.click(within(soda).getByRole('button', {
+    name: `Change source for ${chemical} in Caustic Soda 50%`,
+  }));
+  expect(within(soda).getByLabelText(
+    `Source for ${chemical} in Caustic Soda 50%`,
+  )).toBeTruthy();
+}
+
+describe('Ingredient source selector', () => {
+  it('gives every ingredient row a source and reads a legacy row as In house', async () => {
+    renderRecipes({ recipes: [RECIPE_ROW] });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    // No source data at all (Slice 1 recipe) is an in-house row, not a blank.
+    expect(within(soda).getByRole('button', {
+      name: 'Change source for NaOH in Caustic Soda 50%',
+    }).textContent).toBe('In house');
+    // An in-house row keeps showing what stands on the shelf.
+    expect(within(soda).getByText('500.00 KG')).toBeTruthy();
+  });
+
+  it('loads this client\'s outward receipts when a row is switched to Outward', async () => {
+    const { fetchMock } = renderRecipes({
+      recipes: [RECIPE_ROW],
+      outwardSources: [OUTWARD_SOURCE],
+    });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    await openSourceEditor(soda);
+    fireEvent.change(within(soda).getByLabelText(
+      'Source for NaOH in Caustic Soda 50%',
+    ), { target: { value: 'outward' } });
+
+    // The client id is the recipe's own company_id — never picked by hand.
+    await waitFor(() => expect(called(
+      fetchMock, '/api/chemical-purchases/outward-sources?client_id=7',
+    )).toBe(true));
+
+    const picker = within(soda).getByLabelText(
+      'Outward receipt for NaOH in Caustic Soda 50%',
+    );
+    fireEvent.focus(picker);
+    const option = await screen.findByRole('option', { name: /PO-OUT/ });
+    expect(option.textContent).toContain('NaOH');
+    expect(option.textContent).toContain('900.00 KG');
+    expect(option.textContent).toContain('SupCo');
+    expect(option.textContent).toContain('2026-10-30');
+    fireEvent.click(option);
+
+    fireEvent.click(within(soda).getByRole('button', {
+      name: 'Save source for NaOH in Caustic Soda 50%',
+    }));
+
+    await waitFor(() => {
+      const put = fetchMock.mock.calls.find(
+        ([url, options]) => String(url).endsWith('/api/recipes/by-id/3/items/101')
+          && options?.method === 'PUT',
+      );
+      expect(put).toBeTruthy();
+      expect(JSON.parse(put[1].body)).toEqual({
+        percentage: 40, source_type: 'outward', outward_purchase_line_id: 71,
+      });
+    });
+  });
+
+  it('changes only the source: the row keeps its own percentage and chemical', async () => {
+    const { fetchMock } = renderRecipes({
+      recipes: [RECIPE_ROW],
+      outwardSources: [OUTWARD_SOURCE],
+    });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    await openSourceEditor(soda);
+    fireEvent.change(within(soda).getByLabelText(
+      'Source for NaOH in Caustic Soda 50%',
+    ), { target: { value: 'outward' } });
+    await waitFor(() => expect(called(fetchMock, 'outward-sources')).toBe(true));
+
+    expect(within(soda).getByText('NaOH')).toBeTruthy();
+    expect(within(soda).getByText('40%')).toBeTruthy();
+    expect(within(soda).queryByLabelText(
+      'Percentage for NaOH in Caustic Soda 50%',
+    )).toBeNull();
+
+    // An outward row with no receipt picked cannot be saved — the pairing is
+    // refused client-side so the server's 400 never arrives as a surprise.
+    fireEvent.click(within(soda).getByRole('button', {
+      name: 'Save source for NaOH in Caustic Soda 50%',
+    }));
+    expect(within(soda).getByText(
+      /pick the receipt line the client delivered/,
+    )).toBeTruthy();
+    expect(fetchMock.mock.calls.some(
+      ([url, options]) => options?.method === 'PUT'
+        && String(url).endsWith('/items/101'),
+    )).toBe(false);
+  });
+
+  it('shows outward evidence instead of a stock balance or a shortage', async () => {
+    renderRecipes({
+      recipes: [RECIPE_ROW],
+      items: { 'Caustic Soda 50%': [OUTWARD_ITEM] },
+    });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    expect(within(soda).getByRole('button', {
+      name: 'Change source for NaOH in Caustic Soda 50%',
+    }).textContent).toBe('Outward');
+
+    const evidence = within(soda).getByLabelText(
+      'Outward source for NaOH in Caustic Soda 50%',
+    );
+    expect(evidence.textContent).toContain('SupCo');
+    expect(evidence.textContent).toContain('PO-OUT');
+    expect(evidence.textContent).toContain('2026-10-30');
+    expect(evidence.textContent).toContain('Globex');
+    expect(evidence.textContent).toContain('Received 900.00 KG');
+    expect(evidence.textContent).toContain('Deducted 0.00 KG');
+
+    // The gross need is still shown — the material really is used.
+    expect(within(soda).getByText('60.00 KG')).toBeTruthy();
+    // Never a balance, never an availability pill for what we never held.
+    expect(within(soda).getByText('Not in our stock')).toBeTruthy();
+    expect(within(soda).queryByText('500.00 KG')).toBeNull();
+    expect(within(soda).queryByText('440.00 KG')).toBeNull();
+  });
+
+  it('adds a new ingredient sourced outward with both source fields', async () => {
+    const { fetchMock } = renderRecipes({
+      recipes: [RECIPE_ROW],
+      outwardSources: [OUTWARD_SOURCE],
+    });
+    await openRecipeDetail();
+
+    const ash = card('Soda Ash');
+    fireEvent.change(within(ash).getByLabelText('Source for Soda Ash'), {
+      target: { value: 'outward' },
+    });
+    await waitFor(() => expect(called(fetchMock, 'outward-sources')).toBe(true));
+
+    const picker = within(ash).getByLabelText('Outward receipt for Soda Ash');
+    fireEvent.focus(picker);
+    fireEvent.click(await screen.findByRole('option', { name: /PO-OUT/ }));
+    // The receipt decides the material — it cannot be typed into a mismatch.
+    expect(within(ash).getByLabelText('Chemical for Soda Ash')).toHaveValue('NaOH');
+
+    fireEvent.change(within(ash).getByLabelText('Percentage for Soda Ash'), {
+      target: { value: '10' },
+    });
+    fireEvent.click(within(ash).getByRole('button', {
+      name: 'Add ingredient to Soda Ash',
+    }));
+
+    await waitFor(() => {
+      const post = fetchMock.mock.calls.find(
+        ([url, options]) => decodeURIComponent(String(url))
+          .includes('/api/recipes/by-id/3/products/Soda Ash/items')
+          && options?.method === 'POST',
+      );
+      expect(post).toBeTruthy();
+      expect(JSON.parse(post[1].body)).toEqual({
+        chemical: 'NaOH', percentage: 10,
+        source_type: 'outward', outward_purchase_line_id: 71,
+      });
+    });
+  });
+
+  it('keeps a frozen receipt line selectable and says what frozen means', async () => {
+    renderRecipes({
+      recipes: [RECIPE_ROW],
+      outwardSources: [OUTWARD_SOURCE, FROZEN_SOURCE],
+    });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    await openSourceEditor(soda);
+    fireEvent.change(within(soda).getByLabelText(
+      'Source for NaOH in Caustic Soda 50%',
+    ), { target: { value: 'outward' } });
+
+    const picker = within(soda).getByLabelText(
+      'Outward receipt for NaOH in Caustic Soda 50%',
+    );
+    fireEvent.focus(picker);
+    const option = await screen.findByRole('option', { name: /PO-FROZEN/ });
+    expect(option).not.toHaveAttribute('aria-disabled', 'true');
+    expect(option.textContent).toContain('referenced');
+    fireEvent.click(option);
+
+    const badge = within(soda).getByText('Referenced');
+    expect(badge.textContent).toBe('Referenced');
+    expect(within(soda).getByText(/cannot be edited here, but it is usable/))
+      .toBeTruthy();
+  });
+
+  it('surfaces a 400 field error on the picker instead of a generic toast', async () => {
+    renderRecipes({
+      recipes: [RECIPE_ROW],
+      outwardSources: [OUTWARD_SOURCE],
+      sourcesError: {
+        status: 400,
+        body: {
+          error: 'Invalid client_id',
+          details: [{
+            field: 'client_id',
+            message: 'client_id must be a positive integer',
+          }],
+        },
+      },
+    });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    await openSourceEditor(soda);
+    fireEvent.change(within(soda).getByLabelText(
+      'Source for NaOH in Caustic Soda 50%',
+    ), { target: { value: 'outward' } });
+
+    expect(await within(soda).findByText(
+      'client_id must be a positive integer',
+    )).toBeTruthy();
+    expect(within(soda).getByText(/Could not list the outward receipts/))
+      .toBeTruthy();
+  });
+
+  it('carries the register\'s outward line into the create flow and the new row', async () => {
+    const { fetchMock } = renderRecipes({
+      outwardSources: [{
+        ...OUTWARD_SOURCE, line_id: 73, purchase_number: 'PO-CAUSTIC',
+        chemical_id: 2, chemical_name: 'Caustic Flakes', quantity: 300,
+      }],
+      initialEntries: [{
+        pathname: '/recipes',
+        state: {
+          useOutwardLine: {
+            line_id: 73, client_id: 7, client_name: 'Globex',
+            chemical_id: 2, chemical_name: 'Caustic Flakes', quantity: 300,
+            unit: 'KG', supplier_name: 'SupCo',
+            purchase_number: 'PO-CAUSTIC', purchase_date: '2026-10-30',
+          },
+        },
+      }],
+    });
+
+    // Straight into the existing workflow, with the client already set.
+    expect(await screen.findByRole('heading', {
+      name: 'Create New Recipe',
+    })).toBeTruthy();
+    await waitFor(() => expect(screen.getByLabelText(/^Company/))
+      .toHaveValue('Acme'));
+    expect(screen.getByLabelText('Outward receipt carried from the register')
+      .textContent).toContain('PO-CAUSTIC');
+
+    await pickInvoice();
+    fireEvent.change(screen.getByLabelText(/^Recipe Name/), {
+      target: { value: 'PI-2026-014 · INV-014' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^Create$/ }));
+
+    await screen.findByRole('heading', { name: 'PI-2026-014 · INV-014' });
+    const ash = card('Soda Ash');
+    expect(within(ash).getByLabelText('Source for Soda Ash').value)
+      .toBe('outward');
+    expect(within(ash).getByLabelText('Chemical for Soda Ash'))
+      .toHaveValue('Caustic Flakes');
+    // The receipt list is read for this client before the row can name it.
+    await waitFor(() => expect(
+      within(ash).getByLabelText('Outward receipt for Soda Ash').value,
+    ).toContain('PO-CAUSTIC'));
+
+    // Only the percentage is left to choose.
+    fireEvent.change(within(ash).getByLabelText('Percentage for Soda Ash'), {
+      target: { value: '10' },
+    });
+    fireEvent.click(within(ash).getByRole('button', {
+      name: 'Add ingredient to Soda Ash',
+    }));
+
+    await waitFor(() => {
+      const post = fetchMock.mock.calls.find(
+        ([url, options]) => options?.method === 'POST'
+          && decodeURIComponent(String(url)).includes('/products/Soda Ash/items'),
+      );
+      expect(post).toBeTruthy();
+      expect(JSON.parse(post[1].body)).toEqual({
+        chemical: 'Caustic Flakes', percentage: 10,
+        source_type: 'outward', outward_purchase_line_id: 73,
+      });
+    });
+  });
+
+  it('refuses to open the outward picker without a client on the recipe', async () => {
+    renderRecipes({
+      recipes: [{ ...RECIPE_ROW, company_id: null }],
+      outwardSources: [OUTWARD_SOURCE],
+    });
+    await openRecipeDetail();
+
+    const soda = card('Caustic Soda 50%');
+    await openSourceEditor(soda);
+    fireEvent.change(within(soda).getByLabelText(
+      'Source for NaOH in Caustic Soda 50%',
+    ), { target: { value: 'outward' } });
+
+    expect(await within(soda).findByText(/has no client on its PI/)).toBeTruthy();
   });
 });

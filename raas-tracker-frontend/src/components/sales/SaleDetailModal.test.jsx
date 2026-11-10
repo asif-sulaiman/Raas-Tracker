@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import React from 'react';
-import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, cleanup, fireEvent, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { AuthProvider } from '../../context/AuthContext';
 import { ConfirmProvider } from '../../context/ConfirmContext';
@@ -98,6 +98,125 @@ function renderDetail(opts = {}) {
     </MemoryRouter>
   );
 }
+
+vi.mock('../recipes/PiDemoEditor', () => ({
+  default: ({ saleId, isOpen, onClose }) => isOpen ? (
+    <div role="dialog" aria-label={`Demo editor for sale ${saleId}`}>
+      <button onClick={onClose}>Close demo editor</button>
+    </div>
+  ) : null,
+}));
+
+const DEMO = {
+  id: 11, sale_id: 5, pi_number: 'PI-5', client_name: 'Acme',
+  draft_revision: 1, active_revision: null, activated_at: null, activated_by: null,
+  products: [], active_products: [], progress: [],
+};
+const EARLY_PI = { ...DETAIL, stage: 'pi_issued', lc_number: null, invoices: [], shipments: [] };
+
+function demoProviders({ children }) {
+  return <MemoryRouter><AuthProvider><ConfirmProvider>{children}</ConfirmProvider></AuthProvider></MemoryRouter>;
+}
+
+function renderDemoEntry({ demoHandler, detail = EARLY_PI, saleHandler, onSaved = vi.fn() } = {}) {
+  installFetch({ detail });
+  const existingFetch = globalThis.fetch;
+  const fetchMock = vi.fn((url, options) => {
+    const path = String(url);
+    if (/\/api\/sales\/\d+\/demo-recipe$/.test(path)) {
+      return demoHandler ? demoHandler(path, options) : jsonResponse({ demo: DEMO });
+    }
+    if (saleHandler && /\/api\/sales\/\d+$/.test(path)) return saleHandler(path);
+    return existingFetch(url, options);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return {
+    ...render(<SaleDetailModal saleId={5} onClose={vi.fn()} onSaved={onSaved} />, { wrapper: demoProviders }),
+    fetchMock, onSaved,
+  };
+}
+
+describe('SaleDetailModal PI demo integration', () => {
+  it('offers Create before LC/invoices only after a demo GET 404 and opens without writing', async () => {
+    const { fetchMock } = renderDemoEntry({
+      demoHandler: () => jsonResponse({ error: 'No demo' }, false, 404),
+    });
+    const create = await screen.findByRole('button', { name: 'Create Demo Recipe' });
+    expect(screen.getByRole('button', { name: 'Edit Sale' })).toBeTruthy();
+    expect(screen.queryByRole('dialog', { name: /Demo editor/ })).toBeNull();
+    fireEvent.click(create);
+    expect(await screen.findByRole('dialog', { name: 'Demo editor for sale 5' })).toBeTruthy();
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === '/api/sales/5/demo-recipe')).toBe(true);
+    expect(fetchMock.mock.calls.every(([, options]) => !options?.method || options.method === 'GET')).toBe(true);
+  });
+
+  it('opens an existing demo and refreshes sale, demo and parent on close', async () => {
+    let demoReads = 0;
+    let saleReads = 0;
+    const { onSaved } = renderDemoEntry({
+      demoHandler: () => {
+        demoReads += 1;
+        return demoReads === 1 ? jsonResponse({ error: 'No demo' }, false, 404) : jsonResponse({ demo: DEMO });
+      },
+      saleHandler: () => {
+        saleReads += 1;
+        return jsonResponse({ ...EARLY_PI, comments: saleReads > 1 ? 'Refreshed sale' : '' });
+      },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: 'Create Demo Recipe' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Close demo editor' }));
+    expect(await screen.findByRole('button', { name: 'Open Demo Recipe' })).toBeTruthy();
+    await waitFor(() => expect(screen.getByLabelText('Sale comments').value).toBe('Refreshed sale'));
+    expect(onSaved).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('dialog', { name: /Demo editor/ })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Open Demo Recipe' }));
+    expect(await screen.findByRole('dialog', { name: 'Demo editor for sale 5' })).toBeTruthy();
+  });
+
+  it('keeps failed demo reads visible and retryable instead of offering Create', async () => {
+    let reads = 0;
+    renderDemoEntry({ demoHandler: () => {
+      reads += 1;
+      return reads === 1 ? jsonResponse({ error: 'Demo service unavailable' }, false, 503) : jsonResponse({ demo: DEMO });
+    } });
+    expect(await screen.findByText(/Demo service unavailable/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Create Demo Recipe' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Open Demo Recipe' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry demo recipe' }));
+    expect(await screen.findByRole('button', { name: 'Open Demo Recipe' })).toBeTruthy();
+  });
+
+  it('keeps completed PI demos available without changing invoice or sale controls', async () => {
+    renderDemoEntry({ detail: { ...DETAIL, stage: 'completed' } });
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Demo Recipe' }));
+    expect(await screen.findByRole('dialog', { name: 'Demo editor for sale 5' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Edit Sale' })).toBeTruthy();
+    expect(screen.queryByText(/add lines to invoice/i)).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Book shipment' })).toBeNull();
+  });
+
+  it('ignores late sale and demo responses after switching PIs', async () => {
+    let resolveDemo;
+    let resolveSale;
+    const oldDemo = new Promise((resolve) => { resolveDemo = resolve; });
+    const oldSale = new Promise((resolve) => { resolveSale = resolve; });
+    const { rerender, fetchMock } = renderDemoEntry({
+      demoHandler: (path) => path.includes('/5/') ? oldDemo : jsonResponse({ demo: { ...DEMO, sale_id: 6 } }),
+      saleHandler: (path) => path.endsWith('/5') ? oldSale : jsonResponse({ ...EARLY_PI, id: 6, pi_number: 'PI-6' }),
+    });
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/5/demo-recipe'))).toBe(true));
+    rerender(<SaleDetailModal saleId={6} onClose={vi.fn()} onSaved={vi.fn()} />);
+    expect(await screen.findByRole('button', { name: 'Open Demo Recipe' })).toBeTruthy();
+    await act(async () => {
+      resolveDemo(jsonResponse({ error: 'No old demo' }, false, 404));
+      resolveSale(jsonResponse(EARLY_PI));
+    });
+    expect(screen.getByRole('heading', { name: 'PI-6 — Acme' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Create Demo Recipe' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Open Demo Recipe' }));
+    expect(await screen.findByRole('dialog', { name: 'Demo editor for sale 6' })).toBeTruthy();
+  });
+});
 
 describe('SaleDetailModal shipments', () => {
   it('lists shipments without offering legacy recording', async () => {
