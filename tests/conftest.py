@@ -36,8 +36,10 @@ from chem_stock import get_connection, create_first_admin, ensure_setup_token, c
 
 _TABLES = (
     "api_key_rate_limits api_keys approval_workflow audit_logs "
+    "chemical_purchases chemical_purchase_items "
     "chemicals companies invoices invoice_items letters_of_credit login_attempts "
     "notification_reads notifications packaging_items packaging_movements reason_codes "
+    "pi_demos pi_demo_products pi_demo_items "
     "recipe_items recipe_products recipes reconciliation_periods production_run_items "
     "production_run_links production_run_outputs production_runs "
     "sale_items sale_payments sales sales_stage_history sessions shipments "

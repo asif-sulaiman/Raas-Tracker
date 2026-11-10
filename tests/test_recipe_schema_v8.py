@@ -35,7 +35,12 @@ def test_v9_recipe_shape_is_invoice_scoped(db):
     assert _columns(db, "recipe_products") == {
         "id", "recipe_id", "product_name", "unit", "water_percentage"}
     assert _columns(db, "recipe_items") == {
-        "id", "recipe_product_id", "chemical_id", "percentage"}
+        "id", "recipe_product_id", "chemical_id", "percentage",
+        # v14: an ingredient line may now draw from an outward purchase instead
+        # of the in-house shelf. `test_recipe_material_sources.py` pins what
+        # those two columns mean; this pin says they are the only additions, so
+        # the v8 invoice-scoped shape itself never drifted.
+        "source_type", "outward_purchase_line_id"}
     assert _columns(db, "production_run_outputs") == {
         "id", "run_id", "recipe_product_id", "product_name", "unit",
         "qty_produced"}
