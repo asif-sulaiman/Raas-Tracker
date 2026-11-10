@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
-import { Link } from 'react-router-dom';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { Link, useLocation } from 'react-router-dom';
 import {
   BookOpen,
   FlaskConical,
@@ -21,6 +21,14 @@ import KpiCard from '../components/cards/KpiCard';
 import { formatNumber } from '../utils/format';
 import { isBalanced } from '../utils/formulation';
 import { INVOICE_STATUS_LABELS } from '../utils/invoices';
+import {
+  SOURCE_IN_HOUSE,
+  SOURCE_OUTWARD,
+  NO_STOCK_LABEL,
+  isOutward,
+  sourceLabel,
+  outwardEvidence,
+} from '../utils/ingredientSource';
 import { useAuth } from '../context/AuthContext';
 import { useConfirm } from '../context/ConfirmContext';
 import { toast } from 'sonner';
@@ -36,18 +44,143 @@ const waterDraftFromServer = (value) => (
   value == null ? '' : String(Math.round(Number(value) * 100) / 100)
 );
 
+// A 400 answers with details:[{field,message}]. The field that broke the save
+// keeps its own message here instead of being flattened into a generic toast.
+const fieldErrorOf = (err, field) => (
+  (Array.isArray(err?.fields) ? err.fields : [])
+    .find((entry) => entry?.field === field)?.message || null
+);
+
+const messagesOf = (err) => (Array.isArray(err?.fields)
+  ? err.fields.map((entry) => entry?.message).filter(Boolean)
+  : []);
+
+// One receipt line names the material, what arrived, who sent it and when. A
+// line another recipe or run already references says so — and stays pickable.
+const sourceOptionLabel = (source) => [
+  source.chemical_name,
+  `${formatNumber(source.quantity)} ${source.unit}`,
+  source.supplier_name,
+  source.purchase_number,
+  source.purchase_date,
+  source.frozen ? 'referenced — usable, not editable' : null,
+].filter(Boolean).join(' · ');
+
+// What the client delivered, and the fact that none of our stock moved.
+const evidenceText = (row) => [
+  ...outwardEvidence(row),
+  `Received ${formatNumber(row.source_qty)} ${row.source_unit || row.unit || ''}`.trim(),
+  `Deducted ${formatNumber(0)} ${row.unit || row.source_unit || ''}`.trim(),
+].join(' · ');
+
+/**
+ * Receipt picker for one outward ingredient: only lines this client delivered
+ * are listed, and only lines of this material when a row is being switched.
+ */
+function OutwardSourcePicker({
+  ariaLabel, id, label, sources, state, value, onChange, chemicalId, onRetry,
+  className = inputCls,
+}) {
+  const list = chemicalId == null
+    ? sources
+    : sources.filter((s) => String(s.chemical_id) === String(chemicalId));
+  const picked = list.find((s) => String(s.line_id) === String(value));
+  return (
+    <div>
+      {label && (
+        <label
+          htmlFor={id}
+          className="block text-xs text-slate-500 dark:text-slate-400 mb-1"
+        >
+          {label}
+        </label>
+      )}
+      <EntityCombobox
+        id={id}
+        aria-label={ariaLabel}
+        options={list.map((s) => ({ value: s.line_id, label: sourceOptionLabel(s) }))}
+        value={value}
+        onChange={onChange}
+        placeholder={state.loading ? 'Loading client receipts…' : 'Search client receipts…'}
+        emptyMessage="This client has no outward receipt recorded"
+        hint="Pick the receipt line the client delivered"
+        className={className}
+      />
+      {state.noClient && (
+        <p
+          role="alert"
+          className="mt-1 text-[11px] font-medium text-amber-700 dark:text-amber-300"
+        >
+          This recipe has no client on its PI, so outward receipts cannot be listed.
+        </p>
+      )}
+      {state.error && (
+        <div role="alert" className="mt-1 space-y-0.5">
+          <p className="text-[11px] font-medium text-rose-600 dark:text-rose-400">
+            Could not list the outward receipts for this client
+          </p>
+          <p className="text-[11px] text-rose-600 dark:text-rose-400">{state.error}</p>
+          {state.fieldError && (
+            <p className="text-[11px] font-medium text-rose-600 dark:text-rose-400">
+              {state.fieldError}
+            </p>
+          )}
+          <Button variant="secondary" size="sm" onClick={onRetry}>Try again</Button>
+        </div>
+      )}
+      {picked?.frozen && (
+        <div className="mt-1 flex items-start gap-1.5">
+          <Badge variant="warning">Referenced</Badge>
+          <p className="text-[11px] text-slate-500 dark:text-slate-400">
+            Already used by a recipe or a run: it cannot be edited here, but it is usable.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const OUTWARD_SOURCES_EMPTY = {
+  loading: false, error: null, fieldError: null, noClient: false,
+};
+
+// The API refuses this pairing, so it is refused here first and said in the
+// same words the operator sees on the field.
+const NEED_RECEIPT_MESSAGE = 'An outward ingredient needs a receipt line — pick the receipt line the client delivered.';
+
 /**
  * One product's formulation. The invoice defines the product and its
  * quantities; this card only owns the chemicals and their percentages, so a
  * product added to the invoice later appears as an empty card on reload.
  */
-function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, onDelete, onSetWater }) {
-  const [chemical, setChemical] = useState('');
+function ProductFormulationCard({
+  product, chemicals, isAdmin, onAdd, onUpdate, onDelete, onSetWater,
+  onUpdateSource, outward, onLoadSources, onRetrySources, presetSource,
+}) {
+  const [chemical, setChemical] = useState(presetSource?.chemical || '');
   const [pct, setPct] = useState('');
   const [editItemId, setEditItemId] = useState(null);
   const [editPct, setEditPct] = useState('');
   const [saving, setSaving] = useState(false);
   const [savingWater, setSavingWater] = useState(false);
+
+  // The add footer holds its own source draft — what the operator is about to
+  // write, not what is already stored. A receipt carried in from the outward
+  // register pre-fills it, so the entry point is never a dead end.
+  const [addSource, setAddSource] = useState(
+    presetSource?.sourceType || SOURCE_IN_HOUSE,
+  );
+  const [addLine, setAddLine] = useState(presetSource?.lineId || '');
+  const [addSourceError, setAddSourceError] = useState(null);
+
+  // One row's source is edited at a time, so the table can never end up with
+  // two half-written sources.
+  const [sourceItemId, setSourceItemId] = useState(null);
+  const [sourceDraft, setSourceDraft] = useState(
+    { sourceType: SOURCE_IN_HOUSE, lineId: '' },
+  );
+  const [sourceError, setSourceError] = useState(null);
+  const [savingSource, setSavingSource] = useState(false);
 
   // The water input is a draft the operator types; the server wins whenever it
   // reports a different value (save, add/remove item, dialog re-open). Syncing
@@ -85,15 +218,98 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
       toast.error('Select chemical and enter percentage');
       return;
     }
+    if (addSource === SOURCE_OUTWARD && !addLine) {
+      setAddSourceError(NEED_RECEIPT_MESSAGE);
+      return;
+    }
     setSaving(true);
     try {
-      const ok = await onAdd(product, chemical, parseFloat(pct));
+      const ok = await onAdd(product, chemical, parseFloat(pct), {
+        sourceType: addSource,
+        lineId: addLine ? Number(addLine) : null,
+      });
       if (ok) {
         setChemical('');
         setPct('');
+        // The delivery on that line is now committed to this formulation; the
+        // next ingredient needs its own receipt.
+        if (addSource === SOURCE_OUTWARD) setAddLine('');
+        setAddSourceError(null);
       }
     } finally {
       setSaving(false);
+    }
+  };
+
+  const changeAddSource = (event) => {
+    const next = event.target.value;
+    setAddSource(next);
+    if (next === SOURCE_IN_HOUSE) setAddLine('');
+    else onLoadSources();
+    setAddSourceError(null);
+  };
+
+  const pickReceiptForAdd = (lineId) => {
+    setAddLine(lineId);
+    const source = outward.sources.find((s) => String(s.line_id) === String(lineId));
+    // The receipt names the material. A different chemical typed into the next
+    // field could only be refused, so the field follows the line.
+    if (source?.chemical_name) setChemical(source.chemical_name);
+    setAddSourceError(null);
+  };
+
+  const openSourceEditor = (item) => {
+    setEditItemId(null);
+    setSourceItemId(item.id);
+    setSourceDraft({
+      sourceType: isOutward(item) ? SOURCE_OUTWARD : SOURCE_IN_HOUSE,
+      lineId: item.outward_purchase_line_id == null
+        ? ''
+        : String(item.outward_purchase_line_id),
+    });
+    setSourceError(null);
+    // The stored line can only be named once its client's receipts are back.
+    if (isOutward(item)) onLoadSources();
+  };
+
+  const changeSourceDraft = (event) => {
+    const next = event.target.value;
+    setSourceDraft((draft) => ({
+      sourceType: next,
+      lineId: next === SOURCE_OUTWARD ? draft.lineId : '',
+    }));
+    setSourceError(null);
+    if (next === SOURCE_OUTWARD) onLoadSources();
+  };
+
+  const closeSourceEditor = () => {
+    setSourceItemId(null);
+    setSourceError(null);
+  };
+
+  const submitSource = async (item) => {
+    if (sourceDraft.sourceType === SOURCE_OUTWARD && !sourceDraft.lineId) {
+      setSourceError(NEED_RECEIPT_MESSAGE);
+      return;
+    }
+    setSavingSource(true);
+    try {
+      const result = await onUpdateSource(
+        product,
+        item,
+        sourceDraft.sourceType,
+        sourceDraft.lineId ? Number(sourceDraft.lineId) : null,
+      );
+      if (result?.ok) {
+        closeSourceEditor();
+      } else {
+        setSourceError(
+          (result?.messages || []).join(' — ')
+          || 'Could not change where this ingredient comes from',
+        );
+      }
+    } finally {
+      setSavingSource(false);
     }
   };
 
@@ -192,6 +408,7 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
             <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">#</th>
             <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Chemical</th>
             <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Percentage</th>
+            <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Source</th>
             <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Chemical needed</th>
             <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Current Stock</th>
             <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider">Stock remaining</th>
@@ -231,11 +448,96 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
                 ) : (
                   <button
                     aria-label={`Edit ${item.chemical_name} percentage in ${product.product_name}`}
-                    onClick={() => { setEditItemId(item.id); setEditPct(String(item.percentage)); }}
+                    onClick={() => { setSourceItemId(null); setEditItemId(item.id); setEditPct(String(item.percentage)); }}
                     className="px-2 py-1 text-sm rounded-md bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-mono transition-colors cursor-pointer"
                   >
                     {item.percentage}%
                   </button>
+                )}
+              </td>
+              <td className="px-4 py-2.5 align-top">
+                {sourceItemId === item.id ? (
+                  <div className="space-y-2">
+                    <div>
+                      <label
+                        htmlFor={`row-source-${item.id}`}
+                        className="block text-[11px] text-slate-500 dark:text-slate-400 mb-1"
+                      >
+                        Where this comes from
+                      </label>
+                      <select
+                        id={`row-source-${item.id}`}
+                        aria-label={`Source for ${item.chemical_name} in ${product.product_name}`}
+                        value={sourceDraft.sourceType}
+                        onChange={changeSourceDraft}
+                        className="w-full px-2 py-1 text-sm rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      >
+                        <option value={SOURCE_IN_HOUSE}>In house — from our stock</option>
+                        <option value={SOURCE_OUTWARD}>Outward — the client delivered it</option>
+                      </select>
+                    </div>
+                    {sourceDraft.sourceType === SOURCE_OUTWARD && (
+                      <OutwardSourcePicker
+                        ariaLabel={`Outward receipt for ${item.chemical_name} in ${product.product_name}`}
+                        id={`row-receipt-${item.id}`}
+                        label="Client receipt line"
+                        sources={outward.sources}
+                        state={outward}
+                        value={sourceDraft.lineId}
+                        onChange={(lineId) => {
+                          setSourceDraft((draft) => ({ ...draft, lineId }));
+                          setSourceError(null);
+                        }}
+                        chemicalId={item.chemical_id}
+                        onRetry={onRetrySources}
+                      />
+                    )}
+                    {sourceError && (
+                      <p
+                        role="alert"
+                        className="text-[11px] font-medium text-rose-600 dark:text-rose-400"
+                      >
+                        {sourceError}
+                      </p>
+                    )}
+                    <div className="flex items-center gap-1.5">
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        icon={Check}
+                        onClick={() => submitSource(item)}
+                        loading={savingSource}
+                        aria-label={`Save source for ${item.chemical_name} in ${product.product_name}`}
+                      >
+                        Save source
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={closeSourceEditor}
+                      >
+                        Cancel
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <button
+                      aria-label={`Change source for ${item.chemical_name} in ${product.product_name}`}
+                      onClick={() => openSourceEditor(item)}
+                      className="px-2 py-1 text-sm rounded-md bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 transition-colors cursor-pointer"
+                    >
+                      {sourceLabel(item)}
+                    </button>
+                    {isOutward(item) && (
+                      <p
+                        aria-label={`Outward source for ${item.chemical_name} in ${product.product_name}`}
+                        className="mt-1 text-[11px] text-slate-500 dark:text-slate-400"
+                      >
+                        {evidenceText(item)}
+                      </p>
+                    )}
+                  </>
                 )}
               </td>
               <td className="px-4 py-2.5">
@@ -251,9 +553,17 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
                 </span>
               </td>
               <td className="px-4 py-2.5">
-                <span className={clsx('font-mono', item.current_stock > 0 ? 'text-slate-700 dark:text-slate-300' : 'text-rose-500')}>
-                  {formatNumber(item.current_stock)} {item.unit}
-                </span>
+                {isOutward(item) ? (
+                  // What the client delivered never stood on our shelf, so no
+                  // balance and no shortage may be printed for it.
+                  <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">
+                    {NO_STOCK_LABEL}
+                  </span>
+                ) : (
+                  <span className={clsx('font-mono', item.current_stock > 0 ? 'text-slate-700 dark:text-slate-300' : 'text-rose-500')}>
+                    {formatNumber(item.current_stock)} {item.unit}
+                  </span>
+                )}
               </td>
               <td className="px-4 py-2.5">
                 <span className={clsx(
@@ -284,7 +594,7 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
           ))}
           {product.items.length === 0 && (
             <tr>
-              <td colSpan="7" className="px-4 py-6 text-center text-slate-400 dark:text-slate-500">
+              <td colSpan="8" className="px-4 py-6 text-center text-slate-400 dark:text-slate-500">
                 No ingredients yet. Add this product&apos;s chemicals below.
               </td>
             </tr>
@@ -364,6 +674,38 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
             className={inputCls}
           />
         </div>
+        <div className="w-56">
+          <label
+            htmlFor={`source-${product.product_name}`}
+            className="block text-xs text-slate-500 dark:text-slate-400 mb-1"
+          >
+            Source
+          </label>
+          <select
+            id={`source-${product.product_name}`}
+            aria-label={`Source for ${product.product_name}`}
+            value={addSource}
+            onChange={changeAddSource}
+            className={inputCls}
+          >
+            <option value={SOURCE_IN_HOUSE}>In house — from our stock</option>
+            <option value={SOURCE_OUTWARD}>Outward — the client delivered it</option>
+          </select>
+        </div>
+        {addSource === SOURCE_OUTWARD && (
+          <div className="flex-1 min-w-[220px]">
+            <OutwardSourcePicker
+              ariaLabel={`Outward receipt for ${product.product_name}`}
+              id={`receipt-${product.product_name}`}
+              label="Client receipt line"
+              sources={outward.sources}
+              state={outward}
+              value={addLine}
+              onChange={pickReceiptForAdd}
+              onRetry={onRetrySources}
+            />
+          </div>
+        )}
         <div className="w-32">
           <label
             htmlFor={`pct-${product.product_name}`}
@@ -384,16 +726,26 @@ function ProductFormulationCard({ product, chemicals, isAdmin, onAdd, onUpdate, 
             className={inputCls}
           />
         </div>
-        <Button
-          variant="primary"
-          size="sm"
-          icon={Plus}
-          onClick={submitAdd}
-          loading={saving}
-          aria-label={`Add ingredient to ${product.product_name}`}
-        >
-          Add
-        </Button>
+        <div className="flex flex-col items-start gap-1">
+          <Button
+            variant="primary"
+            size="sm"
+            icon={Plus}
+            onClick={submitAdd}
+            loading={saving}
+            aria-label={`Add ingredient to ${product.product_name}`}
+          >
+            Add
+          </Button>
+          {addSourceError && (
+            <p
+              role="alert"
+              className="text-[11px] font-medium text-rose-600 dark:text-rose-400"
+            >
+              {addSourceError}
+            </p>
+          )}
+        </div>
       </div>
     </section>
   );
@@ -403,6 +755,12 @@ export default function Recipes() {
   const { apiFetch, user } = useAuth();
   const isAdmin = user?.role === 'admin';
   const { confirm } = useConfirm();
+  const location = useLocation();
+  // The outward register hands a receipt line over through location state:
+  // arriving here means "build the recipe that uses this delivery".
+  const [carriedLine, setCarriedLine] = useState(
+    () => location.state?.useOutwardLine || null,
+  );
   const [recipes, setRecipes] = useState([]);
   const [chemicals, setChemicals] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -410,7 +768,7 @@ export default function Recipes() {
   const [selectedRecipe, setSelectedRecipe] = useState(null);
   const [detailProducts, setDetailProducts] = useState([]);
 
-  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showCreateModal, setShowCreateModal] = useState(Boolean(carriedLine));
   const [showDetail, setShowDetail] = useState(false);
   const [showEditMeta, setShowEditMeta] = useState(false);
   const [showProductionRun, setShowProductionRun] = useState(false);
@@ -418,7 +776,9 @@ export default function Recipes() {
   const [newName, setNewName] = useState('');
   const [companies, setCompanies] = useState([]);
   const [allLcs, setAllLcs] = useState([]);
-  const [companyId, setCompanyId] = useState('');
+  const [companyId, setCompanyId] = useState(
+    carriedLine?.client_id == null ? '' : String(carriedLine.client_id),
+  );
   const [lcId, setLcId] = useState('');
   const [lcPis, setLcPis] = useState([]);
   const [saleId, setSaleId] = useState('');
@@ -432,6 +792,61 @@ export default function Recipes() {
   const [editName, setEditName] = useState('');
   const [editError, setEditError] = useState(null);
   const [savingMeta, setSavingMeta] = useState(false);
+
+  // Outward receipts are read once per client: every picker on the page lists
+  // the same rows, so switching a source never fires a second fetch.
+  const [outward, setOutward] = useState(
+    { ...OUTWARD_SOURCES_EMPTY, sources: [] },
+  );
+  const sourcesKey = useRef('');
+
+  const loadOutwardSources = useCallback(async (clientId) => {
+    const key = clientId == null || clientId === '' ? '' : String(clientId);
+    sourcesKey.current = key;
+    if (!key) {
+      // No client on the PI means no delivery to point at — say that, rather
+      // than sending a client_id the API must refuse.
+      setOutward({ ...OUTWARD_SOURCES_EMPTY, sources: [], noClient: true });
+      return;
+    }
+    setOutward((prev) => ({
+      ...prev, loading: true, error: null, fieldError: null, noClient: false,
+    }));
+    try {
+      const res = await apiFetch(
+        `/api/chemical-purchases/outward-sources?client_id=${encodeURIComponent(key)}`,
+      );
+      const data = await res.json();
+      setOutward({
+        ...OUTWARD_SOURCES_EMPTY,
+        sources: Array.isArray(data?.sources) ? data.sources : [],
+      });
+    } catch (err) {
+      // A failed read must stay retryable, so the key is dropped with it.
+      sourcesKey.current = '';
+      setOutward({
+        ...OUTWARD_SOURCES_EMPTY,
+        sources: [],
+        error: err?.message || 'The server refused this request',
+        fieldError: fieldErrorOf(err, 'client_id'),
+      });
+    }
+  }, [apiFetch]);
+
+  // The client behind the receipts is the recipe's own — never picked by hand.
+  const outwardClientId = selectedRecipe?.company_id
+    ?? (showCreateModal ? carriedLine?.client_id : null) ?? null;
+  const requestOutwardSources = useCallback(() => {
+    const key = outwardClientId == null ? '' : String(outwardClientId);
+    if (key && sourcesKey.current === key) return;
+    loadOutwardSources(outwardClientId);
+  }, [loadOutwardSources, outwardClientId]);
+
+  const presetSource = useMemo(() => (carriedLine ? {
+    sourceType: SOURCE_OUTWARD,
+    lineId: String(carriedLine.line_id),
+    chemical: carriedLine.chemical_name,
+  } : null), [carriedLine]);
 
   // Fetch only — loading is already true on mount; event-handler refreshers
   // flip the spinner on themselves before calling this.
@@ -514,6 +929,12 @@ export default function Recipes() {
     : 'e.g. PI-2026-014 · INV-014';
 
   const handleCompanyChange = (value) => {
+    // A receipt carried from the register belongs to one client only: once the
+    // company moves, that line is no longer a source this recipe may use.
+    if (carriedLine && String(value) !== String(carriedLine.client_id)) {
+      setCarriedLine(null);
+      sourcesKey.current = '';
+    }
     setCompanyId(value);
     setLcId('');
     setLcPis([]);
@@ -638,6 +1059,11 @@ export default function Recipes() {
       // The new recipe is empty until its products are formulated, so open it
       // instead of dropping the operator back on the list.
       const created = data.recipe || {};
+      // A receipt carried in from the register must be nameable in the very
+      // next ingredient row, so its client's lines are read before the detail.
+      if (carriedLine?.client_id != null) {
+        await loadOutwardSources(carriedLine.client_id);
+      }
       if (created.id != null) {
         await fetchRecipeDetail(created);
       }
@@ -725,7 +1151,7 @@ export default function Recipes() {
 
   // Formulation writes key off the product, not the recipe name: the invoice
   // defines which slot an ingredient belongs to.
-  const handleAddItem = async (product, chemical, percentage) => {
+  const handleAddItem = async (product, chemical, percentage, source) => {
     if (!selectedRecipe) return false;
     try {
       const res = await apiFetch(
@@ -734,7 +1160,12 @@ export default function Recipes() {
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ chemical, percentage }),
+          body: JSON.stringify({
+            chemical,
+            percentage,
+            source_type: source?.sourceType || SOURCE_IN_HOUSE,
+            outward_purchase_line_id: source?.lineId ?? null,
+          }),
         }
       );
       const data = await res.json().catch(() => ({}));
@@ -745,6 +1176,40 @@ export default function Recipes() {
     } catch (err) {
       toast.error(err.message || 'Failed to add ingredient');
       return false;
+    }
+  };
+
+  // Changing a source writes the whole pairing at once: the stored percentage
+  // rides along because the API requires it, and the line goes null the moment
+  // the ingredient comes back from our own stock.
+  const handleUpdateItemSource = async (product, item, sourceType, lineId) => {
+    if (!selectedRecipe) return { ok: false, messages: [] };
+    try {
+      const res = await apiFetch(
+        '/api/recipes/by-id/' + encodeURIComponent(selectedRecipe.id) +
+          '/items/' + encodeURIComponent(item.id),
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            percentage: Number(item.percentage),
+            source_type: sourceType,
+            outward_purchase_line_id: sourceType === SOURCE_OUTWARD ? lineId : null,
+          }),
+        }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error || 'Could not change the source');
+      toast.success(sourceType === SOURCE_OUTWARD
+        ? 'Ingredient now draws on the client delivery'
+        : 'Ingredient draws on our stock again');
+      await fetchRecipeDetail(selectedRecipe);
+      return { ok: true, messages: [] };
+    } catch (err) {
+      // Field refusals stay on the field that caused them.
+      const messages = messagesOf(err);
+      if (!messages.length) toast.error(err.message || 'Could not change the source');
+      return { ok: false, messages };
     }
   };
 
@@ -844,7 +1309,7 @@ export default function Recipes() {
         <div className="flex items-center gap-4">
           <button
             aria-label="Back to recipes"
-            onClick={() => { setShowDetail(false); setSelectedRecipe(null); setDetailProducts([]); setLoading(true); fetchData(); }}
+            onClick={() => { setShowDetail(false); setSelectedRecipe(null); setDetailProducts([]); setCarriedLine(null); setLoading(true); fetchData(); }}
             className="p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
           >
             <ArrowLeft className="h-5 w-5 text-slate-600 dark:text-slate-400" />
@@ -900,6 +1365,11 @@ export default function Recipes() {
               onUpdate={handleUpdateItem}
               onDelete={handleDeleteItem}
               onSetWater={handleSetWater}
+              onUpdateSource={handleUpdateItemSource}
+              outward={outward}
+              onLoadSources={requestOutwardSources}
+              onRetrySources={requestOutwardSources}
+              presetSource={presetSource}
             />
           ))}
         </div>
@@ -1091,6 +1561,30 @@ export default function Recipes() {
             One recipe covers every product on one invoice. Only LCs with open
             PIs, and invoices still in production, are listed.
           </p>
+          {carriedLine && (
+            <div className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 dark:border-blue-800 dark:bg-blue-950/40">
+              <p
+                aria-label="Outward receipt carried from the register"
+                className="text-xs font-medium text-blue-800 dark:text-blue-200"
+              >
+                {[
+                  `Outward receipt ${carriedLine.purchase_number || `line #${carriedLine.line_id}`}`,
+                  carriedLine.chemical_name,
+                  `${formatNumber(carriedLine.quantity)} ${carriedLine.unit}`,
+                  carriedLine.client_name,
+                ].filter(Boolean).join(' · ')}
+                {' — this client is already selected, and a new ingredient starts on this line.'}
+              </p>
+              <Button
+                variant="secondary"
+                size="sm"
+                className="mt-2"
+                onClick={() => { setCarriedLine(null); sourcesKey.current = ''; }}
+              >
+                Don&apos;t use this receipt
+              </Button>
+            </div>
+          )}
           <div className="grid grid-cols-1 gap-3">
             <div>
               <label htmlFor="recipe-company" className="block text-xs text-slate-500 dark:text-slate-400 mb-1">Company *</label>

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import React from 'react';
-import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, cleanup, fireEvent, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { AuthProvider } from '../../context/AuthContext';
 import { toast } from 'sonner';
@@ -320,4 +320,74 @@ describe('ProductionRunModal invoice scope', () => {
       ]);
     },
   );
+});
+
+const MIXED_ITEMS = [
+  {
+    id: 1, chemical_name: 'NaOH', percentage: 40, unit: 'KG',
+    required_qty: 1600, stock_remaining: 400, source_type: 'in_house',
+    outward_purchase_line_id: null,
+  },
+  {
+    id: 5, chemical_name: 'Wax', percentage: 20, unit: 'KG',
+    required_qty: 800, stock_remaining: null, source_type: 'outward',
+    outward_purchase_line_id: 71, purchase_number: 'PO-OUT',
+    purchase_date: '2026-10-30', supplier_name: 'SupCo',
+    client_name: 'Acme LLC', source_qty: 900, source_unit: 'KG',
+  },
+];
+
+const withItems = (items) => [{ ...PRODUCTS[0], items }];
+
+describe('ProductionRunModal ingredient sourcing', () => {
+  it('separates gross use from the stock an in-house row really draws down', async () => {
+    installFetch({ products: withItems([MIXED_ITEMS[0]]) });
+    renderModal();
+    await waitForSource();
+
+    const naoh = within(screen.getByLabelText('Ingredient NaOH in Cleaner'));
+    expect(naoh.getByText('In house')).toBeTruthy();
+    expect(naoh.getByText('Gross use 1,600.00 KG')).toBeTruthy();
+    expect(naoh.getByText('Stock impact 1,600.00 KG')).toBeTruthy();
+  });
+
+  it('shows outward evidence and never a balance for what we never held', async () => {
+    installFetch({ products: withItems(MIXED_ITEMS) });
+    renderModal();
+    await waitForSource();
+
+    const wax = within(screen.getByLabelText('Ingredient Wax in Cleaner'));
+    expect(wax.getByText('Outward')).toBeTruthy();
+    expect(wax.getByText('Gross use 800.00 KG')).toBeTruthy();
+    expect(wax.getByText('Deducted 0.00 KG')).toBeTruthy();
+    expect(wax.getByText('Not in our stock')).toBeTruthy();
+
+    const evidence = wax.getByLabelText('Outward source for Wax');
+    expect(evidence.textContent).toContain('SupCo');
+    expect(evidence.textContent).toContain('PO-OUT');
+    expect(evidence.textContent).toContain('2026-10-30');
+    expect(evidence.textContent).toContain('Acme LLC');
+    expect(evidence.textContent).toContain('Received 900.00 KG');
+
+    // No stock number of any kind may sit on an outward row.
+    expect(wax.queryByText(/available/i)).toBeNull();
+    expect(wax.queryByText(/shortage/i)).toBeNull();
+    expect(wax.queryByText(/stock impact/i)).toBeNull();
+    // The in-house neighbour keeps its own stock impact line.
+    expect(within(screen.getByLabelText('Ingredient NaOH in Cleaner'))
+      .getByText('Stock impact 1,600.00 KG')).toBeTruthy();
+  });
+
+  it('reads a legacy ingredient with no source field as in house', async () => {
+    installFetch({
+      products: withItems([{ id: 9, chemical_name: 'Wax', percentage: 20 }]),
+    });
+    renderModal();
+    await waitForSource();
+
+    const wax = within(screen.getByLabelText('Ingredient Wax in Cleaner'));
+    expect(wax.getByText('In house')).toBeTruthy();
+    // No projected quantities means no invented ones.
+    expect(wax.getByText('Gross use —')).toBeTruthy();
+  });
 });

@@ -1,8 +1,10 @@
 import { useState, useEffect, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   Package,
   FlaskConical,
   Boxes,
+  Truck,
   Settings,
   Info,
   AlertTriangle,
@@ -17,8 +19,9 @@ import Button from '../components/ui/Button';
 import Modal from '../components/modals/Modal';
 import KpiCard from '../components/cards/KpiCard';
 import StockHistory from '../components/stock/StockHistory';
+import ChemicalPurchaseModal from '../components/stock/ChemicalPurchaseModal';
+import PurchaseHistory from '../components/stock/PurchaseHistory';
 import SuggestionInput from '../components/ui/SuggestionInput';
-import { COMMON_UNITS } from '../utils/units';
 import { formatNumber } from '../utils/format';
 import { useAuth } from '../context/AuthContext';
 import { toast } from 'sonner';
@@ -32,12 +35,16 @@ const REASON_SUGGESTIONS = [
   'Supplier delivery',
 ];
 
+const PROJECTED_TOOLTIP =
+  'Additional quantity to purchase for active PI plans';
+
 const fieldCls =
   'w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500';
 
 export default function Chemicals() {
   const { apiFetch, user } = useAuth();
   const isAdmin = user?.role === 'admin';
+  const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState('chemicals');
   const [chemicals, setChemicals] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -50,12 +57,13 @@ export default function Chemicals() {
   const [adjustSaving, setAdjustSaving] = useState(false);
   const [alarmValue, setAlarmValue] = useState('');
   const [alarmSaving, setAlarmSaving] = useState(false);
-  const [showAddModal, setShowAddModal] = useState(false);
-  const [addName, setAddName] = useState('');
-  const [addQty, setAddQty] = useState('');
-  const [addUnit, setAddUnit] = useState('KG');
-  const [addReorder, setAddReorder] = useState('');
-  const [addSaving, setAddSaving] = useState(false);
+  const [showPurchaseModal, setShowPurchaseModal] = useState(false);
+  const [outwardRows, setOutwardRows] = useState([]);
+  const [outwardLoading, setOutwardLoading] = useState(false);
+  const [outwardError, setOutwardError] = useState(null);
+  const [coverage, setCoverage] = useState(null);
+  const [unstocked, setUnstocked] = useState([]);
+  const [unstockedOpen, setUnstockedOpen] = useState(false);
 
   const openAdjust = (row) => {
     setSelectedChemical(row);
@@ -101,53 +109,6 @@ export default function Chemicals() {
     }
   };
 
-  const resetAdd = () => {
-    setAddName('');
-    setAddQty('');
-    setAddUnit('KG');
-    setAddReorder('');
-  };
-
-  const openAdd = () => {
-    resetAdd();
-    setShowAddModal(true);
-  };
-
-  const handleSaveNew = async () => {
-    const name = addName.trim();
-    if (!name) {
-      toast.error('Enter a chemical name');
-      return;
-    }
-    const qty = addQty === '' ? 0 : parseFloat(addQty);
-    if (Number.isNaN(qty) || qty < 0) {
-      toast.error('Opening quantity must be 0 or greater');
-      return;
-    }
-    const reorder = addReorder === '' ? 0 : parseFloat(addReorder);
-    if (Number.isNaN(reorder) || reorder < 0) {
-      toast.error('Low-stock alarm must be 0 or greater');
-      return;
-    }
-    setAddSaving(true);
-    try {
-      const res = await apiFetch('/api/chemicals', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, qty, unit: addUnit, reorder_level: reorder }),
-      });
-      const data = await res.json().catch(() => ({}));
-      toast.success(`Added ${data.name || name} to stock`);
-      setShowAddModal(false);
-      resetAdd();
-      loadChemicals();
-    } catch (err) {
-      toast.error(err.message || 'Could not add chemical');
-    } finally {
-      setAddSaving(false);
-    }
-  };
-
   const handleSaveAlarm = async () => {
     if (!selectedChemical) return;
     const level = alarmValue === '' ? 0 : parseFloat(alarmValue);
@@ -177,17 +138,20 @@ export default function Chemicals() {
     setLoading(true);
     setError(null);
     try {
-      const res = await apiFetch('/api/chemicals');
+      const res = await apiFetch('/api/chemicals/inventory');
       const data = await res.json();
-      if (!Array.isArray(data)) throw new Error('Unexpected response from server');
-      setChemicals(data.map(c => ({
+      const materials = Array.isArray(data.materials) ? data.materials : [];
+      setChemicals(materials.map(c => ({
         ...c,
-        balance_this_month: c.qty,
         status: stockStatus(c)
       })));
+      setCoverage(data.coverage ?? null);
+      setUnstocked(Array.isArray(data.unstocked_requirements) ? data.unstocked_requirements : []);
     } catch (err) {
       setError(err.message || 'Could not load chemical stock');
       setChemicals([]);
+      setCoverage(null);
+      setUnstocked([]);
     } finally {
       setLoading(false);
     }
@@ -196,6 +160,45 @@ export default function Chemicals() {
   useEffect(() => {
     loadChemicals();
   }, [loadChemicals]);
+
+  const loadOutward = useCallback(async () => {
+    setOutwardLoading(true);
+    setOutwardError(null);
+    try {
+      const res = await apiFetch('/api/chemical-purchases?delivery_type=outward&per_page=50&include_cancelled=true');
+      const data = await res.json();
+      const purchases = Array.isArray(data.purchases) ? data.purchases : [];
+      setOutwardRows(purchases.flatMap((p) => (p.items || []).map((it) => ({
+        id: it.id,
+        purchase_id: p.id,
+        material: it.chemical_name,
+        chemical_id: it.chemical_id,
+        quantity: it.quantity,
+        unit: it.unit,
+        supplier: p.supplier_name,
+        purchase_number: p.purchase_number,
+        date: p.purchase_date,
+        client: p.client_name || '—',
+        client_id: p.client_id ?? null,
+        client_name: p.client_name ?? null,
+        cancelled: p.cancelled,
+      }))));
+    } catch (err) {
+      setOutwardError(err.message || 'Could not load outward purchases');
+      setOutwardRows([]);
+    } finally {
+      setOutwardLoading(false);
+    }
+  }, [apiFetch]);
+
+  useEffect(() => {
+    // Outward receipts load lazily when the tab opens — an external-system sync.
+    // loadOutward flips loading up front and wraps the fetch in try/catch;
+    // oxlint's set-state-in-effect flags that residual, suppressed here exactly
+    // as StockHistory does.
+    // oxlint-disable-next-line react/set-state-in-effect
+    if (activeTab === 'outward') loadOutward();
+  }, [activeTab, loadOutward]);
 
   const getStockStatus = (chem) => stockStatus(chem);
 
@@ -207,7 +210,7 @@ export default function Chemicals() {
 
   const columns = [
     {
-      header: 'Chemical Name',
+      header: 'Raw Material',
       accessor: 'name',
       render: (val) => (
         <div className="flex items-center gap-2.5">
@@ -233,31 +236,42 @@ export default function Chemicals() {
       )
     },
     {
-      header: 'Last Month',
-      accessor: 'balance_last_month',
+      header: 'Last Purchase Date',
+      accessor: 'last_purchase_date',
       render: (val) => (
-        <span className="text-slate-600 dark:text-slate-400">{formatNumber(val)}</span>
+        <span className="text-slate-600 dark:text-slate-400">{val || '—'}</span>
       )
     },
     {
-      header: 'This Month',
-      accessor: 'balance_this_month',
+      header: 'Last Purchase Quantity',
+      accessor: 'last_purchase_quantity',
       render: (val) => (
-        <span className="font-medium text-slate-800 dark:text-slate-200">{formatNumber(val)}</span>
+        <span className="font-mono text-slate-700 dark:text-slate-200">{val != null ? formatNumber(val) : '—'}</span>
       )
     },
     {
-      header: 'Variance',
-      accessor: 'variance',
-      render: (_val, row) => {
-        const diff = (row.qty || 0) - (row.balance_last_month || 0);
-        const pct = row.balance_last_month > 0 ? ((diff / row.balance_last_month) * 100).toFixed(1) : '0.0';
+      header: 'Supplier Name',
+      accessor: 'supplier_name',
+      render: (val) => (
+        <span className="text-slate-600 dark:text-slate-400">{val || '—'}</span>
+      )
+    },
+    {
+      header: 'Projected Quantity',
+      accessor: 'projected_quantity',
+      sortable: false,
+      render: (val, row) => {
+        const unknown = val == null;
+        const text = unknown ? '—' : val === 0 ? '0' : `${formatNumber(val)} ${row.unit}`;
         return (
-          <span className={clsx(
-            'text-xs font-semibold',
-            diff > 0 ? 'text-emerald-600 dark:text-emerald-400' : diff < 0 ? 'text-rose-600 dark:text-rose-400' : 'text-slate-400'
-          )}>
-            {diff > 0 ? '+' : ''}{formatNumber(diff)} ({pct}%)
+          <span
+            title={PROJECTED_TOOLTIP}
+            aria-label={unknown
+              ? 'Projected quantity unknown: missing unit conversion or no active plan'
+              : `Projected purchase ${text}`}
+            className={unknown ? 'text-slate-400 dark:text-slate-500 cursor-help' : 'font-mono text-slate-700 dark:text-slate-200 cursor-help'}
+          >
+            {text}
           </span>
         );
       }
@@ -297,24 +311,119 @@ export default function Chemicals() {
     }
   ];
 
+  const outwardColumns = [
+    {
+      header: 'Material',
+      accessor: 'material',
+      render: (val) => (
+        <span className="font-medium text-slate-900 dark:text-white">{val}</span>
+      )
+    },
+    {
+      header: 'Quantity',
+      accessor: 'quantity',
+      render: (val) => (
+        <span className="font-mono font-bold text-slate-800 dark:text-slate-100">{formatNumber(val)}</span>
+      )
+    },
+    {
+      header: 'Unit',
+      accessor: 'unit',
+      render: (val) => (
+        <span className="px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 text-[11px] font-mono text-slate-600 dark:text-slate-300">{val}</span>
+      )
+    },
+    {
+      header: 'Supplier',
+      accessor: 'supplier',
+      render: (val) => (
+        <span className="text-slate-600 dark:text-slate-400">{val || '—'}</span>
+      )
+    },
+    {
+      header: 'Purchase #',
+      accessor: 'purchase_number',
+      render: (val) => (
+        <span className="font-mono text-slate-700 dark:text-slate-200">{val}</span>
+      )
+    },
+    {
+      header: 'Date',
+      accessor: 'date',
+      render: (val) => (
+        <span className="text-slate-600 dark:text-slate-400">{val || '—'}</span>
+      )
+    },
+    {
+      header: 'Client',
+      accessor: 'client',
+      render: (val) => (
+        <span className="text-slate-600 dark:text-slate-400">{val || '—'}</span>
+      )
+    },
+    {
+      header: 'Status',
+      accessor: 'cancelled',
+      sortable: false,
+      render: (val) => (
+        val ? <Badge variant="default">Cancelled</Badge> : <Badge variant="success">Active</Badge>
+      )
+    },
+    {
+      // Entry point into the recipe workflow: the client and the line travel
+      // with it, so nothing has to be re-picked there. A cancelled delivery
+      // can back no recipe, so it offers no button.
+      header: 'Actions',
+      accessor: 'id',
+      sortable: false,
+      render: (_, row) => (row.cancelled ? null : (
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={() => navigate('/recipes', {
+            state: {
+              useOutwardLine: {
+                line_id: row.id,
+                purchase_id: row.purchase_id,
+                client_id: row.client_id,
+                client_name: row.client,
+                chemical_id: row.chemical_id,
+                chemical_name: row.material,
+                quantity: row.quantity,
+                unit: row.unit,
+                supplier_name: row.supplier,
+                purchase_number: row.purchase_number,
+                purchase_date: row.date,
+              },
+            },
+          })}
+        >
+          Use in invoice recipe
+        </Button>
+      ))
+    }
+  ];
+
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
           <h2 className="text-2xl font-bold text-slate-900 dark:text-white tracking-tight">
-            {activeTab === 'chemicals' ? 'Chemicals Inventory' : 'Packaging Register'}
+            {activeTab === 'chemicals' ? 'Chemicals Inventory' : activeTab === 'outward' ? 'Outward Purchases' : 'Packaging Register'}
           </h2>
           <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
             {activeTab === 'chemicals'
               ? 'Complete catalog of all registered chemicals'
-              : 'Bags, jars and drums counted as objects — not chemicals, never a recipe ingredient'}
+              : activeTab === 'outward'
+                ? 'Materials purchased for delivery to client sites'
+                : 'Bags, jars and drums counted as objects — not chemicals, never a recipe ingredient'}
           </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           {activeTab === 'chemicals' && (
             <>
               {isAdmin && !loading && !error && (
-                <Button variant="primary" size="sm" icon={Plus} onClick={openAdd}>Add Chemical</Button>
+                <Button variant="primary" size="sm" icon={Plus} onClick={() => setShowPurchaseModal(true)}>Add Chemical</Button>
               )}
               {loading || error ? (
                 <Badge variant="default">Unavailable</Badge>
@@ -352,6 +461,18 @@ export default function Chemicals() {
           >
             <Boxes className="h-4 w-4" /> Packaging
           </button>
+          <button
+            onClick={() => setActiveTab('outward')}
+            aria-pressed={activeTab === 'outward'}
+            className={clsx(
+              'inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-colors cursor-pointer',
+              activeTab === 'outward'
+                ? 'bg-blue-600 text-white'
+                : 'bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
+            )}
+          >
+            <Truck className="h-4 w-4" /> Outward
+          </button>
         </div>
       </div>
 
@@ -366,6 +487,49 @@ export default function Chemicals() {
 
       {activeTab === 'packaging' ? (
         <PackagingPanel isAdmin={isAdmin} />
+      ) : activeTab === 'outward' ? (
+        outwardLoading ? (
+          <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 shadow-xs" aria-label="Loading outward purchases">
+            <div className="h-5 w-40 rounded bg-slate-200 dark:bg-slate-700 mb-1 animate-pulse" />
+            <div className="h-3 w-64 rounded bg-slate-100 dark:bg-slate-800 mb-4 animate-pulse" />
+            {Array.from({ length: 6 }).map((_, i) => (
+              <div key={i} className="flex items-center gap-3 py-3 border-t border-slate-100 dark:border-slate-800/60 animate-pulse">
+                <div className="h-4 flex-1 rounded bg-slate-200 dark:bg-slate-700" />
+                <div className="h-4 w-20 rounded bg-slate-100 dark:bg-slate-800" />
+                <div className="h-4 w-16 rounded bg-slate-100 dark:bg-slate-800" />
+              </div>
+            ))}
+          </div>
+        ) : outwardError ? (
+          <div className="rounded-xl border border-rose-200 dark:border-rose-800 bg-rose-50 dark:bg-rose-950/30 p-8 text-center" role="alert">
+            <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-rose-100 dark:bg-rose-950/60">
+              <AlertTriangle className="h-6 w-6 text-rose-600 dark:text-rose-400" />
+            </div>
+            <p className="text-sm font-semibold text-rose-700 dark:text-rose-300">Could not load outward purchases</p>
+            <p className="text-xs text-rose-600/80 dark:text-rose-400/80 mt-1">{outwardError}</p>
+            <Button variant="primary" size="sm" onClick={loadOutward} className="mt-4">
+              Retry
+            </Button>
+          </div>
+        ) : outwardRows.length === 0 ? (
+          <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 text-center">
+            <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-slate-100 dark:bg-slate-800">
+              <Truck className="h-6 w-6 text-slate-400" />
+            </div>
+            <p className="text-sm font-semibold text-slate-800 dark:text-white">No outward purchases recorded yet</p>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">Materials bought for delivery to a client will appear here.</p>
+          </div>
+        ) : (
+          <DataTable
+            title="Outward Purchases"
+            subtitle="Materials purchased for delivery to client sites"
+            columns={outwardColumns}
+            data={outwardRows}
+            searchKey="material"
+            searchPlaceholder="Search by material..."
+            initialPageSize={15}
+          />
+        )
       ) : loading ? (
         <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-5 shadow-xs" aria-label="Loading chemical stock">
           <div className="h-5 w-40 rounded bg-slate-200 dark:bg-slate-700 mb-1 animate-pulse" />
@@ -396,9 +560,9 @@ export default function Chemicals() {
             <FlaskConical className="h-6 w-6 text-slate-400" />
           </div>
           <p className="text-sm font-semibold text-slate-800 dark:text-white">No chemicals registered yet</p>
-          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">Upload a monthly stock file or add chemicals to get started.</p>
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">Record a purchase to add chemicals to stock.</p>
           {isAdmin && (
-            <Button variant="primary" size="sm" icon={Plus} onClick={openAdd} className="mt-4">
+            <Button variant="primary" size="sm" icon={Plus} onClick={() => setShowPurchaseModal(true)} className="mt-4">
               Add your first chemical
             </Button>
           )}
@@ -417,43 +581,73 @@ export default function Chemicals() {
         />
       )}
 
+      {activeTab === 'chemicals' && !loading && !error && coverage && (
+        (coverage.open_pis_without_plan?.length ?? 0) > 0 ? (
+          <div role="alert" className="rounded-xl border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30 p-4 space-y-2">
+            <p className="text-sm font-semibold text-amber-800 dark:text-amber-300">
+              {coverage.open_pis_without_plan.length} open PIs lack an active formulation
+            </p>
+            <ul className="text-xs text-amber-700 dark:text-amber-400 list-disc pl-5">
+              {coverage.open_pis_without_plan.map((pi) => (
+                <li key={pi.sale_id}>{pi.pi_number} ({(pi.products || []).join(', ')})</li>
+              ))}
+            </ul>
+            <p className="text-xs text-amber-700 dark:text-amber-400">
+              Their purchasing forecasts stay incomplete until a demo recipe is activated.
+            </p>
+          </div>
+        ) : (coverage.incomplete_plans?.length ?? 0) > 0 ? (
+          <div role="alert" className="rounded-xl border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30 p-4 space-y-2">
+            <p className="text-sm font-semibold text-amber-800 dark:text-amber-300">Active plans are incomplete</p>
+            <ul className="text-xs text-amber-700 dark:text-amber-400 list-disc pl-5">
+              {coverage.incomplete_plans.map((pi) => (
+                <li key={pi.sale_id}>{pi.pi_number} ({(pi.products || []).join(', ')})</li>
+              ))}
+            </ul>
+          </div>
+        ) : coverage.state === 'no_active_plans' ? (
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            No active PI plans — projected purchases are zero.
+          </p>
+        ) : null
+      )}
+
+      {activeTab === 'chemicals' && !loading && !error && unstocked.length > 0 && (
+        <details
+          open={unstockedOpen}
+          className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 p-4"
+        >
+          <summary
+            onClick={(e) => { e.preventDefault(); setUnstockedOpen((o) => !o); }}
+            className="text-sm font-semibold text-slate-800 dark:text-white cursor-pointer"
+          >
+            Unstocked requirements ({unstocked.length})
+          </summary>
+          <ul className="mt-3 space-y-2">
+            {unstocked.map((u) => (
+              <li key={u.name} className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-600 dark:text-slate-300">
+                <span className="font-medium text-slate-900 dark:text-white">{u.name}</span>
+                <span>Required: {u.required_quantity == null ? '—' : `${formatNumber(u.required_quantity)} ${u.unit}`}</span>
+                <span>Projected purchase: {u.projected_quantity == null ? '—' : `${formatNumber(u.projected_quantity)} ${u.unit}`}</span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+
       {activeTab === 'chemicals' && isAdmin && !loading && !error && chemicals.length > 0 && (
         <StockHistory chemicals={chemicals} />
       )}
 
-      <Modal
-        isOpen={showAddModal}
-        onClose={() => { setShowAddModal(false); resetAdd(); }}
-        title="Add Chemical"
-        subtitle="Register a new chemical in stock"
-        footer={
-          <>
-            <Button variant="secondary" onClick={() => { setShowAddModal(false); resetAdd(); }} disabled={addSaving}>Cancel</Button>
-            <Button variant="primary" onClick={handleSaveNew} loading={addSaving} disabled={addSaving}>Save</Button>
-          </>
-        }
-      >
-        <div className="space-y-4">
-          <div>
-            <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Chemical name</label>
-            <input aria-label="Chemical name" type="text" value={addName} onChange={(e) => setAddName(e.target.value)} placeholder="e.g. Citric Acid" className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500" />
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Opening quantity</label>
-              <input aria-label="Opening quantity" type="number" min="0" value={addQty} onChange={(e) => setAddQty(e.target.value)} placeholder="0" className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500" />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Unit</label>
-              <SuggestionInput aria-label="Unit" options={COMMON_UNITS} value={addUnit} onChange={(e) => setAddUnit(e.target.value)} className={fieldCls} />
-            </div>
-          </div>
-          <div>
-              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Low-stock alarm (0 = off)</label>
-              <input aria-label="Low-stock alarm" type="number" min="0" value={addReorder} onChange={(e) => setAddReorder(e.target.value)} placeholder="0" className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500" />
-          </div>
-        </div>
-      </Modal>
+      {activeTab === 'chemicals' && isAdmin && !loading && !error && (
+        <PurchaseHistory onChanged={loadChemicals} />
+      )}
+
+      <ChemicalPurchaseModal
+        isOpen={showPurchaseModal}
+        onClose={() => setShowPurchaseModal(false)}
+        onSuccess={loadChemicals}
+      />
 
       <Modal
         isOpen={showAdjustModal}
@@ -475,8 +669,8 @@ export default function Chemicals() {
                 <p className="text-xl font-bold text-slate-900 dark:text-white mt-0.5">{formatNumber(selectedChemical.qty)} <span className="text-xs font-normal text-slate-500">{selectedChemical.unit}</span></p>
               </div>
               <div className="rounded-lg border border-slate-200 dark:border-slate-700 p-3 bg-slate-50 dark:bg-slate-800/60">
-                <p className="text-[11px] font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">Last Month</p>
-                <p className="text-xl font-bold text-slate-900 dark:text-white mt-0.5">{formatNumber(selectedChemical.balance_last_month)} <span className="text-xs font-normal text-slate-500">{selectedChemical.unit}</span></p>
+                <p className="text-[11px] font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">Last Purchase</p>
+                <p className="text-xl font-bold text-slate-900 dark:text-white mt-0.5">{selectedChemical.last_purchase_date || '—'}</p>
               </div>
             </div>
             <div>
@@ -503,10 +697,10 @@ export default function Chemicals() {
             {[
               ['ID', selectedChemical.id],
               ['Unit', selectedChemical.unit],
-              ['Balance Last Month', `${formatNumber(selectedChemical.balance_last_month)} ${selectedChemical.unit}`],
-              ['Balance This Month', `${formatNumber(selectedChemical.qty)} ${selectedChemical.unit}`],
+              ['Current Stock', `${formatNumber(selectedChemical.qty)} ${selectedChemical.unit}`],
+              ['Last Purchase Date', selectedChemical.last_purchase_date || '—'],
+              ['Supplier Name', selectedChemical.supplier_name || '—'],
               ['Status', getStockStatus(selectedChemical) === 'matched' ? 'Reconciled' : getStockStatus(selectedChemical) === 'low' ? 'Low Stock' : 'Out of Stock'],
-              ['Last Updated', selectedChemical.last_updated]
             ].map(([label, value]) => (
               <div key={label} className="rounded-lg border border-slate-200 dark:border-slate-700 p-3">
                 <span className="text-slate-500 dark:text-slate-400 block mb-0.5">{label}</span>

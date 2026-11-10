@@ -2,10 +2,17 @@ import { useState, useEffect } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import Modal from './Modal';
 import Button from '../ui/Button';
+import Badge from '../ui/Badge';
 import { useAuth } from '../../context/AuthContext';
 import { toast } from 'sonner';
 import { formatNumber } from '../../utils/format';
 import { isBalanced } from '../../utils/formulation';
+import {
+  NO_STOCK_LABEL,
+  isOutward,
+  sourceLabel,
+  outwardEvidence,
+} from '../../utils/ingredientSource';
 
 const inputCls =
   'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
@@ -20,6 +27,31 @@ const keyOf = (product) => String(product.product_name || '').toLowerCase();
 // says why per row and never sends that product, so one unfinished card does
 // not stop the rest of the invoice from being produced.
 const balancedOf = (product) => isBalanced(product.grand_total);
+
+// Gross use is what the formula consumes; stock impact is what leaves our
+// shelf. For a client delivery those are two different numbers, and only the
+// second one is ever ours to spend.
+const grossUseLine = (item) => {
+  const qty = Number(item.required_qty);
+  return Number.isFinite(qty)
+    ? `Gross use ${formatNumber(qty)} ${item.unit || ''}`.trim()
+    : 'Gross use —';
+};
+
+const stockImpactLine = (item) => {
+  const qty = Number(item.required_qty);
+  return Number.isFinite(qty)
+    ? `Stock impact ${formatNumber(qty)} ${item.unit || ''}`.trim()
+    : 'Stock impact —';
+};
+
+const outwardReceivedLine = (item) => (
+  `Received ${formatNumber(item.source_qty)} ${item.source_unit || item.unit || ''}`.trim()
+);
+
+const deductedLine = (item) => (
+  `Deducted ${formatNumber(0)} ${item.unit || item.source_unit || ''}`.trim()
+);
 
 const remainingOf = (product) => {
   const remaining = Number(product.remaining_qty);
@@ -331,6 +363,52 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, onSaved })
                                   ? `${total.toFixed(1)}%`
                                   : 'unknown'} — must equal 100% before production
                               </p>
+                            )}
+                            {Array.isArray(product.items) && product.items.length > 0 && (
+                              <ul
+                                aria-label={`Ingredients for ${product.product_name}`}
+                                className="mt-1.5 space-y-1"
+                              >
+                                {product.items.map((item) => (
+                                  <li
+                                    key={item.id ?? item.chemical_name}
+                                    aria-label={`Ingredient ${item.chemical_name} in ${product.product_name}`}
+                                    className="text-[11px] text-slate-500 dark:text-slate-400"
+                                  >
+                                    <span className="flex flex-wrap items-center gap-1.5">
+                                      <Badge variant={isOutward(item) ? 'info' : 'default'}>
+                                        {sourceLabel(item)}
+                                      </Badge>
+                                      <span className="font-medium text-slate-700 dark:text-slate-200">
+                                        {item.chemical_name}
+                                      </span>
+                                      <span className="font-mono">{grossUseLine(item)}</span>
+                                    </span>
+                                    {isOutward(item) ? (
+                                      <>
+                                        <span className="block font-mono">
+                                          {deductedLine(item)}
+                                        </span>
+                                        <span className="block">
+                                          {NO_STOCK_LABEL}
+                                        </span>
+                                        <span
+                                          aria-label={`Outward source for ${item.chemical_name}`}
+                                          className="block"
+                                        >
+                                          {[...outwardEvidence(item), outwardReceivedLine(item)]
+                                            .filter(Boolean)
+                                            .join(' · ')}
+                                        </span>
+                                      </>
+                                    ) : (
+                                      <span className="block font-mono">
+                                        {stockImpactLine(item)}
+                                      </span>
+                                    )}
+                                  </li>
+                                ))}
+                              </ul>
                             )}
                           </td>
                           <td className="px-3 py-2 text-right font-mono text-slate-600 dark:text-slate-300">
