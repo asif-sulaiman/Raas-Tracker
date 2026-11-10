@@ -534,3 +534,105 @@ def test_create_invoice_for_unknown_sale_returns_404(admin_client, db):
                                 "lines": [{"sale_item_id": item, "quantity": 1}]})
     assert r.status_code == 404, r.get_json()
     assert db.execute("SELECT COUNT(*) FROM invoices").fetchone()[0] == before
+
+
+# ---------- 7. a mixed-source run is atomic too (Slice 2) ----------
+#
+# Outward sourcing adds a fourth write to the run: the immutable per-run
+# source evidence. A failure anywhere after it must remove that evidence with
+# everything else, or a later reader would see a delivery that was never
+# produced against.
+
+
+def _outward_source(admin_client, db, client_id, name, quantity=25, number="PO-ATOMIC-OUT"):
+    r = admin_client.post("/api/chemical-purchases", json={
+        "supplier_name": "Outward Supplier", "purchase_number": number,
+        "purchase_date": "2026-01-15", "delivery_type": "outward",
+        "client_id": client_id,
+        "lines": [{"chemical_name": name, "quantity": quantity, "unit": "KG",
+                   "is_new": True}]})
+    assert r.status_code == 201, r.get_json()
+    return r.get_json()["items"][0]["id"]
+
+
+def _add_outward_item(admin_client, recipe_id, product, chemical, percentage,
+                      line_id):
+    r = admin_client.post(
+        f"/api/recipes/by-id/{recipe_id}/products/{quote(product)}/items",
+        json={"chemical": chemical, "percentage": percentage,
+              "source_type": "outward", "outward_purchase_line_id": line_id})
+    assert r.status_code == 200, r.get_json()
+
+
+def test_mixed_source_run_rolls_back_source_evidence_when_audit_fails(
+        admin_client, db, monkeypatch):
+    """Audit blows up AFTER the deduction + evidence writes: nothing survives.
+
+    ``create_production_run`` audits inside the same transaction, so a dead
+    audit sink must take the run, its outputs, its links, the in-house
+    deduction AND the outward source snapshot back with it.
+    """
+    from raas_tracker import recipes as recipes_module
+
+    cid = _company(admin_client, db, "MixAtomicCo")
+    sid = _sale(admin_client, cid, "PI-MIXAT-1", ("MixAtProdA", "MixAtProdB"))
+    line_id = _outward_source(admin_client, db, cid, "MixAtOut")
+    _chemical(admin_client, "MixAtIn", 100)
+    out_id = db.execute("SELECT id FROM chemicals WHERE name = 'MixAtOut'"
+                        ).fetchone()[0]
+    in_id = db.execute("SELECT id FROM chemicals WHERE name = 'MixAtIn'"
+                       ).fetchone()[0]
+    assert out_id < in_id, "the evidence row must be written before the failure"
+
+    inv = _invoice(admin_client, db, sid, "INV-MIXAT-1")
+    rid = _recipe(admin_client, cid, inv, "MixAtomicRecipe",
+                  {"MixAtProdB": [("MixAtIn", 10)]})
+    _add_outward_item(admin_client, rid, "MixAtProdA", "MixAtOut", 10, line_id)
+
+    before_stock = _stock(db, ["MixAtIn", "MixAtOut"])
+    before_state = _state(db, sid, inv)
+
+    # Injected only for the run under test: add_recipe and add_recipe_item audit
+    # through this same sink, so patching it earlier fails the setup instead of
+    # proving anything about production atomicity.
+    def _boom(*args, **kwargs):
+        raise RuntimeError("audit sink down")
+
+    monkeypatch.setattr(recipes_module, "log_audit_action", _boom)
+
+    r = _produce(admin_client, rid, {"MixAtProdA": 10, "MixAtProdB": 10})
+    assert r.status_code == 500, r.get_json()
+
+    assert _stock(db, ["MixAtIn", "MixAtOut"]) == before_stock
+    assert _state(db, sid, inv) == before_state
+    assert db.execute("SELECT COUNT(*) FROM production_run_items").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM audit_logs "
+                      "WHERE action = 'PRODUCTION_RUN_CREATE'").fetchone()[0] == 0
+
+
+def test_all_outward_run_writes_evidence_without_touching_stock(admin_client, db):
+    """The success-side twin: one transaction, evidence committed, stock still.
+
+    Pinned here as well as in the sourcing suite because it is the atomicity
+    contract -- the evidence row and the run header commit together, and no
+    ``update_stock`` call is made at all when every ingredient is outward.
+    """
+    cid = _company(admin_client, db, "AllOutAtomicCo")
+    sid = _sale(admin_client, cid, "PI-ALLAT-1", ("AllAtProd",))
+    line_id = _outward_source(admin_client, db, cid, "AllAtOut")
+    inv = _invoice(admin_client, db, sid, "INV-ALLAT-1")
+    rid = _recipe(admin_client, cid, inv, "AllAtomicRecipe", {})
+    _add_outward_item(admin_client, rid, "AllAtProd", "AllAtOut", 40, line_id)
+
+    before_stock = _stock(db, ["AllAtOut"])
+    r = _produce(admin_client, rid, {"AllAtProd": 10})
+    assert r.status_code == 201, r.get_json()
+
+    state = _state(db, sid, inv)
+    assert (state["runs"], state["outputs"], state["run_items"],
+            state["links"]) == (1, 1, 1, 1)
+    assert _stock(db, ["AllAtOut"]) == before_stock
+    row = db.execute("SELECT source_type, deducted_qty, purchase_number, "
+                     "source_qty FROM production_run_items").fetchone()
+    assert row == ("outward", 0, "PO-ATOMIC-OUT", 25)
+    assert state["invoice_status"] == "produced"
