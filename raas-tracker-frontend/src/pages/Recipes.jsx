@@ -101,6 +101,7 @@ function OutwardSourcePicker({
         options={list.map((s) => ({ value: s.line_id, label: sourceOptionLabel(s) }))}
         value={value}
         onChange={onChange}
+        disabled={state.loading}
         placeholder={state.loading ? 'Loading client receipts…' : 'Search client receipts…'}
         emptyMessage="This client has no outward receipt recorded"
         hint="Pick the receipt line the client delivered"
@@ -799,29 +800,39 @@ export default function Recipes() {
     { ...OUTWARD_SOURCES_EMPTY, sources: [] },
   );
   const sourcesKey = useRef('');
+  const outwardToken = useRef(0);
 
   const loadOutwardSources = useCallback(async (clientId) => {
     const key = clientId == null || clientId === '' ? '' : String(clientId);
     sourcesKey.current = key;
+    // Whoever fires last owns the picker. Two reads can be in flight at once
+    // (the operator moved to another client before the first answered), and the
+    // older one resolving last must not pin the wrong client's receipts — so a
+    // response whose token is no longer current is a no-op.
+    const token = outwardToken.current + 1;
+    outwardToken.current = token;
+    const isCurrent = () => token === outwardToken.current;
     if (!key) {
       // No client on the PI means no delivery to point at — say that, rather
       // than sending a client_id the API must refuse.
       setOutward({ ...OUTWARD_SOURCES_EMPTY, sources: [], noClient: true });
       return;
     }
-    setOutward((prev) => ({
-      ...prev, loading: true, error: null, fieldError: null, noClient: false,
-    }));
+    // Drop the previous client's rows the moment a new load starts: they are
+    // another client's receipts and must not stay pickable while this reads.
+    setOutward({ ...OUTWARD_SOURCES_EMPTY, sources: [], loading: true });
     try {
       const res = await apiFetch(
         `/api/chemical-purchases/outward-sources?client_id=${encodeURIComponent(key)}`,
       );
       const data = await res.json();
+      if (!isCurrent()) return;
       setOutward({
         ...OUTWARD_SOURCES_EMPTY,
         sources: Array.isArray(data?.sources) ? data.sources : [],
       });
     } catch (err) {
+      if (!isCurrent()) return;
       // A failed read must stay retryable, so the key is dropped with it.
       sourcesKey.current = '';
       setOutward({

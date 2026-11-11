@@ -176,6 +176,63 @@ describe('PurchaseHistory', () => {
     await waitFor(() => expect(onChanged).toHaveBeenCalled());
   });
 
+  it('attaches each correction field error to its material input, not one banner', async () => {
+    const puts = [];
+    renderHistory({
+      puts,
+      putHandler: () => jsonResponse({
+        error: 'Invalid payload',
+        details: [
+          { field: 'line_patches.0.quantity', message: 'Salt quantity must be positive' },
+          { field: 'line_patches.1.quantity', message: 'Acid quantity must be positive' },
+        ],
+      }, false, 400),
+    });
+    await screen.findByText('PO-2');
+    fireEvent.click(within(rowFor('PO-2')).getByRole('button', { name: 'Edit' }));
+    const salt = await screen.findByLabelText('Quantity for Salt');
+    const acid = screen.getByLabelText('Quantity for Acid');
+    fireEvent.change(salt, { target: { value: '6' } });
+    fireEvent.change(acid, { target: { value: '4' } });
+    fireEvent.change(screen.getByLabelText('Correction reason'), { target: { value: 'Quantity typo' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Correction' }));
+    await waitFor(() => expect(puts).toHaveLength(1));
+
+    // Patches go out in item order: Salt (id 21) then Acid (id 22), so patch 0
+    // is Salt and patch 1 is Acid — each message must sit by its own input.
+    await waitFor(() => expect(within(salt.parentElement).getByRole('alert')).toBeTruthy());
+    expect(within(salt.parentElement).getByRole('alert').textContent).toContain('Salt quantity must be positive');
+    expect(within(acid.parentElement).getByRole('alert').textContent).toContain('Acid quantity must be positive');
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it('maps a patch error to the edited material even when earlier materials are unchanged', async () => {
+    const puts = [];
+    renderHistory({
+      puts,
+      putHandler: () => jsonResponse({
+        error: 'Invalid payload',
+        details: [{ field: 'line_patches.0.quantity', message: 'Acid quantity must be positive' }],
+      }, false, 400),
+    });
+    await screen.findByText('PO-2');
+    fireEvent.click(within(rowFor('PO-2')).getByRole('button', { name: 'Edit' }));
+    const salt = await screen.findByLabelText('Quantity for Salt');
+    const acid = screen.getByLabelText('Quantity for Acid');
+    // Only Acid changes, so the single submitted patch (index 0) is Acid — not
+    // Salt, which sits at items[0]. The error must follow the patch, not the row.
+    fireEvent.change(acid, { target: { value: '4' } });
+    fireEvent.change(screen.getByLabelText('Correction reason'), { target: { value: 'Quantity typo' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Correction' }));
+    await waitFor(() => expect(puts).toHaveLength(1));
+    expect(puts[0].body.line_patches).toEqual([{ id: 22, quantity: 4 }]);
+
+    await waitFor(() => expect(within(acid.parentElement).getByRole('alert')).toBeTruthy());
+    expect(within(acid.parentElement).getByRole('alert').textContent).toContain('Acid quantity must be positive');
+    expect(within(salt.parentElement).queryByRole('alert')).toBeNull();
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
   it('confirming cancellation POSTs expected_version and reason', async () => {
     const cancels = [];
     const { onChanged } = renderHistory({ cancels });

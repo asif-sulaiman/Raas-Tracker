@@ -216,6 +216,30 @@ describe('Chemicals stock table', () => {
     expect(screen.queryByText(/open PIs lack/)).toBeNull();
   });
 
+  it('surfaces the unplanned-PI and incomplete-plan warnings together', async () => {
+    renderChemicals({ coverage: {
+      state: 'incomplete', active_plan_count: 1, open_pi_count: 2,
+      open_pis_without_plan: [{ sale_id: 5, pi_number: 'PI-5', products: ['Cotton'] }],
+      incomplete_plans: [{ sale_id: 9, pi_number: 'PI-9', products: ['Resin'] }],
+    } });
+    const warnings = await screen.findAllByRole('alert');
+    expect(warnings).toHaveLength(2);
+    expect(warnings[0]).toHaveTextContent('1 open PIs lack an active formulation');
+    expect(warnings[0]).toHaveTextContent('PI-5');
+    expect(warnings[1]).toHaveTextContent(/active plans.*incomplete/i);
+    expect(warnings[1]).toHaveTextContent('PI-9');
+  });
+
+  it('reads no active plans as unknown, never as zero purchases', async () => {
+    renderChemicals({ coverage: {
+      state: 'no_active_plans', active_plan_count: 0, open_pi_count: 1,
+      open_pis_without_plan: [], incomplete_plans: [],
+    } });
+    const note = await screen.findByText(/No active PI plans/);
+    expect(note.textContent).toMatch(/unknown/i);
+    expect(note.textContent).not.toMatch(/zero/i);
+  });
+
   it('hides coverage warnings and unstocked section for complete covered inventory', async () => {
     renderChemicals({ coverage: {
       state: 'complete', active_plan_count: 1, open_pi_count: 1,

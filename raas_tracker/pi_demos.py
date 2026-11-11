@@ -93,6 +93,9 @@ _PLAN_ITEMS_SQL = (
 # one PI is still one output, and joining outputs through the link rows would
 # fan the quantity out. An output reachable from two different sales cannot be
 # attributed to either and is reported unknown instead of credited.
+#
+# The open-PI filter is NOT baked in here: `_produced` adds it for the forecast
+# and leaves it off for a single-PI editor read, exactly as `_pi_progress` does.
 _PRODUCED_SQL = (
     "SELECT l.sale_id, o.id, o.run_id, o.product_name, o.unit, o.qty_produced "
     "FROM (SELECT DISTINCT x.run_id, x.sale_id FROM ("
@@ -103,7 +106,7 @@ _PRODUCED_SQL = (
     "JOIN invoices i ON i.id = l.invoice_id WHERE i.sale_id IS NOT NULL"
     ") x) l "
     "JOIN production_run_outputs o ON o.run_id = l.run_id "
-    "JOIN sales s ON s.id = l.sale_id AND " + _OPEN_SALE + " ")
+    "JOIN sales s ON s.id = l.sale_id ")
 
 
 class DemoGateFailure(ServiceError):
@@ -781,18 +784,26 @@ def _active_plan(conn) -> dict:
 
 
 def _produced(conn, sale_id: Optional[int] = None) -> dict:
-    """Production outputs attributed to open PIs, grouped by PI and product.
+    """Production outputs attributed to PIs, grouped by PI and product.
 
     ``{(sale_id, identity): [output, …]}`` where an output carries the set of
     PIs that can reach it, so the caller can tell one attributable run from an
     output two PIs both claim. Read in ``o.id`` order, which keeps every sum
     below reproducible.
+
+    With no ``sale_id`` this is the forecast's read and completed PIs are
+    excluded, so settled work never generates buying. Given a ``sale_id`` it is
+    the editor's read of one PI as it is NOW, at any stage — the same rule
+    ``_pi_progress`` applies — because a completed PI's header must still show
+    what it produced instead of reporting zero beside its full target.
     """
     sql = _PRODUCED_SQL
     params: tuple = ()
     if sale_id is not None:
         sql += "WHERE s.id = %s "
         params = (sale_id,)
+    else:
+        sql += "AND " + _OPEN_SALE + " "
     sql += "ORDER BY o.id"
     outputs: dict = {}
     by_sale: dict = {}
@@ -840,6 +851,10 @@ def project_purchasing(conn) -> dict:
 
     Statement count is a property of the query shape, not of how many PIs are
     open, so one more PI never means one more query.
+
+    Published quantities are rounded to 6 decimal places, the precision every
+    other figure in this module uses, and the "is there anything to buy" test
+    runs on the rounded value so binary dust cannot open a requirement line.
     """
     _begin_snapshot(conn)
     graph = _conversion_graph(conn)
@@ -896,6 +911,17 @@ def project_purchasing(conn) -> dict:
                     unknown.add(item["chemical_id"])
                 continue
             remaining = max(target["target"] - produced, 0.0)
+            # `remaining` is in the PI LINE's canonical unit; the percentages are
+            # per unit of the DEMO product. Nothing forces those two to agree —
+            # a draft may be written in DRUM while the PI line is KG — so the
+            # link between them is part of the arithmetic. One factor per
+            # product, and a missing link is unknown, never an assumed ratio of 1.
+            line_to_product = _factor(graph, target["unit"], product["unit"])
+            if line_to_product is None:
+                incomplete.setdefault(sid, set()).add(target["name"])
+                for item in product["items"]:
+                    unknown.add(item["chemical_id"])
+                continue
             for item in product["items"]:
                 factor = _factor(graph, product["unit"], item["unit"])
                 percentage = item["percentage"]
@@ -905,7 +931,7 @@ def project_purchasing(conn) -> dict:
                     continue
                 required[item["chemical_id"]] = (
                     required.get(item["chemical_id"], 0.0)
-                    + remaining * percentage / 100.0 * factor)
+                    + remaining * line_to_product * percentage / 100.0 * factor)
 
     # A produced name that is no longer one of this PI's lines is an
     # unattributable historical identity: it credits nothing, and saying so is
@@ -922,8 +948,15 @@ def project_purchasing(conn) -> dict:
             need: Optional[float] = None
             buy: Optional[float] = None
         else:
+            # Published at the module's 6 dp, like every other figure here.
+            # `required` accumulates remaining x pct/100 x factor as floats, so a
+            # fully covered requirement can arrive as 5.68e-14; rounding BEFORE
+            # the `> 0` test below is what stops that dust from manufacturing a
+            # line an operator is told to go and buy.
             need = _num(required.get(cid, 0.0))
+            need = None if need is None else round(need, 6)
             buy = _num(max((need or 0.0) - chem["qty"], 0.0))
+            buy = None if buy is None else round(buy, 6)
         row = {"chemical_id": cid, "name": chem["name"], "unit": chem["unit"],
                "current_qty": chem["qty"], "required_quantity": need,
                "projected_quantity": buy}
@@ -941,13 +974,16 @@ def project_purchasing(conn) -> dict:
 
     open_unplanned = _rows_by(unplanned)
     incomplete_plans = _rows_by(incomplete)
-    # "complete" describes the arithmetic, not the world: it says every demand
-    # this forecast claims to cover is covered. Unplanned PIs are listed beside
-    # it, and only a forecast with no activated plan behind it at all is
-    # declared to be nothing but a list of open questions.
+    # "complete" is a claim about the WORLD, not just about the arithmetic: it
+    # says every open PI's demand is behind these figures. An unplanned PI has no
+    # formulation, so its chemicals cannot be attributed per row and stay at zero
+    # — but the label beside them must not read "complete", or the screen implies
+    # work nobody has looked at is already included. Only a forecast with no
+    # activated plan at all is "no_active_plans", and that case publishes None.
     coverage = {
         "state": ("no_active_plans" if open_unplanned and not activated
-                  else "incomplete" if incomplete_plans else "complete"),
+                  else "incomplete" if incomplete_plans or open_unplanned
+                  else "complete"),
         "open_pis_without_plan": open_unplanned,
         "incomplete_plans": incomplete_plans}
 

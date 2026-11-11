@@ -71,13 +71,17 @@ def import_from_json(json_path: str = JSON_PATH) -> Dict[str, int]:
                 ).fetchone() is not None
                 if has_history:
                     conn.execute(
-                        "UPDATE chemicals SET current_qty = %s, balance_last_month = %s, last_updated = %s WHERE UPPER(name) = %s",
-                        (float(qty), float(last_qty), date.isoformat(date.today()), name.upper())
+                        "UPDATE chemicals SET current_qty = %s, balance_last_month = %s, last_updated = %s, "
+                        "in_house_registered = CASE WHEN %s THEN TRUE ELSE in_house_registered END "
+                        "WHERE UPPER(name) = %s",
+                        (float(qty), float(last_qty), date.isoformat(date.today()), float(qty) > 0, name.upper())
                     )
                 else:
                     conn.execute(
-                        "UPDATE chemicals SET current_qty = %s, balance_last_month = %s, unit = %s, last_updated = %s WHERE UPPER(name) = %s",
-                        (float(qty), float(last_qty), unit, date.isoformat(date.today()), name.upper())
+                        "UPDATE chemicals SET current_qty = %s, balance_last_month = %s, unit = %s, last_updated = %s, "
+                        "in_house_registered = CASE WHEN %s THEN TRUE ELSE in_house_registered END "
+                        "WHERE UPPER(name) = %s",
+                        (float(qty), float(last_qty), unit, date.isoformat(date.today()), float(qty) > 0, name.upper())
                     )
             else:
                 conn.execute(

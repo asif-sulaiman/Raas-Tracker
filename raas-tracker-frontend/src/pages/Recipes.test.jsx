@@ -17,14 +17,6 @@ vi.mock('sonner', () => {
   return { toast: toastFn };
 });
 
-vi.mock('../components/recipes/PiDemoEditor', () => ({
-  default: ({ saleId, isOpen, onClose }) => isOpen ? (
-    <div role="dialog" aria-label={`Demo editor for sale ${saleId}`}>
-      <button onClick={onClose}>Close demo editor</button>
-    </div>
-  ) : null,
-}));
-
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
@@ -159,7 +151,7 @@ function installFetch({
   omitQuantities = false,
   outwardSources = [],
   sourcesError = null,
-  demosHandler = () => jsonResponse({ demos: [], coverage: null }),
+  outwardHandler = null,
 } = {}) {
   const state = {
     recipes: [...recipes],
@@ -260,8 +252,8 @@ function installFetch({
     if (u.includes('/api/auth/me')) {
       return jsonResponse({ id: 1, username: 'admin', role: 'admin' });
     }
-    if (u === '/api/pi-demos') return demosHandler();
     if (u.includes('/api/chemical-purchases/outward-sources')) {
+      if (outwardHandler) return outwardHandler(u);
       if (sourcesError) {
         return jsonResponse(sourcesError.body, false, sourcesError.status);
       }
@@ -1192,6 +1184,65 @@ describe('Ingredient source selector', () => {
     });
   });
 
+  it('keeps the picker on the current client when an older client response lands last', async () => {
+    const gates = {};
+    const outwardHandler = (url) => {
+      const cid = new URL(url, 'http://localhost').searchParams.get('client_id');
+      return new Promise((resolve) => { gates[cid] = resolve; });
+    };
+    const recipeA = { ...RECIPE_ROW, id: 3, company_id: 7, name: 'PI-A · INV-A' };
+    const recipeB = { ...RECIPE_ROW, id: 4, company_id: 8, name: 'PI-B · INV-B' };
+    renderRecipes({ recipes: [recipeA, recipeB], outwardHandler });
+
+    const openRecipe = async (name) => {
+      const row = (await screen.findByText(name)).closest('tr');
+      fireEvent.click(within(row).getByRole('button', { name: 'View' }));
+      await screen.findByRole('heading', { name });
+    };
+    const switchNaohOutward = async () => {
+      const soda = card('Caustic Soda 50%');
+      await openSourceEditor(soda);
+      fireEvent.change(within(soda).getByLabelText(
+        'Source for NaOH in Caustic Soda 50%',
+      ), { target: { value: 'outward' } });
+      return soda;
+    };
+
+    // Client A's read goes on the wire and stays pending.
+    await openRecipe('PI-A · INV-A');
+    await switchNaohOutward();
+    await waitFor(() => expect(gates['7']).toBeTruthy());
+
+    // Move to client B and switch a row outward: B's read goes out behind A's.
+    fireEvent.click(screen.getByRole('button', { name: 'Back to recipes' }));
+    await openRecipe('PI-B · INV-B');
+    const soda = await switchNaohOutward();
+    await waitFor(() => expect(gates['8']).toBeTruthy());
+
+    // While B's read is on the wire the picker is inert and the previous
+    // client's rows are gone — nothing belonging to A stays pickable.
+    expect(within(soda).getByLabelText(
+      'Outward receipt for NaOH in Caustic Soda 50%',
+    )).toBeDisabled();
+
+    // B answers first; the superseded A answers last and must change nothing.
+    gates['8'](jsonResponse({ sources: [
+      { ...OUTWARD_SOURCE, line_id: 81, client_id: 8, purchase_number: 'PO-B' },
+    ] }));
+    gates['7'](jsonResponse({ sources: [
+      { ...OUTWARD_SOURCE, line_id: 71, client_id: 7, purchase_number: 'PO-A' },
+    ] }));
+
+    const picker = within(soda).getByLabelText(
+      'Outward receipt for NaOH in Caustic Soda 50%',
+    );
+    // The picker stays disabled until the current client's lines arrive.
+    await waitFor(() => expect(picker).not.toBeDisabled());
+    fireEvent.focus(picker);
+    expect(await screen.findByRole('option', { name: /PO-B/ })).toBeTruthy();
+    expect(screen.queryByRole('option', { name: /PO-A/ })).toBeNull();
+  });
+
   it('changes only the source: the row keeps its own percentage and chemical', async () => {
     const { fetchMock } = renderRecipes({
       recipes: [RECIPE_ROW],
@@ -1312,6 +1363,7 @@ describe('Ingredient source selector', () => {
     const picker = within(soda).getByLabelText(
       'Outward receipt for NaOH in Caustic Soda 50%',
     );
+    await waitFor(() => expect(picker).not.toBeDisabled());
     fireEvent.focus(picker);
     const option = await screen.findByRole('option', { name: /PO-FROZEN/ });
     expect(option).not.toHaveAttribute('aria-disabled', 'true');

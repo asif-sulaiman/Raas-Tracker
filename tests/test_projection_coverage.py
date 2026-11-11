@@ -81,20 +81,64 @@ def test_open_pis_without_a_plan_are_reported_alongside_the_totals(admin_client,
 
     The numbers cover active plans; the PI list says which open PIs are not in
     them, so nobody reads a short buying list as a complete one.
+
+    The state word is part of that sentence. It used to read ``complete`` here,
+    on the argument that "complete" described only the arithmetic over the plans
+    the forecast claims to cover. That reading is the one this file rejects: the
+    per-chemical zeros beside an unplanned PI mean "nothing owed *within the
+    activated plans*", which is not something a buyer can act on, and the word
+    ``complete`` next to a non-empty ``open_pis_without_plan`` is precisely how a
+    400 KG of unplanned demand gets read as no demand at all. Unplanned PIs make
+    the answer ``incomplete``; the zeros stay, because an unplanned PI has no
+    formulation to attribute them to.
     """
     _chem(db, "Chem Cov", qty=0)
     planned = _planned_chem(admin_client, db, "PI-COV-PLANNED", "Chem Cov", ordered=100)
     unplanned = _pi(db, "PI-COV-UNPLANNED", [("Later", 400, "KG")])
 
     coverage = _coverage(_svc().project_purchasing(db))
-    assert coverage["state"] == "complete", coverage
+    assert coverage["state"] == "incomplete", coverage
     assert unplanned in {row["sale_id"] for row in coverage["open_pis_without_plan"]}, coverage
     assert planned not in {row["sale_id"] for row in coverage["open_pis_without_plan"]}, coverage
 
     body = _inventory(admin_client).get_json()
-    assert body["coverage"]["state"] == "complete", body["coverage"]
+    assert body["coverage"]["state"] == "incomplete", body["coverage"]
     text = json.dumps(body).lower()
     assert "pi-cov-unplanned" in text, text
+
+
+def test_complete_is_claimed_only_when_nothing_is_unplanned_or_incomplete(admin_client, db):
+    """The one data shape allowed to say ``complete``: nothing left outside.
+
+    Every other state has its own word — ``no_active_plans`` when nothing is
+    activated at all, ``incomplete`` when any open PI is unplanned or any active
+    plan no longer matches its PI — so ``complete`` is a claim a buyer can act on
+    rather than the absence of a problem being reported. Planning the late PI is
+    what restores the claim; the label follows the lists, never the totals.
+    """
+    _chem(db, "Chem State", qty=0)
+    _planned_chem(admin_client, db, "PI-COV-STATE", "Chem State")
+
+    coverage = _coverage(_svc().project_purchasing(db))
+    assert coverage["state"] == "complete", coverage
+    assert coverage["open_pis_without_plan"] == [], coverage
+    assert coverage["incomplete_plans"] == [], coverage
+
+    late = _pi(db, "PI-COV-STATE-LATE", [("Later", 50, "KG")])
+    coverage = _coverage(_svc().project_purchasing(db))
+    assert coverage["state"] == "incomplete", coverage
+    assert late in {row["sale_id"] for row in coverage["open_pis_without_plan"]}, coverage
+
+    # The projection above armed a REPEATABLE READ snapshot on `db`; the demo
+    # below is committed on the client's own connection, so `db` must end that
+    # snapshot before it can read (or re-project) the newly planned PI.
+    db.commit()
+    _create_ok(admin_client, late)
+    assert _plan(admin_client, db, late,
+                 [_product("Later", [("Chem State", 60)])]).status_code == 200
+    coverage = _coverage(_svc().project_purchasing(db))
+    assert coverage["state"] == "complete", coverage
+    assert coverage["open_pis_without_plan"] == [], coverage
 
 
 def test_an_incomplete_active_plan_is_surfaced_instead_of_a_partial_total(admin_client, db):
@@ -181,7 +225,9 @@ def test_changed_coverage_changes_the_body_and_the_etag_even_when_totals_match(a
 
     changed = _inventory(admin_client)
     body = changed.get_json()
-    assert body["coverage"]["state"] == "complete", body["coverage"]
+    # Same totals, different truth — and the truth now moves the state word too,
+    # which is the part a totals-only ETag would have left cached as "complete".
+    assert body["coverage"]["state"] == "incomplete", body["coverage"]
     assert "pi-cov-etag-late" in json.dumps(body).lower(), body["coverage"]
     assert changed.headers.get("ETag") != etag, (changed.headers.get("ETag"), etag)
     assert changed.headers.get("Cache-Control", "").startswith("private"), changed.headers

@@ -767,6 +767,19 @@ def add_recipe_item(conn: psycopg.Connection, recipe_id: int, product_name: str,
     An outward item is only accepted once ``validate_source`` has proved the
     line is this invoice's client's own outward delivery of the same material,
     in the material's registered unit, and not cancelled.
+
+    Selection locks what it validates. Plan §5 puts source selection and
+    production under one rule — "source selection and production lock the same
+    purchase headers as correction/cancellation before rechecking references and
+    ownership" — so the header (and then the material row) is locked BEFORE the
+    line is read. Without it a ``cancel_purchase`` committed between validation
+    and the INSERT leaves this formulation permanently pointing at a cancelled
+    receipt (``chk_recipe_item_source`` only enforces the column pairing, so the
+    database will not refuse it), and while this row is uncommitted the
+    canceller's own reference check — READ COMMITTED, no lock held on our side —
+    waves a cancellation through against a line that is becoming evidence at
+    that moment. ``_lock_outward_sources`` is production's answer; reuse it
+    rather than invent a second locking dialect.
     """
     finite_values(percentage)
     if percentage < 0:
@@ -777,9 +790,10 @@ def add_recipe_item(conn: psycopg.Connection, recipe_id: int, product_name: str,
     # leave an uncommitted ghost-slot INSERT for the caller's close() to commit.
     chem = _chemical(conn, chemical_name)
     if source == "outward":
-        validate_source(conn, chemical_id=chem[0],
-                        outward_purchase_line_id=outward_purchase_line_id,
-                        invoice_id=recipe["invoice_id"])
+        _lock_outward_sources(
+            conn, [{"chemical_id": chem[0], "source_type": "outward",
+                    "outward_purchase_line_id": outward_purchase_line_id}],
+            invoice_id=recipe["invoice_id"])
     slot_id = _slot_for_product(conn, recipe, product_name)
 
     existing = conn.execute(
@@ -850,6 +864,11 @@ def update_recipe_item(conn: psycopg.Connection, recipe_id: int, item_id: int,
     tuned from the Slice 1 screen sends only the percentage, and silently
     reverting an outward row to in-house there would make the run deduct stock
     the client's own delivery already covers.
+
+    Any outward row — the one being switched to, and the one whose percentage
+    alone moves — takes the purchase header lock first, exactly like
+    ``add_recipe_item`` and like production, so a correction or cancellation
+    cannot commit into the gap between reading the line and writing this row.
     """
     finite_values(new_percentage)
     if new_percentage < 0:
@@ -881,11 +900,15 @@ def update_recipe_item(conn: psycopg.Connection, recipe_id: int, item_id: int,
             outward_purchase_line_id)
         line = outward_purchase_line_id
     if source == "outward":
-        # Validated before the UPDATE: a refused switch must leave the row
-        # exactly as it was, not half-written with a source that fails.
-        validate_source(conn, chemical_id=row[3],
-                        outward_purchase_line_id=line,
-                        invoice_id=recipe["invoice_id"])
+        # Locked and validated before the UPDATE: a refused switch must leave
+        # the row exactly as it was, not half-written with a source that fails,
+        # and a cancellation committed after an unlocked read must not be able
+        # to make this row's evidence a cancelled receipt. Same lock, same
+        # order as production and as `add_recipe_item` above.
+        _lock_outward_sources(
+            conn, [{"chemical_id": row[3], "source_type": "outward",
+                    "outward_purchase_line_id": line}],
+            invoice_id=recipe["invoice_id"])
     if (source, line) == (old_source, old_line):
         conn.execute(
             "UPDATE recipe_items SET percentage = %s WHERE id = %s",

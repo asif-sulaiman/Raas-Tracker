@@ -412,9 +412,72 @@ def _outward_recipe(admin_client, db, cid, invoice_id, name, chem_name, line_id,
     return recipe_id
 
 
+def _bare_recipe(admin_client, cid, invoice_id, name):
+    """A recipe with NO ingredient yet — the reference is what must race.
+
+    ``_outward_recipe`` saves an outward line first, which pre-creates the
+    reference and therefore cannot exercise the window the plan cares about:
+    "source selection and production lock the same purchase headers".
+    """
+    r = admin_client.post("/api/recipes", json={
+        "name": name, "company_id": cid, "invoice_id": invoice_id})
+    assert r.status_code == 201, r.get_json()
+    return r.get_json()["recipe"]["id"]
+
+
 def _line_quantity(db, line_id):
     return db.execute("SELECT quantity FROM chemical_purchase_items WHERE id = %s",
                       (line_id,)).fetchone()[0]
+
+
+def _reference_and_cancellation(db, pid, line_id):
+    """(cancelled, references) read from outside every racing transaction."""
+    cancelled = db.execute(
+        "SELECT cancelled FROM chemical_purchases WHERE id = %s",
+        (pid,)).fetchone()[0]
+    references = db.execute(
+        "SELECT COUNT(*) FROM recipe_items WHERE outward_purchase_line_id = %s",
+        (line_id,)).fetchone()[0]
+    return bool(cancelled), references
+
+
+def _cancel_after_source_validation(monkeypatch, pg_dsn, pid, *, version=1):
+    """Cancel the receipt inside the window between validation and the write.
+
+    A two-thread race can only hit that window by luck: the selector must have
+    validated a live line and not yet INSERTed while the canceller commits.
+    Driving the cancellation from the validation call itself makes the
+    interleaving happen on every run, which is the point — an unlogged
+    ``FOR UPDATE`` on the header cannot be tested by hoping two threads
+    overlap. The injected cancellation is bounded by ``lock_timeout``, so when
+    the selector DOES hold the header the wait is a recorded refusal rather
+    than a hang.
+    """
+    real_validate = recipes.validate_source
+    outcome = {}
+
+    def _wrapped(conn, **kwargs):
+        snapshot = real_validate(conn, **kwargs)
+        if not outcome:
+            other = psycopg.connect(pg_dsn, autocommit=False)
+            try:
+                other.execute("SET LOCAL lock_timeout = '2s'")
+                purchases.cancel_purchase(
+                    other, pid, expected_version=version,
+                    reason="cancelled while the recipe was being written",
+                    actor="admin")
+                outcome["cancel"] = "committed"
+            except psycopg.errors.LockNotAvailable:
+                other.rollback()
+                outcome["cancel"] = "blocked"
+            except BaseException as exc:  # noqa: BLE001 - surfaced to the test
+                outcome["cancel"] = exc
+            finally:
+                other.close()
+        return snapshot
+
+    monkeypatch.setattr(recipes, "validate_source", _wrapped)
+    return outcome
 
 
 def test_referenced_source_correction_cannot_bypass_production(admin_client, db,
@@ -539,3 +602,123 @@ def test_client_reassignment_cannot_invalidate_a_referenced_source(admin_client,
     db.rollback()
     assert "client" in str(exc.value).lower(), exc.value
     assert db.execute("SELECT COUNT(*) FROM production_runs").fetchone()[0] == 0
+
+
+# --------------------------------------------------------------------------- #
+# W1: SOURCE SELECTION must lock the same purchase headers production locks
+# --------------------------------------------------------------------------- #
+def test_selecting_a_source_locks_the_purchase_header(admin_client, db, pg_dsn,
+                                                      monkeypatch):
+    """A cancellation committed between validation and the INSERT must not be
+    able to leave a formulation pointing at a cancelled receipt.
+
+    Plan §5 puts selection and production under one rule. Production complies
+    via ``_lock_outward_sources``; selection (``add_recipe_item``) validated the
+    line on an UNlocked header, and `chk_recipe_item_source` only enforces the
+    column pairing — the database will not refuse the poisoned row afterwards.
+    With the header locked, the injected cancellation cannot enter the window at
+    all, so it loses on the lock rather than winning it.
+    """
+    chem_id = _chemical(admin_client, db, "Window Mat", 0)
+    cid = _company(admin_client, db, "WindowCo")
+    sid = _sale(admin_client, cid, "PI-SRC-WINDOW")
+    inv = _invoice(admin_client, db, sid, "INV-SRC-WINDOW")
+    pid, line_id = _outward_purchase(admin_client, db, cid, chem_id,
+                                     "Window Mat", number="PO-SRC-WINDOW")
+    rid = _bare_recipe(admin_client, cid, inv, "WindowRecipe")
+    outcome = _cancel_after_source_validation(monkeypatch, pg_dsn, pid)
+
+    conn = psycopg.connect(pg_dsn, autocommit=False)
+    try:
+        recipes.add_recipe_item(conn, rid, "SortProd", "Window Mat", 50,
+                                source_type="outward",
+                                outward_purchase_line_id=line_id)
+    finally:
+        conn.close()
+
+    cancelled, references = _reference_and_cancellation(db, pid, line_id)
+    assert not (cancelled and references), (
+        "a formulation may never point at a cancelled receipt")
+    assert outcome["cancel"] == "blocked", (
+        f"selection must hold the header lock across the write window, so the "
+        f"cancellation waits instead of slipping into it: {outcome!r}")
+    assert references == 1 and cancelled is False
+
+
+def test_switching_an_item_to_outward_locks_the_purchase_header(admin_client, db,
+                                                                pg_dsn,
+                                                                monkeypatch):
+    """The same window on the other selection path (``update_recipe_item``).
+
+    Switching an existing in-house ingredient to an outward line validates the
+    source and then UPDATEs the row; without the header lock a cancellation
+    committed in between is recorded as the row's source.
+    """
+    chem_id = _chemical(admin_client, db, "Switch Mat", 0)
+    cid = _company(admin_client, db, "SwitchCo")
+    sid = _sale(admin_client, cid, "PI-SRC-SWITCH")
+    inv = _invoice(admin_client, db, sid, "INV-SRC-SWITCH")
+    pid, line_id = _outward_purchase(admin_client, db, cid, chem_id,
+                                     "Switch Mat", number="PO-SRC-SWITCH")
+    rid = _recipe(admin_client, cid, inv, "SwitchRecipe",
+                  {"SortProd": [("Switch Mat", 50)]})
+    item_id = db.execute(
+        "SELECT id FROM recipe_items WHERE outward_purchase_line_id IS NULL"
+    ).fetchone()[0]
+    outcome = _cancel_after_source_validation(monkeypatch, pg_dsn, pid)
+
+    conn = psycopg.connect(pg_dsn, autocommit=False)
+    try:
+        recipes.update_recipe_item(conn, rid, item_id, 50,
+                                   source_type="outward",
+                                   outward_purchase_line_id=line_id)
+    finally:
+        conn.close()
+
+    cancelled, references = _reference_and_cancellation(db, pid, line_id)
+    assert not (cancelled and references), (
+        "a formulation may never point at a cancelled receipt")
+    assert outcome["cancel"] == "blocked", outcome
+    assert references == 1 and cancelled is False
+
+
+def test_source_selection_and_cancellation_race_stays_honest(admin_client, db,
+                                                             pg_dsn):
+    """The symmetric race of the two tests above, run for real on two threads.
+
+    Selecting a source and cancelling that receipt now contend for one header
+    lock, so exactly one of them can be refused and the end state is always one
+    of the two honest ones: the reference exists and the line was not cancelled,
+    or the cancellation won and no reference was written. Never both.
+    """
+    chem_id = _chemical(admin_client, db, "Race Select Mat", 0)
+    cid = _company(admin_client, db, "RaceSelectCo")
+    sid = _sale(admin_client, cid, "PI-SRC-RACE")
+    inv = _invoice(admin_client, db, sid, "INV-SRC-RACE")
+    pid, line_id = _outward_purchase(admin_client, db, cid, chem_id,
+                                     "Race Select Mat", number="PO-SRC-RACE")
+    rid = _bare_recipe(admin_client, cid, inv, "RaceSelectRecipe")
+
+    def worker(index, conn):
+        if index == 0:
+            return recipes.add_recipe_item(
+                conn, rid, "SortProd", "Race Select Mat", 50,
+                source_type="outward", outward_purchase_line_id=line_id)
+        return purchases.cancel_purchase(
+            conn, pid, expected_version=1, reason="cancel during selection",
+            actor="admin")
+
+    outcomes = _run_pair(pg_dsn, worker)
+    _assert_no_lock_error(outcomes)
+
+    cancelled, references = _reference_and_cancellation(db, pid, line_id)
+    assert not (cancelled and references), (
+        f"a formulation may never point at a cancelled receipt: {outcomes!r}")
+    statuses = [status for status, _ in outcomes]
+    assert statuses == ["ok", "err"] or statuses == ["err", "ok"], (
+        f"the header lock must serialize the two writers, so exactly one loses: "
+        f"{outcomes!r}")
+    losers = [value for status, value in outcomes if status == "err"]
+    assert len(losers) == 1 and isinstance(losers[0], ValueError), losers
+    assert (references == 1 and cancelled is False) or \
+        (cancelled is True and references == 0), outcomes

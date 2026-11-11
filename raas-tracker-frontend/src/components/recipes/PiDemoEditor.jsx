@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Plus, X } from 'lucide-react';
 import Modal from '../modals/Modal';
 import Button from '../ui/Button';
 import EntityCombobox from '../ui/EntityCombobox';
 import { useAuth } from '../../context/AuthContext';
+import { formatNumber } from '../../utils/format';
 import { toast } from 'sonner';
 
 const fieldCls =
@@ -11,6 +12,12 @@ const fieldCls =
 const labelCls = 'block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5';
 
 const clone = (value) => structuredClone(value ?? []);
+
+// Percentages are float arithmetic on this screen (100 - 99.99 is
+// 0.010000000000005116), and the activation gate reads "ingredients + water =
+// 100 within tolerance" — so the operator gets the same one-decimal figure the
+// recipe cards show, never the float dust that makes a legal plan look illegal.
+const pct = (value) => formatNumber(value, 1);
 
 function quantityLine(label, value, unit) {
   return value == null ? `${label} unknown` : `${label} ${value} ${unit}`;
@@ -53,15 +60,25 @@ export default function PiDemoEditor({ saleId, isOpen, onClose }) {
     setValidationError(null);
   }, []);
 
+  // SaleDetailModal keys its late-response guard on the PI; here the same job
+  // needs a counter, because the retired read and the one replacing it can
+  // belong to the same PI (close and reopen, retry twice). Whoever claims the
+  // newest token owns the screen; every older answer is a no-op.
+  const readToken = useRef(0);
+
   const loadDemo = useCallback(async () => {
+    const token = readToken.current + 1;
+    readToken.current = token;
+    const isCurrent = () => token === readToken.current;
     setLoading(true);
     setReadError(null);
     setNotFound(false);
     try {
       const res = await apiFetch(`/api/sales/${saleId}/demo-recipe`);
       const data = await res.json();
-      applyDemo(data.demo);
+      if (isCurrent()) applyDemo(data.demo);
     } catch (err) {
+      if (!isCurrent()) return;
       if (err.status === 404) {
         setNotFound(true);
         setDemo(null);
@@ -69,7 +86,8 @@ export default function PiDemoEditor({ saleId, isOpen, onClose }) {
         setReadError(err.message || 'Could not load the demo recipe');
       }
     } finally {
-      setLoading(false);
+      // A retired read must not clear the spinner its replacement raised.
+      if (isCurrent()) setLoading(false);
     }
   }, [apiFetch, saleId, applyDemo]);
 
@@ -82,7 +100,12 @@ export default function PiDemoEditor({ saleId, isOpen, onClose }) {
       .catch(() => { /* the picker degrades to empty; percentages still edit */ });
     // oxlint-disable-next-line react/set-state-in-effect
     loadDemo();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      // Retire whatever is in flight — a switching PI or a closing editor
+      // leaves no response that is allowed to write to this screen.
+      readToken.current += 1;
+    };
   }, [isOpen, loadDemo, apiFetch]);
 
   const dirty = JSON.stringify(products) !== JSON.stringify(baseline);
@@ -122,6 +145,8 @@ export default function PiDemoEditor({ saleId, isOpen, onClose }) {
   };
 
   const handleCreate = async () => {
+    const token = readToken.current;
+    const isCurrent = () => token === readToken.current;
     setSaving(true);
     try {
       const res = await apiFetch(`/api/sales/${saleId}/demo-recipe`, {
@@ -130,11 +155,14 @@ export default function PiDemoEditor({ saleId, isOpen, onClose }) {
         body: JSON.stringify({}),
       });
       const data = await res.json();
+      if (!isCurrent()) return;
       applyDemo(data.demo);
       setNotFound(false);
     } catch (err) {
-      toast.error(err.message || 'Could not create the demo recipe');
+      if (isCurrent()) toast.error(err.message || 'Could not create the demo recipe');
     } finally {
+      // The busy flag is this screen's, not the PI's: clearing it unconditionally
+      // is what stops a retired write from leaving the next PI's buttons dead.
       setSaving(false);
     }
   };
@@ -151,6 +179,8 @@ export default function PiDemoEditor({ saleId, isOpen, onClose }) {
     }
     setValidationError(null);
     setConflict(false);
+    const token = readToken.current;
+    const isCurrent = () => token === readToken.current;
     setSaving(true);
     const body = {
       expected_revision: readRevision,
@@ -169,8 +199,9 @@ export default function PiDemoEditor({ saleId, isOpen, onClose }) {
         body: JSON.stringify(body),
       });
       const data = await res.json();
-      applyDemo(data.demo);
+      if (isCurrent()) applyDemo(data.demo);
     } catch (err) {
+      if (!isCurrent()) return;
       if (err.status === 409) {
         setConflict(true);
       } else {
@@ -182,6 +213,8 @@ export default function PiDemoEditor({ saleId, isOpen, onClose }) {
   };
 
   const handleActivate = async () => {
+    const token = readToken.current;
+    const isCurrent = () => token === readToken.current;
     setActivating(true);
     setFieldErrors({});
     setActivationNotice(false);
@@ -192,8 +225,9 @@ export default function PiDemoEditor({ saleId, isOpen, onClose }) {
         body: JSON.stringify({ expected_revision: readRevision }),
       });
       const data = await res.json();
-      applyDemo(data.demo);
+      if (isCurrent()) applyDemo(data.demo);
     } catch (err) {
+      if (!isCurrent()) return;
       const details = Array.isArray(err.fields) ? err.fields : [];
       const mapped = {};
       details.forEach((d) => {
@@ -211,10 +245,10 @@ export default function PiDemoEditor({ saleId, isOpen, onClose }) {
   const footer = demo && !notFound && !readError ? (
     <>
       <Button variant="secondary" onClick={onClose} disabled={saving || activating}>Close</Button>
-      <Button variant="secondary" onClick={handleSave} loading={saving} disabled={saving || activating}>
+      <Button variant="secondary" onClick={handleSave} loading={saving} disabled={saving || activating || loading}>
         Save Draft
       </Button>
-      <Button variant="success" onClick={handleActivate} loading={activating} disabled={!canActivate || saving || activating}>
+      <Button variant="success" onClick={handleActivate} loading={activating} disabled={!canActivate || saving || activating || loading}>
         Activate
       </Button>
     </>
@@ -246,7 +280,7 @@ export default function PiDemoEditor({ saleId, isOpen, onClose }) {
             <div className="flex flex-wrap items-center gap-2 text-xs">
               <span className="text-slate-600 dark:text-slate-300">Draft revision {demo.draft_revision}</span>
               <span className="text-slate-600 dark:text-slate-300">Active revision {demo.active_revision ?? '—'}</span>
-              {demo.draft_revision > demo.active_revision && (
+              {demo.active_revision != null && demo.draft_revision > demo.active_revision && (
                 <span className="rounded-full bg-amber-100 dark:bg-amber-900/40 px-2 py-0.5 font-medium text-amber-700 dark:text-amber-300">
                   Draft changes since activation
                 </span>
@@ -261,8 +295,11 @@ export default function PiDemoEditor({ saleId, isOpen, onClose }) {
 
           {conflict && (
             <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/30 p-3">
-              <p className="text-sm text-amber-700 dark:text-amber-300">Draft was modified elsewhere. Your edits are kept — reload to pick up the latest revision.</p>
-              <Button variant="secondary" size="sm" onClick={loadDemo}>Reload draft</Button>
+              <p className="text-sm text-amber-700 dark:text-amber-300">
+                Draft was modified elsewhere. Your edits are still in this form and nothing has
+                been saved — reloading picks up the latest revision and replaces your edits.
+              </p>
+              <Button variant="secondary" size="sm" onClick={loadDemo}>Discard edits and reload</Button>
             </div>
           )}
 
@@ -369,9 +406,9 @@ export default function PiDemoEditor({ saleId, isOpen, onClose }) {
                       <p className="text-amber-600 dark:text-amber-400">Add an ingredient to resolve automatic water.</p>
                     ) : (
                       <>
-                        <p>Automatic water: {automatic}%</p>
-                        <p>Water used: {waterUsed}%{hasOverride ? ' (override)' : ''}</p>
-                        <p>Total {total}%</p>
+                        <p>Automatic water: {pct(automatic)}%</p>
+                        <p>Water used: {pct(waterUsed)}%{hasOverride ? ' (override)' : ''}</p>
+                        <p>Total {pct(total)}%</p>
                       </>
                     )}
                   </div>

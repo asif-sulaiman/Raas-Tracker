@@ -582,34 +582,38 @@ export default function Chemicals() {
       )}
 
       {activeTab === 'chemicals' && !loading && !error && coverage && (
-        (coverage.open_pis_without_plan?.length ?? 0) > 0 ? (
-          <div role="alert" className="rounded-xl border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30 p-4 space-y-2">
-            <p className="text-sm font-semibold text-amber-800 dark:text-amber-300">
-              {coverage.open_pis_without_plan.length} open PIs lack an active formulation
+        <>
+          {(coverage.open_pis_without_plan?.length ?? 0) > 0 && (
+            <div role="alert" className="rounded-xl border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30 p-4 space-y-2">
+              <p className="text-sm font-semibold text-amber-800 dark:text-amber-300">
+                {coverage.open_pis_without_plan.length} open PIs lack an active formulation
+              </p>
+              <ul className="text-xs text-amber-700 dark:text-amber-400 list-disc pl-5">
+                {coverage.open_pis_without_plan.map((pi) => (
+                  <li key={pi.sale_id}>{pi.pi_number} ({(pi.products || []).join(', ')})</li>
+                ))}
+              </ul>
+              <p className="text-xs text-amber-700 dark:text-amber-400">
+                Their purchasing forecasts stay incomplete until a demo recipe is activated.
+              </p>
+            </div>
+          )}
+          {(coverage.incomplete_plans?.length ?? 0) > 0 && (
+            <div role="alert" className="rounded-xl border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30 p-4 space-y-2">
+              <p className="text-sm font-semibold text-amber-800 dark:text-amber-300">Active plans are incomplete</p>
+              <ul className="text-xs text-amber-700 dark:text-amber-400 list-disc pl-5">
+                {coverage.incomplete_plans.map((pi) => (
+                  <li key={pi.sale_id}>{pi.pi_number} ({(pi.products || []).join(', ')})</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {coverage.state === 'no_active_plans' && (
+            <p className="text-xs text-slate-500 dark:text-slate-400">
+              No active PI plans — projected quantities are unknown until a demo recipe is activated.
             </p>
-            <ul className="text-xs text-amber-700 dark:text-amber-400 list-disc pl-5">
-              {coverage.open_pis_without_plan.map((pi) => (
-                <li key={pi.sale_id}>{pi.pi_number} ({(pi.products || []).join(', ')})</li>
-              ))}
-            </ul>
-            <p className="text-xs text-amber-700 dark:text-amber-400">
-              Their purchasing forecasts stay incomplete until a demo recipe is activated.
-            </p>
-          </div>
-        ) : (coverage.incomplete_plans?.length ?? 0) > 0 ? (
-          <div role="alert" className="rounded-xl border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30 p-4 space-y-2">
-            <p className="text-sm font-semibold text-amber-800 dark:text-amber-300">Active plans are incomplete</p>
-            <ul className="text-xs text-amber-700 dark:text-amber-400 list-disc pl-5">
-              {coverage.incomplete_plans.map((pi) => (
-                <li key={pi.sale_id}>{pi.pi_number} ({(pi.products || []).join(', ')})</li>
-              ))}
-            </ul>
-          </div>
-        ) : coverage.state === 'no_active_plans' ? (
-          <p className="text-xs text-slate-500 dark:text-slate-400">
-            No active PI plans — projected purchases are zero.
-          </p>
-        ) : null
+          )}
+        </>
       )}
 
       {activeTab === 'chemicals' && !loading && !error && unstocked.length > 0 && (
