@@ -39,7 +39,7 @@ const PROJECTED_TOOLTIP =
   'Additional quantity to purchase for active PI plans';
 
 const fieldCls =
-  'w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500';
+  'w-full px-3 py-2 text-base sm:text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500';
 
 export default function Chemicals() {
   const { apiFetch, user } = useAuth();
@@ -679,7 +679,7 @@ export default function Chemicals() {
             </div>
             <div>
               <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">New Quantity ({selectedChemical.unit})</label>
-              <input aria-label="New quantity" type="number" value={adjustQty} onChange={(e) => setAdjustQty(e.target.value)} className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500" />
+              <input aria-label="New quantity" inputMode="decimal" type="number" value={adjustQty} onChange={(e) => setAdjustQty(e.target.value)} className="w-full px-3 py-2 text-base sm:text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500" />
             </div>
             <div>
               <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Reason</label>
@@ -716,7 +716,7 @@ export default function Chemicals() {
             <span className="text-slate-500 dark:text-slate-400 block mb-1.5 text-xs">Low-stock alarm</span>
             {isAdmin ? (
               <div className="flex items-center gap-2">
-                <input aria-label="Low-stock alarm" type="number" min="0" value={alarmValue} onChange={(e) => setAlarmValue(e.target.value)} placeholder="0" className="w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500" />
+                <input aria-label="Low-stock alarm" inputMode="numeric" type="number" min="0" value={alarmValue} onChange={(e) => setAlarmValue(e.target.value)} placeholder="0" className="w-full px-3 py-2 text-base sm:text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500" />
                 <span className="text-xs text-slate-500 dark:text-slate-400 shrink-0">{selectedChemical.unit}</span>
                 <Button variant="primary" size="sm" onClick={handleSaveAlarm} loading={alarmSaving} disabled={alarmSaving}>Save</Button>
               </div>

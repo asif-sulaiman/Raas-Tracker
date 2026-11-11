@@ -10,7 +10,7 @@ import { useAuth } from '../../context/AuthContext';
 import { toast } from 'sonner';
 
 const fieldCls =
-  'w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500';
+  'w-full px-3 py-2 text-base sm:text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500';
 
 const labelCls = 'block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5';
 
@@ -305,7 +305,7 @@ export default function ChemicalPurchaseModal({ isOpen, onClose, onSuccess }) {
                   </div>
                   <div>
                     <label className={labelCls}>Low-stock alarm (optional)</label>
-                    <input aria-label="Low-stock alarm" type="number" min="0" value={l.reorder} onChange={(e) => updateLine(l.key, { reorder: e.target.value })} placeholder="0" className={fieldCls} />
+                    <input aria-label="Low-stock alarm" inputMode="numeric" type="number" min="0" value={l.reorder} onChange={(e) => updateLine(l.key, { reorder: e.target.value })} placeholder="0" className={fieldCls} />
                   </div>
                 </>
               ) : (
@@ -323,7 +323,7 @@ export default function ChemicalPurchaseModal({ isOpen, onClose, onSuccess }) {
 
               <div>
                 <label className={labelCls}>Quantity</label>
-                <input aria-label="Quantity" type="number" min="0" step="any" value={l.quantity} onChange={(e) => updateLine(l.key, { quantity: e.target.value })} placeholder="0" className={fieldCls} />
+                <input aria-label="Quantity" inputMode="decimal" type="number" min="0" step="any" value={l.quantity} onChange={(e) => updateLine(l.key, { quantity: e.target.value })} placeholder="0" className={fieldCls} />
               </div>
             </div>
           ))}

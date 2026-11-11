@@ -8,7 +8,7 @@ import { formatNumber } from '../../utils/format';
 import { toast } from 'sonner';
 
 const fieldCls =
-  'w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500';
+  'w-full px-3 py-2 text-base sm:text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500';
 const labelCls = 'block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5';
 
 const clone = (value) => structuredClone(value ?? []);
@@ -357,7 +357,7 @@ export default function PiDemoEditor({ saleId, isOpen, onClose }) {
                       <div className="w-28">
                         <input
                           aria-label={`Percentage for ${it.chemical} in ${p.product_name}`}
-                          type="number" min="0" max="100" step="any"
+                          inputMode="decimal" type="number" min="0" max="100" step="any"
                           value={it.percentage ?? ''}
                           onChange={(e) => updateItem(pIdx, iIdx, { percentage: e.target.value })}
                           className={fieldCls}
@@ -394,7 +394,7 @@ export default function PiDemoEditor({ saleId, isOpen, onClose }) {
                     <label className={labelCls}>Water override (optional)</label>
                     <input
                       aria-label={`Water override for ${p.product_name}`}
-                      type="number" min="0" max="100" step="any"
+                      inputMode="decimal" type="number" min="0" max="100" step="any"
                       value={p.water_percentage ?? ''}
                       onChange={(e) => setWater(pIdx, e.target.value)}
                       placeholder="Automatic"

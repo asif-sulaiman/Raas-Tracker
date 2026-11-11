@@ -4,7 +4,7 @@ import { formatNumber, toCents, fromCents, todayLocalISO } from '../../utils/for
 import { computeMaturity, balanceCents } from '../../utils/invoices';
 
 const inputCls =
-  'rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1 text-xs text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
+  'rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1 text-base sm:text-xs text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
 
 function usd(value) {
   return `$${formatNumber(value)}`;
@@ -76,7 +76,7 @@ export default function InvoiceStepForm({ kind, invoice, saving = false, error =
             </label>
             <input
               aria-label="Payment amount"
-              type="number"
+              inputMode="decimal" type="number"
               min="0"
               step="any"
               value={payAmount}

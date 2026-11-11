@@ -12,10 +12,10 @@ import { useAuth } from '../../context/AuthContext';
 import { toast } from 'sonner';
 
 const inputCls =
-  'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
+  'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
 
 const rowInputCls =
-  'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1 text-xs text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
+  'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1 text-base sm:text-xs text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
 
 let seq = 0;
 // P1-B: POST /api/sales/batch caps a batch at 50 sales (and at MAX_BATCH_ROWS
@@ -432,7 +432,7 @@ export default function MultiPICreateModal({ isOpen, initialDocs, onClose, onSav
                             <td className="px-2.5 py-1.5">
                               <input
                                 aria-label={`Quantity document ${docIdx + 1} row ${rowIdx + 1}`}
-                                type="number"
+                                inputMode="decimal" type="number"
                                 min="0.001"
                                 step="any"
                                 value={item.quantity}
@@ -456,7 +456,7 @@ export default function MultiPICreateModal({ isOpen, initialDocs, onClose, onSav
                             <td className="px-2.5 py-1.5">
                               <input
                                 aria-label={`Unit price document ${docIdx + 1} row ${rowIdx + 1}`}
-                                type="number"
+                                inputMode="decimal" type="number"
                                 min="0.001"
                                 step="any"
                                 value={item.unit_price}

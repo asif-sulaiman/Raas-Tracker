@@ -174,7 +174,7 @@ export default function UnitMapping({ rows = [], onMappingsSaved }) {
                     onChange={(e) => setForm(g.unit, { factor: e.target.value })}
                     placeholder="200"
                     inputMode="decimal"
-                    className="ml-2 w-24 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1.5 text-sm text-slate-900 dark:text-white"
+                    className="ml-2 w-24 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1.5 text-base sm:text-sm text-slate-900 dark:text-white"
                   />
                   <span className="ml-1">{f.target || '…'}</span>
                 </label>

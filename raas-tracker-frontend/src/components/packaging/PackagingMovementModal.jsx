@@ -23,7 +23,7 @@ const REASON_SUGGESTIONS = [
 ];
 
 const fieldCls =
-  'w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500';
+  'w-full px-3 py-2 text-base sm:text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500';
 
 /**
  * One ledger row for one packaging type.
@@ -115,7 +115,7 @@ export default function PackagingMovementModal({ item, onClose, onSaved }) {
           </label>
           <input
             aria-label={isCount ? 'Counted on site' : 'Pieces'}
-            type="number"
+            inputMode="numeric" type="number"
             min="0"
             step="1"
             value={pieces}

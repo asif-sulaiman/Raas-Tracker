@@ -116,11 +116,11 @@ export default function StockHistory({ chemicals = [] }) {
       <div className="flex flex-wrap items-end gap-3 mb-4">
         <div>
           <label className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1">From date</label>
-          <input aria-label="From date" type="date" value={range.since} onChange={(e) => { startRefresh(); setRange((r) => ({ ...r, since: e.target.value })); }} className="px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20" />
+          <input aria-label="From date" type="date" value={range.since} onChange={(e) => { startRefresh(); setRange((r) => ({ ...r, since: e.target.value })); }} className="px-2.5 py-1.5 text-base sm:text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20" />
         </div>
         <div>
           <label className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1">To date</label>
-          <input aria-label="To date" type="date" value={range.until} onChange={(e) => { startRefresh(); setRange((r) => ({ ...r, until: e.target.value })); }} className="px-2.5 py-1.5 text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20" />
+          <input aria-label="To date" type="date" value={range.until} onChange={(e) => { startRefresh(); setRange((r) => ({ ...r, until: e.target.value })); }} className="px-2.5 py-1.5 text-base sm:text-xs rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-800 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20" />
         </div>
         <div>
           <span className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1">Group by</span>
