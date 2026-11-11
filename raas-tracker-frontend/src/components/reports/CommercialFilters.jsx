@@ -84,7 +84,7 @@ export default function CommercialFilters({
             placeholder="Quick Search: PI No / Customer"
             value={filters.q}
             onChange={(e) => updateFilters({ q: e.target.value })}
-            className="w-full pl-9 pr-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500"
+            className="w-full pl-9 pr-3 py-2 text-base sm:text-sm rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500"
           />
           <Filter className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
         </div>
@@ -137,7 +137,7 @@ export default function CommercialFilters({
               type="date"
               value={filters.date_from}
               onChange={(e) => updateFilters({ date_from: e.target.value, date_preset: '' })}
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500"
+              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-base sm:text-sm text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500"
             />
           </div>
           <div className="flex-1">
@@ -149,7 +149,7 @@ export default function CommercialFilters({
               type="date"
               value={filters.date_to}
               onChange={(e) => updateFilters({ date_to: e.target.value, date_preset: '' })}
-              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500"
+              className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-2 text-base sm:text-sm text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500"
             />
           </div>
         </div>

@@ -10,7 +10,7 @@ import { useConfirm } from '../../context/ConfirmContext';
 import { toast } from 'sonner';
 
 const inputCls =
-  'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
+  'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
 
 function Field({ label, value, mono }) {
   return (
@@ -291,7 +291,7 @@ export default function LcDetailModal({ lcId, isOpen, onClose, onSaved, onViewPI
                   </label>
                   <input
                     aria-label="Tenor days"
-                    type="number"
+                    inputMode="numeric" type="number"
                     min="1"
                     max="720"
                     value={tenorDays}

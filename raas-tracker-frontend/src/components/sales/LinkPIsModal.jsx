@@ -9,7 +9,7 @@ import { useAuth } from '../../context/AuthContext';
 import { toast } from 'sonner';
 
 const inputCls =
-  'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
+  'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
 
 /**
  * Phase 3 — link unlinked PIs under one LC.
@@ -232,7 +232,7 @@ export default function LinkPIsModal({
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search PI number or client…"
-            className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 pl-8 pr-2.5 py-1.5 text-sm text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500"
+            className="w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 pl-8 pr-2.5 py-1.5 text-base sm:text-sm text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500"
           />
         </div>
 
@@ -396,7 +396,7 @@ export default function LinkPIsModal({
                   </label>
                   <input
                     aria-label="Tenor days"
-                    type="number"
+                    inputMode="numeric" type="number"
                     min="1"
                     max="720"
                     value={tenorDays}

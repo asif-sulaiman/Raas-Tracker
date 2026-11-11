@@ -15,7 +15,7 @@ import {
 } from '../../utils/ingredientSource';
 
 const inputCls =
-  'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
+  'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
 
 function today() {
   return new Date().toISOString().slice(0, 10);
@@ -423,7 +423,7 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, onSaved })
                           <td className="px-3 py-2">
                             <input
                               aria-label={`Quantity for ${product.product_name}`}
-                              type="number"
+                              inputMode="decimal" type="number"
                               min="0"
                               step="any"
                               value={quantities[keyOf(product)] ?? ''}

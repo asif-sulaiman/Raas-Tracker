@@ -35,7 +35,7 @@ import { toast } from 'sonner';
 import ProductionRunModal from '../components/modals/ProductionRunModal';
 
 const inputCls =
-  'w-full px-3 py-2 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent';
+  'w-full px-3 py-2 text-base sm:text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent';
 
 // recipe_products.water_percentage is a float4, so a stored 33.33 reads back as
 // 33.332998… — round to the input's own step for display. An explicit 0 stays
@@ -427,14 +427,14 @@ function ProductFormulationCard({
                 {editItemId === item.id ? (
                   <div className="flex items-center gap-1.5">
                     <input
-                      type="number"
+                      inputMode="decimal" type="number"
                       step="0.01"
                       min="0"
                       max="100"
                       aria-label={`Percentage for ${item.chemical_name} in ${product.product_name}`}
                       value={editPct}
                       onChange={(e) => setEditPct(e.target.value)}
-                      className="w-20 px-2 py-1 text-sm rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+                      className="w-20 px-2 py-1 text-base sm:text-sm rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
                       autoFocus
                     />
                     <button
@@ -613,14 +613,14 @@ function ProductFormulationCard({
         <input
           id={`water-${product.product_name}`}
           aria-label={`Water percentage for ${product.product_name}`}
-          type="number"
+          inputMode="decimal" type="number"
           step="0.01"
           min="0"
           max="100"
           value={waterDraft}
           onChange={(e) => setWaterDraft(e.target.value)}
           placeholder="auto"
-          className="w-24 px-2 py-1 text-sm rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
+          className="w-24 px-2 py-1 text-base sm:text-sm rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white"
         />
         <Button
           variant="secondary"
@@ -717,7 +717,7 @@ function ProductFormulationCard({
           <input
             id={`pct-${product.product_name}`}
             aria-label={`Percentage for ${product.product_name}`}
-            type="number"
+            inputMode="decimal" type="number"
             step="0.01"
             min="0"
             max="100"

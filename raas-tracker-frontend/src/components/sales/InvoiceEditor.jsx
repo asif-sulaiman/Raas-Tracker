@@ -7,7 +7,7 @@ import { formatNumber, lineTotal, todayLocalISO } from '../../utils/format';
 import useInvoiceBudget from './useInvoiceBudget';
 
 const inputCls =
-  'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
+  'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
 
 const readOnlyCls =
   `${inputCls} w-28 text-right bg-slate-100 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400 cursor-not-allowed`;
@@ -279,7 +279,7 @@ export default function InvoiceEditor({
                   <td className="px-2 py-1 text-right">
                     <input
                       aria-label={`Invoice qty for ${line.product_name}`}
-                      type="number"
+                      inputMode="decimal" type="number"
                       step="any"
                       min="0"
                       value={qtys[line.sale_item_id] || ''}

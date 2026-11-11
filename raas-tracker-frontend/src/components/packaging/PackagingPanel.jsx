@@ -22,7 +22,7 @@ import { packagingStatus, packagingTotals, packableKg, kindOf } from '../../util
 import { toast } from 'sonner';
 
 const fieldCls =
-  'w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500';
+  'w-full px-3 py-2 text-base sm:text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500';
 
 const KIND_VARIANT = {
   RECEIVED: 'success',
@@ -366,7 +366,7 @@ export default function PackagingPanel({ isAdmin }) {
           </div>
           <div>
             <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Capacity (KG)</label>
-            <input aria-label="Capacity in KG" type="number" min="0" step="0.001" value={addCapacity} onChange={(e) => setAddCapacity(e.target.value)} placeholder="0" className={fieldCls} />
+            <input aria-label="Capacity in KG" inputMode="decimal" type="number" min="0" step="0.001" value={addCapacity} onChange={(e) => setAddCapacity(e.target.value)} placeholder="0" className={fieldCls} />
             <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
               How much one of these holds, used for the packable-KG total.
             </p>
@@ -389,7 +389,7 @@ export default function PackagingPanel({ isAdmin }) {
         <div className="space-y-4">
           <div>
             <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Alert me at (pieces)</label>
-            <input aria-label="Alarm level" type="number" min="0" step="1" value={alarmValue} onChange={(e) => setAlarmValue(e.target.value)} placeholder="0" className={fieldCls} />
+            <input aria-label="Alarm level" inputMode="numeric" type="number" min="0" step="1" value={alarmValue} onChange={(e) => setAlarmValue(e.target.value)} placeholder="0" className={fieldCls} />
             <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
               0 turns the alarm off — an empty stack still reports, and nothing else does.
             </p>

@@ -11,7 +11,7 @@ import { toast } from 'sonner';
 const PER_PAGE = 10;
 
 const fieldCls =
-  'w-full px-3 py-2 text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500';
+  'w-full px-3 py-2 text-base sm:text-sm rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500';
 const labelCls = 'block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5';
 const viewBtnCls =
   'inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-semibold bg-slate-100 text-slate-700 hover:bg-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700 transition-colors cursor-pointer';
@@ -334,7 +334,7 @@ export default function PurchaseHistory({ onChanged }) {
                 )}
                 <input
                   aria-label={`Quantity for ${i.chemical_name}`}
-                  type="number"
+                  inputMode="decimal" type="number"
                   min="0"
                   step="any"
                   value={editQuantities[i.id] ?? ''}

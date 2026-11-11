@@ -881,13 +881,13 @@ export default function Reports() {
                                       <input
                                         id={key}
                                         aria-label={`Quantity for ${product.product_name}`}
-                                        type="number"
+                                        inputMode="decimal" type="number"
                                         min="0"
                                         step="any"
                                         value={qty}
                                         disabled={!product.formulated}
                                         onChange={e => setQuantities(prev => ({ ...prev, [key]: e.target.value }))}
-                                        className="w-28 px-2 py-1.5 text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
+                                        className="w-28 px-2 py-1.5 text-base sm:text-sm rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
                                       />
                                     </div>
                                   );

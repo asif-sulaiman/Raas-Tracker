@@ -15,7 +15,7 @@ import { useConfirm } from '../../context/ConfirmContext';
 import { toast } from 'sonner';
 
 const inputCls =
-  'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1 text-xs text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
+  'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1 text-base sm:text-xs text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
 
 function Field({ label, value, mono }) {
   return (
@@ -537,13 +537,13 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
                           />
                         </td>
                         <td className="px-2.5 py-1.5">
-                          <input type="number" min="0.001" step="any" value={i.quantity} onChange={(e) => updateEditItem(i.key, 'quantity', e.target.value)} className={inputCls} />
+                          <input inputMode="decimal" type="number" min="0.001" step="any" value={i.quantity} onChange={(e) => updateEditItem(i.key, 'quantity', e.target.value)} className={inputCls} />
                         </td>
                         <td className="px-2.5 py-1.5">
                           <input value={i.unit || 'KG'} onChange={(e) => updateEditItem(i.key, 'unit', e.target.value.toUpperCase())} className={inputCls} aria-label="Unit" />
                         </td>
                         <td className="px-2.5 py-1.5">
-                          <input type="number" min="0.001" step="any" value={i.unit_price} onChange={(e) => updateEditItem(i.key, 'unit_price', e.target.value)} className={inputCls} />
+                          <input inputMode="decimal" type="number" min="0.001" step="any" value={i.unit_price} onChange={(e) => updateEditItem(i.key, 'unit_price', e.target.value)} className={inputCls} />
                         </td>
                         <td className="px-2.5 py-1.5 text-right font-semibold">
                           ${formatNumber(lineTotal(i.quantity, i.unit_price))}
@@ -601,15 +601,15 @@ export default function SaleDetailModal({ saleId, onClose, onSaved }) {
                           type="date"
                           value={editPayDate}
                           onChange={(e) => setEditPayDate(e.target.value)}
-                          className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1 text-xs"
+                          className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1 text-base sm:text-xs"
                         />
                         <input
-                          type="number"
+                          inputMode="decimal" type="number"
                           min="0"
                           step="any"
                           value={editPayAmount}
                           onChange={(e) => setEditPayAmount(e.target.value)}
-                          className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1 text-xs w-24"
+                          className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1 text-base sm:text-xs w-24"
                         />
                         <button onClick={() => handleSavePaymentEdit(p.id)} className="p-1 text-emerald-600 cursor-pointer" title="Save">
                           <Check className="h-4 w-4" />

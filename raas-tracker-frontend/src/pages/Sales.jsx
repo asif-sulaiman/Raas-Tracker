@@ -318,7 +318,7 @@ export default function Sales() {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Search PI, client, product, LC…"
-              className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 pl-8 pr-2.5 py-1.5 text-sm text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500 w-56"
+              className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 pl-8 pr-2.5 py-1.5 text-base sm:text-sm text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500 w-56"
             />
           </div>
           <Button variant="secondary" size="sm" icon={Download} onClick={handleExport}>
