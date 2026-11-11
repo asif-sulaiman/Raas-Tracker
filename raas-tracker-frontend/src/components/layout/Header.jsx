@@ -26,11 +26,11 @@ export default function Header({ onOpenNavigation, navigationOpen = false }) {
         )}
         <Link
           to="/"
-          className="flex min-w-0 items-center gap-3 rounded-lg transition-opacity hover:opacity-80"
+          className="flex shrink-0 items-center gap-3 rounded-lg transition-opacity hover:opacity-80"
           title="Go to Home"
         >
           <BrandLogo size="h-8 w-8" />
-          <h1 className="text-xl font-semibold text-gray-800">
+          <h1 className="hidden sm:block text-xl font-semibold text-gray-800">
             RAAS Tracker
           </h1>
         </Link>
@@ -50,7 +50,9 @@ export default function Header({ onOpenNavigation, navigationOpen = false }) {
             {user?.username || '…'}
           </span>
           {user?.role === 'admin' && (
-            <Badge variant="new" size="xs">admin</Badge>
+            <span className="hidden sm:block">
+              <Badge variant="new" size="xs">admin</Badge>
+            </span>
           )}
           <Link
             to="/change-password"
