@@ -13,7 +13,11 @@ case below:
   (in-house production spends the stock it just consumed);
 * reporting an unknown as zero — a missing conversion or an unattributable
   historical output must come back as ``None``, while a genuine "nothing left to
-  make" comes back as ``0.0``.
+  make" comes back as ``0.0``;
+* mixing up the three units one line meets (the PI line's unit the remainder is
+  counted in, the formulation's unit the percentages apply to, the chemical's
+  unit the answer is published in), and publishing binary dust as if it were a
+  quantity.
 
 Demand is only ever read from an **activated** demo of a PI whose
 ``sales.stage != 'completed'``; ``paid`` is an invoice status and never a PI
@@ -28,8 +32,8 @@ from ``tests/test_pi_demos.py`` (same slice, same fixtures) rather than
 re-derived.
 """
 from test_pi_demos import (  # noqa: F401  (shared Slice 3 test scaffolding)
-    _chem, _convert, _coverage, _create_ok, _invoice, _line_ids, _plan, _pi,
-    _produce, _product, _required, _rows, _svc,
+    _chem, _convert, _coverage, _create_ok, _demo, _get_demo, _invoice, _line_ids,
+    _plan, _pi, _produce, _product, _required, _rows, _svc,
 )
 
 from raas_tracker.sales import set_sale_item_wont_ship
@@ -245,6 +249,56 @@ def test_units_are_converted_before_anything_is_summed(admin_client, db):
     assert row["projected_quantity"] == 250.0, row
 
 
+def test_the_line_unit_and_the_formulation_unit_are_two_different_facts(admin_client, db):
+    """A PI sold in KG, planned in DRUM, of a chemical registered in BOTTLE.
+
+    Three units meet in one product line: the PI line's canonical unit (which is
+    what `target` and `produced` are stated in), the demo product's unit (which
+    is what the percentages are percentages OF), and the chemical's own unit.
+    Only the last two were ever chained together, so a plan drafted in DRUM
+    against a line sold in KG multiplied the KG remainder by the DRUM -> BOTTLE
+    factor — 100 KG ordered here published 8000 BOTTLE instead of 40.
+    """
+    _chem(db, "Chem Chain", unit="BOTTLE", qty=0)
+    sid = _pi(db, "PI-PROJ-CHAIN", [("Dosed", 100, "KG")])
+    _create_ok(admin_client, sid)
+    assert _plan(admin_client, db, sid,
+                 [_product("Dosed", [("Chem Chain", 100)], unit="DRUM",
+                           water=0)]).status_code == 200
+
+    # 100 KG of output is 0.5 DRUM of formula, and 0.5 DRUM is 40 BOTTLE
+    # (1 DRUM = 200 KG, 1 BOTTLE = 2.5 KG).
+    row = _project(db)["chem chain"]
+    assert row["required_quantity"] == 40.0, row
+    assert row["projected_quantity"] == 40.0, row
+
+
+def test_an_unreachable_formulation_unit_is_unknown_not_a_ratio(admin_client, db):
+    """No path from the line's unit to the formula's unit: the figure is unknown.
+
+    Nothing at draft or activation time ties those two units together, and a
+    missing path means the multiplier itself is missing — not that it is 1, and
+    not that the demand is 0. The plan is reported incomplete and its chemicals
+    unknown, exactly like every other gap in this module.
+    """
+    _chem(db, "Chem Split", unit="VIAL", qty=0)
+    _convert(db, "AMPOULE", "VIAL", 5)
+    sid = _pi(db, "PI-PROJ-NOLINK", [("Dosed", 100, "KG")])
+    _create_ok(admin_client, sid)
+    # Legal at the gate: the formula reaches its chemical (AMPOULE -> VIAL); it
+    # simply has nothing to do with the unit the PI is sold in.
+    assert _plan(admin_client, db, sid,
+                 [_product("Dosed", [("Chem Split", 100)], unit="AMPOULE",
+                           water=0)]).status_code == 200
+
+    row = _project(db)["chem split"]
+    assert row["required_quantity"] is None, row
+    assert row["projected_quantity"] is None, row
+    coverage = _coverage(_svc().project_purchasing(db))
+    assert coverage["state"] == "incomplete", coverage
+    assert sid in {entry["sale_id"] for entry in coverage["incomplete_plans"]}, coverage
+
+
 def test_a_missing_conversion_is_unknown_not_zero(admin_client, db):
     """No conversion path means the figure cannot be computed: null, and visibly
     different from the genuine zero of a covered requirement.
@@ -285,6 +339,41 @@ def test_a_completed_pi_contributes_no_demand(admin_client, db):
 
     _retire(db, sid)
     assert _required(_project(db), "Chem Done") == 0.0
+
+
+def test_a_completed_pi_still_shows_what_it_produced(admin_client, db):
+    """Completion removes a PI from the forecast, not from its own record.
+
+    `progress` is the header an operator reads to decide whether a plan is
+    finished: ordered, produced, remaining, side by side. The produced side took
+    the forecast's `stage <> completed` filter while the target side never did,
+    so a fully closed PI displayed "0 of 100 produced" next to its own shipped
+    drums — two numbers about one PI that disagree. The editor reads the PI as it
+    is NOW at any stage, which is what `activate_demo` already tells it.
+
+    The forecast beside it keeps the exclusion: completed work must not generate
+    buying, so the filter belongs to the demand, not to the read.
+    """
+    _chem(db, "Chem Finished", qty=0)
+    sid, item_id = _one_activated(db, admin_client, "PI-PROJ-CLOSED", "Chem Finished",
+                                  ordered=100)
+    invoice = _invoice(db, sid, "INV-CLOSED", [(item_id, "A", "KG", 60)])
+    _produce(db, sid, item_id, "A", "KG", 60, invoice)
+
+    rows = _demo(_get_demo(admin_client, sid))["progress"]
+    still_open = {r["product_name"].strip().lower(): r for r in rows}
+    assert still_open["a"]["target_quantity"] == 100.0, still_open
+    assert still_open["a"]["produced_quantity"] == 60.0, still_open
+    assert still_open["a"]["remaining_quantity"] == 40.0, still_open
+
+    _retire(db, sid)
+    closed = {r["product_name"].strip().lower(): r
+              for r in _demo(_get_demo(admin_client, sid))["progress"]}
+    assert closed["a"]["produced_quantity"] == 60.0, closed
+    assert closed["a"]["remaining_quantity"] == 40.0, closed
+
+    # The paired half of the rule: the same PI is absent from the buying list.
+    assert _required(_project(db), "Chem Finished") == 0.0
 
 
 def test_a_reopened_pi_is_back_using_its_current_remaining_quantities(admin_client, db):
@@ -430,3 +519,56 @@ def test_open_requirements_with_no_active_plans_are_a_state_not_a_zero(admin_cli
     # either absent or unknown, never an authoritative "0 to buy".
     row = _rows(projection).get("chem unplanned")
     assert row is None or row["projected_quantity"] is None, row
+
+
+# --------------------------------------------------------------------------- #
+# 18-19 — the precision a figure is published at
+# --------------------------------------------------------------------------- #
+def test_requirements_are_published_at_the_module_precision(admin_client, db):
+    """0.1 + 0.2 is not 0.3 in binary, and the buyer sees every last bit.
+
+    Quantities arrive as REAL and percentages as NUMERIC, so a sum of innocent
+    decimal amounts carries float dust below the 7th decimal. Every other figure
+    site in this module rounds to 6 dp on the way out (`_demo_progress`,
+    `_pi_progress`, `_check_product`); the forecast is printed as published, so
+    it rounds at the same precision.
+    """
+    _chem(db, "Chem Rounded", qty=0)
+    _one_activated(db, admin_client, "PI-F3-ROUND-A", "Chem Rounded", ordered=0.1)
+    _one_activated(db, admin_client, "PI-F3-ROUND-B", "Chem Rounded", ordered=0.2)
+
+    row = _project(db)["chem rounded"]
+    assert row["required_quantity"] == 0.3, row
+    assert row["projected_quantity"] == 0.3, row
+
+
+def test_float_dust_does_not_manufacture_a_buying_line(admin_client, db):
+    """A requirement that nets to nothing must not open a row at all.
+
+    Ordered 0.3, produced 0.1 + 0.2: exact arithmetic says the work is finished,
+    the floats leave 7.45e-09 behind. The outward-only promotion is guarded by
+    `required > 0`, so dust published unrounded puts a line on the buying list
+    that an operator is told to go and order. Rounding comes before the test, not
+    after it.
+    """
+    hidden = _chem(db, "Chem Dust", qty=0)
+    db.execute("UPDATE chemicals SET in_house_registered = FALSE WHERE id = %s",
+               (hidden,))
+    db.commit()
+    sid, item_id = _one_activated(db, admin_client, "PI-F3-DUST", "Chem Dust",
+                                  ordered=0.3)
+    # One recipe per invoice, so the 0.1 and the 0.2 ride on two invoices.
+    first = _invoice(db, sid, "INV-DUST-1", [(item_id, "A", "KG", 0.1)])
+    second = _invoice(db, sid, "INV-DUST-2", [(item_id, "A", "KG", 0.2)])
+    _produce(db, sid, item_id, "A", "KG", 0.1, first)
+    _produce(db, sid, item_id, "A", "KG", 0.2, second)
+
+    projection = _svc().project_purchasing(db)
+    print("DEBUG", repr(db.execute("SELECT quantity FROM sale_items WHERE sale_id = %s",
+                                   (sid,)).fetchone()[0]),
+          repr([r[0] for r in db.execute(
+              "SELECT qty_produced FROM production_run_outputs ORDER BY id").fetchall()]),
+          repr(projection["unstocked_requirements"]), repr(projection["materials"]))
+    assert "chem dust" not in {r["name"].strip().lower()
+                               for r in projection["unstocked_requirements"]}, projection
+    assert "chem dust" not in _rows(projection), projection

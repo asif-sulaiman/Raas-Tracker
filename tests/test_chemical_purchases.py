@@ -7,6 +7,8 @@ test client + the isolated pgserver database from conftest; the one rollback
 test drives the service directly so a mid-transaction audit failure is exercised
 without the HTTP error handler masking it.
 """
+import json
+
 import psycopg
 import pytest
 
@@ -455,3 +457,293 @@ def test_backdated_purchase_latest(admin_client, db):
     assert m["last_purchase_quantity"] == 100
     assert m["supplier_name"] == "Newer"
     assert _chem(db, "Backdate Chem")[1] == 150
+
+
+# --------------------------------------------------------------------------- #
+# 21. a correction may not blank the receipt's identity, and it must be audited
+#     with a real before/after payload (review W2)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("field", ["supplier_name", "purchase_number"])
+def test_correction_rejects_a_blank_identity(admin_client, db, field):
+    """`{"supplier_name": "  "}` used to store an EMPTY supplier on a NOT NULL
+    column, while create refuses exactly that input.
+
+    `purchase_number` is the worse of the two: it is the string snapshotted
+    onto every run's evidence and the only handle an operator has on a receipt.
+    The model strips whitespace, so the refusal is a 400 naming the field — the
+    same field-error shape every other validation here uses.
+    """
+    r = _post(admin_client, _payload([_line("Blank Identity", 10)]))
+    assert r.status_code == 201, r.get_json()
+    pid = r.get_json()["id"]
+
+    ru = admin_client.put(f"/api/chemical-purchases/{pid}", json={
+        "expected_version": 1, "reason": "blank the header", field: "   "})
+    assert ru.status_code == 400, ru.get_json()
+    payload = ru.get_json()
+    named = {row["field"] for row in payload.get("details", [])}
+    assert field in named or field in (payload.get("error") or ""), payload
+
+    # Nothing was written and no version was burned.
+    row = db.execute("SELECT supplier_name, purchase_number, version "
+                     "FROM chemical_purchases WHERE id = %s", (pid,)).fetchone()
+    assert row == ("Acme Supplies", "PO-1001", 1), row
+
+
+def test_update_purchase_service_refuses_a_blank_identity(admin_client, db):
+    """The rule belongs to the service, not only to the route's Pydantic model:
+    a CLI or direct caller must not be able to store a blank supplier either."""
+    r = _post(admin_client, _payload([_line("Service Blank", 10)]))
+    pid = r.get_json()["id"]
+
+    with pytest.raises(ValueError, match="supplier_name"):
+        purchases.update_purchase(db, pid, expected_version=1,
+                                 reason="blank it", supplier_name="   ",
+                                 actor="admin")
+    row = db.execute("SELECT supplier_name, version FROM chemical_purchases "
+                     "WHERE id = %s", (pid,)).fetchone()
+    assert row == ("Acme Supplies", 1), row
+
+    with pytest.raises(ValueError, match="purchase_number"):
+        purchases.update_purchase(db, pid, expected_version=1,
+                                  reason="blank it", purchase_number="\t ",
+                                  actor="admin")
+    row = db.execute("SELECT purchase_number, version FROM chemical_purchases "
+                    "WHERE id = %s", (pid,)).fetchone()
+    assert row == ("PO-1001", 1), row
+
+
+def test_correction_audits_previous_and_new_values(admin_client, db):
+    """A corrected receipt amount has to be RECOVERABLE from the audit row.
+
+    The version stamp (`old_value="version=1"`) recorded nothing about what the
+    receipt said before, so a corrected supplier, number, date or quantity was
+    unrecoverable — while the sibling service in this branch snapshots the
+    whole old formulation. Header fields plus every changed line go in now.
+    Only changed lines are listed (a receipt may carry 100 of them and the
+    audit column is bounded), but the header is recorded whole.
+    """
+    r = _post(admin_client, _payload(
+        [_line("Audit Old", 100), _line("Audit Held", 50)],
+        supplier="Old Supplier", number="PO-AUDIT-HDR", date="2026-01-15"))
+    assert r.status_code == 201, r.get_json()
+    body = r.get_json()
+    pid = body["id"]
+    by_name = {item["chemical_name"]: item for item in body["items"]}
+    old_line = by_name["Audit Old"]
+
+    ru = admin_client.put(f"/api/chemical-purchases/{pid}", json={
+        "expected_version": 1, "reason": "supplier invoiced the wrong quantity",
+        "supplier_name": "New Supplier", "purchase_number": "PO-AUDIT-HDR-2",
+        "purchase_date": "2026-02-02",
+        "line_patches": [{"id": old_line["id"], "quantity": 120}]})
+    assert ru.status_code == 200, ru.get_json()
+
+    row = db.execute("SELECT old_value, new_value FROM audit_logs "
+                     "WHERE action = 'PURCHASE_UPDATE' AND entity_id = %s "
+                     "ORDER BY id DESC LIMIT 1", (pid,)).fetchone()
+    assert row is not None, "the correction must leave an audit row"
+    old = json.loads(row[0])
+    new = json.loads(row[1])
+
+    assert (old["supplier_name"], old["purchase_number"],
+            old["purchase_date"]) == ("Old Supplier", "PO-AUDIT-HDR",
+                                      "2026-01-15"), old
+    assert {line["id"]: line["quantity"] for line in old["lines"]} == {
+        old_line["id"]: 100}, old
+    assert (new["supplier_name"], new["purchase_number"],
+            new["purchase_date"]) == ("New Supplier", "PO-AUDIT-HDR-2",
+                                      "2026-02-02"), new
+    assert {line["id"]: line["quantity"] for line in new["lines"]} == {
+        old_line["id"]: 120}, new
+    # The untouched line is not claimed to have changed...
+    assert all(line["id"] != by_name["Audit Held"]["id"] for line in new["lines"])
+    # ...and the reason + version trail the payload carries is still there.
+    assert new["reason"] == "supplier invoiced the wrong quantity", new
+    assert (old["version"], new["version"]) == (1, 2), (old, new)
+
+
+# --------------------------------------------------------------------------- #
+# 22. the two new read routes must not turn a transient DB failure into a 500
+#     (review W4) and must release the connection unconditionally (W5.3)
+# --------------------------------------------------------------------------- #
+class _Releasing:
+    """Wrap a pooled connection so a route can be watched releasing it."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+        self._conn.close()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+@pytest.mark.parametrize(
+    "service,url",
+    [("project_purchasing", "/api/chemicals/inventory"),
+     ("get_demo", "/api/sales/1/demo-recipe")],
+    ids=["inventory", "demo-get"],
+)
+def test_transient_db_failure_on_a_read_route_is_503(admin_client, monkeypatch,
+                                                   service, url):
+    """`except Exception:` in front of the service call swallowed the very
+    exceptions the app maps to 503 by TYPE, and answered "server bug" for what
+    is "try again". Roll back, release, and re-raise instead.
+    """
+    import flask_app
+
+    seen = {}
+    inner = flask_app.get_db
+
+    def _get_db():
+        seen["conn"] = _Releasing(inner())
+        return seen["conn"]
+
+    def _boom(*_args, **_kwargs):
+        raise psycopg.OperationalError("connection failed: server closed it")
+
+    monkeypatch.setattr(flask_app, "get_db", _get_db)
+    monkeypatch.setattr(flask_app, service, _boom)
+
+    r = admin_client.get(url)
+    assert r.status_code == 503, r.get_json()
+    assert r.get_json() == {"error": "database unavailable, retry shortly"}
+    assert r.headers.get("Retry-After") == "5"
+    assert seen["conn"].closed is True, "the pooled connection must be released"
+
+
+def test_ordinary_bug_on_the_read_route_is_still_500(admin_client, monkeypatch):
+    """The re-raise must not become a new catch-all: a real defect still answers
+    500 with the generic body, and still releases the connection."""
+    import flask_app
+
+    seen = {}
+    inner = flask_app.get_db
+
+    def _get_db():
+        seen["conn"] = _Releasing(inner())
+        return seen["conn"]
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("a real defect")
+
+    monkeypatch.setattr(flask_app, "get_db", _get_db)
+    monkeypatch.setattr(flask_app, "project_purchasing", _boom)
+
+    r = admin_client.get("/api/chemicals/inventory")
+    assert r.status_code == 500, r.get_json()
+    assert r.get_json() == {"error": "internal server error"}
+    assert "Retry-After" not in r.headers
+    assert seen["conn"].closed is True
+
+
+def test_inventory_route_closes_even_when_the_inject_step_aborts(admin_client,
+                                                                monkeypatch):
+    """W5.3: the close cannot sit on the success path of a `try/except` the
+    error path returns out of — an abort the except clause cannot match would
+    hand a still-open transaction back to the pool.
+    """
+    import flask_app
+
+    seen = {}
+    inner = flask_app.get_db
+
+    def _get_db():
+        seen["conn"] = _Releasing(inner())
+        return seen["conn"]
+
+    class _Abort(BaseException):
+        """Not an `Exception`, so no `except Exception:` can catch or release."""
+
+    def _boom(*_args, **_kwargs):
+        raise _Abort("interrupted mid-request")
+
+    monkeypatch.setattr(flask_app, "get_db", _get_db)
+    monkeypatch.setattr(flask_app, "project_purchasing", _boom)
+
+    with pytest.raises(_Abort):
+        admin_client.get("/api/chemicals/inventory")
+    assert seen["conn"].closed is True
+
+
+# --------------------------------------------------------------------------- #
+# 23. an unexpected client field is a 400, never a silently ignored key (W5.1)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "method,path,body",
+    [("post", "/api/chemical-purchases",
+      _payload([_line("Forbid Chem", 10)], number="PO-FORBID-1")),
+     ("put", "/api/chemical-purchases/1",
+      {"expected_version": 1, "reason": "typo"}),
+     ("post", "/api/chemical-purchases/1/cancel",
+      {"expected_version": 1, "reason": "typo"})],
+    ids=["create", "update", "cancel"],
+)
+def test_purchase_write_models_forbid_unknown_fields(admin_client, method, path,
+                                                    body):
+    """The recipe write models in this branch already refuse extras; the
+    purchase family must not be the one place a mistyped key is dropped on the
+    floor (a `suplier_name` typo then posts a receipt under the wrong name).
+    """
+    sent = dict(body)
+    sent["suplier_name"] = "typo, not a field"
+    r = getattr(admin_client, method)(path, json=sent)
+    assert r.status_code == 400, r.get_json()
+    details = r.get_json().get("details") or []
+    assert any("suplier_name" in row["field"] for row in details), r.get_json()
+
+
+def test_purchase_write_models_still_accept_a_valid_body(admin_client, db):
+    """The refusal above is the EXTRA key, not the body: each model still
+    accepts what the SPA actually sends."""
+    r = _post(admin_client, _payload([_line("Forbid OK Chem", 10)],
+                                     number="PO-FORBID-2"))
+    assert r.status_code == 201, r.get_json()
+    pid = r.get_json()["id"]
+    assert _post(admin_client, _payload([_line("Forbid OK Chem 2", 5)],
+                                        number="PO-FORBID-3")).status_code == 201
+
+    assert admin_client.put(f"/api/chemical-purchases/{pid}", json={
+        "expected_version": 1, "reason": "supplier name fix",
+        "supplier_name": "Later Supplier"}).status_code == 200
+    assert admin_client.post(f"/api/chemical-purchases/{pid}/cancel", json={
+        "expected_version": 2, "reason": "voided"}).status_code == 200
+
+
+def test_demo_write_models_forbid_unknown_fields(admin_client):
+    """One case for the demo family (brief W5.1 says one per family is enough):
+    a draft save with a key the model never declared is a 400 naming it."""
+    r = admin_client.put("/api/sales/1/demo-recipe/draft", json={
+        "expected_revision": 1, "products": [], "prodcts": []})
+    assert r.status_code == 400, r.get_json()
+    details = r.get_json().get("details") or []
+    assert any("prodcts" in row["field"] for row in details), r.get_json()
+
+
+# --------------------------------------------------------------------------- #
+# 24. a malformed filter on the purchase list is a 400, not an unfiltered list
+#     (review W5.2)
+# --------------------------------------------------------------------------- #
+def test_purchase_list_refuses_a_malformed_filter(admin_client, db):
+    """`request.args.get("client_id", type=int)` drops an unparseable value, so
+    `?client_id=abc` silently returned EVERY client's receipts — the worst
+    default for a tenant filter a typo can disarm."""
+    cid = _new_client(db, "Filter Co")
+    assert _post(admin_client, _payload(
+        [_line("Filter Chem", 10)], delivery_type="outward",
+        client_id=cid)).status_code == 201
+
+    for param in ("client_id", "chemical_id"):
+        r = admin_client.get(f"/api/chemical-purchases?{param}=not-a-number")
+        assert r.status_code == 400, (param, r.get_json())
+        details = r.get_json().get("details") or []
+        assert any(row["field"] == param for row in details), (param, r.get_json())
+
+    # A well-formed filter and an absent one both still work.
+    assert admin_client.get(
+        f"/api/chemical-purchases?client_id={cid}").status_code == 200
+    assert admin_client.get("/api/chemical-purchases").status_code == 200

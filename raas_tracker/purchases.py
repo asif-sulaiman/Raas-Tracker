@@ -20,6 +20,7 @@ Statuses are carried by exception TYPE (see ``_exceptions``): a plain
 stock), ``LifecycleConflict`` is a 409 (version mismatch / already cancelled),
 ``ResourceMissing`` is a 404. ``status_for`` reads the type, never the message.
 """
+import json
 from typing import Any, Optional
 
 import psycopg
@@ -538,10 +539,21 @@ def update_purchase(conn: psycopg.Connection, purchase_id: int, *,
     while ANY line of the receipt is referenced the shared header (supplier,
     number, date) freezes too, because the run's evidence snapshots it.
     Unreferenced lines of the same receipt keep their audited corrections.
+
+    The identity fields are as required here as they are on create: a corrected
+    header may not erase the supplier or the purchase number, which is the only
+    handle an operator has on a receipt and the string every run's evidence
+    quotes. And the audit row carries the BEFORE and AFTER of what this
+    correction changed — header fields and every line's quantity — because a
+    version stamp cannot reproduce a receipt that no longer exists.
     """
     reason = (reason or "").strip()
     if not reason:
         raise ValueError("a correction reason is required")
+    if supplier_name is not None and not str(supplier_name).strip():
+        raise ValueError("supplier_name is required")
+    if purchase_number is not None and not str(purchase_number).strip():
+        raise ValueError("purchase_number is required")
     line_patches = line_patches or []
     if (supplier_name is None and purchase_number is None
             and purchase_date is None and not line_patches):
@@ -569,9 +581,12 @@ def update_purchase(conn: psycopg.Connection, purchase_id: int, *,
         item_map = {i[0]: i for i in items}
         referenced = _referenced_line_ids(conn, purchase_id)
 
-        # Validate patches against this purchase's own lines before any write.
+        # Validate patches against this purchase's own lines before any write,
+        # and keep what each line said beforehand: the audit snapshot below is
+        # the only place a corrected quantity survives.
         seen = set()
         deltas: dict = {}
+        changes: list = []
         for patch in line_patches:
             item_id = patch.get("id")
             if item_id not in item_map:
@@ -582,6 +597,9 @@ def update_purchase(conn: psycopg.Connection, purchase_id: int, *,
             new_q = _positive_quantity(patch.get("quantity"))
             chem_id = item_map[item_id][1]
             deltas[chem_id] = new_q - float(item_map[item_id][2])
+            changes.append({"id": item_id,
+                            "old_quantity": float(item_map[item_id][2]),
+                            "new_quantity": new_q})
 
         if referenced:
             frozen_lines = sorted(pid for pid in seen if pid in referenced)
@@ -602,7 +620,15 @@ def update_purchase(conn: psycopg.Connection, purchase_id: int, *,
                     f"production run — its {', '.join(held_header)} cannot "
                     "change while the receipt is source evidence")
 
-        eff_number = (purchase_number or old_number or "").strip()
+        # What the row will actually hold afterwards — computed once, so the
+        # write, the stock reason and the audit snapshot cannot disagree about
+        # it. `purchase_number` is the handle the evidence quotes, so an absent
+        # field means "unchanged", never "blank".
+        eff_supplier = (supplier_name.strip() if supplier_name is not None
+                        else old_supplier)
+        eff_number = (purchase_number.strip() if purchase_number is not None
+                      else old_number)
+        eff_date = purchase_date if purchase_date is not None else old_date
         if delivery_type == "in_house" and deltas:
             locked = {}
             for chem_id in sorted(deltas):
@@ -618,7 +644,7 @@ def update_purchase(conn: psycopg.Connection, purchase_id: int, *,
                     continue
                 name, unit = locked[chem_id]
                 if not update_stock(conn, name, delta, unit,
-                                    reason=f"Purchase {eff_number} correction",
+                                    reason=f"Purchase {eff_number or ''} correction",
                                     atomic=False):
                     raise ValueError(f"chemical '{name}' not found")
                 reorder_names.append(name)
@@ -632,21 +658,36 @@ def update_purchase(conn: psycopg.Connection, purchase_id: int, *,
         params: list = []
         if supplier_name is not None:
             set_clause += ", supplier_name = %s"
-            params.append(supplier_name.strip())
+            params.append(eff_supplier)
         if purchase_number is not None:
             set_clause += ", purchase_number = %s"
-            params.append(purchase_number.strip())
+            params.append(eff_number)
         if purchase_date is not None:
             set_clause += ", purchase_date = %s"
-            params.append(purchase_date)
+            params.append(eff_date)
         params.append(purchase_id)
         conn.execute("UPDATE chemical_purchases SET " + set_clause +
                      " WHERE id = %s", params)
 
-        log_audit_action(conn, "PURCHASE_UPDATE", "chemical_purchase", purchase_id,
-                         user_id=actor, old_value=f"version={version}",
-                         new_value=f"version={version + 1} reason={reason}",
-                         atomic=False)
+        # Before/after, not version stamps: only the header fields and the
+        # lines that moved are listed, because a receipt may carry 100 lines and
+        # the audit column is bounded — everything else on it is unchanged and
+        # still readable from the row.
+        log_audit_action(
+            conn, "PURCHASE_UPDATE", "chemical_purchase", purchase_id,
+            user_id=actor,
+            old_value=json.dumps({
+                "supplier_name": old_supplier, "purchase_number": old_number,
+                "purchase_date": _iso(old_date), "version": version,
+                "lines": [{"id": c["id"], "quantity": c["old_quantity"]}
+                          for c in changes]}),
+            new_value=json.dumps({
+                "supplier_name": eff_supplier, "purchase_number": eff_number,
+                "purchase_date": _iso(eff_date), "version": version + 1,
+                "reason": reason,
+                "lines": [{"id": c["id"], "quantity": c["new_quantity"]}
+                          for c in changes]}),
+            atomic=False)
         conn.commit()
     except Exception:
         conn.rollback()

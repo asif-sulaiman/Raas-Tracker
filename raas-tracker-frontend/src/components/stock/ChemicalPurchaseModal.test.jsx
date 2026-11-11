@@ -223,6 +223,36 @@ describe('ChemicalPurchaseModal', () => {
     expect(screen.getByRole('button', { name: 'Save' }).disabled).toBe(false);
   });
 
+  it('attaches each server field error to its own material row, not one banner', async () => {
+    const posts = [];
+    renderModal({
+      posts,
+      postHandler: () => jsonResponse({
+        error: 'Invalid payload',
+        details: [
+          { field: 'lines.0.quantity', message: 'Input should be greater than 0' },
+          { field: 'lines.1.unit', message: 'String should have at least 1 character' },
+        ],
+      }, false, 400),
+    });
+    await fillValidHeader();
+    fillFirstNewLine();
+    fireEvent.click(screen.getByRole('button', { name: 'Add material' }));
+    const row2 = screen.getByRole('group', { name: 'Material 2' });
+    fireEvent.change(within(row2).getByLabelText('Chemical name'), { target: { value: 'NewBase' } });
+    fireEvent.change(within(row2).getByLabelText('Unit'), { target: { value: 'KG' } });
+    fireEvent.change(within(row2).getByLabelText('Quantity'), { target: { value: '5' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    const row1 = screen.getByRole('group', { name: 'Material 1' });
+    await waitFor(() => expect(within(row1).getByRole('alert')).toBeTruthy());
+    expect(within(row1).getByRole('alert').textContent).toContain('greater than 0');
+    expect(within(row2).getByRole('alert').textContent).toContain('at least 1 character');
+    // Both errors landed on their fields, so no generic banner toast is needed.
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(posts).toHaveLength(1);
+  });
+
   it('Outward save requires a client and posts client_id', async () => {
     const posts = [];
     renderModal({ posts });

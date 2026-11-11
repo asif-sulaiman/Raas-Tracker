@@ -1517,6 +1517,15 @@ def api_chemicals_inventory():
     computed against it come from one instant rather than two — and both land
     on the same row, because a buyer must never be shown two tables that can
     disagree about what is on the shelf.
+
+    The failure path rolls back, releases and RE-RAISES instead of answering
+    500 itself. `PoolTimeout` and `psycopg.OperationalError` are transient and
+    the app maps them to 503 by exception class; a local `except Exception:`
+    here used to swallow them before those handlers could see them, which tells
+    the client "server bug" for what is "try again". The close is in `finally`
+    because this route deliberately ends and re-arms the checkout's
+    transaction, so no path — not one an `except Exception` cannot match — may
+    hand a snapshot back to the pool still open.
     """
     conn = get_db()
     try:
@@ -1527,10 +1536,10 @@ def api_chemicals_inventory():
         forecast = project_purchasing(conn)
         body = get_inventory(conn)
     except Exception:
-        _rollback_close(conn)
-        app.logger.exception("Chemical inventory failed")
-        return jsonify({"error": "internal server error"}), 500
-    conn.close()
+        _rollback(conn)
+        raise
+    finally:
+        conn.close()
     by_id = {row["chemical_id"]: row for row in forecast["materials"]}
     for material in body["materials"]:
         need = by_id.get(material["id"])
@@ -1542,6 +1551,11 @@ def api_chemicals_inventory():
 
 
 class PurchaseLineIn(_FiniteModel):
+    # `extra="forbid"` for the whole purchase family, as the recipe models in
+    # this branch already do: a mistyped key ("suplier_name") must be a 400,
+    # not a field silently dropped on the way to a posted receipt.
+    model_config = ConfigDict(
+        str_strip_whitespace=True, allow_inf_nan=False, extra="forbid")
     chemical_name: str = Field(min_length=1)
     chemical_id: int | None = None
     quantity: Decimal = Field(gt=0, max_digits=18, decimal_places=6)
@@ -1552,6 +1566,7 @@ class PurchaseLineIn(_FiniteModel):
 
 
 class PurchaseCreateIn(_StrippedModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     supplier_name: str = Field(min_length=1)
     purchase_number: str = Field(min_length=1)
     purchase_date: date
@@ -1570,27 +1585,42 @@ class PurchaseCreateIn(_StrippedModel):
 
 
 class PurchaseLinePatchIn(_FiniteModel):
+    model_config = ConfigDict(
+        str_strip_whitespace=True, allow_inf_nan=False, extra="forbid")
     id: int
     quantity: Decimal = Field(gt=0, max_digits=18, decimal_places=6)
 
 
 class PurchaseUpdateIn(_StrippedModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     expected_version: int = Field(gt=0)
     reason: str = Field(min_length=1)
-    supplier_name: str | None = None
-    purchase_number: str | None = None
+    # `min_length` AFTER the model's whitespace strip, because a correction may
+    # not blank the identity fields: `create` refuses a blank supplier/number,
+    # and `purchase_number` is the string every production run's evidence
+    # quotes. Absent (None) still means "unchanged" — see `update_purchase`.
+    supplier_name: str | None = Field(default=None, min_length=1)
+    purchase_number: str | None = Field(default=None, min_length=1)
     purchase_date: date | None = None
     line_patches: list[PurchaseLinePatchIn] | None = Field(default=None,
                                                           max_length=100)
 
 
 class PurchaseCancelIn(_StrippedModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     expected_version: int = Field(gt=0)
     reason: str = Field(min_length=1)
 
 
 @app.route("/api/chemical-purchases", methods=["GET"])
 def api_list_purchases():
+    # A malformed filter must not degrade into an unfiltered list: with
+    # `?client_id=abc` dropped by `type=int`, this answers with EVERY client's
+    # receipts, which is the wrong default for a tenant filter a typo can
+    # disarm. Refuse it as a 400 naming the field.
+    bad = _bad_int_query_param(("client_id", "chemical_id"))
+    if bad:
+        return bad
     conn = get_db()
     try:
         body = get_purchases(
@@ -4158,11 +4188,17 @@ def api_set_item_wont_ship(sale_id, item_id):
 # until activated. None of these routes touches stock, production or recipes.
 # --------------------------------------------------------------------------- #
 class DemoIngredientIn(_FiniteModel):
+    # Same `extra="forbid"` rule as the purchase and recipe families above: a
+    # mistyped key must be a 400, not a field silently dropped from a plan.
+    model_config = ConfigDict(
+        str_strip_whitespace=True, allow_inf_nan=False, extra="forbid")
     chemical: str = Field(min_length=1)
     percentage: float = Field(ge=0, le=100)
 
 
 class DemoProductIn(_FiniteModel):
+    model_config = ConfigDict(
+        str_strip_whitespace=True, allow_inf_nan=False, extra="forbid")
     product_name: str = Field(min_length=1)
     unit: str = Field(min_length=1)
     # None means "derive it at activation"; the active row then stores a number.
@@ -4171,11 +4207,13 @@ class DemoProductIn(_FiniteModel):
 
 
 class DemoDraftIn(_StrippedModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     expected_revision: int = Field(gt=0)
     products: list[DemoProductIn] = Field(max_length=200)
 
 
 class DemoActivateIn(_StrippedModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     expected_revision: int = Field(gt=0)
 
 
@@ -4201,15 +4239,22 @@ def api_get_demo_recipe(sale_id):
     "Nobody has planned this PI" and "this PI is planned with nothing in it"
     are different facts, and the coverage report can only keep telling them
     apart while a miss stays a miss.
+
+    A read, so the failure path releases the connection and re-raises rather
+    than answering 500: the app's handlers map `PoolTimeout` and
+    `psycopg.OperationalError` to 503 by exception class, and a local catch-all
+    here turned a stalled pool into "server bug". The close sits in `finally`
+    for the same reason as the inventory route above — the success path now
+    leaves this `try` by way of a re-raise.
     """
     conn = get_db()
     try:
         demo = get_demo(conn, sale_id)
     except Exception:
-        _rollback_close(conn)
-        app.logger.exception("PI demo read failed")
-        return jsonify({"error": "internal server error"}), 500
-    conn.close()
+        _rollback(conn)
+        raise
+    finally:
+        conn.close()
     if demo is None:
         return jsonify({"error": "Demo recipe not found"}), 404
     return jsonify({"demo": demo})

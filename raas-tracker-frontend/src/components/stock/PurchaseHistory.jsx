@@ -43,6 +43,7 @@ export default function PurchaseHistory({ onChanged }) {
   const [viewPurchase, setViewPurchase] = useState(null);
   const [editPurchase, setEditPurchase] = useState(null);
   const [editQuantities, setEditQuantities] = useState({});
+  const [fieldErrors, setFieldErrors] = useState({});
   const [editReason, setEditReason] = useState('');
   const [editSaving, setEditSaving] = useState(false);
   const [cancelPurchase, setCancelPurchase] = useState(null);
@@ -107,6 +108,7 @@ export default function PurchaseHistory({ onChanged }) {
       patches.push({ id: i.id, quantity: q });
     }
     setEditSaving(true);
+    setFieldErrors({});
     try {
       await apiFetch(`/api/chemical-purchases/${editPurchase.id}`, {
         method: 'PUT',
@@ -118,7 +120,23 @@ export default function PurchaseHistory({ onChanged }) {
       load();
       onChanged?.();
     } catch (err) {
-      toast.error(err.message || 'Could not save the correction');
+      const details = err?.fields;
+      let attached = false;
+      if (Array.isArray(details) && details.length > 0) {
+        const next = {};
+        for (const d of details) {
+          const m = String(d.field || '').match(/^line_patches\.(\d+)\./);
+          // The server indexes the submitted patches, which skip unchanged
+          // materials — so follow patches[N].id, not items[N].
+          const patch = m ? patches[Number(m[1])] : null;
+          if (patch) {
+            next[patch.id] = d.message;
+            attached = true;
+          }
+        }
+        setFieldErrors(next);
+      }
+      if (!attached) toast.error(err.message || 'Could not save the correction');
     } finally {
       setEditSaving(false);
     }
@@ -311,13 +329,19 @@ export default function PurchaseHistory({ onChanged }) {
             {(editPurchase.items || []).map((i) => (
               <div key={i.id}>
                 <label className={labelCls}>{i.chemical_name} ({i.unit})</label>
+                {fieldErrors[i.id] && (
+                  <p role="alert" className="text-[11px] text-red-600 dark:text-red-400 font-medium leading-none">{fieldErrors[i.id]}</p>
+                )}
                 <input
                   aria-label={`Quantity for ${i.chemical_name}`}
                   type="number"
                   min="0"
                   step="any"
                   value={editQuantities[i.id] ?? ''}
-                  onChange={(e) => setEditQuantities((q) => ({ ...q, [i.id]: e.target.value }))}
+                  onChange={(e) => {
+                    setEditQuantities((q) => ({ ...q, [i.id]: e.target.value }));
+                    setFieldErrors((f) => { const n = { ...f }; delete n[i.id]; return n; });
+                  }}
                   className={fieldCls}
                 />
               </div>

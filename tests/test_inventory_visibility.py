@@ -201,3 +201,60 @@ def test_import_from_json_updates_unit_without_purchase_history(db, tmp_path):
     row = db.execute("SELECT current_qty, unit FROM chemicals "
                      "WHERE name = 'No History'").fetchone()
     assert row == (7, "L")              # no history: unit may still change
+
+
+# --------------------------------------------------------------------------- #
+# W3: the monthly file is the THIRD thing that stocks material, so it promotes
+# the same way an in-house purchase and an approved upload do.
+# --------------------------------------------------------------------------- #
+def _inventory_names(admin_client):
+    body = admin_client.get("/api/chemicals/inventory").get_json()
+    assert body is not None
+    return {m["name"] for m in body["materials"]}
+
+
+def test_import_from_json_promotes_a_hidden_identity(admin_client, db, tmp_path):
+    """An outward-only identity the file reports with 500 KG on site stayed
+    ``in_house_registered = FALSE``: invisible in the stock list, the inventory
+    view and reorder alerts, while the purchasing projection still subtracted
+    that invisible 500 from its demand and reported a smaller buy no visible
+    row explained. A shelf number a buyer cannot audit is the defect.
+    """
+    hidden_id = _hidden(admin_client, db, "File Promote", 10)
+    assert "File Promote" not in _inventory_names(admin_client)
+
+    payload = tmp_path / "stock.json"
+    payload.write_text(json.dumps([
+        {"product_name": "File Promote", "balance_this_month": 500,
+         "balance_last_month": 480, "this_month_unit": "KG"}]), encoding="utf-8")
+    import_from_json(str(payload))
+
+    row = db.execute("SELECT current_qty, in_house_registered FROM chemicals "
+                     "WHERE id = %s", (hidden_id,)).fetchone()
+    assert row[0] == 500, row
+    assert row[1] is True, "positive stocked quantity promotes the identity"
+    # The projection's 500 and the visible shelf are now the same row.
+    assert "File Promote" in _inventory_names(admin_client)
+    assert "File Promote" in {c["name"] for c in
+                              admin_client.get("/api/chemicals").get_json()}
+
+
+def test_import_from_json_zero_count_never_demotes_registered(admin_client, db,
+                                                              tmp_path):
+    """The paired rule: promotion is one-way. A file that reports 0 must keep a
+    once-stocked material visible at stock 0, never hide a receipt's material.
+    """
+    visible_id = _visible(admin_client, db, "File Zero Keep", 5)
+    assert "File Zero Keep" in _inventory_names(admin_client)
+
+    payload = tmp_path / "stock.json"
+    payload.write_text(json.dumps([
+        {"product_name": "File Zero Keep", "balance_this_month": 0,
+         "balance_last_month": 5, "this_month_unit": "KG"}]), encoding="utf-8")
+    import_from_json(str(payload))
+
+    row = db.execute("SELECT current_qty, in_house_registered FROM chemicals "
+                     "WHERE id = %s", (visible_id,)).fetchone()
+    assert row[0] == 0, row
+    assert row[1] is True, "a zero count never demotes a registered material"
+    assert "File Zero Keep" in _inventory_names(admin_client)

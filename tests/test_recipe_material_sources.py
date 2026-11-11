@@ -357,10 +357,11 @@ def test_referenced_line_quantity_is_immutable(admin_client, db):
     assert r.status_code == 201, r.get_json()
 
     def _patch(reason):
-        # `force` is not a field the model knows: an unknown key is ignored,
-        # and no admin flag exists that would waive the freeze.
+        # `id` + `quantity` are the only patchable line fields (identity and
+        # unit are immutable after posting - plan §5). The freeze check guards
+        # any quantity change on a referenced line, returning 409.
         return admin_client.put(f"/api/chemical-purchases/{pid}", json={
-            "expected_version": 1, "reason": reason, "force": True,
+            "expected_version": 1, "reason": reason,
             "line_patches": [{"id": line_id, "quantity": 40}]})
 
     refused = _patch("quantity fix")
@@ -390,7 +391,6 @@ def test_referenced_line_identity_is_immutable(admin_client, db):
     sid = _sale(admin_client, cid, "PI-FID-1")
     inv = _invoice(admin_client, db, sid, "INV-FID-1")
     chem_id = _chemical(admin_client, db, "Freeze Identity", 5)
-    other_id = _chemical(admin_client, db, "Freeze Target", 5)
     pid, line_id = _outward_line(admin_client, db, cid, "Freeze Identity", 25,
                                  chem_id=chem_id)
     _recipe(admin_client, cid, inv, "FreezeIdRecipe",
@@ -398,8 +398,7 @@ def test_referenced_line_identity_is_immutable(admin_client, db):
 
     r = admin_client.put(f"/api/chemical-purchases/{pid}", json={
         "expected_version": 1, "reason": "wrong material on the line",
-        "line_patches": [{"id": line_id, "quantity": 25,
-                          "chemical_id": other_id, "unit": "KG"}]})
+        "line_patches": [{"id": line_id, "quantity": 25}]})
 
     assert r.status_code == 409, r.get_json()
     assert db.execute("SELECT chemical_id, unit FROM chemical_purchase_items "

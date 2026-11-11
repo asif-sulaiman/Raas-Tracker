@@ -53,6 +53,7 @@ export default function ChemicalPurchaseModal({ isOpen, onClose, onSuccess }) {
   const [saving, setSaving] = useState(false);
   const [catalog, setCatalog] = useState([]);
   const [companies, setCompanies] = useState([]);
+  const [fieldErrors, setFieldErrors] = useState({});
 
   // Load the entry selectors once per open. Every setState lands after an
   // await, and a close mid-flight is ignored so a stale response cannot
@@ -94,8 +95,13 @@ export default function ChemicalPurchaseModal({ isOpen, onClose, onSuccess }) {
     onClose();
   };
 
-  const updateLine = (key, patch) =>
+  const updateLine = (key, patch) => {
+    clearFieldError(key);
     setLines((ls) => ls.map((l) => (l.key === key ? { ...l, ...patch } : l)));
+  };
+
+  // A row's own field error is cleared as soon as the operator touches it.
+  const clearFieldError = (key) => setFieldErrors((f) => { const n = { ...f }; delete n[key]; return n; });
 
   const addRow = () => setLines((ls) => [...ls, makeRow()]);
 
@@ -145,6 +151,7 @@ export default function ChemicalPurchaseModal({ isOpen, onClose, onSuccess }) {
     }
 
     setSaving(true);
+    setFieldErrors({});
     try {
       const body = {
         supplier_name: supplier,
@@ -186,7 +193,22 @@ export default function ChemicalPurchaseModal({ isOpen, onClose, onSuccess }) {
       onClose();
     } catch (err) {
       // Preserve every entered value so the operator can correct and retry.
-      toast.error(err.message || 'Could not save the purchase');
+      // Attach server field errors (lines.N.<field>) to their own material row
+      // instead of one generic banner, so each correction is next to its field.
+      const details = err?.fields;
+      let attached = false;
+      if (Array.isArray(details) && details.length > 0) {
+        const next = {};
+        for (const d of details) {
+          const m = String(d.field || '').match(/^lines\.(\d+)\./);
+          if (m && lines[Number(m[1])]) {
+            next[lines[Number(m[1])].key] = d.message;
+            attached = true;
+          }
+        }
+        setFieldErrors(next);
+      }
+      if (!attached) toast.error(err.message || 'Could not save the purchase');
     } finally {
       setSaving(false);
     }
@@ -250,6 +272,9 @@ export default function ChemicalPurchaseModal({ isOpen, onClose, onSuccess }) {
 
           {lines.map((l, idx) => (
             <div key={l.key} role="group" aria-label={`Material ${idx + 1}`} className="rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50/50 dark:bg-slate-800/40 p-3 space-y-3">
+              {fieldErrors[l.key] && (
+                <p role="alert" className="text-[11px] text-red-600 dark:text-red-400 font-medium leading-none">{fieldErrors[l.key]}</p>
+              )}
               <div className="flex items-center justify-between gap-2">
                 <div className="flex rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden">
                   <button type="button" onClick={() => updateLine(l.key, { mode: 'new' })} aria-pressed={l.mode === 'new'} className={segCls(l.mode === 'new')}>New Chemical</button>
