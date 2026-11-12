@@ -198,6 +198,37 @@ describe('InvoiceEditor — create mode', () => {
     }
   });
 
+  it('keeps only the quantity field in the keyboard path of the card view', async () => {
+    installFetch();
+    const originalWidth = window.innerWidth;
+    try {
+      window.innerWidth = 390;
+      renderEditor();
+      await screen.findByText('Alpha');
+
+      const list = screen.getByRole('list', { name: 'Invoice lines' });
+      const inputs = Array.from(list.querySelectorAll('input'));
+      const tabbable = inputs.filter((input) => input.tabIndex !== -1);
+
+      // Only the editable quantity is tabbable: the restated unit price and
+      // total price are read-only and stay out of the keyboard path, exactly
+      // as in the table view.
+      expect(tabbable.map((input) => input.getAttribute('aria-label'))).toEqual([
+        'Invoice qty for Alpha',
+        'Invoice qty for Beta',
+      ]);
+      expect(priceFor('Alpha').tabIndex).toBe(-1);
+      expect(totalFor('Alpha').tabIndex).toBe(-1);
+
+      // The tabbable field still drives the live remaining and the total.
+      fireEvent.change(qtyFor('Alpha'), { target: { value: '3' } });
+      expect(list.textContent).toContain('Remaining 5.00 KG');
+      expect(totalFor('Alpha').value).toBe('$15.00');
+    } finally {
+      window.innerWidth = originalWidth;
+    }
+  });
+
   it('prices the line as quantity times unit price', async () => {
     installFetch();
     renderEditor();
