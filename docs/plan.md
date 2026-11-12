@@ -2310,7 +2310,8 @@ accessibility 0.92, best-practices 1.00.
 
 **How it landed.** PR #21 (branch `feat/mobile-ux-pass`), rebase-merged into `main` as
 `d6e1075`; PR #23 (`fix/ci-async-budget`) followed as `2a14b09` to close the load-induced
-test flakes. `main` is a protected branch: changes go through a pull request and both
+test flakes; PR #24 (`fix/auth-a11y-and-recipes-touch-targets`) closed the two remaining
+defects. `main` is a protected branch: changes go through a pull request and both
 required checks - the CI workflow's `backend` and `frontend` jobs - must be green. Both
 were green before each merge, and the CI run on `main` was green after it.
 
@@ -2319,17 +2320,25 @@ were green before each merge, and the CI run on `main` was green after it.
 off-limits `db.py`). M-7 was folded into M-4. `DataTable` needed no card view - it already
 scrolls.
 
-**Open items carried forward.**
+**Follow-ups, and where they stand.**
 1. The load-induced test flakes are closed: PR #23 raised Testing Library's async
    assertion budget to 5 s and vitest's per-test timeout to 15 s, and
    `src/testBudget.test.js` pins them. The assertions themselves are unchanged - a state
    change that never arrives still fails.
-2. The Recipes dense-table icon buttons stay 26 px: a 44 px target there would overlap the
-   neighbouring row and the destructive action beside it. It needs a row menu, not a wider
-   tap area.
-3. The login page has no field labels, no `main` landmark and no meta description
-   (Lighthouse accessibility 0.92 / SEO 0.80) - a small accessibility slice closes it.
-4. `react_frontend/` is gitignored and drifts unless `dist/` is copied after every build.
+2. The Recipes dense-table icon buttons are closed: PR #24 gave them the shared 44x44
+   target and widened the recipe row actions from 6 px to 12 px, so the destructive
+   control cannot overlap the button beside it. Measured in Chromium at 390 px: the target
+   stops 9 px short of the next row and the View button keeps its full width. The 12 px
+   gap itself still belongs to the destructive button - a tap in the exact middle opens
+   its confirmation dialog.
+3. The login page's missing labels, `main` landmark and meta description are closed:
+   PR #24 associated every control on all four auth pages with its label, made each page
+   a `main` landmark and declared the document description. Lighthouse mobile now scores
+   accessibility 1.00, best-practices 1.00 and SEO 1.00 with no failing audit.
+
+**Still open.**
+1. `react_frontend/` is gitignored and drifts unless `dist/` is copied after every build.
+   Vercel's build command does it in production; a local Flask serve needs the copy.
 
 ---
 
