@@ -86,6 +86,28 @@ describe('mobile navigation drawer', () => {
     expect(drawer()).toBeNull();
   });
 
+  it('returns focus to the menu button when the drawer closes', () => {
+    renderShell();
+    const trigger = menuButton();
+    trigger.focus();
+    fireEvent.click(trigger);
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it('keeps Tab inside the open drawer', () => {
+    renderShell();
+    const trigger = menuButton();
+    trigger.focus();
+    fireEvent.click(trigger);
+    const dialog = drawer();
+    expect(document.activeElement).toBe(within(dialog).getByRole('button', { name: 'Close menu' }));
+    const links = within(dialog).getAllByRole('link');
+    links[0].focus();
+    fireEvent.keyDown(window, { key: 'Tab', shiftKey: true });
+    expect(document.activeElement).toBe(links[links.length - 1]);
+  });
+
   it('closes the drawer when the route changes', () => {
     renderShell();
     fireEvent.click(menuButton());

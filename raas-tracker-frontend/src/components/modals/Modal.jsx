@@ -1,5 +1,6 @@
-import { useEffect } from 'react';
+import { useId, useRef } from 'react';
 import { X } from 'lucide-react';
+import { useDialogLayer } from '../../hooks/useDialogLayer';
 
 export default function Modal({
   isOpen,
@@ -10,39 +11,46 @@ export default function Modal({
   footer,
   maxWidth = 'max-w-lg'
 }) {
-  useEffect(() => {
-    const handleKeyDown = (e) => {
-      if (e.key === 'Escape') onClose?.();
-    };
-    if (isOpen) {
-      document.body.style.overflow = 'hidden';
-      window.addEventListener('keydown', handleKeyDown);
-    }
-    return () => {
-      document.body.style.overflow = '';
-      window.removeEventListener('keydown', handleKeyDown);
-    };
-  }, [isOpen, onClose]);
+  const titleId = useId();
+  const dialogRef = useRef(null);
+  const closeButtonRef = useRef(null);
+
+  useDialogLayer({
+    isOpen,
+    onClose,
+    containerRef: dialogRef,
+    initialFocusRef: closeButtonRef,
+  });
 
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 overflow-y-auto">
+    <div className="fixed inset-0 z-50 flex items-end justify-center pb-[env(safe-area-inset-bottom)] md:items-center md:p-4">
       {/* Backdrop */}
       <div
+        aria-hidden="true"
         className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs transition-opacity"
         onClick={onClose}
       />
 
-      {/* Modal Card */}
+      {/* Dialog: a bottom sheet below md, a centred card above it. */}
       <div
-        className={`relative w-full ${maxWidth} rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-2xl transition-all my-8 z-10`}
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={title ? titleId : undefined}
+        aria-label={title ? undefined : 'Dialog'}
+        tabIndex={-1}
+        className={`relative z-10 flex max-h-[85dvh] w-full flex-col ${maxWidth} rounded-t-2xl border border-slate-200 bg-white shadow-2xl transition-all md:max-h-[calc(100dvh-4rem)] md:rounded-2xl dark:border-slate-800 dark:bg-slate-900`}
       >
         {/* Header */}
-        <div className="flex items-start justify-between p-5 border-b border-slate-100 dark:border-slate-800">
-          <div>
+        <div className="flex shrink-0 items-start justify-between gap-4 p-5 border-b border-slate-100 dark:border-slate-800">
+          <div className="min-w-0">
             {title && (
-              <h3 className="text-base font-semibold text-slate-900 dark:text-white">
+              <h3
+                id={titleId}
+                className="text-base font-semibold text-slate-900 dark:text-white"
+              >
                 {title}
               </h3>
             )}
@@ -53,19 +61,22 @@ export default function Modal({
             )}
           </div>
           <button
+            ref={closeButtonRef}
+            type="button"
             onClick={onClose}
-            className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-600 dark:hover:text-slate-200 transition-colors cursor-pointer"
+            aria-label="Close"
+            className="relative shrink-0 rounded-lg p-1.5 text-slate-400 transition-colors after:absolute after:-inset-2 after:content-[''] hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer"
           >
             <X className="h-4 w-4" />
           </button>
         </div>
 
         {/* Body */}
-        <div className="p-5">{children}</div>
+        <div className="min-h-0 flex-1 overflow-y-auto p-5">{children}</div>
 
         {/* Footer */}
         {footer && (
-          <div className="flex items-center justify-end gap-2.5 px-5 py-4 border-t border-slate-100 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 rounded-b-2xl">
+          <div className="flex shrink-0 items-center justify-end gap-2.5 px-5 py-4 border-t border-slate-100 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 md:rounded-b-2xl">
             {footer}
           </div>
         )}
