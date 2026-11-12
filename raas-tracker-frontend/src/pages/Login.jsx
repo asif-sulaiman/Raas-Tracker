@@ -85,7 +85,7 @@ export default function Login() {
   };
 
   return (
-    <div className="flex items-center justify-center min-h-screen bg-slate-100 dark:bg-slate-950 p-4">
+    <div className="flex items-center justify-center min-h-dvh bg-slate-100 dark:bg-slate-950 p-4">
       <div className="w-full max-w-sm rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 shadow-xl">
         <div className="flex justify-center mb-4">
           <BrandLogo size="h-16 w-16" className="rounded-2xl" />

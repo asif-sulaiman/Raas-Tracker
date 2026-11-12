@@ -179,21 +179,28 @@ mobile address bar. `index.html` lacks `viewport-fit=cover`, `theme-color`,
 new `public/manifest.json`, new `public/icons/icon-192.png`, `icon-512.png`, `apple-touch-icon.png`.
 
 **Approach.**
-- `h-screen` → `h-dvh` at all 9 sites.
+- `h-screen` / `min-h-screen` → `h-dvh` / `min-h-dvh` at all 9 sites.
 - `index.html`: `viewport` → `width=device-width, initial-scale=1, viewport-fit=cover`;
-  add `theme-color`, `link rel="manifest"`, `link rel="apple-touch-icon"`.
-- `Layout` main area: `pb-[env(safe-area-inset-bottom)]`.
+  add `theme-color` (light + dark), `link rel="manifest"`, `link rel="apple-touch-icon"`.
+- `Layout` main area: `pb-[calc(1.5rem+env(safe-area-inset-bottom))]` — the plain
+  `pb-[env(...)]` would override `p-6`'s bottom padding and drop the 24 px gutter
+  on desktop; the `calc` keeps it and adds the inset.
 - `manifest.json`: name/short_name/`start_url:"/"`, `display:"standalone"`,
   `theme_color`/`background_color`, icons 192/512.
-- Icons: downscale `public/raas-logo.png` (already PNG, 32 KB) to 192/512/180.
-  No SVG conversion needed.
+- Icons: `scripts/make_pwa_icons.py` resizes `public/raas-logo.png` (384 px RGBA) to
+  192/512/180. The apple-touch-icon is composited onto white (iOS paints
+  transparency black). Pillow comes with the backend requirements (pdfplumber).
+- **Tests.** New `src/mobileViewport.test.js`: no fixed screen-height class in `src`,
+  the document head declarations, the manifest contract, and the declared icon
+  dimensions read from the PNG headers. `Layout.test.jsx` pins the safe-area class.
 - **Deploy step:** `npx vite build` then copy `dist/` → `react_frontend/`
   (AGENTS.md build step; CI does not do this). Without it production keeps serving
   the old shell and the manifest 404s.
 
 **Gate.** `npx vite build` · `npx oxlint` · serve Flask and confirm
 `/manifest.json` + `/icons/icon-192.png` return 200 · Lighthouse mobile
-(Accessibility ≥90, Best Practices ≥90, installable).
+(Accessibility ≥90, Best Practices ≥90) · installable (CDP
+`Page.getInstallabilityErrors` is empty; Lighthouse 12 dropped the PWA category).
 
 ---
 

@@ -31,7 +31,7 @@ export default function ProtectedRoute() {
 
   if (loading || (!user && setupNeeded === null)) {
     return (
-      <div className="flex items-center justify-center h-screen text-sm text-slate-500">
+      <div className="flex items-center justify-center h-dvh text-sm text-slate-500">
         Loading…
       </div>
     );

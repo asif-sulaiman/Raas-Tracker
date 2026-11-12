@@ -9,7 +9,7 @@ import ErrorBoundary from './components/ui/ErrorBoundary.jsx'
 // oxlint-disable-next-line react/only-export-components
 function GlobalFallback() {
   return (
-    <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-slate-950 p-6">
+    <div className="min-h-dvh flex items-center justify-center bg-slate-50 dark:bg-slate-950 p-6">
       <div className="max-w-md w-full rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 text-center shadow-xl" role="alert">
         <p className="text-lg font-bold text-slate-900 dark:text-white">RAAS Tracker ran into a problem</p>
         <p className="text-sm text-slate-500 dark:text-slate-400 mt-2">
