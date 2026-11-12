@@ -29,15 +29,15 @@ scroll, dvh == visible height, sheet flush with the bottom edge) · Flask serves
 `/manifest.json` + the 3 icons with 200 · Chrome reports no installability errors ·
 Lighthouse mobile accessibility 0.92 / best-practices 1.00.
 
+**Closed since the mobile pass.** The load-induced test flakes (PR #23: Testing Library's
+async budget 5 s, vitest's per-test timeout 15 s, pinned by `src/testBudget.test.js`) · the
+Recipes dense-table icon buttons (PR #24: the shared 44x44 target plus a 12 px gap, so the
+destructive control cannot overlap its neighbour) · the login page's labels, `main`
+landmark and meta description (PR #24: Lighthouse now 1.00 / 1.00 / 1.00, no failing audit).
+
 **Still open (ranked):**
-1. The load-induced test flakes are closed (PR #23): Testing Library's async assertion
-   budget is 5 s, vitest's per-test timeout 15 s, and `src/testBudget.test.js` pins both.
-   A state change that never arrives still fails.
-2. Recipes' dense-table icon buttons stay 26 px — needs a row menu, not a wider tap.
-3. Login page: no field labels, no `main` landmark, no meta description (Lighthouse a11y
-   0.92 / SEO 0.80). A small accessibility slice closes it.
-4. `react_frontend/` is gitignored: copy `dist/` there or production serves the old shell.
-5. **Phase PI-DEMOS task #10** — the full-suite gate, pyright and the browser flow for the
+1. `react_frontend/` is gitignored: copy `dist/` there or production serves the old shell.
+2. **Phase PI-DEMOS task #10** — the full-suite gate, pyright and the browser flow for the
    PI-demo slice were never run (`docs/plan.md`, last section).
 
 **Decisions a future session should not re-litigate:** one shared centred 44x44
