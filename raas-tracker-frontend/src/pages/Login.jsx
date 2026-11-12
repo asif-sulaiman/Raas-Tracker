@@ -85,7 +85,7 @@ export default function Login() {
   };
 
   return (
-    <div className="flex items-center justify-center min-h-dvh bg-slate-100 dark:bg-slate-950 p-4">
+    <main className="flex items-center justify-center min-h-dvh bg-slate-100 dark:bg-slate-950 p-4">
       <div className="w-full max-w-sm rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 shadow-xl">
         <div className="flex justify-center mb-4">
           <BrandLogo size="h-16 w-16" className="rounded-2xl" />
@@ -103,12 +103,12 @@ export default function Login() {
 
         <form onSubmit={handleSubmit} className="space-y-3">
           <div>
-            <label className="text-xs font-medium text-slate-600 dark:text-slate-300">Username</label>
-            <input value={username} onChange={(e) => setUsername(e.target.value)} className={inputCls} autoComplete="username" autoFocus />
+            <label htmlFor="login-username" className="text-xs font-medium text-slate-600 dark:text-slate-300">Username</label>
+            <input id="login-username" value={username} onChange={(e) => setUsername(e.target.value)} className={inputCls} autoComplete="username" autoFocus />
           </div>
           <div>
-            <label className="text-xs font-medium text-slate-600 dark:text-slate-300">Password</label>
-            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} className={inputCls} autoComplete="current-password" />
+            <label htmlFor="login-password" className="text-xs font-medium text-slate-600 dark:text-slate-300">Password</label>
+            <input id="login-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} className={inputCls} autoComplete="current-password" />
           </div>
           {error && (
             <p className="flex items-center gap-1.5 text-xs font-medium text-rose-600 dark:text-rose-400">
@@ -151,8 +151,8 @@ export default function Login() {
         ) : (
           <form onSubmit={handleForgot} className="space-y-3">
             <div>
-              <label className="text-xs font-medium text-slate-600 dark:text-slate-300">Username</label>
-              <input
+              <label htmlFor="forgot-username" className="text-xs font-medium text-slate-600 dark:text-slate-300">Username</label>
+              <input id="forgot-username"
                 value={forgotName}
                 onChange={(e) => setForgotName(e.target.value)}
                 className={inputCls}
@@ -172,6 +172,6 @@ export default function Login() {
           </form>
         )}
       </Modal>
-    </div>
+    </main>
   );
 }

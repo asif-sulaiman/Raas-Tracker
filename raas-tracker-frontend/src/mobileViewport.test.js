@@ -71,6 +71,10 @@ describe('document head', () => {
     expect(html).toContain('viewport-fit=cover');
   });
 
+  it('declares a meta description for search engines and link previews', () => {
+    expect(html).toMatch(/<meta name="description" content="[^"]{20,}"/);
+  });
+
   it('declares a theme colour, a manifest and an apple touch icon', () => {
     expect(html).toMatch(/<meta name="theme-color"[^>]*content="#[0-9a-f]{6}"/i);
     expect(html).toMatch(/<link rel="manifest" href="\/manifest\.json"/);

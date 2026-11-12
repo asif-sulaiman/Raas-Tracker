@@ -60,7 +60,7 @@ export default function ChangePassword() {
   };
 
   return (
-    <div className="flex items-center justify-center min-h-dvh bg-slate-100 dark:bg-slate-950 p-4">
+    <main className="flex items-center justify-center min-h-dvh bg-slate-100 dark:bg-slate-950 p-4">
       <div className="w-full max-w-sm rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 shadow-xl">
         <h2 className="text-xl font-bold text-slate-900 dark:text-white flex items-center gap-2">
           <KeyRound className="h-5 w-5 text-blue-600" /> Change password
@@ -73,8 +73,8 @@ export default function ChangePassword() {
 
         <form onSubmit={handleSubmit} className="space-y-3">
           <div>
-            <label className="text-xs font-medium text-slate-600 dark:text-slate-300">Current password</label>
-            <input
+            <label htmlFor="change-current-password" className="text-xs font-medium text-slate-600 dark:text-slate-300">Current password</label>
+            <input id="change-current-password"
               type="password"
               value={current}
               onChange={(e) => setCurrent(e.target.value)}
@@ -84,8 +84,8 @@ export default function ChangePassword() {
             />
           </div>
           <div>
-            <label className="text-xs font-medium text-slate-600 dark:text-slate-300">New password (min 8 characters)</label>
-            <input
+            <label htmlFor="change-new-password" className="text-xs font-medium text-slate-600 dark:text-slate-300">New password (min 8 characters)</label>
+            <input id="change-new-password"
               type="password"
               value={next}
               onChange={(e) => setNext(e.target.value)}
@@ -94,8 +94,8 @@ export default function ChangePassword() {
             />
           </div>
           <div>
-            <label className="text-xs font-medium text-slate-600 dark:text-slate-300">Confirm new password</label>
-            <input
+            <label htmlFor="change-confirm-password" className="text-xs font-medium text-slate-600 dark:text-slate-300">Confirm new password</label>
+            <input id="change-confirm-password"
               type="password"
               value={confirm}
               onChange={(e) => setConfirm(e.target.value)}
@@ -121,6 +121,6 @@ export default function ChangePassword() {
           </p>
         )}
       </div>
-    </div>
+    </main>
   );
 }
