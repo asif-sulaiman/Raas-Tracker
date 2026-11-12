@@ -42,19 +42,21 @@ catalog, the draft saved, the demo activated, and the Chemical Stock forecast sh
 demand it created).
 
 **Production.** The live app is `https://raastracker-omega.vercel.app` - the project's
-verified custom domain, and the only alias that answers publicly. The URL on record,
+production alias (a Vercel-provided `*.vercel.app` domain, not a DNS name anyone owns),
+and the only alias that answers publicly. The URL on record,
 `https://chemcalc-omega.vercel.app/`, answers `404 DEPLOYMENT_NOT_FOUND`: that alias no
-longer exists (the Vercel project is `raastracker`, and its domain is `raastracker-omega`).
-The deployment and branch URLs (`raastracker-git-main-...`,
+longer exists (the Vercel project is `raastracker`, and its production alias is
+`raastracker-omega`). The deployment and branch URLs (`raastracker-git-main-...`,
 `raastracker-asifsulaiman95-9156s-projects.vercel.app`) sit behind Vercel Authentication;
-the custom domain does not. It serves the SPA, `/manifest.json` (200, `application/json`)
+the production alias does not. It serves the SPA, `/manifest.json` (200, `application/json`)
 and the icons (200, `image/png`), and Chrome's installability check on the live site reports
 **no errors** - the app is installable, which was the point of the mobile pass. Checked on
 2026-11-12 against the production deployment for
 `0528b40e040f39e11a485241bd3e27cd1ea8bfef`, which Vercel reported as READY and PROMOTED.
 The Vercel project is `raastracker` (`prj_26v9jiAIykiYyuSuGmo8rNEJHB50`) in the scope
-`asifsulaiman95-9156s-projects`; every merge on `main` auto-deploys to production, and
-the `raastracker-omega.vercel.app` domain is the alias that carries the traffic.
+`asifsulaiman95-9156s-projects`; every merge on `main` auto-deploys to production (other
+branches get a preview deployment), and the `raastracker-omega.vercel.app` production
+alias is the one that carries the traffic.
 
 **Known limitations, not work items.**
 1. The Recipes dense-table delete buttons keep their 26 px target on purpose: a 44 px target
