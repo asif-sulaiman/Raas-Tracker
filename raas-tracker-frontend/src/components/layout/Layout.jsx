@@ -23,7 +23,7 @@ export default function Layout() {
   }
 
   return (
-    <div className="flex h-screen bg-gray-50 dark:bg-gray-900">
+    <div className="flex h-dvh bg-gray-50 dark:bg-gray-900">
       <Sidebar
         open={mobileOpen}
         collapsed={desktopCollapsed}
@@ -35,7 +35,7 @@ export default function Layout() {
           navigationOpen={mobileOpen}
           onOpenNavigation={() => setMobileOpen(true)}
         />
-        <main className="flex-1 overflow-auto p-6">
+        <main className="flex-1 overflow-auto p-6 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
           <Outlet />
         </main>
       </div>

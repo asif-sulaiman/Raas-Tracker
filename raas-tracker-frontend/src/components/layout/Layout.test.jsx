@@ -122,6 +122,12 @@ describe('mobile navigation drawer', () => {
 });
 
 describe('touch targets', () => {
+  it('reserves the safe-area inset under the main area', () => {
+    renderShell();
+    expect(screen.getByRole('main').className)
+      .toContain('pb-[calc(1.5rem+env(safe-area-inset-bottom))]');
+  });
+
   it('gives the menu button and the rail toggle the shared 44px hit area', () => {
     renderShell();
     expect(menuButton().className).toContain(ICON_HIT_AREA);
