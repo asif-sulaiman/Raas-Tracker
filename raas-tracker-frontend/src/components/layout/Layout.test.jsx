@@ -6,6 +6,7 @@ import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import { AuthProvider } from '../../context/AuthContext';
 import { NotificationProvider } from '../../context/NotificationContext';
 import Layout from './Layout.jsx';
+import { ICON_HIT_AREA } from '../ui/Button.jsx';
 
 afterEach(() => {
   cleanup();
@@ -117,6 +118,23 @@ describe('mobile navigation drawer', () => {
     return screen.findByText('home marker').then(() => {
       expect(drawer()).toBeNull();
     });
+  });
+});
+
+describe('touch targets', () => {
+  it('gives the menu button and the rail toggle the shared 44px hit area', () => {
+    renderShell();
+    expect(menuButton().className).toContain(ICON_HIT_AREA);
+    const shell = screen.getByRole('complementary');
+    expect(within(shell).getByRole('button', { name: 'Collapse navigation' }).className)
+      .toContain(ICON_HIT_AREA);
+  });
+
+  it('gives the drawer close control the shared 44px hit area', () => {
+    renderShell();
+    fireEvent.click(menuButton());
+    expect(within(drawer()).getByRole('button', { name: 'Close menu' }).className)
+      .toContain(ICON_HIT_AREA);
   });
 });
 

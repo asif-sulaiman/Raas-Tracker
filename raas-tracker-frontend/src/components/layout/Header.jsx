@@ -3,6 +3,7 @@ import { Menu, User, LogOut, KeyRound } from 'lucide-react';
 import Badge from '../ui/Badge';
 import NotificationBell from '../notifications/NotificationBell';
 import BrandLogo from '../BrandLogo';
+import { ICON_HIT_AREA } from '../ui/Button';
 import { useAuth } from '../../context/AuthContext';
 
 export default function Header({ onOpenNavigation, navigationOpen = false }) {
@@ -19,7 +20,7 @@ export default function Header({ onOpenNavigation, navigationOpen = false }) {
             aria-label="Open navigation"
             aria-expanded={navigationOpen}
             aria-controls="app-sidebar"
-            className="lg:hidden -ml-2 p-2 rounded-lg hover:bg-gray-100 text-gray-500"
+            className={`lg:hidden -ml-2 p-2 rounded-lg hover:bg-gray-100 text-gray-500 ${ICON_HIT_AREA}`}
           >
             <Menu size={20} />
           </button>
@@ -56,14 +57,14 @@ export default function Header({ onOpenNavigation, navigationOpen = false }) {
           )}
           <Link
             to="/change-password"
-            className="p-2 rounded-lg hover:bg-gray-100 text-gray-500 hover:text-blue-600 transition-colors"
+            className={`p-2 rounded-lg hover:bg-gray-100 text-gray-500 hover:text-blue-600 transition-colors ${ICON_HIT_AREA}`}
             title="Change password"
           >
             <KeyRound size={18} />
           </Link>
           <button
             onClick={logout}
-            className="p-2 rounded-lg hover:bg-gray-100 text-gray-500 hover:text-rose-600 transition-colors cursor-pointer"
+            className={`p-2 rounded-lg hover:bg-gray-100 text-gray-500 hover:text-rose-600 transition-colors cursor-pointer ${ICON_HIT_AREA}`}
             title="Log out"
           >
             <LogOut size={18} />

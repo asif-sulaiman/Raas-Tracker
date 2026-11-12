@@ -16,6 +16,7 @@ import { useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { useDialogLayer } from '../../hooks/useDialogLayer';
 import BrandLogo from '../BrandLogo';
+import { ICON_HIT_AREA } from '../ui/Button';
 
 const navItems = [
   { path: '/', label: 'Home', icon: Home },
@@ -101,7 +102,7 @@ export default function Sidebar({
             onClick={onToggleCollapse}
             aria-label={collapsed ? 'Expand navigation' : 'Collapse navigation'}
             aria-expanded={!collapsed}
-            className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400"
+            className={`p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400 ${ICON_HIT_AREA}`}
           >
             {collapsed ? <Menu size={20} /> : <X size={20} />}
           </button>
@@ -149,7 +150,7 @@ export default function Sidebar({
                 type="button"
                 aria-label="Close menu"
                 onClick={onClose}
-                className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400"
+                className={`p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400 ${ICON_HIT_AREA}`}
               >
                 <X size={20} />
               </button>
