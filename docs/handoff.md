@@ -11,11 +11,12 @@ The mobile fix plan (`MOBILE_FIX_PLAN.md`) shipped in full: seven slices, one co
 every slice starting from a failing test. The phase record is `docs/plan.md` § Phase
 MOBILE-UX; the plan file itself carries a status line.
 
-**Commits (all on `main`, not pushed as of this handoff):**
-`09e6b6e` M-0 plan · `76d5d42`+`c74b0bc` M-1 drawer/rail · `c7d7328` M-2 input zoom ·
-`6b55764` M-3 dialog semantics · `7eb3960` M-4 tables · `7a6537a` M-5 touch targets ·
-`c01ad08` M-6 viewport/PWA · `75649ac`+`d841456` final-review fixes ·
-`2a392da` + the docs commit for this close-out.
+**Commits (landed on `main` via PR #21, rebase-merged as `d6e1075`, CI green):**
+`0493ec5` M-0 plan · `75fb7b7`+`063e3b9` M-1 drawer/rail · `21ad527` M-2 input zoom ·
+`1c242d7` M-3 dialog semantics · `a5d2b13` M-4 tables · `8b5039f` M-5 touch targets ·
+`301a2cd` M-6 viewport/PWA · `0986aeb`+`4502eec` final-review fixes ·
+`ede0582` local config · the docs commit. Branch `feat/mobile-ux-pass`; both required
+checks (backend, frontend) green before the merge, and the CI run on `main` green after it.
 
 **What a user gets now:** a reachable navigation drawer on a phone, forms that do not make
 iOS zoom, modals that are real dialogs (focus trap, Escape, body lock) and read as bottom
@@ -29,7 +30,9 @@ scroll, dvh == visible height, sheet flush with the bottom edge) · Flask serves
 Lighthouse mobile accessibility 0.92 / best-practices 1.00.
 
 **Still open (ranked):**
-1. Full-suite load makes the 5 s-timeout tests flake (Recipes focus, Reports pagination).
+1. The load-induced test flakes are closed (PR #23): Testing Library's async assertion
+   budget is 5 s, vitest's per-test timeout 15 s, and `src/testBudget.test.js` pins both.
+   A state change that never arrives still fails.
 2. Recipes' dense-table icon buttons stay 26 px — needs a row menu, not a wider tap.
 3. Login page: no field labels, no `main` landmark, no meta description (Lighthouse a11y
    0.92 / SEO 0.80). A small accessibility slice closes it.
