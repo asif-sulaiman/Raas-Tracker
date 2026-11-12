@@ -326,6 +326,7 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, onSaved })
                 </p>
               ) : null}
               <div className="rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden">
+                <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="bg-slate-50 dark:bg-slate-800/60 text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">
@@ -446,6 +447,7 @@ export default function ProductionRunModal({ isOpen, onClose, recipe, onSaved })
                     })}
                   </tbody>
                 </table>
+                </div>
               </div>
               {producedOut.length > 0 && (
                 <p className="mt-1.5 text-[11px] text-slate-400 dark:text-slate-500">
