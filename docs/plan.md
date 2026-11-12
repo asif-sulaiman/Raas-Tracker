@@ -2337,8 +2337,23 @@ scrolls.
    accessibility 1.00, best-practices 1.00 and SEO 1.00 with no failing audit.
 
 **Still open.**
-1. `react_frontend/` is gitignored and drifts unless `dist/` is copied after every build.
-   Vercel's build command does it in production; a local Flask serve needs the copy.
+1. `react_frontend/` is gitignored, so a local Flask serve is stale until the
+   build is published. `python scripts/build_frontend.py` now builds and publishes in one
+   step, replacing the previous hashed assets; Vercel's build command does the same copy
+   in production.
+
+**Small findings from the review, and where they stand.**
+- The dialog layer keeps its open-layer stack in module scope, so the app must mount one
+  React root. `src/rootInvariant.test.js` pins that now, instead of leaving it as an
+  assumption in a comment.
+- `Button` treats a child that renders nothing as no child, but a rendered "0" is text: a
+  button showing "0" is not an icon-only control and does not get the 44 px target.
+- The drawer is named with `aria-label="Navigation"` rather than `aria-labelledby`: it
+  carries no heading element to point at, and a descriptive aria-label is a valid
+  accessible name.
+- The viewport invariant test assembles the legacy class name from parts on purpose, so
+  Tailwind's content scanner does not re-emit that dead utility into the production
+  stylesheet.
 
 ---
 
