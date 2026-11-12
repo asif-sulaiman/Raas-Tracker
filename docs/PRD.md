@@ -21,7 +21,7 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 - Multi-warehouse/location tracking (single warehouse assumed)
 - Batch/lot-level traceability (chemical-level only)
 - Real-time IoT sensor integration
-- Mobile app (responsive web is sufficient)
+- Mobile native app (the responsive web app, installable as a PWA, is sufficient)
 
 ## 3. Target Users
 
@@ -241,7 +241,9 @@ RAAS Tracker is a web-based application for chemical warehouse/factory inventory
 ## 8. Non-functional Requirements
 
 - **Performance:** API response < 500ms (p95), page load < 3s
-- **Mobile Responsive:** Tailwind CSS + mobile-first
+- **Mobile Responsive:** Tailwind CSS + mobile-first. Installable as a PWA (manifest +
+  icons), dynamic viewport so the address bar never cuts the app, safe-area insets
+  respected, and icon-only controls with a 44 px touch target (2026-11-12)
 - **Security:** bcrypt-13 (SHA-256 pre-hash), SHA-256 session/key hashes, parameterized queries, secure headers (CSP, HSTS, X-Frame-Options), CSRF-safe cookies (SameSite=Lax, HttpOnly, Secure)
 - **Accessibility:** Labels, keyboard nav, color contrast
 - **Observability:** Structured logging (`raas` logger), audit logs, notifications

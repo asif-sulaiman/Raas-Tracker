@@ -1,5 +1,9 @@
 # Mobile UX Fix Plan — REVISED (final)
 
+> **Status: complete (2026-11-12).** Slices M-0..M-6 shipped; the phase record lives in
+> `docs/plan.md` under "Phase MOBILE-UX". The slices below are kept as the record of what
+> was approved and built.
+
 Supersedes `O:\Projects\Raas-Tracker\MOBILE_FIX_PLAN.md` (untracked draft).
 Revised 2026-11-11 after verifying every claim against the working tree, the
 CI workflow, and the live database.
