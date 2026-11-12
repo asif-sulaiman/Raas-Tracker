@@ -12,8 +12,9 @@ import {
   Menu,
   X
 } from 'lucide-react';
-import { useEffect, useRef } from 'react';
+import { useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
+import { useDialogLayer } from '../../hooks/useDialogLayer';
 import BrandLogo from '../BrandLogo';
 
 const navItems = [
@@ -35,24 +36,19 @@ export default function Sidebar({
   onToggleCollapse = () => {},
 }) {
   const { user } = useAuth();
+  const panelRef = useRef(null);
   const closeButtonRef = useRef(null);
   const visibleItems = navItems.filter((item) => !item.adminOnly || user?.role === 'admin');
 
-  // Escape closes the drawer — but only while it is actually open, so the
-  // listener cannot swallow Escape meant for a dialog opened later.
-  useEffect(() => {
-    if (!open) return undefined;
-    const handleKeyDown = (event) => {
-      if (event.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [open, onClose]);
-
-  // Move focus into the drawer when it opens so keyboard users land inside it.
-  useEffect(() => {
-    if (open) closeButtonRef.current?.focus();
-  }, [open]);
+  // The drawer is a dialog layer: it shares Escape, the Tab trap, focus
+  // restore and the body scroll lock with Modal so only the topmost layer
+  // reacts when a modal opens over it.
+  useDialogLayer({
+    isOpen: open,
+    onClose,
+    containerRef: panelRef,
+    initialFocusRef: closeButtonRef,
+  });
 
   const renderNav = (railCollapsed, onNavigate) => visibleItems.map((item) => (
     <NavLink
@@ -131,7 +127,11 @@ export default function Sidebar({
             onClick={onClose}
             className="absolute inset-0 h-full w-full bg-black/50"
           />
-          <div className="absolute inset-y-0 left-0 flex w-64 max-w-[80vw] flex-col bg-white dark:bg-gray-800 shadow-xl">
+          <div
+            ref={panelRef}
+            tabIndex={-1}
+            className="absolute inset-y-0 left-0 flex w-64 max-w-[80vw] flex-col bg-white dark:bg-gray-800 shadow-xl"
+          >
             <div className="flex h-16 items-center justify-between px-4 border-b border-gray-200 dark:border-gray-700">
               <Link
                 to="/"

@@ -96,19 +96,24 @@ grepping `type="number"`.
 **Verified problem.** No `role="dialog"` anywhere (0 repo-wide), no `aria-modal`,
 no focus trap, close button ≈28 px, card centred with `my-8`.
 
-**Files.** `src/components/modals/Modal.jsx`, new `src/components/modals/Modal.test.jsx`.
+**Files.** `src/components/modals/Modal.jsx`, new `src/components/modals/Modal.test.jsx`,
+new `src/hooks/useDialogLayer.js` (shared by `Modal` and the mobile drawer),
+`src/components/layout/Sidebar.jsx`, `src/components/layout/Layout.test.jsx`.
 
 **Approach.**
-- Below `md`: bottom sheet (`fixed bottom-0 inset-x-0`, rounded top, `max-h-[85dvh]`, scrollable body).
+- Below `md`: bottom sheet (anchored to the viewport bottom, rounded top,
+  `max-h-[85dvh]`, scrollable body, safe-area bottom padding).
 - `role="dialog"`, `aria-modal="true"`, `aria-labelledby` pointing at the title id.
 - Close button ≥44 px hit area (pseudo-element, so layout doesn't shift), `aria-label="Close"`.
 - Focus trap: Tab/Shift+Tab cycle inside; focus restored to the trigger on close.
-- **Stacking:** modals nest (`ConfirmContext`, `NotificationContext`, detail modals).
-  Track open instances in a module-level stack; only the topmost handles Escape
-  and traps focus. Body `overflow` restored only when the stack empties.
+- **Stacking:** modals nest (`ConfirmContext` over detail modals). Track open layers
+  in a module-level stack in `useDialogLayer`; only the topmost handles Escape and
+  traps focus. Body `overflow` restored only when the stack empties. The M-1 mobile
+  drawer uses the same hook, closing known issue #1.
 
 **Tests (red first).** role/aria attributes; Escape closes; Escape on a covered
-modal does nothing; Tab wraps from last to first; focus restored to trigger.
+modal does nothing; Tab wraps from last to first; focus restored to trigger; drawer
+traps Tab and restores focus.
 
 **Gate.** `npx oxlint` + `npx vitest run`. Manual: open a modal at 390×640 — sheet
 scrolls, close is tappable, background doesn't scroll.
