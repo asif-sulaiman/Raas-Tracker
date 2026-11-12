@@ -52,6 +52,9 @@ and the icons (200, `image/png`), and Chrome's installability check on the live 
 **no errors** - the app is installable, which was the point of the mobile pass. Checked on
 2026-11-12 against the production deployment for
 `0528b40e040f39e11a485241bd3e27cd1ea8bfef`, which Vercel reported as READY and PROMOTED.
+The Vercel project is `raastracker` (`prj_26v9jiAIykiYyuSuGmo8rNEJHB50`) in the scope
+`asifsulaiman95-9156s-projects`; every merge on `main` auto-deploys to production, and
+the `raastracker-omega.vercel.app` domain is the alias that carries the traffic.
 
 **Known limitations, not work items.**
 1. The Recipes dense-table delete buttons keep their 26 px target on purpose: a 44 px target
