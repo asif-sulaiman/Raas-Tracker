@@ -2279,9 +2279,20 @@ so neither new writer can join the pre-existing sale↔invoice inversion.
   coverage report can surface, so a miss is a 404 and an unresolvable figure is
   `null`.
 
-**Verification:** focused set (8 files, 250 cases) green; `ruff check raas_tracker/
-tests/` clean. Full-suite gate, pyright and the browser flow are the remaining
-step (task #10) — this line is not a claim that they have run.
+**Verification (task #10, closed 2026-11-12).** Focused set (8 files, 250 cases) green;
+`ruff check raas_tracker/tests/` clean. The full-suite gate ran green afterwards:
+**1760 passed / 8 skipped** against a real PostgreSQL, `pyright` **0 errors**, `ruff`
+clean.
+
+The browser flow ran against a local stack - Flask on an embedded PostgreSQL, so no
+production data was touched. A PI was opened from the sales board, its demo recipe drafted
+one product per PI line with the PI's own quantity and unit, an ingredient picked from the
+chemical catalog (the automatic water resolved the rest to 100%), the draft saved
+(revision 2, then 3) and the demo activated. The Chemical Stock forecast then carried the
+demand that activation created: Caustic Soda 50% required 125 KG against 100 KG in stock,
+so 25 KG projected to buy; NaOH required 400 KG against 500 KG, so nothing to buy. The
+coverage report named the *other* PI as the one without a plan, which is the distinction
+the whole feature exists to keep.
 
 ---
 
