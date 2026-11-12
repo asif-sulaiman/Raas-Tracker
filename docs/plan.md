@@ -2173,7 +2173,10 @@ When starting any task above:
 
 - **Current branch:** `main` (baseline taken at `8a35c2f`)
 - **Local DB:** `DATABASE_URL` set via `setx` (Supabase pooler, encoded pw)
-- **Vercel Preview:** `https://chemcalc-omega.vercel.app/` — auto-deploys on push
+- **Vercel (live app):** `https://raastracker-omega.vercel.app` — the project's verified
+  custom domain, auto-deploys on push. The older alias `chemcalc-omega.vercel.app`
+  answers `404 DEPLOYMENT_NOT_FOUND`; the deployment and branch URLs sit behind Vercel
+  Authentication, the custom domain does not.
 - **Test DB:** `pgserver` embedded (offline) or `TEST_DATABASE_URL`
 - **Secrets:** `RAAS_SECRET` (local + Vercel), `DATABASE_URL` (local `setx` + Vercel), `PRODUCTION=1` (Vercel)
 - **Password rotation:** Run `setx` locally + update Vercel env → redeploy
