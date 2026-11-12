@@ -57,6 +57,16 @@ describe('dialog semantics', () => {
     expect(currentCloseButton().className).toContain(ICON_HIT_AREA);
   });
 
+  it('reserves the safe-area inset inside the sheet, not on the overlay', () => {
+    render(<Harness initialOpen />);
+    const sheet = screen.getByRole('dialog', { name: 'Test dialog' });
+    // Padding the overlay would lift the sheet off the bottom edge on a
+    // notched phone; the inset belongs to the sheet's own bottom.
+    expect(sheet.className).toContain('pb-[env(safe-area-inset-bottom)]');
+    expect(sheet.className).toContain('md:pb-0');
+    expect(sheet.parentElement.className).not.toContain('env(safe-area-inset-bottom)');
+  });
+
   it('moves focus into the dialog when it opens', () => {
     render(<Harness />);
     openFromTrigger();
