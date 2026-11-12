@@ -38,12 +38,19 @@ the stale `react_frontend/` build (`python scripts/build_frontend.py` now builds
 publishes in one step, replacing the previous hashed assets).
 
 **Still open (ranked):**
-1. **Production deployment** — the Vercel URL on record
-   (`https://chemcalc-omega.vercel.app/`) answers `404 DEPLOYMENT_NOT_FOUND`, and GitHub
-   shows no deployment records for `main`. The build is ready (`python
-   scripts/build_frontend.py` produces the exact bundle, and Vercel's build command copies
-   it into `public/` and `react_frontend/`), but the project itself has to be pointed at
-   the repo again before anything is live.
+1. **The live URL changed, and the app is behind Vercel Authentication.** Production *is*
+   live and *is* deploying: Vercel created a Production deployment for every merge on
+   `main` (the last, `64b29f69`, is `success`). The URL on record,
+   `https://chemcalc-omega.vercel.app/`, answers `404 DEPLOYMENT_NOT_FOUND` - that
+   project/alias no longer exists. The project is `raastracker` under the team
+   `asifsulaiman95-9156s-projects`, so the app is at
+   `https://raastracker-asifsulaiman95-9156s-projects.vercel.app` (the plain
+   `raastracker.vercel.app` alias 404s too). Every path on it - `/`, `/manifest.json`,
+   the icons - answers Vercel's login page to an unauthenticated client, because the
+   deployment is protected. **That also blocks the install prompt:** Chrome fetches the
+   manifest unauthenticated, gets the login page instead of JSON, and refuses to offer
+   "Install". The manifest and icons are correct in the repo; they only become an
+   installable app if the origin serves them without the Vercel password.
 2. **Phase PI-DEMOS task #10** is now closed: the full-suite gate and pyright ran green
    (1760 passed / 8 skipped, 0 errors) and the browser flow was exercised against a local
    stack - a PI drafted, an ingredient picked from the catalog, the draft saved, the demo
