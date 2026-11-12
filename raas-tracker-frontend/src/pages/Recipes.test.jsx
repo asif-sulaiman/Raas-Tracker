@@ -688,9 +688,15 @@ describe('Per-product formulation', () => {
     renderRecipes({ recipes: [RECIPE_ROW] });
     await openRecipeDetail();
 
+    // The action row itself wraps, so Edit / Delete / Go for Production can
+    // stack instead of holding the page wide.
     const actions = screen.getByRole('button', { name: /Go for Production/ }).parentElement;
     expect(actions.className).toContain('flex-wrap');
-    expect(actions.parentElement.className).toContain('flex-wrap');
+
+    // The header row that holds it wraps too, so the title and the back
+    // control give way with it.
+    const header = actions.parentElement;
+    expect(header.className).toContain('flex-wrap');
   });
 
   it('adds an ingredient to a specific product', async () => {

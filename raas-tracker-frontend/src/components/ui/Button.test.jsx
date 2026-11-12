@@ -45,4 +45,16 @@ describe('text buttons', () => {
     const button = screen.getByRole('button', { name: 'Edit' });
     expect(button.className).not.toContain('after:size-11');
   });
+
+  it('treats a child that renders nothing as no child at all', () => {
+    render(<Button icon={Pencil}>{false}</Button>);
+    expect(screen.getByRole('button', { name: '' }).className).toContain(ICON_HIT_AREA);
+  });
+
+  it('does not treat a rendered zero as no child', () => {
+    // "0" is text: the button is not an icon-only control.
+    render(<Button icon={Pencil}>{0}</Button>);
+    expect(screen.getByRole('button', { name: '0' }).className)
+      .not.toContain('after:size-11');
+  });
 });

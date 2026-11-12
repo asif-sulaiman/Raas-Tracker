@@ -30,7 +30,10 @@ export default function Button({
   disabled,
   ...props
 }) {
-  const iconOnly = !children && Boolean(Icon || loading);
+  // A child that renders nothing (null, undefined, false, an empty string)
+  // leaves the button icon-only; a child that renders text does not - "0" is
+  // text, and a button showing "0" is not an icon-only control.
+  const iconOnly = !children && children !== 0 && Boolean(Icon || loading);
 
   return (
     <button

@@ -18,7 +18,9 @@ Flask 3 + psycopg3 backend, React 19/Vite/Tailwind 4 frontend, PostgreSQL (Supab
 - **Backend types:** `python -m pyright` (0 errors; warnings are the known baseline)
 - **Frontend tests:** `cd raas-tracker-frontend && npm test`
 - **Lint:** `cd raas-tracker-frontend && npx oxlint`
-- **Build:** `cd raas-tracker-frontend && npx vite build` (then copy `dist/` → `react_frontend/`)
+- **Build:** `python scripts/build_frontend.py` (builds the frontend and publishes
+  `dist/` -> `react_frontend/`, replacing the previous hashed assets; a local Flask
+  serve is stale until it runs. `cd raas-tracker-frontend && npm run build` builds only)
 - **Full gate:** pytest + ruff + pyright + vitest + oxlint + vite build
 - **Production:** `waitress-serve --host=0.0.0.0 --port=$PORT --threads=4 wsgi:app`
 - **Launch (Windows):** `start_flask.bat` — refuses to start without `DATABASE_URL`

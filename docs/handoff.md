@@ -33,12 +33,14 @@ Lighthouse mobile accessibility 0.92 / best-practices 1.00.
 async budget 5 s, vitest's per-test timeout 15 s, pinned by `src/testBudget.test.js`) · the
 Recipes dense-table icon buttons (PR #24: the shared 44x44 target plus a 12 px gap, so the
 destructive control cannot overlap its neighbour) · the login page's labels, `main`
-landmark and meta description (PR #24: Lighthouse now 1.00 / 1.00 / 1.00, no failing audit).
+landmark and meta description (PR #24: Lighthouse now 1.00 / 1.00 / 1.00, no failing audit) ·
+the stale `react_frontend/` build (`python scripts/build_frontend.py` now builds and
+publishes in one step, replacing the previous hashed assets).
 
 **Still open (ranked):**
-1. `react_frontend/` is gitignored: copy `dist/` there or production serves the old shell.
-2. **Phase PI-DEMOS task #10** — the full-suite gate, pyright and the browser flow for the
-   PI-demo slice were never run (`docs/plan.md`, last section).
+1. **Phase PI-DEMOS task #10** — the full-suite gate and pyright have run green (1760
+   passed / 8 skipped, 0 errors), but the **browser flow** for the PI-demo slice has not
+   been exercised in a real browser (`docs/plan.md`, last section).
 
 **Decisions a future session should not re-litigate:** one shared centred 44x44
 pseudo-element for hit areas (not per-control insets); `Button` auto-detects icon-only;
