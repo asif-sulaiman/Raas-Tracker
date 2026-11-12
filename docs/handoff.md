@@ -35,27 +35,30 @@ Recipes dense-table icon buttons (PR #24: the shared 44x44 target plus a 12 px g
 destructive control cannot overlap its neighbour) · the login page's labels, `main`
 landmark and meta description (PR #24: Lighthouse now 1.00 / 1.00 / 1.00, no failing audit) ·
 the stale `react_frontend/` build (`python scripts/build_frontend.py` now builds and
-publishes in one step, replacing the previous hashed assets).
+publishes in one step, replacing the previous hashed assets) · Phase PI-DEMOS task #10
+(PR #26: the full-suite gate and pyright green - 1760 passed / 8 skipped, 0 errors - and the
+browser flow exercised against a local stack: a PI drafted, an ingredient picked from the
+catalog, the draft saved, the demo activated, and the Chemical Stock forecast showing the
+demand it created).
 
-**Still open (ranked):**
-1. **The live URL changed, and the app is behind Vercel Authentication.** Production *is*
-   live and *is* deploying: Vercel created a Production deployment for every merge on
-   `main` (the last, `64b29f69`, is `success`). The URL on record,
-   `https://chemcalc-omega.vercel.app/`, answers `404 DEPLOYMENT_NOT_FOUND` - that
-   project/alias no longer exists. The project is `raastracker` under the team
-   `asifsulaiman95-9156s-projects`, so the app is at
-   `https://raastracker-asifsulaiman95-9156s-projects.vercel.app` (the plain
-   `raastracker.vercel.app` alias 404s too). Every path on it - `/`, `/manifest.json`,
-   the icons - answers Vercel's login page to an unauthenticated client, because the
-   deployment is protected. **That also blocks the install prompt:** Chrome fetches the
-   manifest unauthenticated, gets the login page instead of JSON, and refuses to offer
-   "Install". The manifest and icons are correct in the repo; they only become an
-   installable app if the origin serves them without the Vercel password.
-2. **Phase PI-DEMOS task #10** is now closed: the full-suite gate and pyright ran green
-   (1760 passed / 8 skipped, 0 errors) and the browser flow was exercised against a local
-   stack - a PI drafted, an ingredient picked from the catalog, the draft saved, the demo
-   activated, and the Chemical Stock forecast showing the demand it created
-   (`docs/plan.md`, Phase PI-DEMOS).
+**Production.** The live app is `https://raastracker-omega.vercel.app` - the project's
+verified custom domain, and the only alias that answers publicly. The URL on record,
+`https://chemcalc-omega.vercel.app/`, answers `404 DEPLOYMENT_NOT_FOUND`: that alias no
+longer exists (the Vercel project is `raastracker`, and its domain is `raastracker-omega`).
+The deployment and branch URLs (`raastracker-git-main-...`,
+`raastracker-asifsulaiman95-9156s-projects.vercel.app`) sit behind Vercel Authentication;
+the custom domain does not. It serves the SPA, `/manifest.json` (200, `application/json`)
+and the icons (200, `image/png`), and Chrome's installability check on the live site reports
+**no errors** - the app is installable, which was the point of the mobile pass. Checked on
+2026-11-12 against the production deployment for
+`0528b40e040f39e11a485241bd3e27cd1ea8bfef`, which Vercel reported as READY and PROMOTED.
+
+**Known limitations, not work items.**
+1. The Recipes dense-table delete buttons keep their 26 px target on purpose: a 44 px target
+   there would overlap the neighbouring row, and the delete is behind a confirmation dialog.
+2. `react_frontend/` is gitignored, so a local Flask serve needs
+   `python scripts/build_frontend.py` to be current. Vercel's build command does the same
+   copy in production.
 
 **Decisions a future session should not re-litigate:** one shared centred 44x44
 pseudo-element for hit areas (not per-control insets); `Button` auto-detects icon-only;
