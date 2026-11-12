@@ -13,7 +13,7 @@ import {
   Factory
 } from 'lucide-react';
 import clsx from 'clsx';
-import Button from '../components/ui/Button';
+import Button, { ICON_HIT_AREA } from '../components/ui/Button';
 import Badge from '../components/ui/Badge';
 import EntityCombobox from '../components/ui/EntityCombobox';
 import Modal from '../components/modals/Modal';
@@ -586,7 +586,7 @@ function ProductFormulationCard({
                   <button
                     aria-label={`Remove ${item.chemical_name} from ${product.product_name}`}
                     onClick={() => onDelete(product, item)}
-                    className="p-1.5 rounded-md text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors cursor-pointer"
+                    className={`p-1.5 rounded-md text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors cursor-pointer ${ICON_HIT_AREA}`}
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>
@@ -1323,7 +1323,7 @@ export default function Recipes() {
           <button
             aria-label="Back to recipes"
             onClick={() => { setShowDetail(false); setSelectedRecipe(null); setDetailProducts([]); setCarriedLine(null); setLoading(true); fetchData(); }}
-            className="p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+            className={`p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer ${ICON_HIT_AREA}`}
           >
             <ArrowLeft className="h-5 w-5 text-slate-600 dark:text-slate-400" />
           </button>
@@ -1522,7 +1522,7 @@ export default function Recipes() {
                 </td>
                 <td className="px-4 py-3 text-slate-500 dark:text-slate-400 text-xs">{recipe.created || '—'}</td>
                 <td className="px-4 py-3">
-                  <div className="flex items-center justify-end gap-1.5">
+                  <div className="flex items-center justify-end gap-3">
                     <Button variant="ghost" size="sm" icon={Eye} onClick={() => fetchRecipeDetail(recipe)}>
                       View
                     </Button>
@@ -1530,7 +1530,7 @@ export default function Recipes() {
                       <button
                         aria-label={`Delete recipe ${recipe.name}`}
                         onClick={() => handleDelete(recipe)}
-                        className="p-1.5 rounded-md text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors cursor-pointer"
+                        className={`p-1.5 rounded-md text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors cursor-pointer ${ICON_HIT_AREA}`}
                         title="Delete recipe"
                       >
                         <Trash2 className="h-3.5 w-3.5" />
