@@ -9,6 +9,7 @@ import { AuthProvider } from '../context/AuthContext';
 import { ConfirmProvider } from '../context/ConfirmContext';
 import { toast } from 'sonner';
 import Recipes from './Recipes';
+import { ICON_HIT_AREA } from '../components/ui/Button';
 
 vi.mock('sonner', () => {
   const toastFn = Object.assign(vi.fn(), {
@@ -628,6 +629,39 @@ describe('Recipe detail lookup', () => {
       called(fetchMock,
         '/api/recipes/PI-2026-014%20%C2%B7%20INV-014?company_id=7')
     ).toBe(true));
+  });
+});
+
+describe('icon-only touch targets', () => {
+  it('gives the recipe row delete control a 44px target and keeps it clear of the row action beside it', async () => {
+    renderRecipes({ recipes: [RECIPE_ROW] });
+
+    const remove = await screen.findByRole('button', { name: /Delete recipe/ });
+    expect(remove.className).toContain(ICON_HIT_AREA);
+
+    // The shared target is centred and 44px wide, so a 26px control grows 9px
+    // each way. The row actions need more than 9px between them, or the
+    // destructive button would swallow a strip of its neighbour.
+    const actions = remove.parentElement;
+    expect(actions.className).toContain('gap-3');
+    expect(actions.className).not.toContain('gap-1.5');
+  });
+
+  it('gives the ingredient remove control a 44px target', async () => {
+    renderRecipes({ recipes: [RECIPE_ROW] });
+    await openRecipeDetail();
+
+    const remove = within(card('Caustic Soda 50%'))
+      .getByRole('button', { name: 'Remove NaOH from Caustic Soda 50%' });
+    expect(remove.className).toContain(ICON_HIT_AREA);
+  });
+
+  it('gives the back control a 44px target', async () => {
+    renderRecipes({ recipes: [RECIPE_ROW] });
+    await openRecipeDetail();
+
+    expect(screen.getByRole('button', { name: 'Back to recipes' }).className)
+      .toContain(ICON_HIT_AREA);
   });
 });
 
