@@ -2308,14 +2308,22 @@ height, and the modal sheet sits flush with the bottom edge. Flask serves `/mani
 and the three icons with 200; Chrome reports no installability errors; Lighthouse mobile:
 accessibility 0.92, best-practices 1.00.
 
+**How it landed.** PR #21 (branch `feat/mobile-ux-pass`), rebase-merged into `main` as
+`d6e1075`; PR #23 (`fix/ci-async-budget`) followed as `2a14b09` to close the load-induced
+test flakes. `main` is a protected branch: changes go through a pull request and both
+required checks - the CI workflow's `backend` and `frontend` jobs - must be green. Both
+were green before each merge, and the CI run on `main` was green after it.
+
 **Deliberately not done.** B-1 (`CURRENT_DATE` -> UTC: the DB is already UTC) and B-2
 (`auth.py` `to_char` -> UTC: 8 mixed read/write sites on TEXT columns plus DDL defaults in
 off-limits `db.py`). M-7 was folded into M-4. `DataTable` needed no card view - it already
 scrolls.
 
 **Open items carried forward.**
-1. Full-suite load makes the 5 s-timeout tests flake (Recipes focus, Reports pagination);
-   both pass in isolation.
+1. The load-induced test flakes are closed: PR #23 raised Testing Library's async
+   assertion budget to 5 s and vitest's per-test timeout to 15 s, and
+   `src/testBudget.test.js` pins them. The assertions themselves are unchanged - a state
+   change that never arrives still fails.
 2. The Recipes dense-table icon buttons stay 26 px: a 44 px target there would overlap the
    neighbouring row and the destructive action beside it. It needs a row menu, not a wider
    tap area.
