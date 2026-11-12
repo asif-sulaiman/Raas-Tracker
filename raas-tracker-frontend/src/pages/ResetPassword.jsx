@@ -8,11 +8,11 @@ const inputCls =
 
 function Shell({ children }) {
   return (
-    <div className="flex items-center justify-center min-h-dvh bg-slate-100 dark:bg-slate-950 p-4">
+    <main className="flex items-center justify-center min-h-dvh bg-slate-100 dark:bg-slate-950 p-4">
       <div className="w-full max-w-sm rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6 shadow-xl">
         {children}
       </div>
-    </div>
+    </main>
   );
 }
 
@@ -114,8 +114,8 @@ export default function ResetPassword() {
       </p>
       <form onSubmit={handleSubmit} className="space-y-3">
         <div>
-          <label className="text-xs font-medium text-slate-600 dark:text-slate-300">New password (min 8 characters)</label>
-          <input
+          <label htmlFor="reset-new-password" className="text-xs font-medium text-slate-600 dark:text-slate-300">New password (min 8 characters)</label>
+          <input id="reset-new-password"
             type="password"
             value={next}
             onChange={(e) => setNext(e.target.value)}
@@ -125,8 +125,8 @@ export default function ResetPassword() {
           />
         </div>
         <div>
-          <label className="text-xs font-medium text-slate-600 dark:text-slate-300">Confirm new password</label>
-          <input
+          <label htmlFor="reset-confirm-password" className="text-xs font-medium text-slate-600 dark:text-slate-300">Confirm new password</label>
+          <input id="reset-confirm-password"
             type="password"
             value={confirm}
             onChange={(e) => setConfirm(e.target.value)}
