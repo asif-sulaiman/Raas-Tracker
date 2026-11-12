@@ -2145,7 +2145,7 @@ Not yet sliced — awaiting prioritization.
 | Role-Based Field Permissions | Field-level ACL (e.g., only admin edits `unit_price`) | 2–3 |
 | Email/Webhook Notifications | SMTP/SendGrid + webhook endpoints for critical alerts | 2–3 |
 | Advanced Dashboard | Recharts trends (stock turnover, sales velocity, mismatch trends) | 2–3 |
-| Mobile PWA | Service worker, offline queue for uploads, install prompt | 3–4 |
+| Mobile PWA (partly shipped) | Installability shipped 2026-11-12 (manifest, icons, dynamic viewport, safe area). **Remaining:** service worker, offline queue for uploads, install prompt | 2–3 |
 | Audit Log Export | CSV/Excel export with filters (date, user, entity) | 1–2 |
 | PI Template Library | Save/reuse PI parsing templates for recurring vendors | 2–3 |
 
@@ -2282,6 +2282,46 @@ so neither new writer can join the pre-existing sale↔invoice inversion.
 **Verification:** focused set (8 files, 250 cases) green; `ruff check raas_tracker/
 tests/` clean. Full-suite gate, pyright and the browser flow are the remaining
 step (task #10) — this line is not a claim that they have run.
+
+---
+
+## 📱 Phase MOBILE-UX: phone usability pass (M-0..M-6, completed 2026-11-12)
+
+**What shipped.** The mobile fix plan (`MOBILE_FIX_PLAN.md`, revised after a source-verified
+audit) ran as seven slices, one commit each, each starting from a failing test:
+
+| Slice | Commit | What it fixed |
+|---|---|---|
+| M-0 | `09e6b6e`, `2a392da` | the plan committed; the dead opencode config removed from the tree |
+| M-1 | `76d5d42`, `c74b0bc` | one `collapsed` boolean drove both the desktop rail and the mobile drawer, so the drawer opened expanded over the page and its only toggle slid off-screen. `Layout` now owns `desktopCollapsed` + `mobileOpen`, the header carries a hamburger (`aria-expanded`, `aria-controls="app-sidebar"`), Escape closes the drawer and focus returns to the hamburger |
+| M-2 | `c7d7328` | 26 `type="number"` inputs rendered at 14 px, so iOS Safari auto-zoomed on focus. Now `text-base sm:text-xs` (16 px on phones) plus `inputMode="decimal"` / `"numeric"` |
+| M-3 | `6b55764` | `role="dialog"` appeared nowhere in the repo. `useDialogLayer` gives `Modal` and the drawer the same stack-aware Escape, focus trap, focus restore and body-scroll lock; below `md` a modal is a bottom sheet |
+| M-4 | `7eb3960` | 4 wide tables had no scroll wrapper (Production Run, Reports stock availability, 2x Recipes) and the invoice editor had no phone view. Every wide table now scrolls and `InvoiceEditor` renders stacked cards below `md` |
+| M-5 | `7a6537a` | icon-only controls were 26-36 px. One shared centred 44x44 pseudo-element gives each of them a 44 px target without changing the visual box |
+| M-6 | `c01ad08` | `h-screen` at 9 sites meant the address bar cut the app; `index.html` had no `viewport-fit=cover`, no theme colour and no manifest. Now `h-dvh` / `min-h-dvh`, the safe-area inset is reserved inside the sheet and under the main area, and the app is installable (manifest + 192/512/180 icons, `scripts/make_pwa_icons.py`) |
+
+**Verification.** `vitest` 599/599 (57 files) - `oxlint` 0 errors - `vite build` clean -
+`ruff` clean - `pyright` 0 errors. Chromium at 360x640 and 1280x800: no page-level
+horizontal scroll on any page, 44 px hit areas measured by hit-testing (a tap 21.5 px from
+an icon's centre lands on it, 23 px does not), the dynamic viewport equals the visible
+height, and the modal sheet sits flush with the bottom edge. Flask serves `/manifest.json`
+and the three icons with 200; Chrome reports no installability errors; Lighthouse mobile:
+accessibility 0.92, best-practices 1.00.
+
+**Deliberately not done.** B-1 (`CURRENT_DATE` -> UTC: the DB is already UTC) and B-2
+(`auth.py` `to_char` -> UTC: 8 mixed read/write sites on TEXT columns plus DDL defaults in
+off-limits `db.py`). M-7 was folded into M-4. `DataTable` needed no card view - it already
+scrolls.
+
+**Open items carried forward.**
+1. Full-suite load makes the 5 s-timeout tests flake (Recipes focus, Reports pagination);
+   both pass in isolation.
+2. The Recipes dense-table icon buttons stay 26 px: a 44 px target there would overlap the
+   neighbouring row and the destructive action beside it. It needs a row menu, not a wider
+   tap area.
+3. The login page has no field labels, no `main` landmark and no meta description
+   (Lighthouse accessibility 0.92 / SEO 0.80) - a small accessibility slice closes it.
+4. `react_frontend/` is gitignored and drifts unless `dist/` is copied after every build.
 
 ---
 

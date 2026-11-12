@@ -5,6 +5,47 @@
 
 ---
 
+## 2026-11-12 — MOBILE UX PASS (M-0..M-6): phone usability + installable PWA
+
+The mobile fix plan (`MOBILE_FIX_PLAN.md`) shipped in full: seven slices, one commit each,
+every slice starting from a failing test. The phase record is `docs/plan.md` § Phase
+MOBILE-UX; the plan file itself carries a status line.
+
+**Commits (all on `main`, not pushed as of this handoff):**
+`09e6b6e` M-0 plan · `76d5d42`+`c74b0bc` M-1 drawer/rail · `c7d7328` M-2 input zoom ·
+`6b55764` M-3 dialog semantics · `7eb3960` M-4 tables · `7a6537a` M-5 touch targets ·
+`c01ad08` M-6 viewport/PWA · `75649ac`+`d841456` final-review fixes ·
+`2a392da` + the docs commit for this close-out.
+
+**What a user gets now:** a reachable navigation drawer on a phone, forms that do not make
+iOS zoom, modals that are real dialogs (focus trap, Escape, body lock) and read as bottom
+sheets, no page-level sideways scroll anywhere, 44 px tap targets on every icon-only
+control, an app that is not cut by the address bar, and an installable PWA.
+
+**Verified:** `vitest` 599/599 (57 files) · `oxlint` 0 · `vite build` clean · `ruff` clean ·
+`pyright` 0 errors · Chromium 360x640 + 1280x800 (44 px hit areas by hit-testing, no page
+scroll, dvh == visible height, sheet flush with the bottom edge) · Flask serves
+`/manifest.json` + the 3 icons with 200 · Chrome reports no installability errors ·
+Lighthouse mobile accessibility 0.92 / best-practices 1.00.
+
+**Still open (ranked):**
+1. Full-suite load makes the 5 s-timeout tests flake (Recipes focus, Reports pagination).
+2. Recipes' dense-table icon buttons stay 26 px — needs a row menu, not a wider tap.
+3. Login page: no field labels, no `main` landmark, no meta description (Lighthouse a11y
+   0.92 / SEO 0.80). A small accessibility slice closes it.
+4. `react_frontend/` is gitignored: copy `dist/` there or production serves the old shell.
+5. **Phase PI-DEMOS task #10** — the full-suite gate, pyright and the browser flow for the
+   PI-demo slice were never run (`docs/plan.md`, last section).
+
+**Decisions a future session should not re-litigate:** one shared centred 44x44
+pseudo-element for hit areas (not per-control insets); `Button` auto-detects icon-only;
+the notification bell counts as an icon-only header control; dense-table icons are
+deliberately left small; the safe-area inset lives *inside* the sheet and the main area,
+never on an overlay; the viewport invariant test hides the legacy class name from
+Tailwind's content scanner on purpose.
+
+---
+
 ## 2026-10-29 — LATEST DATE OF SHIPMENT (LC label, LC deadline bell, report dates)
 
 `letters_of_credit.expiry_date` now means the **latest date of shipment**

@@ -875,6 +875,19 @@ future call sites are covered without opting in:
 |---|---|---|---|
 | GET | `/` | Public | `index.html` |
 | GET | `/<path>` | Public | Static file or `index.html` (SPA fallback) |
+| GET | `/manifest.json` | Public | Web app manifest (`display: standalone`, icons 192/512) |
+| GET | `/icons/icon-192.png`, `/icons/icon-512.png`, `/icons/apple-touch-icon.png` | Public | PWA icons, generated from `public/raas-logo.png` by `scripts/make_pwa_icons.py` |
+
+**Mobile shell contract (2026-11-12).**
+- The served shell is `react_frontend/` (gitignored; `dist/` is copied there — CI does not
+  do it, so a deploy that skips the copy serves the old shell and the manifest 404s).
+- `index.html` declares `viewport-fit=cover`, a light and a dark `theme-color`, the manifest
+  link and the apple-touch-icon link.
+- Shell heights use the dynamic viewport (`h-dvh` / `min-h-dvh`): the mobile address bar
+  must not cut the app.
+- The safe-area inset is reserved *inside* the surfaces that reach the screen edge — the
+  modal bottom sheet and the app's main area — never by padding an overlay, which would
+  lift the sheet off the bottom edge.
 
 ### Invoice Lifecycle & Shipment Sub-steps
 - **Per-invoice statuses:** `planned → produced → booked → shipped → paid`, tracked independently — one sale may hold several invoices at different steps.
