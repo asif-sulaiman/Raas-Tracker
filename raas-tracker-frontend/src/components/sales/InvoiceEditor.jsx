@@ -4,13 +4,20 @@ import { toast } from 'sonner';
 import { useAuth } from '../../context/AuthContext';
 import Button from '../ui/Button';
 import { formatNumber, lineTotal, todayLocalISO } from '../../utils/format';
+import { useMinWidth } from '../../hooks/useMinWidth';
 import useInvoiceBudget from './useInvoiceBudget';
 
 const inputCls =
   'w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-base sm:text-sm text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500';
 
-const readOnlyCls =
-  `${inputCls} w-28 text-right bg-slate-100 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400 cursor-not-allowed`;
+const readOnlyTone =
+  'text-right bg-slate-100 dark:bg-slate-800/60 text-slate-500 dark:text-slate-400 cursor-not-allowed';
+
+const readOnlyCls = `${inputCls} w-28 ${readOnlyTone}`;
+
+// Matches Tailwind's `md` breakpoint: below it the table cannot fit five
+// columns without a horizontal scrollbar, so the lines become cards.
+const MD_MIN_WIDTH = 768;
 
 /**
  * What is left of the PI line once the quantity staged here is counted. The
@@ -59,6 +66,7 @@ export default function InvoiceEditor({
   } = useInvoiceBudget(saleId);
 
   const isCreate = mode === 'create';
+  const isWide = useMinWidth(MD_MIN_WIDTH);
   const [invoiceNumber, setInvoiceNumber] = useState('');
   const [invoiceDate, setInvoiceDate] = useState(todayLocalISO());
   const [qtys, setQtys] = useState({});
@@ -250,7 +258,7 @@ export default function InvoiceEditor({
         <p className="text-xs text-slate-400 dark:text-slate-500">
           This PI has no product lines to invoice.
         </p>
-      ) : (
+      ) : isWide ? (
         <table className="w-full text-xs divide-y divide-slate-200 dark:divide-slate-700">
           <thead>
             <tr className="bg-slate-50 dark:bg-slate-800/60 text-slate-500 uppercase tracking-wider">
@@ -312,6 +320,69 @@ export default function InvoiceEditor({
             })}
           </tbody>
         </table>
+      ) : (
+        <ul aria-label="Invoice lines" className="space-y-2">
+          {rows.map(({ line, typed, left }) => {
+            const unit = line.unit || 'KG';
+            return (
+              <li
+                key={line.sale_item_id}
+                className="rounded-lg border border-slate-200 dark:border-slate-700 p-3"
+              >
+                <div className="flex items-baseline justify-between gap-2">
+                  <p className="text-sm font-medium text-slate-900 dark:text-white">
+                    {line.product_name}
+                  </p>
+                  <p className="shrink-0 text-xs text-slate-600 dark:text-slate-400">
+                    PI {formatNumber(line.pi_quantity)} {unit}
+                  </p>
+                </div>
+                <p
+                  aria-live="polite"
+                  className="mt-0.5 text-xs text-slate-500 dark:text-slate-400"
+                >
+                  Remaining {formatNumber(left)} {unit}
+                </p>
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <label className="block min-w-0 text-xs font-medium text-slate-600 dark:text-slate-300">
+                    <span className="mb-1 block">Invoice qty</span>
+                    <input
+                      aria-label={`Invoice qty for ${line.product_name}`}
+                      inputMode="decimal" type="number"
+                      step="any"
+                      min="0"
+                      value={qtys[line.sale_item_id] || ''}
+                      onChange={(e) => setQty(line.sale_item_id, e.target.value)}
+                      className={`${inputCls} text-right`}
+                    />
+                  </label>
+                  <label className="block min-w-0 text-xs font-medium text-slate-600 dark:text-slate-300">
+                    <span className="mb-1 block">Unit price</span>
+                    <input
+                      aria-label={`Unit price for ${line.product_name}`}
+                      value={`$${formatNumber(line.unit_price)}`}
+                      readOnly
+                      tabIndex={-1}
+                      title="Set by the PI line on the server — read-only"
+                      className={`${inputCls} ${readOnlyTone}`}
+                    />
+                  </label>
+                  <label className="col-span-2 block min-w-0 text-xs font-medium text-slate-600 dark:text-slate-300">
+                    <span className="mb-1 block">Total price</span>
+                    <input
+                      aria-label={`Total price for ${line.product_name}`}
+                      value={`$${formatNumber(typed > 0 ? lineTotal(typed, line.unit_price) : 0)}`}
+                      readOnly
+                      tabIndex={-1}
+                      title="Invoiced quantity x unit price - restated by the server on save"
+                      className={`${inputCls} ${readOnlyTone}`}
+                    />
+                  </label>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
       )}
 
       {superseded.length > 0 && (

@@ -126,17 +126,20 @@ components already have `overflow-x-auto`.
 | Site | Fix |
 |---|---|
 | `ProductionRunModal.jsx:328` (5-col) | wrap table in `overflow-x-auto` |
-| `Reports.jsx:913` (6-col Stock Availability) | wrap table in `overflow-x-auto` |
+| `Reports.jsx:913` (7-col Stock Availability) | wrap table in `overflow-x-auto` |
 | `Recipes.jsx:348`, `1479` | wrap tables in `overflow-x-auto` |
 | `InvoiceEditor.jsx:254` (5-col, `text-xs`) | card view below `md`: stacked rows with product header + qty/price/total 2-col grid |
 
 **Also in scope (absorbed M-7).** `Recipes.jsx:378` `grid-cols-3 text-[11px]` →
 `grid-cols-1 sm:grid-cols-3` and `text-xs` minimum. `InvoicePanel` / `CommercialTable`
-need no structural change (already scroll) — verify only.
+need no structural change (already scroll) — verify only. The real-browser pass found
+one more 360 px offender: the recipe detail action row (`Edit` / `Delete` / `Go for
+Production`) pushed the page 73 px wide; it now wraps (`flex-wrap` + `min-w-0`).
 
 **Tests.** Extend `ProductionRunModal.test.jsx`, `InvoiceEditor.test.jsx`,
 `Recipes.test.jsx`, `Reports.test.jsx`: stacked view renders at small breakpoint
-(assert on the DOM branch, not on CSS), table headers still present at `md`.
+(assert on the DOM branch, not on CSS), table headers still present at `md`, and the
+recipe detail action row declares `flex-wrap`.
 
 **Gate.** `npx oxlint` + `npx vitest run` + `npx vite build`. Manual at 360 px:
 no horizontal page scroll on Recipes / Reports / InvoiceEditor / Production Run.

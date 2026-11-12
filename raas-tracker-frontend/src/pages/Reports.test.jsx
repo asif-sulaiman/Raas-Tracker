@@ -586,6 +586,8 @@ describe('Production report sourcing', () => {
     expect(headers).toContain('Gross use');
     expect(headers).toContain('Stock impact');
     expect(headers).not.toContain('Required');
+    // The seven columns scroll inside the card instead of being clipped.
+    expect(screen.getByRole('table').closest('.overflow-x-auto')).not.toBeNull();
   });
 
   it('shows the outward evidence with deducted 0 and no balance to compare', async () => {

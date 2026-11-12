@@ -919,6 +919,7 @@ export default function Reports() {
                     </Badge>
                   </div>
                 </div>
+                <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-slate-100 dark:border-slate-800">
@@ -1039,6 +1040,7 @@ export default function Reports() {
                     })}
                   </tbody>
                 </table>
+                </div>
               </div>
             )}
           </div>

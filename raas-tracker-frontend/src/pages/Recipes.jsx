@@ -375,7 +375,7 @@ function ProductFormulationCard({
           </Badge>
         </div>
 
-        <div className="mt-3 grid grid-cols-3 gap-2 text-[11px] text-slate-600 dark:text-slate-400">
+        <div className="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs text-slate-600 dark:text-slate-400">
           <p>Invoiced {formatNumber(product.invoiced_qty)} {product.unit}</p>
           <p>Produced {formatNumber(product.produced_qty)} {product.unit}</p>
           <p className="font-semibold text-slate-800 dark:text-slate-200">
@@ -403,6 +403,7 @@ function ProductFormulationCard({
         )}
       </div>
 
+      <div className="overflow-x-auto">
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-slate-100 dark:border-slate-800">
@@ -602,6 +603,7 @@ function ProductFormulationCard({
           )}
         </tbody>
       </table>
+      </div>
 
       <div className="flex flex-wrap items-center gap-3 border-t border-slate-100 dark:border-slate-800 px-4 py-3">
         <label
@@ -1317,7 +1319,7 @@ export default function Recipes() {
 
     return (
       <div className="space-y-6 max-w-7xl mx-auto">
-        <div className="flex items-center gap-4">
+        <div className="flex flex-wrap items-center gap-4">
           <button
             aria-label="Back to recipes"
             onClick={() => { setShowDetail(false); setSelectedRecipe(null); setDetailProducts([]); setCarriedLine(null); setLoading(true); fetchData(); }}
@@ -1325,7 +1327,7 @@ export default function Recipes() {
           >
             <ArrowLeft className="h-5 w-5 text-slate-600 dark:text-slate-400" />
           </button>
-          <div className="flex-1">
+          <div className="flex-1 min-w-0">
             <h1 className="text-2xl font-bold text-slate-900 dark:text-white">{selectedRecipe.name}</h1>
             <p className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">
               {selectedRecipe.invoice_number || '—'}
@@ -1335,7 +1337,7 @@ export default function Recipes() {
               <span>{formulatedCount} of {productCount} products formulated</span>
             </p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <Button variant="secondary" size="sm" icon={Edit3} onClick={openEditMeta}>Edit</Button>
             {isAdmin && (
               <Button variant="danger" size="sm" icon={Trash2} onClick={() => handleDelete(selectedRecipe)}>Delete</Button>
@@ -1477,6 +1479,7 @@ export default function Recipes() {
       </div>
 
       <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs overflow-hidden">
+        <div className="overflow-x-auto">
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-slate-100 dark:border-slate-800">
@@ -1546,6 +1549,7 @@ export default function Recipes() {
             )}
           </tbody>
         </table>
+        </div>
       </div>
 
       <Modal

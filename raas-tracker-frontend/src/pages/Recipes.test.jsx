@@ -650,6 +650,15 @@ describe('Per-product formulation', () => {
     expect(within(card('Sodium Silicate')).getByText('Empty formulation')).toBeTruthy();
   });
 
+  it('lets the detail actions wrap on a phone instead of widening the page', async () => {
+    renderRecipes({ recipes: [RECIPE_ROW] });
+    await openRecipeDetail();
+
+    const actions = screen.getByRole('button', { name: /Go for Production/ }).parentElement;
+    expect(actions.className).toContain('flex-wrap');
+    expect(actions.parentElement.className).toContain('flex-wrap');
+  });
+
   it('adds an ingredient to a specific product', async () => {
     const { fetchMock } = renderRecipes({ recipes: [RECIPE_ROW] });
     await openRecipeDetail();
@@ -900,11 +909,26 @@ describe('Per-product formulation', () => {
     expect(within(soda).getAllByRole('columnheader').map((th) => th.textContent))
       .toEqual(['#', 'Chemical', 'Percentage', 'Source', 'Chemical needed',
         'Current Stock', 'Stock remaining', 'Actions']);
+    // Eight columns need their own scroll container inside the clipped card.
+    expect(within(soda).getByRole('table').closest('.overflow-x-auto')).not.toBeNull();
     // 40% of the 150 KG still to produce, from a stock of 500.
     expect(within(soda).getByText('60.00 KG')).toBeTruthy();
     expect(within(soda).getByText('440.00 KG')).toBeTruthy();
     expect(within(soda).getByText(
       /Quantities are for the 150.00 KG still to produce/)).toBeTruthy();
+  });
+
+  it('stacks the invoiced/produced/remaining summary on a phone', async () => {
+    renderRecipes({ recipes: [RECIPE_ROW] });
+    await openRecipeDetail();
+
+    const summary = within(card('Caustic Soda 50%'))
+      .getByText(/^Invoiced /).closest('div');
+    expect(summary.className).toContain('grid-cols-1');
+    expect(summary.className).toContain('sm:grid-cols-3');
+    expect(summary.className).toContain('text-xs');
+    // 11px was too small to read on a phone.
+    expect(summary.className).not.toContain('text-[11px]');
   });
 
   it("shows a shared chemical's invoice-wide remainder on every row", async () => {
@@ -1100,6 +1124,7 @@ describe('Recipe list', () => {
     renderRecipes({ recipes: [RECIPE_ROW] });
 
     expect(await screen.findByText('INV-014')).toBeTruthy();
+    expect(screen.getByRole('table').closest('.overflow-x-auto')).not.toBeNull();
     expect(screen.getByText('1 of 3 formulated')).toBeTruthy();
     expect(screen.getByText('Products awaiting formulation')).toBeTruthy();
     // 3 products, 1 formulated.

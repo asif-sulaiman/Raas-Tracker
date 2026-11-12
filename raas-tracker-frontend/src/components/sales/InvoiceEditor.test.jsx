@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import React from 'react';
-import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, cleanup, fireEvent, within, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { AuthProvider } from '../../context/AuthContext';
 import InvoiceEditor from './InvoiceEditor';
@@ -162,6 +162,40 @@ describe('InvoiceEditor — create mode', () => {
     // The column model no longer restates what is already invoiced.
     expect(screen.queryByRole('columnheader', { name: /invoiced/i })).toBeNull();
     expect(screen.queryByRole('columnheader', { name: /remaining/i })).toBeNull();
+  });
+
+  it('renders stacked cards below md and swaps back to the table at md', async () => {
+    installFetch();
+    const originalWidth = window.innerWidth;
+    try {
+      window.innerWidth = 390;
+      renderEditor();
+      await screen.findByText('Alpha');
+
+      // Below md the table is not in the DOM at all: no headers, no rows.
+      expect(screen.queryAllByRole('columnheader')).toHaveLength(0);
+      const list = screen.getByRole('list', { name: 'Invoice lines' });
+      expect(within(list).getAllByRole('listitem')).toHaveLength(2);
+
+      // The one quantity input still drives the live remaining and total.
+      fireEvent.change(qtyFor('Alpha'), { target: { value: '3' } });
+      expect(list.textContent).toContain('Remaining 5.00 KG');
+      expect(totalFor('Alpha').value).toBe('$15.00');
+      expect(priceFor('Alpha').readOnly).toBe(true);
+
+      act(() => {
+        window.innerWidth = 1024;
+        window.dispatchEvent(new Event('resize'));
+      });
+      expect(
+        screen.getAllByRole('columnheader').map((h) => h.textContent.trim()),
+      ).toEqual(['Product', 'PI qty', 'Invoice qty', 'Unit price', 'Total price']);
+      expect(screen.queryByRole('list', { name: 'Invoice lines' })).toBeNull();
+      // A half-typed line survives the branch swap.
+      expect(qtyFor('Alpha').value).toBe('3');
+    } finally {
+      window.innerWidth = originalWidth;
+    }
   });
 
   it('prices the line as quantity times unit price', async () => {

@@ -137,6 +137,17 @@ describe('ProductionRunModal invoice scope', () => {
     expect(screen.getByText(/no formulation yet/i)).toBeTruthy();
   });
 
+  it('keeps the product table scrollable instead of clipping it on a phone', async () => {
+    installFetch();
+    renderModal();
+    await waitForSource();
+
+    const table = screen.getByRole('table');
+    expect(table.closest('.overflow-x-auto')).not.toBeNull();
+    // The scroll wrapper must not cost the columns.
+    expect(screen.getByRole('columnheader', { name: 'Quantity' })).toBeTruthy();
+  });
+
   it('posts per-product outputs to the recipe id, never legacy fields', async () => {
     const posts = installFetch();
     const { onSaved, onClose } = renderModal();
