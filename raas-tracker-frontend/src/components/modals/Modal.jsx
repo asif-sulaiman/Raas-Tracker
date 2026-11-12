@@ -26,7 +26,7 @@ export default function Modal({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center pb-[env(safe-area-inset-bottom)] md:items-center md:p-4">
+    <div className="fixed inset-0 z-50 flex items-end justify-center md:items-center md:p-4">
       {/* Backdrop */}
       <div
         aria-hidden="true"
@@ -42,7 +42,7 @@ export default function Modal({
         aria-labelledby={title ? titleId : undefined}
         aria-label={title ? undefined : 'Dialog'}
         tabIndex={-1}
-        className={`relative z-10 flex max-h-[85dvh] w-full flex-col ${maxWidth} rounded-t-2xl border border-slate-200 bg-white shadow-2xl transition-all md:max-h-[calc(100dvh-4rem)] md:rounded-2xl dark:border-slate-800 dark:bg-slate-900`}
+        className={`relative z-10 flex max-h-[85dvh] w-full flex-col ${maxWidth} rounded-t-2xl border border-slate-200 bg-white pb-[env(safe-area-inset-bottom)] shadow-2xl transition-all md:max-h-[calc(100dvh-4rem)] md:rounded-2xl md:pb-0 dark:border-slate-800 dark:bg-slate-900`}
       >
         {/* Header */}
         <div className="flex shrink-0 items-start justify-between gap-4 p-5 border-b border-slate-100 dark:border-slate-800">
