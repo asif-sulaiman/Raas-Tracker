@@ -149,14 +149,24 @@ no horizontal page scroll on Recipes / Reports / InvoiceEditor / Production Run.
 **Verified problem.** `Button.sm` ≈30 px; Modal close ≈28 px; Header/Sidebar icon
 buttons ≈36 px.
 
-**Approach.** Do **not** enlarge `sm` text buttons (dense tables degrade). Add a
-44 px hit area via `after:absolute after:-inset-*` to icon-only controls:
-`Modal` close, `Header` (change-password, logout), `Sidebar` toggle, hamburger.
-Keep visual size unchanged.
+**Approach.** Do **not** enlarge `sm` text buttons (dense tables degrade). One shared
+`ICON_HIT_AREA` class set centres a 44×44 pseudo-element on the control
+(`after:absolute after:left-1/2 after:top-1/2 after:size-11
+after:-translate-x-1/2 after:-translate-y-1/2 after:content-['']`), so controls of
+different visual sizes all reach exactly 44 px without shifting layout or
+overlapping neighbours. Apply it to `Modal` close, `Header` (hamburger,
+change-password, logout), the notification bell (the same icon-only header control,
+omitted from the first list), and both `Sidebar` toggles. `Button` gains the icon-only
+variant: a button with an icon/loader and no children gets the same hit area; text
+buttons keep their dense size.
 
-**Files.** `src/components/ui/Button.jsx` (icon-only variant), `Modal.jsx`, `Header.jsx`, `Sidebar.jsx`.
+**Files.** `src/components/ui/Button.jsx` (+ new `Button.test.jsx`), `Modal.jsx`,
+`Header.jsx`, `NotificationBell.jsx`, `Sidebar.jsx`, and hit-area assertions in
+`Header.test.jsx`, `Layout.test.jsx`, `Modal.test.jsx`.
 
-**Gate.** `npx oxlint` + `npx vitest run`. Manual: tap targets ≥44 px measured in DevTools.
+**Gate.** `npx oxlint` + `npx vitest run` + `npx vite build`. Manual at 360 px: every
+listed icon control hit-tests 44 px from its centre, misses at 23 px, and `sm` text
+buttons stay unchanged.
 
 ### M-6 — Viewport, safe area, installability (1.5 h, `feat:`)
 

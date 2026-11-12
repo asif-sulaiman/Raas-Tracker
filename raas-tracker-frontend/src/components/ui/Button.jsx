@@ -15,6 +15,11 @@ const BUTTON_SIZES = {
   lg: 'px-5 py-2.5 text-base',
 };
 
+// Icon-only controls keep their visual box but get a centred 44x44 pointer
+// target. The pseudo-element belongs to the control for hit testing, so a tap
+// slightly outside a 28px button still activates it without shifting layout.
+export const ICON_HIT_AREA = "relative after:absolute after:left-1/2 after:top-1/2 after:size-11 after:-translate-x-1/2 after:-translate-y-1/2 after:content-['']";
+
 export default function Button({
   children,
   variant = 'primary',
@@ -25,6 +30,8 @@ export default function Button({
   disabled,
   ...props
 }) {
+  const iconOnly = !children && Boolean(Icon || loading);
+
   return (
     <button
       disabled={disabled || loading}
@@ -33,6 +40,7 @@ export default function Button({
         'focus:outline-hidden focus:ring-3 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer',
         BUTTON_VARIANTS[variant] || BUTTON_VARIANTS.primary,
         BUTTON_SIZES[size] || BUTTON_SIZES.md,
+        iconOnly && ICON_HIT_AREA,
         className
       )}
       {...props}

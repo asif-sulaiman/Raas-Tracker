@@ -1,6 +1,7 @@
 import { useId, useRef } from 'react';
 import { X } from 'lucide-react';
 import { useDialogLayer } from '../../hooks/useDialogLayer';
+import { ICON_HIT_AREA } from '../ui/Button';
 
 export default function Modal({
   isOpen,
@@ -65,7 +66,7 @@ export default function Modal({
             type="button"
             onClick={onClose}
             aria-label="Close"
-            className="relative shrink-0 rounded-lg p-1.5 text-slate-400 transition-colors after:absolute after:-inset-2 after:content-[''] hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer"
+            className={`shrink-0 rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer ${ICON_HIT_AREA}`}
           >
             <X className="h-4 w-4" />
           </button>

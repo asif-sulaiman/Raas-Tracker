@@ -7,6 +7,7 @@ import { AuthProvider } from '../../context/AuthContext';
 import { NotificationProvider } from '../../context/NotificationContext';
 import Header from './Header.jsx';
 import Sidebar from './Sidebar.jsx';
+import { ICON_HIT_AREA } from '../ui/Button.jsx';
 
 afterEach(() => {
   cleanup();
@@ -35,7 +36,7 @@ function renderShell({ start = '/reports' } = {}) {
             <Route path="/reports" element={(
               <div>
                 <Sidebar />
-                <Header />
+                <Header onOpenNavigation={() => {}} />
               </div>
             )} />
           </Routes>
@@ -44,6 +45,22 @@ function renderShell({ start = '/reports' } = {}) {
     </MemoryRouter>
   );
 }
+
+describe('touch targets', () => {
+  it('gives every icon-only header control the shared 44px hit area', () => {
+    renderShell();
+    const controls = [
+      screen.getByRole('button', { name: 'Open navigation' }),
+      screen.getByTitle('Change password'),
+      screen.getByTitle('Log out'),
+      screen.getByRole('button', { name: /Notifications/ }),
+    ];
+
+    for (const control of controls) {
+      expect(control.className).toContain(ICON_HIT_AREA);
+    }
+  });
+});
 
 describe('brand link to Home', () => {
   it('makes the header brand a link pointing at Home', async () => {

@@ -5,6 +5,7 @@ import {
   Bell, Volume2, VolumeX, CheckCheck, AlertTriangle, Info, RefreshCw, Monitor,
 } from 'lucide-react';
 import { useNotifications } from '../../context/NotificationContext';
+import { ICON_HIT_AREA } from '../ui/Button';
 import { timeAgo, entityRoute, severityMeta } from '../../utils/notifications';
 
 function SeverityIcon({ severity }) {
@@ -57,7 +58,7 @@ export default function NotificationBell() {
         aria-label={unread > 0 ? `Notifications, ${unread} unread` : 'Notifications'}
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
-        className="relative p-2 rounded-lg hover:bg-gray-100 text-gray-500 transition-colors cursor-pointer"
+        className={`p-2 rounded-lg hover:bg-gray-100 text-gray-500 transition-colors cursor-pointer ${ICON_HIT_AREA}`}
       >
         <Bell size={20} />
         {unread > 0 && (

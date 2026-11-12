@@ -3,6 +3,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { useState } from 'react';
 import { render, screen, fireEvent, cleanup, within } from '@testing-library/react';
 import Modal from './Modal.jsx';
+import { ICON_HIT_AREA } from '../ui/Button.jsx';
 
 afterEach(() => {
   cleanup();
@@ -49,6 +50,11 @@ describe('dialog semantics', () => {
     expect(labelId).toBeTruthy();
     expect(document.getElementById(labelId)?.textContent).toBe('Test dialog');
     expect(currentCloseButton()).toBeTruthy();
+  });
+
+  it('gives the close control the shared 44px hit area', () => {
+    render(<Harness initialOpen />);
+    expect(currentCloseButton().className).toContain(ICON_HIT_AREA);
   });
 
   it('moves focus into the dialog when it opens', () => {
