@@ -38,9 +38,17 @@ the stale `react_frontend/` build (`python scripts/build_frontend.py` now builds
 publishes in one step, replacing the previous hashed assets).
 
 **Still open (ranked):**
-1. **Phase PI-DEMOS task #10** — the full-suite gate and pyright have run green (1760
-   passed / 8 skipped, 0 errors), but the **browser flow** for the PI-demo slice has not
-   been exercised in a real browser (`docs/plan.md`, last section).
+1. **Production deployment** — the Vercel URL on record
+   (`https://chemcalc-omega.vercel.app/`) answers `404 DEPLOYMENT_NOT_FOUND`, and GitHub
+   shows no deployment records for `main`. The build is ready (`python
+   scripts/build_frontend.py` produces the exact bundle, and Vercel's build command copies
+   it into `public/` and `react_frontend/`), but the project itself has to be pointed at
+   the repo again before anything is live.
+2. **Phase PI-DEMOS task #10** is now closed: the full-suite gate and pyright ran green
+   (1760 passed / 8 skipped, 0 errors) and the browser flow was exercised against a local
+   stack - a PI drafted, an ingredient picked from the catalog, the draft saved, the demo
+   activated, and the Chemical Stock forecast showing the demand it created
+   (`docs/plan.md`, Phase PI-DEMOS).
 
 **Decisions a future session should not re-litigate:** one shared centred 44x44
 pseudo-element for hit areas (not per-control insets); `Button` auto-detects icon-only;
